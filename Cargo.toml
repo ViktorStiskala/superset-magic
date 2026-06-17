@@ -1,10 +1,10 @@
 [package]
-name = "superset-setup"
+name = "ss-magic"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "superset-setup"
+name = "ss-magic"
 path = "src/main.rs"
 
 [dependencies]

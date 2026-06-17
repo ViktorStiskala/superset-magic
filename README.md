@@ -1,4 +1,4 @@
-# superset-setup
+# ss-magic
 
 Interactive Rust CLI that bootstraps the monorepo's Superset workspace
 contract in the main checkout and applies the configured file copies
@@ -10,7 +10,7 @@ from inside a linked worktree.
 make install
 ```
 
-Builds via `cargo install --path .` and drops `superset-setup` in
+Builds via `cargo install --path .` and drops `ss-magic` in
 `$CARGO_HOME/bin` (usually `~/.cargo/bin`).
 
 ## Modes
@@ -141,7 +141,7 @@ that reference it will need modification.
 **Failure.** A non-zero exit fails the CLI with a message naming the
 exit code. The file copy is NOT rolled back. Recovery: fix the issue,
 then either run the failing commands directly in the worktree, or
-re-run `superset-setup` and decline the file-copy step on the second
+re-run `ss-magic` and decline the file-copy step on the second
 prompt so you only re-run setup.
 
 **Side effects to be aware of.** Setup commands may write outside the
@@ -178,6 +178,18 @@ first. If you've started fixing things locally in the worktree,
 **decline the file-copy prompt on the re-run** so your edits aren't
 clobbered — then accept the setup-confirm prompt to retry the
 commands.
+
+## Commands
+
+The bare invocation chooses bootstrap or apply mode automatically based
+on where you run it (see Modes below). Two non-interactive subcommands
+are also available:
+
+- `ss-magic sync` — non-interactive forward file copy (main → current
+  worktree).
+- `ss-magic update` — force a self-update to the latest release.
+
+Run `ss-magic --help` for the full list.
 
 ## Make targets
 

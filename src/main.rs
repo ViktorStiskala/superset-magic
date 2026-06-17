@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use anyhow::{bail, Context, Result};
 
 mod apply;
+mod cli;
 mod exec;
 mod git;
 mod pattern;
@@ -16,6 +17,7 @@ mod superset_files;
 mod ui;
 
 use crate::apply::{Event, SkipReason};
+use crate::cli::{Command, Parsed};
 use crate::git::Mode;
 use crate::ui::FinalAction;
 
@@ -23,18 +25,81 @@ const COMMIT_MESSAGE: &str = "chore(superset): bootstrap workspace contract";
 
 fn run() -> Result<ExitCode> {
     style::init();
+    // Composition order: style::init (above) → parse argv → git::probe →
+    // dispatch. Parsing happens before the git probe so `--help` answers
+    // without touching the repo.
+    let args: Vec<String> = env::args().skip(1).collect();
+    match cli::parse(&args) {
+        Parsed::Help => {
+            println!("{}", cli::usage());
+            Ok(ExitCode::SUCCESS)
+        }
+        Parsed::Error(token) => {
+            eprintln!(
+                "{}",
+                style::err(format!("error: unknown command `{token}`"))
+            );
+            eprintln!("{}", cli::usage());
+            Ok(ExitCode::from(2))
+        }
+        Parsed::Command(cmd) => dispatch(cmd),
+    }
+}
+
+/// Route a parsed command to its handler. `Bare` keeps the existing
+/// location-auto behavior; `Sync`/`Update` route to placeholders that
+/// downstream units (U4, U7) replace. Each handler runs after `git::probe`
+/// only where it needs the probe result.
+fn dispatch(cmd: Command) -> Result<ExitCode> {
     let cwd = env::current_dir().context("getting current directory")?;
-    match git::probe(&cwd)? {
-        Mode::Bootstrap { repo_root } => bootstrap_flow(&repo_root),
+    match cmd {
+        Command::Bare => match git::probe(&cwd)? {
+            Mode::Bootstrap { repo_root } => bootstrap_flow(&repo_root),
+            Mode::Apply {
+                cwd_root,
+                main_checkout,
+            } => apply_flow(&cwd_root, &main_checkout),
+            Mode::Error(msg) => {
+                eprintln!("{}", style::err(format!("error: {msg}")));
+                Ok(ExitCode::from(1))
+            }
+        },
+        Command::Sync => sync_flow(&cwd),
+        Command::Update => update_flow(),
+    }
+}
+
+/// Non-interactive forward sync placeholder. U4 replaces this with a
+/// main-checkout-config-driven copy into the current worktree; for now it
+/// reuses the existing apply path when the probe lands in apply mode so the
+/// happy path stays functional, and otherwise reports that the
+/// non-interactive form isn't wired yet (without failing).
+fn sync_flow(cwd: &Path) -> Result<ExitCode> {
+    match git::probe(cwd)? {
         Mode::Apply {
             cwd_root,
             main_checkout,
         } => apply_flow(&cwd_root, &main_checkout),
+        Mode::Bootstrap { .. } => {
+            println!(
+                "{}",
+                style::info("non-interactive sync not yet wired (U4)")
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Mode::Error(msg) => {
             eprintln!("{}", style::err(format!("error: {msg}")));
             Ok(ExitCode::from(1))
         }
     }
+}
+
+/// Self-update placeholder. U7 replaces this with the lock/download/swap/
+/// re-exec path; for now it reports that self-update isn't wired and
+/// succeeds.
+fn update_flow() -> Result<ExitCode> {
+    println!("{}", style::info("self-update not yet wired (U7)"));
+    Ok(ExitCode::SUCCESS)
 }
 
 fn bootstrap_flow(repo_root: &Path) -> Result<ExitCode> {

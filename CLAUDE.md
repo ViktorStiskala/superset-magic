@@ -1,7 +1,8 @@
-# superset-setup
+# ss-magic
 
-Interactive Rust CLI for the Superset workspace contract. See README.md
-for user-facing docs.
+Interactive Rust CLI for the Superset workspace contract (standalone repo:
+`ViktorStiskala/superset-magic`; binary: `ss-magic`). See README.md for
+user-facing docs.
 
 ## Build
 
@@ -76,9 +77,17 @@ interactive layer:
   duplicate-of-taken only) round out the module. See
   `docs/solutions/design-patterns/inquire-action-loop-2026-05-26.md`
   for why the pickers are `Select` loops rather than a `MultiSelect`.
-- `main.rs` — composes everything: `style::init` → `git::probe` → branch
-  to `bootstrap_flow` / `apply_flow` / error. Bootstrap captures all
-  decisions, stages writes to a tempdir, materializes via
+- `cli.rs` — hand-rolled arg parser (no `clap`). `parse(&[String]) ->
+  Parsed` selects `Command::{Bare, Sync, Update}` from the first non-flag
+  arg (absent → `Bare`), short-circuits `--help`/`-h` to `Parsed::Help`,
+  and returns `Parsed::Error(token)` for an unknown subcommand. Pure and
+  unit-testable without spawning the process.
+- `main.rs` — composes everything: `style::init` → `cli::parse` →
+  `dispatch`. `Bare` runs `git::probe` → `bootstrap_flow` / `apply_flow` /
+  error (the original location-auto behavior; U10 replaces with a menu).
+  `Sync` and `Update` route to placeholder handlers (`sync_flow`,
+  `update_flow`) that U4/U7 replace. Bootstrap captures all decisions,
+  stages writes to a tempdir, materializes via
   `superset_files::copy_into_repo` after the final-action prompt.
 
 ## Source of truth for setup.sh
