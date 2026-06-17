@@ -22,9 +22,16 @@ use serde::{Deserialize, Serialize};
 /// verbatim to `.superset/setup.sh`.
 pub const SETUP_SH: &str = include_str!("../assets/setup.sh");
 
+/// Embedded canonical body of `magic.sh`. Written to `.superset/magic.sh`
+/// during migration (U9) and bootstrap. Delegates to `ss-magic` via `exec`
+/// when the binary is available; otherwise prints an install hint and exits 0
+/// so Superset's setup pipeline continues uninterrupted.
+pub const MAGIC_SH: &str = include_str!("../assets/magic.sh");
+
 const SUPERSET_DIR: &str = ".superset";
 const CONFIG_JSON: &str = "config.json";
 const SETUP_SH_NAME: &str = "setup.sh";
+const MAGIC_SH_NAME: &str = "magic.sh";
 const SETUP_CONFIG_JSON: &str = "setup_config.json";
 const MAGIC_JSON: &str = "magic.json";
 const MAGIC_LOCAL_JSON: &str = "magic.local.json";
@@ -111,6 +118,8 @@ pub fn load_overlaid(root: &Path) -> Result<Option<MagicConfig>> {
 
 /// Rewrite `.superset/magic.json` from `files`, pretty-printed with a
 /// trailing newline.
+// consumed by U9
+#[allow(dead_code)]
 pub fn write_magic_json(root: &Path, files: &[String]) -> Result<()> {
     ensure_superset_dir(root)?;
     let path = superset_dir(root).join(MAGIC_JSON);
@@ -251,6 +260,23 @@ pub fn write_setup_sh(root: &Path) -> Result<()> {
     ensure_superset_dir(root)?;
     let path = superset_dir(root).join(SETUP_SH_NAME);
     fs::write(&path, SETUP_SH).with_context(|| format!("writing {}", path.display()))?;
+    chmod_executable(&path)?;
+    Ok(())
+}
+
+/// Always overwrite `.superset/magic.sh` with the embedded canonical body
+/// and mark it executable (mode 0755).
+///
+/// The wrapper delegates to `ss-magic` via `exec` when the binary is on
+/// `PATH`, and exits 0 with an install hint when it is absent — so
+/// Superset's setup pipeline always continues. Called by the migration and
+/// init flows (U9); wired there rather than here.
+// consumed by U9
+#[allow(dead_code)]
+pub fn write_magic_sh(root: &Path) -> Result<()> {
+    ensure_superset_dir(root)?;
+    let path = superset_dir(root).join(MAGIC_SH_NAME);
+    fs::write(&path, MAGIC_SH).with_context(|| format!("writing {}", path.display()))?;
     chmod_executable(&path)?;
     Ok(())
 }
@@ -930,6 +956,127 @@ mod tests {
         assert!(
             defaults.iter().any(|s| s == ".superset/magic.local.json"),
             "default_magic_files() must include .superset/magic.local.json; got: {defaults:?}"
+        );
+    }
+
+    // ── write_magic_sh / magic.sh asset tests ────────────────────────────────
+
+    /// write_magic_sh emits a file byte-equal to the embedded MAGIC_SH asset
+    /// and marks it executable (mode 0755) on Unix.
+    #[test]
+    fn write_magic_sh_emits_executable_file_matching_embedded_asset() {
+        let dir = fresh();
+        let root = dir.path();
+        write_magic_sh(root).unwrap();
+
+        let path = root.join(".superset/magic.sh");
+        assert!(path.is_file(), "magic.sh must be created");
+
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, MAGIC_SH, "on-disk content must match embedded asset");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "magic.sh must be mode 0755");
+        }
+    }
+
+    /// Find bash via the host environment, bypassing any controlled PATH we set
+    /// on child processes.  Returns the absolute path to bash, panicking if it
+    /// cannot be located — the tests require bash.
+    fn find_bash() -> std::path::PathBuf {
+        // Try common locations so the test works regardless of the PATH value
+        // we override on child processes.
+        for candidate in &[
+            "/opt/homebrew/bin/bash",
+            "/usr/local/bin/bash",
+            "/usr/bin/bash",
+            "/bin/bash",
+        ] {
+            let p = std::path::Path::new(candidate);
+            if p.exists() {
+                return p.to_path_buf();
+            }
+        }
+        // Fall back to whatever the host PATH exposes at test-compilation time.
+        panic!("bash not found; tests require bash");
+    }
+
+    /// Covers AE8: running magic.sh with ss-magic absent from PATH prints an
+    /// install error to stderr and exits 0 (pipeline must not be interrupted).
+    #[test]
+    fn ae8_magic_sh_absent_binary_prints_error_and_exits_zero() {
+        let dir = fresh();
+        let root = dir.path();
+        write_magic_sh(root).unwrap();
+        let script = root.join(".superset/magic.sh");
+
+        // Use an empty temp dir as PATH so ss-magic is guaranteed absent.
+        let empty_path_dir = tempfile::tempdir().unwrap();
+
+        let output = std::process::Command::new(find_bash())
+            .arg(&script)
+            .env("PATH", empty_path_dir.path())
+            // Ensure NO_COLOR is unset so the color branch is exercised (stderr
+            // may or may not be a TTY in CI — we only verify the text content).
+            .env_remove("NO_COLOR")
+            .output()
+            .expect("failed to run magic.sh via bash");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "magic.sh must exit 0 when ss-magic is absent; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("ss-magic is not installed"),
+            "stderr must mention 'ss-magic is not installed'; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("ViktorStiskala/superset-magic"),
+            "stderr must reference the install repo; got: {stderr}"
+        );
+    }
+
+    /// Exit-code propagation via exec: a stub ss-magic that exits 3 must cause
+    /// magic.sh to exit 3 as well.
+    #[test]
+    fn magic_sh_propagates_exit_code_from_ss_magic_via_exec() {
+        let dir = fresh();
+        let root = dir.path();
+        write_magic_sh(root).unwrap();
+        let script = root.join(".superset/magic.sh");
+
+        // Create a stub ss-magic in a temp dir that always exits 3.
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub_path = stub_dir.path().join("ss-magic");
+        fs::write(&stub_path, "#!/bin/sh\nexit 3\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&stub_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&stub_path, perms).unwrap();
+        }
+
+        // Prepend the stub dir to a minimal PATH so ss-magic resolves to our stub.
+        let path_val = format!("{}:/usr/bin:/bin", stub_dir.path().display());
+
+        let status = std::process::Command::new(find_bash())
+            .arg(&script)
+            .env("PATH", &path_val)
+            .status()
+            .expect("failed to run magic.sh via bash");
+
+        assert_eq!(
+            status.code(),
+            Some(3),
+            "magic.sh must propagate ss-magic's exit code (3) via exec"
         );
     }
 }
