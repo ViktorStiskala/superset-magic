@@ -79,11 +79,9 @@ pub const LOCK_FILE_NAME: &str = "update.lock";
 
 /// Env var set on the re-exec'd child so its update check early-returns
 /// (KTD6, R21). The child inherits it; the gate (U8) honors it.
-#[allow(dead_code)] // consumed by U8 (startup gate) + this module's tests
 pub const UPDATED_ENV: &str = "SS_MAGIC_UPDATED";
 
 /// Documented opt-out: when set the update check is skipped entirely (KTD6).
-#[allow(dead_code)] // consumed by U8 (startup gate) + this module's tests
 pub const NO_UPDATE_ENV: &str = "SS_MAGIC_NO_UPDATE";
 
 /// Stale-lock TTL (KTD4). A lock file whose mtime is at least this old is
@@ -97,13 +95,11 @@ const STALE_TTL: Duration = Duration::from_secs(60);
 /// The re-exec'd child inherits [`UPDATED_ENV`]; [`NO_UPDATE_ENV`] is the
 /// documented manual opt-out. Either one means "do not run the update check".
 /// U8 wires this into startup; U7 owns setting [`UPDATED_ENV`] on the child.
-#[allow(dead_code)] // consumed by U8 (startup gate) + this module's tests
 pub fn guard_active() -> bool {
     env_flag_set(UPDATED_ENV) || env_flag_set(NO_UPDATE_ENV)
 }
 
 /// A guard env var counts as set when present and not literally empty/`0`.
-#[allow(dead_code)] // consumed by U8 (startup gate) via guard_active
 fn env_flag_set(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) => !v.is_empty() && v != "0",
@@ -113,7 +109,7 @@ fn env_flag_set(name: &str) -> bool {
 
 /// Outcome of attempting to acquire the update lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by U8 (startup gate) via try_lock_state + tests
+#[allow(dead_code)] // used in tests via try_lock_state
 pub enum LockState {
     /// The lock was free (or reclaimed as stale) and we hold it.
     Acquired,
@@ -128,7 +124,6 @@ pub enum LockState {
 ///
 /// Kept pure (takes the already-extracted `Option<i32>`) so it is unit-tested
 /// directly without spawning a process.
-#[allow(dead_code)] // consumed by U8 (startup gate) via reexec_and_exit + tests
 pub fn propagate_code(code: Option<i32>) -> i32 {
     code.unwrap_or(1)
 }
@@ -142,14 +137,12 @@ pub fn propagate_code(code: Option<i32>) -> i32 {
 /// already stripped). The implementation must set [`UPDATED_ENV`] on the
 /// child, `wait()` for it (blocking), and return the child's exit code as the
 /// raw `Option<i32>` (`None` for a signal-kill) for [`propagate_code`].
-#[allow(dead_code)] // consumed by U8 (startup gate) + tests
 pub trait Spawner {
     fn spawn_and_wait(&self, exe: &Path, args: &[OsString]) -> std::io::Result<Option<i32>>;
 }
 
 /// Real re-exec: spawn `exe` with `args` + [`UPDATED_ENV`], inherit stdio,
 /// block on `wait()`, return the child's `code()`.
-#[allow(dead_code)] // consumed by U8 (startup gate) via auto_update
 pub struct ProcessSpawner;
 
 impl Spawner for ProcessSpawner {
@@ -172,7 +165,6 @@ impl Spawner for ProcessSpawner {
 /// best-effort skipped but not reported as a failure of *this* process.
 ///
 /// This never returns: it terminates via [`std::process::exit`].
-#[allow(dead_code)] // consumed by U8 (startup gate) via auto_update
 pub fn reexec_and_exit<S: Spawner>(spawner: &S) -> ! {
     let (exe, args) = match reexec_target() {
         Ok(t) => t,
@@ -192,7 +184,6 @@ pub fn reexec_and_exit<S: Spawner>(spawner: &S) -> ! {
 /// (R18 — NEVER `argv[0]`/`$PATH`) plus the original args (program name
 /// stripped, `args_os().skip(1)`). Extracted from [`reexec_and_exit`] so the
 /// resolution itself is unit-testable (the exit is not).
-#[allow(dead_code)] // consumed by U8 (startup gate) via reexec_and_exit + tests
 fn reexec_target() -> std::io::Result<(std::path::PathBuf, Vec<OsString>)> {
     let exe = std::env::current_exe()?;
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -249,13 +240,13 @@ fn touch(path: &Path) {
 ///
 /// This is the seam the AE2 test drives: the test holds a real `fd-lock`
 /// write lock on `lock_path`, then asserts this returns `Contended`.
-#[allow(dead_code)] // consumed by U8 (startup gate) + tests
+#[allow(dead_code)] // used in tests
 pub fn try_lock_state(lock_path: &Path) -> LockState {
     try_lock_state_at(lock_path, STALE_TTL, SystemTime::now())
 }
 
 /// Testable core of [`try_lock_state`] with an injectable TTL + clock.
-#[allow(dead_code)] // consumed by U8 (startup gate) via try_lock_state + tests
+#[allow(dead_code)] // used in tests
 fn try_lock_state_at(lock_path: &Path, ttl: Duration, now: SystemTime) -> LockState {
     let stale = lock_is_stale(lock_path, ttl, now);
 

@@ -30,7 +30,7 @@ use check::UpdateCheck;
 
 // Re-exports for U8 (startup wiring). `check` is consumed only by the U8 gate,
 // so it keeps an allow; the other items below are consumed by U7 here.
-#[allow(unused_imports)] // consumed by U8 (startup gate)
+#[allow(unused_imports)] // available for direct use by external callers if needed
 pub use check::check;
 
 /// Lock-file path inside the OS cache dir, alongside the version cache.
@@ -99,7 +99,6 @@ fn map_report(outcome: ApplyOutcome) -> UpdateReport {
 /// The loop guard ([`apply::guard_active`]) is the caller's responsibility to
 /// check *before* calling this (U8); we re-check it here as a belt-and-braces
 /// early-return so a re-exec'd child can never recurse into another update.
-#[allow(dead_code)] // consumed by U8 (startup gate wiring)
 pub fn auto_update() {
     if apply::guard_active() {
         return;

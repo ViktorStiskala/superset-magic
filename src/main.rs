@@ -25,11 +25,36 @@ use crate::ui::FinalAction;
 
 const COMMIT_MESSAGE: &str = "chore(superset): bootstrap workspace contract";
 
+/// Pure gate-decision helper (U8, AE3). Returns `true` when the auto-update
+/// daily-cache gate should fire for the given command and guard state.
+///
+/// Truth table:
+///
+/// | cmd            | guard_active | result |
+/// |----------------|--------------|--------|
+/// | `Bare`         | false        | true   |
+/// | `Sync`         | false        | true   |
+/// | `Update`       | false        | false  |
+/// | `Bare`/`Sync`  | true         | false  |
+/// | `Update`       | true         | false  |
+///
+/// `Command::Update` always bypasses the gate — it routes to the force path
+/// (U7's `update_command`) which is NOT gated by the 24h cache. When the loop
+/// guard is active (`SS_MAGIC_UPDATED` or `SS_MAGIC_NO_UPDATE` is set) the
+/// gate never fires regardless of command, preventing re-exec loops (AE4).
+pub fn should_run_update_gate(cmd: Command, guard_active: bool) -> bool {
+    if guard_active {
+        return false;
+    }
+    matches!(cmd, Command::Bare | Command::Sync)
+}
+
 fn run() -> Result<ExitCode> {
     style::init();
-    // Composition order: style::init (above) → parse argv → git::probe →
-    // dispatch. Parsing happens before the git probe so `--help` answers
-    // without touching the repo.
+    // Composition order: style::init (above) → parse argv → [help check] →
+    // [auto-update gate for Bare/Sync] → git::probe → dispatch.
+    // Parsing and the help response happen before the git probe and the gate
+    // so `--help` answers instantly without a network call.
     let args: Vec<String> = env::args().skip(1).collect();
     match cli::parse(&args) {
         Parsed::Help => {
@@ -44,7 +69,17 @@ fn run() -> Result<ExitCode> {
             eprintln!("{}", cli::usage());
             Ok(ExitCode::from(2))
         }
-        Parsed::Command(cmd) => dispatch(cmd),
+        Parsed::Command(cmd) => {
+            // U8: run the daily-cache auto-update gate before any work for
+            // `Bare` and `Sync`. On a "newer" verdict, `auto_update` swaps the
+            // binary, re-execs, and terminates this process — the code below is
+            // only reached when no update is needed. `Update` skips the gate
+            // entirely and uses the force path in `update_flow`.
+            if should_run_update_gate(cmd, update::apply::guard_active()) {
+                update::auto_update();
+            }
+            dispatch(cmd)
+        }
     }
 }
 
@@ -880,6 +915,77 @@ mod sync_tests {
             exit_code_to_u8(code),
             0,
             "must exit non-zero when not in a git repo"
+        );
+    }
+}
+
+/// U8 gate-decision tests: `should_run_update_gate` truth table (AE3).
+///
+/// These are pure unit tests over the decision helper only — they do not
+/// perform network calls, lock files, or re-exec. The actual block-in-wait
+/// and exit-with-child-code behavior is seam-tested in U7 (update/apply.rs).
+#[cfg(test)]
+mod update_gate_tests {
+    use super::*;
+
+    // ── Gate fires for Bare / Sync when guard is inactive ───────────────────
+
+    /// AE3 (wiring): Bare command + no guard → gate fires.
+    #[test]
+    fn ae3_bare_no_guard_gate_fires() {
+        assert!(
+            should_run_update_gate(Command::Bare, false),
+            "Bare + guard inactive → gate must fire"
+        );
+    }
+
+    /// Sync command + no guard → gate fires.
+    #[test]
+    fn sync_no_guard_gate_fires() {
+        assert!(
+            should_run_update_gate(Command::Sync, false),
+            "Sync + guard inactive → gate must fire"
+        );
+    }
+
+    // ── Update bypasses the gate regardless of guard state ──────────────────
+
+    /// Update + no guard → gate does NOT fire (uses its own force path).
+    #[test]
+    fn update_no_guard_gate_does_not_fire() {
+        assert!(
+            !should_run_update_gate(Command::Update, false),
+            "Update must bypass the daily-cache gate (uses force path)"
+        );
+    }
+
+    /// Update + guard active → gate does NOT fire.
+    #[test]
+    fn update_guard_active_gate_does_not_fire() {
+        assert!(
+            !should_run_update_gate(Command::Update, true),
+            "Update + guard active → gate must not fire"
+        );
+    }
+
+    // ── Guard active short-circuits the gate for all commands ───────────────
+
+    /// AE4 (no loop): re-exec'd child has SS_MAGIC_UPDATED=1 → guard active →
+    /// gate does not fire, preventing infinite re-exec loops.
+    #[test]
+    fn ae4_bare_guard_active_gate_does_not_fire() {
+        assert!(
+            !should_run_update_gate(Command::Bare, true),
+            "Bare + guard active → gate must not fire (loop prevention)"
+        );
+    }
+
+    /// Sync + guard active → gate does NOT fire.
+    #[test]
+    fn sync_guard_active_gate_does_not_fire() {
+        assert!(
+            !should_run_update_gate(Command::Sync, true),
+            "Sync + guard active (SS_MAGIC_NO_UPDATE) → gate must not fire"
         );
     }
 }
