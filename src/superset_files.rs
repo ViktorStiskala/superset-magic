@@ -358,45 +358,70 @@ pub struct MaterializeReport {
     pub wrote_envrc: bool,
 }
 
-/// Copy staged files from `stage_root` into `repo_root`, applying the
+/// Copy the staged `.superset` tree from `stage_root` into `repo_root` and
+/// delete any repo-relative paths named in `delete`, applying the
 /// preservation rules:
 ///
-/// - `.superset/setup.sh` is always overwritten and chmod 0755'd.
-/// - `.superset/setup_config.json` is always overwritten.
-/// - `.superset/config.json` is always overwritten. Preservation of any
-///   existing `teardown` / `run` arrays must happen upstream by merging
-///   into the staged Config before this call.
+/// - Every regular file present in the staged `.superset/` directory is
+///   copied over the matching path under `repo_root/.superset/`. Files are
+///   always overwritten — preservation (e.g. of `config.json`'s existing
+///   `teardown` / `run` arrays) must happen upstream by merging into the
+///   staged tree before this call. Any staged `*.sh` is chmod 0755'd after
+///   the copy so wrappers (`setup.sh`, `magic.sh`) stay executable.
 /// - `.envrc` is copied only when present at `stage_root`.
-pub fn copy_into_repo(stage_root: &Path, repo_root: &Path) -> Result<MaterializeReport> {
+/// - Each repo-relative path in `delete` (e.g. `.superset/setup.sh`) is
+///   removed from `repo_root` if it exists. Used by migration to strip the
+///   retired `setup.sh`. A missing target is not an error.
+///
+/// The staged tree is the source of truth: the caller stages exactly the
+/// files it wants materialized, so an old-layout bootstrap stages
+/// `setup.sh` + `setup_config.json` + `config.json`, while migration stages
+/// `magic.sh` + `magic.json` + `config.json` (+ `magic.local.json`) and asks
+/// for `.superset/setup.sh` to be deleted.
+pub fn copy_into_repo(
+    stage_root: &Path,
+    repo_root: &Path,
+    delete: &[&str],
+) -> Result<MaterializeReport> {
     ensure_superset_dir(repo_root)?;
     let stage_dir = stage_root.join(SUPERSET_DIR);
     let real_dir = repo_root.join(SUPERSET_DIR);
 
-    let stage_setup = stage_dir.join(SETUP_SH_NAME);
-    let real_setup = real_dir.join(SETUP_SH_NAME);
-    fs::copy(&stage_setup, &real_setup)
-        .with_context(|| format!("copy {} → {}", stage_setup.display(), real_setup.display()))?;
-    chmod_executable(&real_setup)?;
+    // Copy every regular file in the staged `.superset/` directory. The
+    // staged tree is flat (no subdirectories under `.superset/`), matching
+    // both the old-layout and migration staging callers.
+    let entries = fs::read_dir(&stage_dir)
+        .with_context(|| format!("reading staged dir {}", stage_dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading entry in {}", stage_dir.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", entry.path().display()))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let src = entry.path();
+        let dst = real_dir.join(&name);
+        fs::copy(&src, &dst)
+            .with_context(|| format!("copy {} → {}", src.display(), dst.display()))?;
+        // Keep shell wrappers executable.
+        if Path::new(&name)
+            .extension()
+            .is_some_and(|ext| ext == "sh")
+        {
+            chmod_executable(&dst)?;
+        }
+    }
 
-    let stage_setup_config = stage_dir.join(SETUP_CONFIG_JSON);
-    let real_setup_config = real_dir.join(SETUP_CONFIG_JSON);
-    fs::copy(&stage_setup_config, &real_setup_config).with_context(|| {
-        format!(
-            "copy {} → {}",
-            stage_setup_config.display(),
-            real_setup_config.display()
-        )
-    })?;
-
-    let stage_config = stage_dir.join(CONFIG_JSON);
-    let real_config = real_dir.join(CONFIG_JSON);
-    fs::copy(&stage_config, &real_config).with_context(|| {
-        format!(
-            "copy {} → {}",
-            stage_config.display(),
-            real_config.display()
-        )
-    })?;
+    // Delete retired repo-relative paths (e.g. `.superset/setup.sh`).
+    for rel in delete {
+        let target = repo_root.join(rel);
+        if target.exists() {
+            fs::remove_file(&target)
+                .with_context(|| format!("deleting {}", target.display()))?;
+        }
+    }
 
     let stage_envrc = stage_root.join(".envrc");
     let real_envrc = repo_root.join(".envrc");
@@ -653,7 +678,7 @@ mod tests {
         write_setup_config_json(stage.path(), &[".env".to_string()]).unwrap();
         write_envrc(stage.path()).unwrap();
 
-        let report = copy_into_repo(stage.path(), dest.path()).unwrap();
+        let report = copy_into_repo(stage.path(), dest.path(), &[]).unwrap();
         assert!(report.wrote_envrc);
 
         let real = dest.path().join(".superset");
@@ -691,7 +716,7 @@ mod tests {
             r#"{"setup":["./.superset/setup.sh","./extra.sh"],"teardown":[],"run":[]}"#;
         fs::write(dest_dir.join("config.json"), pre_existing).unwrap();
 
-        copy_into_repo(stage.path(), dest.path()).unwrap();
+        copy_into_repo(stage.path(), dest.path(), &[]).unwrap();
         let staged = fs::read_to_string(stage.path().join(".superset/config.json")).unwrap();
         let after = fs::read_to_string(dest_dir.join("config.json")).unwrap();
         assert_eq!(
@@ -719,7 +744,7 @@ mod tests {
         write_config_json(stage.path(), &merged).unwrap();
         write_setup_config_json(stage.path(), &[]).unwrap();
 
-        copy_into_repo(stage.path(), dest.path()).unwrap();
+        copy_into_repo(stage.path(), dest.path(), &[]).unwrap();
 
         let final_cfg = load_config(dest.path()).unwrap().unwrap();
         assert_eq!(final_cfg.setup, vec!["./.superset/setup.sh", "uv sync"]);
@@ -740,7 +765,7 @@ mod tests {
         write_setup_config_json(stage.path(), &[]).unwrap();
         // No write_envrc on stage.
 
-        let report = copy_into_repo(stage.path(), dest.path()).unwrap();
+        let report = copy_into_repo(stage.path(), dest.path(), &[]).unwrap();
         assert!(!report.wrote_envrc);
         assert!(!dest.path().join(".envrc").exists());
     }

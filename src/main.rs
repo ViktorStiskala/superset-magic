@@ -10,6 +10,7 @@ mod cli;
 mod exec;
 mod git;
 mod gitignore;
+mod migrate;
 mod pattern;
 mod repo_detect;
 mod repo_scan;
@@ -363,8 +364,10 @@ fn bootstrap_flow(repo_root: &Path) -> Result<ExitCode> {
         .is_some_and(|raw| raw == staged_config_body);
 
     // ---- Materialize: copy the staged files into repo_root. From here
-    // ---- on, the working tree has been touched.
-    let report = superset_files::copy_into_repo(stage_root, repo_root)?;
+    // ---- on, the working tree has been touched. The old-layout bootstrap
+    // ---- stages setup.sh + setup_config.json + config.json and deletes
+    // ---- nothing.
+    let report = superset_files::copy_into_repo(stage_root, repo_root, &[])?;
 
     println!();
     println!("{}", style::ok("Wrote .superset/setup.sh"));
