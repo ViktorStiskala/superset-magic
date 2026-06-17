@@ -480,4 +480,133 @@ mod tests {
             "expected hint mentioning bootstrap/main checkout, got: {msg}"
         );
     }
+
+    // ── Characterization tests: pin engine semantics before config source changes ──
+
+    /// `**` depth: a `**/<name>` pattern must match at any nesting depth,
+    /// including deep (3+ levels) and shallow (1 level).
+    #[test]
+    fn double_glob_matches_at_any_depth() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(src.path(), ".dev.vars", "root");
+        write(src.path(), "apps/api/.dev.vars", "l1");
+        write(src.path(), "apps/api/nested/deep/.dev.vars", "deep");
+        let (summary, events) = collect(src.path(), dest.path(), &["**/.dev.vars"]);
+        assert!(dest.path().join(".dev.vars").is_file(), "root-level match");
+        assert!(
+            dest.path().join("apps/api/.dev.vars").is_file(),
+            "one-level match"
+        );
+        assert!(
+            dest.path().join("apps/api/nested/deep/.dev.vars").is_file(),
+            "deep match"
+        );
+        assert_eq!(summary.copied, 3, "all three depths must be copied");
+        assert_eq!(
+            copy_events_of(&events).len(),
+            3,
+            "three Copy events expected"
+        );
+    }
+
+    /// `.venv` exclusion: matches inside a `.venv` dir at any depth are
+    /// silently dropped (non-fatal, not counted).
+    #[test]
+    fn venv_matches_are_dropped() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(src.path(), "apps/api/.env", "ok");
+        write(src.path(), ".venv/lib/python3.11/.env", "drop");
+        write(src.path(), "packages/foo/.venv/pyvenv.cfg", "drop");
+        let (summary, events) = collect(src.path(), dest.path(), &["**/.env", "**/*.cfg"]);
+        assert!(
+            dest.path().join("apps/api/.env").is_file(),
+            "real .env must be copied"
+        );
+        assert!(
+            !dest.path().join(".venv/lib/python3.11/.env").exists(),
+            ".venv/.env must be excluded"
+        );
+        assert!(
+            !dest.path()
+                .join("packages/foo/.venv/pyvenv.cfg")
+                .exists(),
+            ".venv/*.cfg must be excluded"
+        );
+        assert_eq!(summary.copied, 1, "only the real .env is copied");
+        assert_eq!(summary.skipped, 0, "excluded items must not count");
+        let skips = skip_events_of(&events);
+        assert!(
+            skips
+                .iter()
+                .filter(|(r, _)| matches!(r, SkipReason::Excluded))
+                .count()
+                >= 2,
+            "expected at least two Excluded skip events, got: {skips:?}"
+        );
+    }
+
+    /// Characterization: `*` in globset matches path separators (unlike POSIX shell
+    /// glob). `apps/*/.env` therefore matches both `apps/api/.env` AND
+    /// `apps/api/nested/.env`. This pins the engine semantics so callers don't
+    /// silently rely on `*` = "one component only".
+    #[test]
+    fn single_star_matches_across_path_separators_in_globset() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(src.path(), "apps/api/.env", "ok");
+        write(src.path(), "apps/api/nested/.env", "nested");
+        // globset's `*` is NOT literal-separator-aware by default, so
+        // `apps/*/.env` matches paths at any depth below `apps/` ending in `/.env`.
+        let (summary, _) = collect(src.path(), dest.path(), &["apps/*/.env"]);
+        assert!(
+            dest.path().join("apps/api/.env").is_file(),
+            "direct child must match"
+        );
+        assert!(
+            dest.path().join("apps/api/nested/.env").is_file(),
+            "globset `*` crosses path separators — nested path also matches"
+        );
+        assert_eq!(summary.copied, 2);
+    }
+
+    /// Directory copies via `apps/*/config` pattern: the directory itself is
+    /// matched (not its entries), so all files inside are copied recursively.
+    #[test]
+    fn matched_directory_is_copied_recursively() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(src.path(), "apps/api/config/a.toml", "a");
+        write(src.path(), "apps/api/config/sub/b.toml", "b");
+        let (summary, _) = collect(src.path(), dest.path(), &["apps/api/config"]);
+        assert!(
+            dest.path().join("apps/api/config/a.toml").is_file(),
+            "top-level file in dir"
+        );
+        assert!(
+            dest.path().join("apps/api/config/sub/b.toml").is_file(),
+            "nested file in dir"
+        );
+        // The directory itself is one matched entry; its contents are copied
+        // recursively — summary.copied == 1 (the dir match), not 2 (the files).
+        assert_eq!(summary.copied, 1, "directory counts as one copy event");
+        assert_eq!(summary.skipped, 0);
+    }
+
+    /// De-duplication: a path matched by two different patterns appears only once.
+    #[test]
+    fn duplicate_match_across_patterns_is_deduplicated() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(src.path(), ".env", "x");
+        // Both patterns match `.env`.
+        let (summary, events) = collect(src.path(), dest.path(), &[".env", "**/.env"]);
+        assert_eq!(summary.copied, 1, ".env must be copied exactly once");
+        assert_eq!(
+            copy_events_of(&events).len(),
+            1,
+            "only one Copy event for a deduped match"
+        );
+    }
 }
