@@ -3,6 +3,8 @@
 //!   .superset/config.json         { setup, teardown, run }
 //!   .superset/setup.sh            executable copy of the embedded asset
 //!   .superset/setup_config.json   { files: [pattern, ...] }
+//!   .superset/magic.json          { files: [pattern, ...] }  (committed)
+//!   .superset/magic.local.json    { files: [pattern, ...] }  (gitignored overlay)
 //!
 //! The embedded `setup.sh` (under `assets/`) is the single source of truth
 //! for the script body; bootstrap mode overwrites the on-disk copy each
@@ -24,6 +26,8 @@ const SUPERSET_DIR: &str = ".superset";
 const CONFIG_JSON: &str = "config.json";
 const SETUP_SH_NAME: &str = "setup.sh";
 const SETUP_CONFIG_JSON: &str = "setup_config.json";
+const MAGIC_JSON: &str = "magic.json";
+const MAGIC_LOCAL_JSON: &str = "magic.local.json";
 
 /// Shape of `.superset/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +46,76 @@ pub struct Config {
 pub struct SetupConfig {
     #[serde(default)]
     pub files: Vec<String>,
+}
+
+/// Shape of `.superset/magic.json` (committed) and `.superset/magic.local.json`
+/// (gitignored local overlay).
+///
+/// Currently holds only `files`; future keys (e.g. per-pattern exclude rules)
+/// should be added here rather than inventing a parallel type.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MagicConfig {
+    /// Glob patterns for files to sync from main into worktrees.
+    #[serde(default)]
+    pub files: Vec<String>,
+    // Future keys go here.
+}
+
+/// Read and overlay `.superset/magic.json` with `.superset/magic.local.json`.
+///
+/// Overlay rules:
+/// - `files`: UNION + DEDUPE — magic.json order is preserved first; local
+///   entries not already present are appended in local order. A local entry
+///   that duplicates a base entry is silently dropped (base position kept).
+/// - Scalar / object keys (future): local value wins.
+/// - Missing base `magic.json` → `Ok(None)`.
+/// - Malformed `magic.json` OR malformed `magic.local.json` → hard error
+///   naming the offending path; no silent fallback.
+/// - Missing `magic.local.json` → base only.
+pub fn load_overlaid(root: &Path) -> Result<Option<MagicConfig>> {
+    let base_path = superset_dir(root).join(MAGIC_JSON);
+    let local_path = superset_dir(root).join(MAGIC_LOCAL_JSON);
+
+    // Missing base → None (not an error).
+    let base: MagicConfig = match read_json::<MagicConfig>(&base_path)
+        .with_context(|| format!("reading {}", base_path.display()))?
+    {
+        None => return Ok(None),
+        Some(cfg) => cfg,
+    };
+
+    // Missing local → use base as-is.
+    let local: Option<MagicConfig> = read_json::<MagicConfig>(&local_path)
+        .with_context(|| format!("reading {}", local_path.display()))?;
+
+    let Some(local) = local else {
+        return Ok(Some(base));
+    };
+
+    // Merge: union + dedupe files (base order first, then new local entries).
+    let mut merged_files = base.files.clone();
+    for entry in &local.files {
+        if !merged_files.iter().any(|e| e == entry) {
+            merged_files.push(entry.clone());
+        }
+    }
+
+    Ok(Some(MagicConfig {
+        files: merged_files,
+    }))
+}
+
+/// Rewrite `.superset/magic.json` from `files`, pretty-printed with a
+/// trailing newline.
+pub fn write_magic_json(root: &Path, files: &[String]) -> Result<()> {
+    ensure_superset_dir(root)?;
+    let path = superset_dir(root).join(MAGIC_JSON);
+    let cfg = MagicConfig {
+        files: files.to_vec(),
+    };
+    let body = format!("{}\n", serde_json::to_string_pretty(&cfg)?);
+    fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 /// Snapshot of what's already present on disk. The bootstrap flow uses
@@ -615,5 +689,135 @@ mod tests {
         let err = load_existing(root).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("not a directory"), "msg: {msg}");
+    }
+
+    // ── MagicConfig / load_overlaid tests ────────────────────────────────────
+
+    fn magic_dir(root: &std::path::Path) {
+        fs::create_dir_all(root.join(".superset")).unwrap();
+    }
+
+    fn write_magic_json_raw(root: &std::path::Path, body: &str) {
+        magic_dir(root);
+        fs::write(root.join(".superset/magic.json"), body).unwrap();
+    }
+
+    fn write_magic_local_raw(root: &std::path::Path, body: &str) {
+        magic_dir(root);
+        fs::write(root.join(".superset/magic.local.json"), body).unwrap();
+    }
+
+    /// AE7 — union of distinct patterns; magic.json order first.
+    #[test]
+    fn ae7_overlay_unions_and_dedupes_files() {
+        let dir = fresh();
+        let root = dir.path();
+        write_magic_json_raw(root, r#"{"files":["**/.env"]}"#);
+        write_magic_local_raw(root, r#"{"files":["**/.dev.vars"]}"#);
+
+        let result = load_overlaid(root).unwrap().unwrap();
+        assert_eq!(result.files, vec!["**/.env", "**/.dev.vars"]);
+    }
+
+    /// Local entry that repeats a base pattern appears only once (base position kept).
+    #[test]
+    fn overlay_dedupes_repeated_local_entry() {
+        let dir = fresh();
+        let root = dir.path();
+        write_magic_json_raw(root, r#"{"files":["**/.env","**/.dev.vars"]}"#);
+        write_magic_local_raw(root, r#"{"files":["**/.dev.vars","extra.txt"]}"#);
+
+        let result = load_overlaid(root).unwrap().unwrap();
+        // **/.dev.vars must appear exactly once, in base position (index 1).
+        assert_eq!(result.files, vec!["**/.env", "**/.dev.vars", "extra.txt"]);
+    }
+
+    /// magic.json present, magic.local.json absent → base only.
+    #[test]
+    fn overlay_base_only_when_local_absent() {
+        let dir = fresh();
+        let root = dir.path();
+        write_magic_json_raw(root, r#"{"files":["**/.env",".dev.vars"]}"#);
+
+        let result = load_overlaid(root).unwrap().unwrap();
+        assert_eq!(result.files, vec!["**/.env", ".dev.vars"]);
+    }
+
+    /// magic.json absent → Ok(None).
+    #[test]
+    fn overlay_returns_none_when_base_absent() {
+        let dir = fresh();
+        let root = dir.path();
+        // No magic.json, not even a .superset dir.
+        let result = load_overlaid(root).unwrap();
+        assert!(result.is_none());
+    }
+
+    /// Malformed magic.json → error naming the path.
+    #[test]
+    fn overlay_malformed_base_returns_error_with_path() {
+        let dir = fresh();
+        let root = dir.path();
+        write_magic_json_raw(root, "{not json");
+
+        let err = load_overlaid(root).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("magic.json"), "msg: {msg}");
+        assert!(msg.contains("malformed JSON"), "msg: {msg}");
+    }
+
+    /// Malformed magic.local.json → error naming the path (no silent fallback).
+    #[test]
+    fn overlay_malformed_local_returns_error_with_path() {
+        let dir = fresh();
+        let root = dir.path();
+        write_magic_json_raw(root, r#"{"files":["**/.env"]}"#);
+        write_magic_local_raw(root, "{bad json");
+
+        let err = load_overlaid(root).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("magic.local.json"), "msg: {msg}");
+        assert!(msg.contains("malformed JSON"), "msg: {msg}");
+    }
+
+    /// write_magic_json produces pretty-printed JSON with a trailing newline
+    /// that round-trips through load_overlaid.
+    #[test]
+    fn write_magic_json_is_pretty_with_trailing_newline_and_round_trips() {
+        let dir = fresh();
+        let root = dir.path();
+        let patterns = vec!["**/.env".to_string(), ".dev.vars".to_string()];
+        write_magic_json(root, &patterns).unwrap();
+
+        let raw = fs::read_to_string(root.join(".superset/magic.json")).unwrap();
+        assert!(raw.contains('\n'), "expected pretty-printed JSON");
+        assert!(raw.ends_with('\n'), "expected trailing newline");
+
+        let result = load_overlaid(root).unwrap().unwrap();
+        assert_eq!(result.files, patterns);
+    }
+
+    /// empty magic.json files array + non-empty local → local entries appended.
+    #[test]
+    fn overlay_empty_base_files_plus_local() {
+        let dir = fresh();
+        let root = dir.path();
+        write_magic_json_raw(root, r#"{"files":[]}"#);
+        write_magic_local_raw(root, r#"{"files":["secrets/**"]}"#);
+
+        let result = load_overlaid(root).unwrap().unwrap();
+        assert_eq!(result.files, vec!["secrets/**"]);
+    }
+
+    /// Both magic.json and magic.local.json have no files key (serde default).
+    #[test]
+    fn overlay_missing_files_key_defaults_to_empty() {
+        let dir = fresh();
+        let root = dir.path();
+        write_magic_json_raw(root, r#"{}"#);
+        write_magic_local_raw(root, r#"{}"#);
+
+        let result = load_overlaid(root).unwrap().unwrap();
+        assert!(result.files.is_empty());
     }
 }
