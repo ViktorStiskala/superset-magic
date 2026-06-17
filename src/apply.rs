@@ -172,6 +172,24 @@ where
     Ok(summary)
 }
 
+/// Public matcher: expand `patterns` against `root` and return the deduped
+/// list of relative paths that match, applying the SAME semantics as
+/// [`run`]'s copy phase (syntax checks via `pattern::check_syntax`, glob/
+/// literal expansion, `DEFAULT_EXCLUDES` dropped at any depth, de-dupe by
+/// relative path) — but WITHOUT copying anything.
+///
+/// This is the seam reverse sync (U11) uses: `run` copies every match
+/// unconditionally and offers no filtered-subset hook, so reverse sync needs
+/// the raw matched paths to intersect with the untracked set and copy only
+/// the user-selected subset itself. Skip events (bad glob, no-match, excluded)
+/// are swallowed here — the caller only wants the resulting paths.
+// consumed by U11 (reverse sync candidate computation)
+#[allow(dead_code)]
+pub fn match_paths(root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {
+    let mut sink = |_: &Event| {};
+    expand_patterns(root, patterns, &mut sink)
+}
+
 /// Expand `patterns` against `src`, emitting skip events through
 /// `on_event`. Returns the deduped list of relative paths to copy.
 fn expand_patterns<F>(src: &Path, patterns: &[String], on_event: &mut F) -> Result<Vec<PathBuf>>

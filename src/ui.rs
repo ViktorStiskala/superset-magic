@@ -4,14 +4,16 @@
 //! the shapes the rest of the binary expects.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use inquire::validator::Validation;
 use inquire::{Confirm, CustomUserError, Select, Text};
 
+use crate::git;
 use crate::pattern;
 use crate::repo_scan;
+use crate::reverse_sync::DiffStatus;
 use crate::style;
 
 /// One of the three finishing actions offered at the end of bootstrap.
@@ -362,6 +364,180 @@ pub fn print_pattern_list(patterns: &[String]) {
     for p in patterns {
         println!("  {}", style::info(format!("• {p}")));
     }
+}
+
+// ── Reverse-sync picker (U11) ────────────────────────────────────────────────
+
+/// One action in the reverse-sync action loop. Mirrors the `pick_with_actions`
+/// pattern (every row is one Enter-action), with an extra per-row "show diff"
+/// action so the user can inspect a candidate against main without committing.
+#[derive(Clone)]
+enum ReverseAction {
+    /// Toggle a candidate's checkbox (index into the offered slice).
+    Toggle { idx: usize },
+    /// Show the diff of a candidate against main, paged.
+    ShowDiff { idx: usize },
+    /// Commit the current selection.
+    Done,
+}
+
+/// One row's display state in the reverse-sync picker.
+struct ReverseRow {
+    rel: PathBuf,
+    status: DiffStatus,
+    checked: bool,
+}
+
+fn reverse_row_label(row: &ReverseRow) -> String {
+    let mark = if row.checked { "[x]" } else { "[ ]" };
+    let tag = match row.status {
+        DiffStatus::WorktreeOnly => style::ok("(new)"),
+        DiffStatus::Differs => style::warn("(differs)"),
+        // Identical rows are filtered out before reaching the picker.
+        DiffStatus::Identical => style::info("(identical)"),
+    };
+    format!("{} {}  {}", mark, row.rel.display(), tag)
+}
+
+/// Diff-aware reverse-sync picker (R24). `offered` is the differing /
+/// worktree-only candidate set (identical files already filtered out). Returns
+/// the user-selected subset of relative paths (empty when the user confirms
+/// with nothing checked or cancels).
+///
+/// Every row is one Enter-action: toggle, "show diff" (paged via
+/// [`git::diff_no_index_paged`]), or "✔ Push selected". This is the
+/// interactive / manual-smoke surface; the copy logic it feeds is unit-tested
+/// in `reverse_sync`.
+///
+/// Cancelling the prompt (Esc/Ctrl-C) propagates as an error context so the
+/// caller leaves main untouched.
+// consumed by reverse_sync::run; manual-smoke (no unit test)
+#[allow(dead_code)]
+pub fn pick_reverse_sync(
+    worktree_root: &Path,
+    main_root: &Path,
+    offered: &[(PathBuf, DiffStatus)],
+) -> Result<Vec<PathBuf>> {
+    let mut rows: Vec<ReverseRow> = offered
+        .iter()
+        .map(|(rel, status)| ReverseRow {
+            rel: rel.clone(),
+            status: *status,
+            checked: false,
+        })
+        .collect();
+
+    // Start on the first row.
+    let mut cursor: usize = 0;
+
+    loop {
+        // Build the action list: per-row Toggle + ShowDiff, then Done.
+        let mut actions: Vec<ReverseAction> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            actions.push(ReverseAction::Toggle { idx: i });
+            labels.push(reverse_row_label(row));
+            actions.push(ReverseAction::ShowDiff { idx: i });
+            labels.push(format!("    {}", style::info("↳ show diff")));
+        }
+        actions.push(ReverseAction::Done);
+        labels.push(style::ok("✔ Push selected").to_string());
+
+        // inquire wants Display options; wrap (label, action) in a tiny struct.
+        let options: Vec<LabeledAction> = labels
+            .into_iter()
+            .zip(actions)
+            .map(|(label, action)| LabeledAction { label, action })
+            .collect();
+
+        let chosen = Select::new("Untracked files to push back to main:", options)
+            .with_starting_cursor(cursor.min(rows.len() * 2))
+            .with_help_message(
+                "↑↓ navigate · enter to toggle / show diff / push · Esc to cancel (main untouched)",
+            )
+            .prompt()
+            .context("reverse sync selection cancelled")?;
+
+        match chosen.action {
+            ReverseAction::Toggle { idx } => {
+                rows[idx].checked = !rows[idx].checked;
+                cursor = idx * 2;
+            }
+            ReverseAction::ShowDiff { idx } => {
+                let rel = &rows[idx].rel;
+                show_candidate_diff(worktree_root, main_root, rel)?;
+                cursor = idx * 2 + 1;
+            }
+            ReverseAction::Done => {
+                return Ok(rows
+                    .into_iter()
+                    .filter(|r| r.checked)
+                    .map(|r| r.rel)
+                    .collect());
+            }
+        }
+    }
+}
+
+/// inquire `Select` option pairing a rendered label with its action.
+struct LabeledAction {
+    label: String,
+    action: ReverseAction,
+}
+
+impl fmt::Display for LabeledAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+/// Show the diff of a candidate against main, paged. For a worktree-only
+/// (new) file there is nothing in main to diff against — print a note instead
+/// of shelling out (git diff --no-index against a missing path is noisy).
+fn show_candidate_diff(worktree_root: &Path, main_root: &Path, rel: &Path) -> Result<()> {
+    let main_path = main_root.join(rel);
+    let wt_path = worktree_root.join(rel);
+    if !main_path.exists() {
+        println!(
+            "{}",
+            style::info(format!(
+                "{} does not exist in main yet — it will be created.",
+                rel.display()
+            ))
+        );
+        return Ok(());
+    }
+    git::diff_no_index_paged(&main_path, &wt_path)
+}
+
+/// Per-file overwrite confirm with a diff (R26, KTD10): a candidate that
+/// already EXISTS in main must show a diff and require explicit confirmation
+/// before its bytes are overwritten. Returns `Ok(true)` to overwrite,
+/// `Ok(false)` to keep main's copy. Declining leaves main intact.
+///
+/// Used as the `overwrite` decision seam passed to
+/// `reverse_sync::copy_candidate_into_main`. Manual-smoke (interactive).
+// consumed by reverse_sync::run
+#[allow(dead_code)]
+pub fn confirm_overwrite_with_diff(
+    worktree_root: &Path,
+    main_root: &Path,
+    rel: &Path,
+) -> Result<bool> {
+    println!();
+    println!(
+        "{}",
+        style::warn(format!(
+            "{} already exists in main. Review the diff before overwriting:",
+            rel.display()
+        ))
+    );
+    show_candidate_diff(worktree_root, main_root, rel)?;
+    Confirm::new(&format!("Overwrite main's copy of {}?", rel.display()))
+        .with_default(false)
+        .with_help_message("N keeps main's copy untouched")
+        .prompt()
+        .context("overwrite confirm cancelled")
 }
 
 #[cfg(test)]

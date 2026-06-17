@@ -14,6 +14,7 @@ mod migrate;
 mod pattern;
 mod repo_detect;
 mod repo_scan;
+mod reverse_sync;
 mod style;
 mod superset_files;
 mod ui;

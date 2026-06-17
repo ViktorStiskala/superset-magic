@@ -255,6 +255,189 @@ pub fn pr_create(repo_root: &Path, base: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Read-only probes used by reverse sync (U11).
+// ---------------------------------------------------------------------------
+
+/// Repo-relative paths of files that are git-UNTRACKED in the working tree
+/// rooted at `repo_root`. Runs `git ls-files --others --exclude-standard`,
+/// which lists untracked files honoring `.gitignore`/exclude rules (so an
+/// ignored, untracked file is NOT returned) but excludes tracked files.
+///
+/// Output is one repo-relative path per line, in git's own porcelain form
+/// (forward slashes, relative to `repo_root`). Empty output → empty vector.
+/// Paths with a leading `..` or that are absolute are defensively dropped —
+/// `git ls-files` never emits such paths from the repo root, but reverse
+/// sync intersects this set with the (already-validated) pattern matcher and
+/// must never let a path escape the tree.
+// consumed by U11 (reverse sync candidates); wired into the menu by U10
+#[allow(dead_code)]
+pub fn untracked_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let out = git(
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        Some(repo_root),
+    )?;
+    // `-z` gives NUL-separated, unquoted paths so filenames with spaces or
+    // special characters survive intact (the default output quotes them).
+    // `git`'s trim() above strips a trailing NUL, so split on NUL and drop
+    // any empty trailing segment.
+    let mut paths = Vec::new();
+    for raw in out.split('\0') {
+        if raw.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(raw);
+        if p.is_absolute() || raw.split('/').any(|seg| seg == "..") {
+            // Defensive: git never emits these from the repo root.
+            continue;
+        }
+        paths.push(p);
+    }
+    Ok(paths)
+}
+
+/// True when `rel` (a repo-relative path) is gitignored in the working tree
+/// rooted at `repo_root`. Runs `git check-ignore -q -- <rel>`: exit 0 means
+/// ignored, exit 1 means not ignored, any other exit is a real error.
+///
+/// Used by reverse sync to decide whether a copied path is already covered
+/// by main's `.gitignore` before appending a new rule.
+// consumed by U11
+#[allow(dead_code)]
+pub fn is_ignored(repo_root: &Path, rel: &Path) -> Result<bool> {
+    let rel_str = rel
+        .to_str()
+        .with_context(|| format!("non-UTF-8 path: {}", rel.display()))?;
+    let out = git_raw(&["check-ignore", "-q", "--", rel_str], Some(repo_root))?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            bail!("`git check-ignore -- {rel_str}` failed: {stderr}");
+        }
+    }
+}
+
+/// Resolve the `.gitignore` rule that COVERS `rel` in the working tree rooted
+/// at `repo_root`, via `git check-ignore -v --no-index -- <rel>`.
+///
+/// Returns `Ok(Some(pattern))` when a rule matches (the bare pattern text,
+/// e.g. `**/.dev.vars`), `Ok(None)` when no rule covers the path.
+///
+/// `-v` prints `<source>:<line>:<pattern>\t<pathname>`. We parse the pattern
+/// out of the colon-delimited prefix before the tab. `--no-index` makes the
+/// check independent of whether the path is tracked, so a covering rule is
+/// found even for a path that git would otherwise consider already tracked.
+///
+/// A leading `!` (negation) pattern means the path is explicitly *un*-ignored;
+/// such a match is reported as `None` so the caller falls back to the literal
+/// path rather than copying a negation rule into main.
+// consumed by U11 (gitignore::find_covering_rule)
+#[allow(dead_code)]
+pub fn check_ignore_pattern(repo_root: &Path, rel: &Path) -> Result<Option<String>> {
+    let rel_str = rel
+        .to_str()
+        .with_context(|| format!("non-UTF-8 path: {}", rel.display()))?;
+    let out = git_raw(
+        &["check-ignore", "-v", "--no-index", "--", rel_str],
+        Some(repo_root),
+    )?;
+    match out.status.code() {
+        // 0 → matched; parse the pattern. 1 → no match. Other → error.
+        Some(1) => return Ok(None),
+        Some(0) => {}
+        _ => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            bail!("`git check-ignore -v --no-index -- {rel_str}` failed: {stderr}");
+        }
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().next().unwrap_or("").trim_end();
+    Ok(parse_check_ignore_line(line))
+}
+
+/// Parse one `git check-ignore -v` line into its bare pattern.
+///
+/// Format: `<source>:<line>:<pattern>\t<pathname>`. The source path may itself
+/// contain colons, so we split off the trailing `\t<pathname>` first, then
+/// take everything AFTER the second colon as the pattern (so a pattern that
+/// contains colons survives). A blank pattern (no matching gitignore source —
+/// e.g. a command-line `-e` exclude renders as `::pattern`) still parses. A
+/// negation pattern (`!…`) is reported as `None`.
+fn parse_check_ignore_line(line: &str) -> Option<String> {
+    if line.is_empty() {
+        return None;
+    }
+    // Strip the trailing `\t<pathname>` if present.
+    let prefix = line.split('\t').next().unwrap_or(line);
+    // `<source>:<line>:<pattern>` — find the first two colons. The pattern is
+    // everything after the second colon (it may contain further colons).
+    let first = prefix.find(':')?;
+    let rest = &prefix[first + 1..];
+    let second = rest.find(':')?;
+    let pattern = rest[second + 1..].trim();
+    if pattern.is_empty() || pattern.starts_with('!') {
+        return None;
+    }
+    Some(pattern.to_string())
+}
+
+/// Run `git diff --no-index` between two absolute paths and stream the
+/// (colored) output through the user's pager. `--no-index` lets git diff two
+/// arbitrary files outside any repo; `--color=always` forces color even when
+/// piped. The pager is `$PAGER` or `less -R` so a large diff isn't buried by
+/// the picker's re-render. A "files differ" exit (1) is NOT an error — git
+/// diff exits 1 when the inputs differ.
+///
+/// This is a TUI/manual-smoke path: it inherits the terminal and blocks until
+/// the pager is dismissed. It is not unit-tested (consistent with the repo's
+/// final-action convention).
+// consumed by U11 (reverse-sync picker "show diff" action)
+#[allow(dead_code)]
+pub fn diff_no_index_paged(left: &Path, right: &Path) -> Result<()> {
+    let pager = std::env::var("PAGER").unwrap_or_else(|_| "less -R".to_string());
+
+    // `git diff --no-index --color=always <left> <right> | $PAGER`. Wire the
+    // pipeline through `git`'s own `core.pager` would require config; spawn
+    // the two processes explicitly so we control the pager and force color.
+    let mut diff = Command::new("git")
+        .args([
+            "diff",
+            "--no-index",
+            "--color=always",
+            "--",
+            left.to_str()
+                .with_context(|| format!("non-UTF-8 path: {}", left.display()))?,
+            right
+                .to_str()
+                .with_context(|| format!("non-UTF-8 path: {}", right.display()))?,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("failed to spawn `git diff --no-index`")?;
+
+    let diff_out = diff
+        .stdout
+        .take()
+        .context("git diff produced no stdout pipe")?;
+
+    // Run the pager via the shell so `$PAGER` may carry arguments (`less -R`).
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut pager_child = Command::new(shell)
+        .arg("-c")
+        .arg(&pager)
+        .stdin(Stdio::from(diff_out))
+        .spawn()
+        .with_context(|| format!("failed to spawn pager `{pager}`"))?;
+
+    // Wait for both: the pager drains stdout, git diff exits 0/1.
+    let _ = pager_child.wait();
+    let _ = diff.wait();
+    Ok(())
+}
+
 /// Shell out to `date +%Y%m%d-%H%M%S` for the feature-branch suffix.
 /// Local timezone — matches what a developer would type by hand.
 pub fn timestamp_branch_suffix() -> Result<String> {
@@ -284,6 +467,12 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
             .env("GIT_COMMITTER_NAME", "Test")
             .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            // Isolate from machine-level git config (e.g. commit.gpgsign=true)
+            // so commits don't intermittently fail on a slow/absent gpg agent.
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+            .env("GIT_CONFIG_VALUE_0", "false")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -387,5 +576,127 @@ mod tests {
             Mode::Error(msg) => assert!(msg.contains("not inside a git repository")),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    // ── Reverse-sync probes (U11) ───────────────────────────────────────────
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+
+    /// `untracked_files` lists untracked-but-not-ignored files and excludes
+    /// both tracked files and gitignored files.
+    #[test]
+    fn untracked_files_lists_only_untracked_unignored() {
+        let dir = init_repo("main");
+        let root = dir.path();
+        // tracked file (README.md committed by init_repo).
+        // untracked, not ignored:
+        write(root, "apps/api/.dev.vars", "SECRET=1\n");
+        write(root, "new.txt", "hi\n");
+        // untracked, but ignored:
+        write(root, ".gitignore", "ignored.txt\n");
+        write(root, "ignored.txt", "nope\n");
+        // The .gitignore itself is untracked here, so it would also show up.
+        // Track it to keep the assertion focused on the data files.
+        run(&["add", ".gitignore"], root);
+
+        let mut got: Vec<String> = untracked_files(root)
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        got.sort();
+
+        assert!(
+            got.contains(&"apps/api/.dev.vars".to_string()),
+            "untracked secret must be listed; got {got:?}"
+        );
+        assert!(got.contains(&"new.txt".to_string()), "got {got:?}");
+        assert!(
+            !got.contains(&"README.md".to_string()),
+            "tracked file must NOT be listed; got {got:?}"
+        );
+        assert!(
+            !got.contains(&"ignored.txt".to_string()),
+            "gitignored file must NOT be listed; got {got:?}"
+        );
+    }
+
+    /// `is_ignored` reports true for a gitignored path, false otherwise.
+    #[test]
+    fn is_ignored_reflects_gitignore() {
+        let dir = init_repo("main");
+        let root = dir.path();
+        write(root, ".gitignore", "**/.dev.vars\n");
+        assert!(is_ignored(root, Path::new("apps/api/.dev.vars")).unwrap());
+        assert!(!is_ignored(root, Path::new("apps/api/config.json")).unwrap());
+    }
+
+    /// `check_ignore_pattern` returns the covering glob, not the literal path,
+    /// when a glob rule matches.
+    #[test]
+    fn check_ignore_pattern_returns_covering_glob() {
+        let dir = init_repo("main");
+        let root = dir.path();
+        write(root, ".gitignore", "**/.dev.vars\n");
+        let pat = check_ignore_pattern(root, Path::new("apps/api/.dev.vars")).unwrap();
+        assert_eq!(pat, Some("**/.dev.vars".to_string()));
+    }
+
+    /// `check_ignore_pattern` returns the literal pattern when the rule is an
+    /// exact path entry.
+    #[test]
+    fn check_ignore_pattern_returns_literal_when_exact() {
+        let dir = init_repo("main");
+        let root = dir.path();
+        write(root, ".gitignore", "secrets/api.key\n");
+        let pat = check_ignore_pattern(root, Path::new("secrets/api.key")).unwrap();
+        assert_eq!(pat, Some("secrets/api.key".to_string()));
+    }
+
+    /// `check_ignore_pattern` returns None when no rule covers the path.
+    #[test]
+    fn check_ignore_pattern_none_when_no_rule() {
+        let dir = init_repo("main");
+        let root = dir.path();
+        write(root, ".gitignore", "node_modules/\n");
+        let pat = check_ignore_pattern(root, Path::new("apps/api/.dev.vars")).unwrap();
+        assert_eq!(pat, None);
+    }
+
+    /// A negation rule (`!…`) is reported as None, so callers fall back to the
+    /// literal path rather than copying a negation into main.
+    #[test]
+    fn check_ignore_pattern_negation_is_none() {
+        let dir = init_repo("main");
+        let root = dir.path();
+        // Ignore everything, then un-ignore the secret — git check-ignore -v
+        // reports the LAST matching rule, which is the negation.
+        write(root, ".gitignore", "**/.dev.vars\n!apps/api/.dev.vars\n");
+        let pat = check_ignore_pattern(root, Path::new("apps/api/.dev.vars")).unwrap();
+        assert_eq!(pat, None, "negation rule must not be copied as a pattern");
+    }
+
+    /// Pure parser unit: pattern after the second colon, before the tab.
+    #[test]
+    fn parse_check_ignore_line_extracts_pattern() {
+        let line = ".gitignore:1:**/.dev.vars\tapps/api/.dev.vars";
+        assert_eq!(
+            parse_check_ignore_line(line),
+            Some("**/.dev.vars".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_check_ignore_line_handles_negation_and_empty() {
+        assert_eq!(
+            parse_check_ignore_line(".gitignore:2:!foo\tfoo"),
+            None,
+            "negation → None"
+        );
+        assert_eq!(parse_check_ignore_line(""), None);
     }
 }

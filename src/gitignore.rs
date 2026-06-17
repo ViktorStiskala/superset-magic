@@ -10,6 +10,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::git;
+
 /// Append `line` to `<git_root>/.gitignore` if no EXACT line match already
 /// exists.  Creates `.gitignore` if the file is absent.
 ///
@@ -54,6 +56,26 @@ pub fn ensure_entry(git_root: &Path, line: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve the `.gitignore` rule in the working tree rooted at `worktree_root`
+/// that COVERS `rel`, for copying into another checkout's `.gitignore`.
+///
+/// Returns `Ok(Some(pattern))` when a rule matches (the bare pattern text,
+/// e.g. `**/.dev.vars`), and `Ok(None)` when NO rule covers `rel`. The caller
+/// (reverse sync, U11) appends the returned pattern via [`ensure_entry`] when
+/// `Some`, and falls back to the literal relative path when `None` — so a
+/// reverse-synced secret lands gitignored in main even if the worktree relied
+/// on an inherited glob.
+///
+/// Delegates to `git check-ignore -v --no-index` (via [`git::check_ignore_pattern`])
+/// rather than hand-parsing `.gitignore` files, so nested `.gitignore`s,
+/// inherited rules, and git's full match semantics are respected. A negation
+/// rule (`!…`) is reported as `None` by the underlying probe.
+// consumed by U11 (reverse sync gitignore safety); wired into the menu by U10
+#[allow(dead_code)]
+pub fn find_covering_rule(worktree_root: &Path, rel: &Path) -> Result<Option<String>> {
+    git::check_ignore_pattern(worktree_root, rel)
 }
 
 #[cfg(test)]
@@ -152,5 +174,43 @@ mod tests {
             after.contains(".superset/magic.local.json\n"),
             "entry must be appended; got: {after:?}"
         );
+    }
+
+    // ── find_covering_rule (U11) ─────────────────────────────────────────────
+
+    fn git_init(root: &Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed in {}", root.display());
+    }
+
+    /// A glob rule covering the path is returned as the glob, NOT the literal
+    /// path — so reverse sync copies the broad rule into main.
+    #[test]
+    fn covering_rule_returns_glob_not_literal() {
+        let dir = fresh();
+        git_init(dir.path());
+        fs::write(dir.path().join(".gitignore"), "**/.dev.vars\n").unwrap();
+
+        let got =
+            find_covering_rule(dir.path(), Path::new("apps/api/.dev.vars")).unwrap();
+        assert_eq!(got, Some("**/.dev.vars".to_string()));
+    }
+
+    /// No covering rule → None → caller falls back to the literal path.
+    #[test]
+    fn covering_rule_none_when_uncovered() {
+        let dir = fresh();
+        git_init(dir.path());
+        fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+
+        let got =
+            find_covering_rule(dir.path(), Path::new("apps/api/.dev.vars")).unwrap();
+        assert_eq!(got, None);
     }
 }
