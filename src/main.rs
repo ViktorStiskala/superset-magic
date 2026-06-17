@@ -9,6 +9,7 @@ mod apply;
 mod cli;
 mod exec;
 mod git;
+mod gitignore;
 mod pattern;
 mod repo_detect;
 mod repo_scan;

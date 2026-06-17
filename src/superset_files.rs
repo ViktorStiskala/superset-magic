@@ -29,6 +29,10 @@ const SETUP_CONFIG_JSON: &str = "setup_config.json";
 const MAGIC_JSON: &str = "magic.json";
 const MAGIC_LOCAL_JSON: &str = "magic.local.json";
 
+/// Relative path of `magic.local.json` as it appears inside the repo.
+/// Referenced by [`default_magic_files`] and the bootstrap helper.
+const MAGIC_LOCAL_PATTERN: &str = ".superset/magic.local.json";
+
 /// Shape of `.superset/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -114,6 +118,40 @@ pub fn write_magic_json(root: &Path, files: &[String]) -> Result<()> {
         files: files.to_vec(),
     };
     let body = format!("{}\n", serde_json::to_string_pretty(&cfg)?);
+    fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Default patterns included in every freshly-written `magic.json`.
+///
+/// Contains `.superset/magic.local.json` so forward sync copies the local
+/// overlay into each worktree.  Consumed by the init/migration unit (U9)
+/// when it writes `magic.json` for the first time.
+// consumed by U9
+#[allow(dead_code)]
+pub fn default_magic_files() -> Vec<String> {
+    vec![MAGIC_LOCAL_PATTERN.to_string()]
+}
+
+/// Bootstrap `.superset/magic.local.json` if it does not already exist.
+///
+/// Writes a strict JSON object with a `_comment` string key (serde
+/// round-trips it) and an empty `files` array.  The comment explains
+/// that the file is gitignored and acts as the local overlay.
+///
+/// Idempotent: does nothing when the file already exists.
+// consumed by U9
+#[allow(dead_code)]
+pub fn bootstrap_magic_local_json(root: &Path) -> Result<()> {
+    ensure_superset_dir(root)?;
+    let path = superset_dir(root).join(MAGIC_LOCAL_JSON);
+    if path.exists() {
+        return Ok(());
+    }
+    // Write raw JSON so the _comment key is included without requiring a
+    // corresponding struct field on MagicConfig.  serde ignores unknown
+    // keys on deserialisation, so load_overlaid round-trips this as empty.
+    let body = "{\n  \"_comment\": \"Local overlay for magic.json — gitignored, never committed. Add patterns here that are specific to this machine or checkout.\",\n  \"files\": []\n}\n";
     fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
@@ -819,5 +857,79 @@ mod tests {
 
         let result = load_overlaid(root).unwrap().unwrap();
         assert!(result.files.is_empty());
+    }
+
+    // ── bootstrap_magic_local_json / default_magic_files tests ───────────────
+
+    /// Bootstrapped magic.local.json parses as {} (+ comment key) and overlays
+    /// as empty files (the _comment key is ignored by serde).
+    #[test]
+    fn bootstrap_magic_local_json_creates_valid_overlay_noop() {
+        let dir = fresh();
+        let root = dir.path();
+
+        // Need a magic.json so load_overlaid can return Some(_).
+        write_magic_json_raw(root, r#"{"files":["**/.env"]}"#);
+
+        bootstrap_magic_local_json(root).unwrap();
+
+        let path = root.join(".superset/magic.local.json");
+        assert!(path.is_file(), "magic.local.json must be created");
+
+        // Must be valid JSON.
+        let raw = fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw)
+            .expect("bootstrapped magic.local.json must be valid JSON");
+        assert!(parsed.is_object(), "must be a JSON object");
+        assert!(parsed.get("_comment").is_some(), "must contain _comment key");
+
+        // load_overlaid must round-trip: local contributes zero extra files.
+        let result = load_overlaid(root).unwrap().unwrap();
+        assert_eq!(
+            result.files,
+            vec!["**/.env"],
+            "local overlay must add no files beyond the base"
+        );
+    }
+
+    /// bootstrap_magic_local_json is idempotent: existing file is not overwritten.
+    #[test]
+    fn bootstrap_magic_local_json_idempotent_when_file_exists() {
+        let dir = fresh();
+        let root = dir.path();
+        let path = root.join(".superset/magic.local.json");
+
+        // Write a custom file first.
+        fs::create_dir_all(root.join(".superset")).unwrap();
+        let custom = r#"{"files":["custom/**"]}"#;
+        fs::write(&path, custom).unwrap();
+
+        bootstrap_magic_local_json(root).unwrap();
+
+        // Must be unchanged.
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after, custom, "existing file must not be overwritten");
+    }
+
+    /// Bootstrapped file has a trailing newline (consistent with the write convention).
+    #[test]
+    fn bootstrap_magic_local_json_has_trailing_newline() {
+        let dir = fresh();
+        let root = dir.path();
+
+        bootstrap_magic_local_json(root).unwrap();
+
+        let raw = fs::read_to_string(root.join(".superset/magic.local.json")).unwrap();
+        assert!(raw.ends_with('\n'), "must end with a trailing newline");
+    }
+
+    /// default_magic_files includes .superset/magic.local.json.
+    #[test]
+    fn default_magic_files_includes_magic_local_json() {
+        let defaults = default_magic_files();
+        assert!(
+            defaults.iter().any(|s| s == ".superset/magic.local.json"),
+            "default_magic_files() must include .superset/magic.local.json; got: {defaults:?}"
+        );
     }
 }
