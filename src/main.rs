@@ -190,12 +190,34 @@ where
     Ok(ExitCode::SUCCESS)
 }
 
-/// Self-update placeholder. U7 replaces this with the lock/download/swap/
-/// re-exec path; for now it reports that self-update isn't wired and
-/// succeeds.
+/// `ss-magic update` (R4): force a self-update regardless of the 24h cache.
+///
+/// Routes straight to the forced apply path (U7), which bypasses the daily
+/// cache, runs the `self_update` lock/download/swap if a newer release exists,
+/// and reports the resulting version or "already latest". Unlike the bare/sync
+/// auto-update gate (U8), this does not re-exec — the update itself is the
+/// requested work.
 fn update_flow() -> Result<ExitCode> {
-    println!("{}", style::info("self-update not yet wired (U7)"));
-    Ok(ExitCode::SUCCESS)
+    style::print_section("Self-update");
+    match update::update_command() {
+        update::UpdateReport::Updated { version } => {
+            println!("{}", style::ok(format!("Updated to v{version}.")));
+            Ok(ExitCode::SUCCESS)
+        }
+        update::UpdateReport::AlreadyLatest => {
+            println!("{}", style::info("Already on the latest release."));
+            Ok(ExitCode::SUCCESS)
+        }
+        update::UpdateReport::Skipped => {
+            println!(
+                "{}",
+                style::warn(
+                    "Another update is already in progress; skipped. Try again in a moment."
+                )
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
 
 fn bootstrap_flow(repo_root: &Path) -> Result<ExitCode> {

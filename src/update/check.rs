@@ -24,8 +24,10 @@ use serde::{Deserialize, Serialize};
 
 /// GitHub owner/repo slug. Placeholder until the standalone repo exists (see
 /// the plan's Open Questions); wired as a single constant to fill at split
-/// time. `check`'s default client targets this repo's `releases/latest`.
-const REPO_SLUG: &str = "ViktorStiskala/superset-magic";
+/// time. `check`'s default client targets this repo's `releases/latest`;
+/// U7's apply path (`super::apply`) reuses the same slug for the download
+/// backend, so it is `pub(crate)` rather than module-private.
+pub(crate) const REPO_SLUG: &str = "ViktorStiskala/superset-magic";
 
 /// How long a cache entry is trusted before we re-check the network.
 const FRESH_FOR: Duration = Duration::from_secs(24 * 60 * 60);
@@ -330,7 +332,7 @@ impl ReleaseClient for UreqReleaseClient {
 /// Public entry point: wire the real OS cache path + real ureq client, then
 /// run the cached check against the compiled-in version. Infallible — any
 /// inability to resolve a cache dir collapses to `UpToDate`.
-#[allow(dead_code)] // consumed by U8 (startup wiring) and U7 (forced check)
+#[allow(dead_code)] // consumed by U8 (startup gate); the U7 force path bypasses it
 pub fn check() -> UpdateCheck {
     let Some(dir) = cache_dir() else {
         return UpdateCheck::UpToDate;
