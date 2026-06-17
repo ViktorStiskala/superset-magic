@@ -16,6 +16,7 @@ mod repo_scan;
 mod style;
 mod superset_files;
 mod ui;
+mod update;
 
 use crate::apply::{Event, SkipReason};
 use crate::cli::{Command, Parsed};
