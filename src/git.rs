@@ -271,7 +271,6 @@ pub fn pr_create(repo_root: &Path, base: &str) -> Result<String> {
 /// sync intersects this set with the (already-validated) pattern matcher and
 /// must never let a path escape the tree.
 // consumed by U11 (reverse sync candidates); wired into the menu by U10
-#[allow(dead_code)]
 pub fn untracked_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
     let out = git(
         &["ls-files", "--others", "--exclude-standard", "-z"],
@@ -303,7 +302,6 @@ pub fn untracked_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
 /// Used by reverse sync to decide whether a copied path is already covered
 /// by main's `.gitignore` before appending a new rule.
 // consumed by U11
-#[allow(dead_code)]
 pub fn is_ignored(repo_root: &Path, rel: &Path) -> Result<bool> {
     let rel_str = rel
         .to_str()
@@ -334,7 +332,6 @@ pub fn is_ignored(repo_root: &Path, rel: &Path) -> Result<bool> {
 /// such a match is reported as `None` so the caller falls back to the literal
 /// path rather than copying a negation rule into main.
 // consumed by U11 (gitignore::find_covering_rule)
-#[allow(dead_code)]
 pub fn check_ignore_pattern(repo_root: &Path, rel: &Path) -> Result<Option<String>> {
     let rel_str = rel
         .to_str()
@@ -394,7 +391,6 @@ fn parse_check_ignore_line(line: &str) -> Option<String> {
 /// the pager is dismissed. It is not unit-tested (consistent with the repo's
 /// final-action convention).
 // consumed by U11 (reverse-sync picker "show diff" action)
-#[allow(dead_code)]
 pub fn diff_no_index_paged(left: &Path, right: &Path) -> Result<()> {
     let pager = std::env::var("PAGER").unwrap_or_else(|_| "less -R".to_string());
 

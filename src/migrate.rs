@@ -57,7 +57,6 @@ const MAGIC_LOCAL_REL: &str = ".superset/magic.local.json";
 /// Which branch the main-checkout bare invocation should take, decided from
 /// the parsed `config.json` `setup` array (KTD8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by U10
 pub enum Branch {
     /// Old `setup.sh` reference present (with or without the new marker) —
     /// migrate the layout. Migrate wins when both markers are present.
@@ -74,7 +73,6 @@ fn entry_is_setup_sh(entry: &str) -> bool {
 }
 
 /// True when a `setup` entry references the new wrapper / sync marker.
-#[allow(dead_code)] // consumed by U10 (via detect_branch)
 fn entry_is_magic_marker(entry: &str) -> bool {
     entry.contains("magic.sh") || entry.contains("ss-magic sync")
 }
@@ -95,7 +93,6 @@ fn entry_is_magic_marker(entry: &str) -> bool {
 /// half-migrated `setup` array (both markers) is repaired by migration rather
 /// than treated as already-done. A malformed `config.json` is handled by the
 /// caller as a hard error and never reaches this function.
-#[allow(dead_code)] // consumed by U10
 pub fn detect_branch(config: Option<&Config>) -> Branch {
     let Some(cfg) = config else {
         return Branch::Init;
@@ -200,7 +197,6 @@ fn stage_migration(repo_root: &Path, stage_root: &Path, existing: &Config) -> Re
 /// already-migrated repo is detected upstream (`Branch::Normal`) and never
 /// reaches here; this function additionally reports "nothing changed" if the
 /// `setup` array already lacks a `setup.sh` reference (defensive).
-#[allow(dead_code)] // consumed by U10
 pub fn run_migrate(repo_root: &Path, existing: &Config) -> Result<ExitCode> {
     style::print_section("Migrate .superset layout");
     println!(
@@ -294,7 +290,6 @@ fn init_magic_files(chosen: &[String]) -> Vec<String> {
 /// `magic.sh`, sets `config.json` `setup` to the wrapper entry, and bootstraps
 /// `magic.local.json` + gitignore. Stage → prompt → materialize, same as
 /// migration.
-#[allow(dead_code)] // consumed by U10
 pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode> {
     style::print_section("Initialize .superset (magic layout)");
     println!(

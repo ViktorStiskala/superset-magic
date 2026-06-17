@@ -89,7 +89,6 @@ fn is_safe_rel(rel: &Path) -> bool {
 /// (nothing configured to sync). Defensively drops any path that fails the
 /// in-tree safety check.
 // consumed by U11 run(); wired into the menu by U10
-#[allow(dead_code)]
 pub fn compute_candidates(worktree_root: &Path) -> Result<Vec<PathBuf>> {
     let cfg = match superset_files::load_overlaid(worktree_root)? {
         Some(c) => c,
@@ -126,7 +125,6 @@ pub fn compute_candidates(worktree_root: &Path) -> Result<Vec<PathBuf>> {
 /// [`DiffStatus::Differs`]. A read error on main's copy is treated as
 /// `Differs` (surface it in the picker rather than silently hide it).
 // consumed by U11 run()
-#[allow(dead_code)]
 pub fn classify(main_root: &Path, worktree_root: &Path, rel: &Path) -> Result<DiffStatus> {
     let main_path = main_root.join(rel);
     if !main_path.exists() {
@@ -161,7 +159,6 @@ pub fn classify(main_root: &Path, worktree_root: &Path, rel: &Path) -> Result<Di
 /// The `overwrite` closure is the test seam: production passes a closure that
 /// shows the diff and prompts; tests pass a fixed decision.
 // consumed by U11 run()
-#[allow(dead_code)]
 pub fn copy_candidate_into_main<O>(
     worktree_root: &Path,
     main_root: &Path,
@@ -246,7 +243,6 @@ fn ensure_gitignored_in_main(
 /// are interactive. The logic it orchestrates is covered through
 /// [`compute_candidates`], [`classify`], and [`copy_candidate_into_main`].
 /// Wired into the menu by U10.
-#[allow(dead_code)]
 pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
     style::print_section("Reverse sync (untracked → main)");
     println!(

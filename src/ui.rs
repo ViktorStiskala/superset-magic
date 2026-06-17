@@ -412,7 +412,6 @@ fn reverse_row_label(row: &ReverseRow) -> String {
 /// Cancelling the prompt (Esc/Ctrl-C) propagates as an error context so the
 /// caller leaves main untouched.
 // consumed by reverse_sync::run; manual-smoke (no unit test)
-#[allow(dead_code)]
 pub fn pick_reverse_sync(
     worktree_root: &Path,
     main_root: &Path,
@@ -518,7 +517,6 @@ fn show_candidate_diff(worktree_root: &Path, main_root: &Path, rel: &Path) -> Re
 /// Used as the `overwrite` decision seam passed to
 /// `reverse_sync::copy_candidate_into_main`. Manual-smoke (interactive).
 // consumed by reverse_sync::run
-#[allow(dead_code)]
 pub fn confirm_overwrite_with_diff(
     worktree_root: &Path,
     main_root: &Path,
