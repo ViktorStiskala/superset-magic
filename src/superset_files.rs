@@ -1,26 +1,21 @@
 //! Read and write the `.superset/` workspace contract:
 //!
-//!   .superset/config.json         { setup, teardown, run }
-//!   .superset/setup.sh            executable copy of the embedded asset
-//!   .superset/setup_config.json   { files: [pattern, ...] }
+//!   .superset/config.json         { setup, teardown, run }  (Superset-owned)
+//!   .superset/magic.sh            executable wrapper (embedded asset)
+//!   .superset/setup_config.json   { files: [pattern, ...] }  (legacy; read-only)
 //!   .superset/magic.json          { files: [pattern, ...] }  (committed)
 //!   .superset/magic.local.json    { files: [pattern, ...] }  (gitignored overlay)
 //!
-//! The embedded `setup.sh` (under `assets/`) is the single source of truth
-//! for the script body; bootstrap mode overwrites the on-disk copy each
-//! time. `config.json` is always rewritten in bootstrap mode from the
-//! picker output; `teardown` and `run` arrays are preserved verbatim from
-//! the existing on-disk `config.json` by merging upstream of the write.
+//! The embedded `magic.sh` (under `assets/`) is the single source of truth
+//! for the wrapper body; migration and init write the on-disk copy. The
+//! legacy `setup_config.json` is still read by migration (to carry its
+//! `files` into `magic.json`) but never written.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-
-/// Embedded canonical body of `setup.sh`. Bootstrap mode writes this
-/// verbatim to `.superset/setup.sh`.
-pub const SETUP_SH: &str = include_str!("../assets/setup.sh");
 
 /// Embedded canonical body of `magic.sh`. Written to `.superset/magic.sh`
 /// during migration (U9) and bootstrap. Delegates to `ss-magic` via `exec`
@@ -30,7 +25,6 @@ pub const MAGIC_SH: &str = include_str!("../assets/magic.sh");
 
 const SUPERSET_DIR: &str = ".superset";
 const CONFIG_JSON: &str = "config.json";
-const SETUP_SH_NAME: &str = "setup.sh";
 const MAGIC_SH_NAME: &str = "magic.sh";
 const SETUP_CONFIG_JSON: &str = "setup_config.json";
 const MAGIC_JSON: &str = "magic.json";
@@ -52,7 +46,8 @@ pub struct Config {
 }
 
 
-/// Shape of `.superset/setup_config.json`.
+/// Shape of the legacy `.superset/setup_config.json`. Read-only: migration
+/// reads its `files` to carry them into `magic.json`. Never written.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SetupConfig {
     #[serde(default)]
@@ -165,45 +160,8 @@ pub fn bootstrap_magic_local_json(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Snapshot of what's already present on disk. The bootstrap flow uses
-/// this to decide between "first run" and "edit mode" banners and to
-/// seed the multi-select with the existing patterns.
-#[derive(Debug, Default)]
-pub struct ExistingState {
-    /// True when `.superset/` exists as a directory under the repo root.
-    pub superset_dir_present: bool,
-    /// Parsed `setup_config.json` content when present and well-formed.
-    pub setup_config_json: Option<SetupConfig>,
-    /// Parsed `config.json` content when present and well-formed. Bootstrap
-    /// merges its `teardown` / `run` arrays into the new Config before
-    /// writing.
-    pub config_json: Option<Config>,
-}
-
 fn superset_dir(root: &Path) -> PathBuf {
     root.join(SUPERSET_DIR)
-}
-
-/// Read the current state of `.superset/` under `root` without writing
-/// anything. Errors when `.superset/` exists as a non-directory, or when
-/// either JSON file is malformed.
-pub fn load_existing(root: &Path) -> Result<ExistingState> {
-    let dir = superset_dir(root);
-    if !dir.exists() {
-        return Ok(ExistingState::default());
-    }
-    if !dir.is_dir() {
-        bail!(
-            "`{}` exists but is not a directory; remove or rename it before running bootstrap",
-            dir.display()
-        );
-    }
-
-    Ok(ExistingState {
-        superset_dir_present: true,
-        setup_config_json: load_setup_config(root)?,
-        config_json: load_config(root)?,
-    })
 }
 
 /// Load just `config.json` from `root/.superset/`. `Ok(None)` when the
@@ -267,16 +225,6 @@ pub fn ensure_superset_dir(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Always overwrite `.superset/setup.sh` with the embedded canonical body
-/// and mark it executable.
-pub fn write_setup_sh(root: &Path) -> Result<()> {
-    ensure_superset_dir(root)?;
-    let path = superset_dir(root).join(SETUP_SH_NAME);
-    fs::write(&path, SETUP_SH).with_context(|| format!("writing {}", path.display()))?;
-    chmod_executable(&path)?;
-    Ok(())
-}
-
 /// Always overwrite `.superset/magic.sh` with the embedded canonical body
 /// and mark it executable (mode 0755).
 ///
@@ -336,41 +284,6 @@ pub fn merge_setup_into_config(existing: Option<&Config>, new_setup: Vec<String>
     }
 }
 
-/// Rewrite `.superset/setup_config.json` from `files`, pretty-printed with
-/// a trailing newline.
-pub fn write_setup_config_json(root: &Path, files: &[String]) -> Result<()> {
-    ensure_superset_dir(root)?;
-    let path = superset_dir(root).join(SETUP_CONFIG_JSON);
-    let cfg = SetupConfig {
-        files: files.to_vec(),
-    };
-    let body = format!("{}\n", serde_json::to_string_pretty(&cfg)?);
-    fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
-
-/// True when `.env` exists as a regular file at `root` and `.envrc` does
-/// not. The orchestration uses this to decide whether to prompt the user
-/// about creating `.envrc`.
-pub fn should_offer_envrc(root: &Path) -> bool {
-    root.join(".env").is_file() && !root.join(".envrc").exists()
-}
-
-/// Write `.envrc` at `root` with the body `dotenv_if_exists\n`.
-pub fn write_envrc(root: &Path) -> Result<()> {
-    let path = root.join(".envrc");
-    fs::write(&path, "dotenv_if_exists\n")
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
-
-/// Report of what `copy_into_repo` actually wrote at the real repo root.
-#[derive(Debug, Default)]
-pub struct MaterializeReport {
-    /// True when `.envrc` was copied into the repo root (staging had one).
-    pub wrote_envrc: bool,
-}
-
 /// Copy the staged `.superset` tree from `stage_root` into `repo_root` and
 /// delete any repo-relative paths named in `delete`, applying the
 /// preservation rules:
@@ -380,22 +293,15 @@ pub struct MaterializeReport {
 ///   always overwritten — preservation (e.g. of `config.json`'s existing
 ///   `teardown` / `run` arrays) must happen upstream by merging into the
 ///   staged tree before this call. Any staged `*.sh` is chmod 0755'd after
-///   the copy so wrappers (`setup.sh`, `magic.sh`) stay executable.
-/// - `.envrc` is copied only when present at `stage_root`.
+///   the copy so the `magic.sh` wrapper stays executable.
 /// - Each repo-relative path in `delete` (e.g. `.superset/setup.sh`) is
 ///   removed from `repo_root` if it exists. Used by migration to strip the
 ///   retired `setup.sh`. A missing target is not an error.
 ///
-/// The staged tree is the source of truth: the caller stages exactly the
-/// files it wants materialized, so an old-layout bootstrap stages
-/// `setup.sh` + `setup_config.json` + `config.json`, while migration stages
-/// `magic.sh` + `magic.json` + `config.json` (+ `magic.local.json`) and asks
-/// for `.superset/setup.sh` to be deleted.
-pub fn copy_into_repo(
-    stage_root: &Path,
-    repo_root: &Path,
-    delete: &[&str],
-) -> Result<MaterializeReport> {
+/// The staged tree is the source of truth: migration stages `magic.sh` +
+/// `magic.json` + `config.json` (+ `magic.local.json`) and asks for
+/// `.superset/setup.sh` to be deleted.
+pub fn copy_into_repo(stage_root: &Path, repo_root: &Path, delete: &[&str]) -> Result<()> {
     ensure_superset_dir(repo_root)?;
     let stage_dir = stage_root.join(SUPERSET_DIR);
     let real_dir = repo_root.join(SUPERSET_DIR);
@@ -436,18 +342,7 @@ pub fn copy_into_repo(
         }
     }
 
-    let stage_envrc = stage_root.join(".envrc");
-    let real_envrc = repo_root.join(".envrc");
-    let wrote_envrc = if stage_envrc.exists() {
-        fs::copy(&stage_envrc, &real_envrc).with_context(|| {
-            format!("copy {} → {}", stage_envrc.display(), real_envrc.display())
-        })?;
-        true
-    } else {
-        false
-    };
-
-    Ok(MaterializeReport { wrote_envrc })
+    Ok(())
 }
 
 /// Entries from `existing` that are NOT in `options`, in their original
@@ -482,37 +377,22 @@ mod tests {
     }
 
     #[test]
-    fn fresh_repo_emits_all_three_files() {
+    fn write_config_json_emits_expected_shape() {
         let dir = fresh();
         let root = dir.path();
-        write_setup_sh(root).unwrap();
-        write_config_json(root, &cfg(vec!["./.superset/setup.sh"], vec![], vec![])).unwrap();
-        write_setup_config_json(root, &[".env".to_string()]).unwrap();
+        write_config_json(
+            root,
+            &cfg(vec!["./.superset/magic.sh sync"], vec![], vec![]),
+        )
+        .unwrap();
 
         let dot = root.join(".superset");
-        assert!(dot.join("setup.sh").is_file());
         assert!(dot.join("config.json").is_file());
-        assert!(dot.join("setup_config.json").is_file());
-
-        // setup.sh is executable on unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(dot.join("setup.sh"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o755);
-        }
-
-        // setup.sh content matches the embedded asset
-        let on_disk = fs::read_to_string(dot.join("setup.sh")).unwrap();
-        assert_eq!(on_disk, SETUP_SH);
 
         // config.json matches the shape we wrote
         let parsed: Config =
             serde_json::from_str(&fs::read_to_string(dot.join("config.json")).unwrap()).unwrap();
-        assert_eq!(parsed.setup, vec!["./.superset/setup.sh".to_string()]);
+        assert_eq!(parsed.setup, vec!["./.superset/magic.sh sync".to_string()]);
         assert!(parsed.teardown.is_empty());
         assert!(parsed.run.is_empty());
     }
@@ -599,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_setup_config_entries_survive_rewrite() {
+    fn existing_unknown_entries_keeps_non_preconfigured() {
         let existing = vec![
             "apps/*/config".to_string(),
             ".env".to_string(),
@@ -613,13 +493,20 @@ mod tests {
                 "packages/**/fixtures".to_string()
             ]
         );
+    }
 
+    /// `load_setup_config` (the legacy reader migration relies on) round-trips
+    /// a `files` array from a raw `setup_config.json` on disk.
+    #[test]
+    fn load_setup_config_reads_files_array() {
         let dir = fresh();
         let root = dir.path();
-        let selected = vec![".env".to_string(), "**/.dev.vars".to_string()];
-        let mut merged = selected.clone();
-        merged.extend(unknown);
-        write_setup_config_json(root, &merged).unwrap();
+        fs::create_dir_all(root.join(".superset")).unwrap();
+        fs::write(
+            root.join(".superset/setup_config.json"),
+            r#"{"files":[".env","**/.dev.vars","apps/*/config"]}"#,
+        )
+        .unwrap();
 
         let parsed = load_setup_config(root).unwrap().unwrap();
         assert_eq!(
@@ -628,7 +515,6 @@ mod tests {
                 ".env".to_string(),
                 "**/.dev.vars".to_string(),
                 "apps/*/config".to_string(),
-                "packages/**/fixtures".to_string(),
             ]
         );
     }
@@ -646,64 +532,28 @@ mod tests {
     }
 
     #[test]
-    fn write_envrc_writes_dotenv_if_exists() {
-        let dir = fresh();
-        let root = dir.path();
-        write_envrc(root).unwrap();
-        let body = fs::read_to_string(root.join(".envrc")).unwrap();
-        assert_eq!(body, "dotenv_if_exists\n");
-    }
-
-    #[test]
-    fn should_offer_envrc_true_when_env_alone() {
-        let dir = fresh();
-        let root = dir.path();
-        fs::write(root.join(".env"), "FOO=1").unwrap();
-        assert!(should_offer_envrc(root));
-    }
-
-    #[test]
-    fn should_offer_envrc_false_when_envrc_exists() {
-        let dir = fresh();
-        let root = dir.path();
-        fs::write(root.join(".env"), "FOO=1").unwrap();
-        fs::write(root.join(".envrc"), "dotenv_if_exists\n").unwrap();
-        assert!(!should_offer_envrc(root));
-    }
-
-    #[test]
-    fn should_offer_envrc_false_when_env_absent() {
-        let dir = fresh();
-        let root = dir.path();
-        assert!(!should_offer_envrc(root));
-    }
-
-    #[test]
     fn copy_into_repo_materializes_all_staged_files() {
         let stage = fresh();
         let dest = fresh();
-        write_setup_sh(stage.path()).unwrap();
+        write_magic_sh(stage.path()).unwrap();
         write_config_json(
             stage.path(),
-            &cfg(vec!["./.superset/setup.sh"], vec![], vec![]),
+            &cfg(vec!["./.superset/magic.sh sync"], vec![], vec![]),
         )
         .unwrap();
-        write_setup_config_json(stage.path(), &[".env".to_string()]).unwrap();
-        write_envrc(stage.path()).unwrap();
+        write_magic_json(stage.path(), &[".env".to_string()]).unwrap();
 
-        let report = copy_into_repo(stage.path(), dest.path(), &[]).unwrap();
-        assert!(report.wrote_envrc);
+        copy_into_repo(stage.path(), dest.path(), &[]).unwrap();
 
         let real = dest.path().join(".superset");
-        assert!(real.join("setup.sh").is_file());
+        assert!(real.join("magic.sh").is_file());
         assert!(real.join("config.json").is_file());
-        assert!(real.join("setup_config.json").is_file());
-        assert!(dest.path().join(".envrc").is_file());
+        assert!(real.join("magic.json").is_file());
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(real.join("setup.sh"))
+            let mode = fs::metadata(real.join("magic.sh"))
                 .unwrap()
                 .permissions()
                 .mode();
@@ -715,18 +565,18 @@ mod tests {
     fn copy_into_repo_overwrites_existing_config_json() {
         let stage = fresh();
         let dest = fresh();
-        write_setup_sh(stage.path()).unwrap();
+        write_magic_sh(stage.path()).unwrap();
         write_config_json(
             stage.path(),
-            &cfg(vec!["./.superset/setup.sh", "uv sync"], vec![], vec![]),
+            &cfg(vec!["./.superset/magic.sh sync", "uv sync"], vec![], vec![]),
         )
         .unwrap();
-        write_setup_config_json(stage.path(), &[".env".to_string()]).unwrap();
+        write_magic_json(stage.path(), &[".env".to_string()]).unwrap();
 
         let dest_dir = dest.path().join(".superset");
         fs::create_dir_all(&dest_dir).unwrap();
         let pre_existing =
-            r#"{"setup":["./.superset/setup.sh","./extra.sh"],"teardown":[],"run":[]}"#;
+            r#"{"setup":["./.superset/magic.sh sync","./extra.sh"],"teardown":[],"run":[]}"#;
         fs::write(dest_dir.join("config.json"), pre_existing).unwrap();
 
         copy_into_repo(stage.path(), dest.path(), &[]).unwrap();
@@ -747,40 +597,22 @@ mod tests {
         let pre_existing = r#"{"setup":["./old.sh"],"teardown":["./drop.sh"],"run":[]}"#;
         fs::write(dest_dir.join("config.json"), pre_existing).unwrap();
 
-        // Bootstrap simulation: read existing, merge with new picker output, stage, copy.
+        // Migration simulation: read existing, merge with new setup, stage, copy.
         let existing = load_config(dest.path()).unwrap();
-        let new_setup: Vec<String> = vec!["./.superset/setup.sh".into(), "uv sync".into()];
+        let new_setup: Vec<String> = vec!["./.superset/magic.sh sync".into(), "uv sync".into()];
         let merged = merge_setup_into_config(existing.as_ref(), new_setup);
 
         let stage = fresh();
-        write_setup_sh(stage.path()).unwrap();
+        write_magic_sh(stage.path()).unwrap();
         write_config_json(stage.path(), &merged).unwrap();
-        write_setup_config_json(stage.path(), &[]).unwrap();
+        write_magic_json(stage.path(), &[]).unwrap();
 
         copy_into_repo(stage.path(), dest.path(), &[]).unwrap();
 
         let final_cfg = load_config(dest.path()).unwrap().unwrap();
-        assert_eq!(final_cfg.setup, vec!["./.superset/setup.sh", "uv sync"]);
+        assert_eq!(final_cfg.setup, vec!["./.superset/magic.sh sync", "uv sync"]);
         assert_eq!(final_cfg.teardown, vec!["./drop.sh".to_string()]);
         assert!(final_cfg.run.is_empty());
-    }
-
-    #[test]
-    fn copy_into_repo_skips_envrc_when_not_staged() {
-        let stage = fresh();
-        let dest = fresh();
-        write_setup_sh(stage.path()).unwrap();
-        write_config_json(
-            stage.path(),
-            &cfg(vec!["./.superset/setup.sh"], vec![], vec![]),
-        )
-        .unwrap();
-        write_setup_config_json(stage.path(), &[]).unwrap();
-        // No write_envrc on stage.
-
-        let report = copy_into_repo(stage.path(), dest.path(), &[]).unwrap();
-        assert!(!report.wrote_envrc);
-        assert!(!dest.path().join(".envrc").exists());
     }
 
     #[test]
@@ -788,7 +620,7 @@ mod tests {
         let dir = fresh();
         let root = dir.path();
         fs::write(root.join(".superset"), "not a dir").unwrap();
-        let err = load_existing(root).unwrap_err();
+        let err = ensure_superset_dir(root).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("not a directory"), "msg: {msg}");
     }

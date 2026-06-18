@@ -204,10 +204,10 @@ where
     Ok(answer.map(|s| s.trim().to_string()))
 }
 
-/// Pick the patterns the user wants written to `setup_config.json`.
+/// Pick the patterns the user wants written to `magic.json`.
 ///
 /// `options` carries the four preconfigured patterns followed by any
-/// existing custom patterns from `setup_config.json` (use
+/// existing custom patterns from `magic.json` (use
 /// [`super::superset_files::existing_unknown_entries`] to compute the
 /// tail). `preselected` is the set of indices that should start checked.
 /// `repo_root` is needed to compute filesystem-match status for the
@@ -241,7 +241,7 @@ pub fn pick_patterns(
         help: "↑↓ navigate, enter to toggle / add / confirm",
         add_row_label: "+ Add new pattern…",
         add_prompt_label: "New pattern (Esc to cancel):",
-        add_prompt_help: "e.g. `apps/*/.env` — same glob syntax as setup.sh",
+        add_prompt_help: "e.g. `apps/*/.env` — standard glob syntax",
         cancel_context: "pattern selection cancelled",
         add_cancel_context: "custom pattern prompt cancelled",
     };
@@ -249,44 +249,6 @@ pub fn pick_patterns(
         let matched = repo_scan::pattern_matches_any(&repo_root, s)?;
         Ok(if matched { None } else { Some("(no matches)") })
     })
-}
-
-/// Pick the setup commands written into `.superset/config.json`'s `setup`
-/// array. `options` is `repo_detect::OPTIONS` extended with any existing
-/// unknown entries from the current `config.json`. `preselected` carries
-/// the indices that start checked (detected commands plus any already in
-/// the current setup array). `detected[i]` drives the dim `(not detected)`
-/// suffix on rows the repo-scan didn't trip.
-pub fn pick_setup_commands(
-    options: &[String],
-    preselected: &[usize],
-    detected: &[bool],
-) -> Result<Vec<String>> {
-    let rows: Vec<Row> = options
-        .iter()
-        .enumerate()
-        .map(|(i, raw)| Row {
-            raw: raw.clone(),
-            checked: preselected.contains(&i),
-            dim_suffix: if detected[i] {
-                None
-            } else {
-                Some("(not detected)")
-            },
-        })
-        .collect();
-
-    const STRINGS: PickerStrings = PickerStrings {
-        prompt: "Setup commands to run on `superset apply`:",
-        help: "↑↓ navigate, enter to toggle / add / confirm",
-        add_row_label: "+ Add new command…",
-        add_prompt_label: "New command (Esc to cancel):",
-        add_prompt_help:
-            "e.g. make setup or ./scripts/build.sh — runs from the workspace root on superset apply",
-        cancel_context: "setup command selection cancelled",
-        add_cancel_context: "custom command prompt cancelled",
-    };
-    pick_with_actions(&STRINGS, rows, validate_command, |_| Ok(None))
 }
 
 /// Validate a single user-entered pattern. Wraps `pattern::check_syntax`
@@ -297,53 +259,6 @@ fn validate_pattern(pattern_str: &str, taken: &[String]) -> std::result::Result<
         return Err(format!("`{pattern_str}` is already in the list"));
     }
     Ok(())
-}
-
-/// Validate a single user-entered setup command. The caller trims the
-/// input before invoking; the validator rejects empty strings and
-/// duplicates of any already-taken row. No shell-syntax checks beyond that.
-fn validate_command(cmd: &str, taken: &[String]) -> std::result::Result<(), String> {
-    if cmd.is_empty() {
-        return Err("command is empty".to_string());
-    }
-    if taken.iter().any(|c| c == cmd) {
-        return Err(format!("`{cmd}` is already in the list"));
-    }
-    Ok(())
-}
-
-/// Yes/No on writing `.envrc` (default Yes).
-pub fn confirm_envrc() -> Result<bool> {
-    Confirm::new("Create `.envrc` with `dotenv_if_exists`?")
-        .with_default(true)
-        .with_help_message("direnv will auto-load `.env` for shells entering this directory")
-        .prompt()
-        .context(".envrc prompt cancelled")
-}
-
-/// Yes/No on copying configured files into `dest` from `src` (default Yes).
-pub fn confirm_apply(src: &Path, dest: &Path) -> Result<bool> {
-    let msg = format!(
-        "Copy configured files from {} into {}?",
-        src.display(),
-        dest.display(),
-    );
-    Confirm::new(&msg)
-        .with_default(true)
-        .prompt()
-        .context("apply confirm cancelled")
-}
-
-/// Yes/No on running the setup commands shown above the prompt (default
-/// Yes). The caller prints the banner, the bullet list, the invocation
-/// preview, the working directory, and the no-rollback note before
-/// calling this — the prompt itself is just the Y/N gate.
-pub fn confirm_run_setup_commands() -> Result<bool> {
-    Confirm::new("Run setup commands?")
-        .with_default(true)
-        .with_help_message("Y to run · N to skip (files stay copied)")
-        .prompt()
-        .context("setup run confirm cancelled")
 }
 
 /// Final action picker after bootstrap finishes writing files.
@@ -586,28 +501,5 @@ mod tests {
     fn validate_rejects_empty() {
         let err = validate_pattern("", &[]).unwrap_err();
         assert!(err.contains("empty"));
-    }
-
-    #[test]
-    fn command_accepts_typical_shell_string() {
-        validate_command("pnpm -r install", &[]).unwrap();
-    }
-
-    #[test]
-    fn command_accepts_single_token() {
-        validate_command("make", &[]).unwrap();
-    }
-
-    #[test]
-    fn command_rejects_empty() {
-        let err = validate_command("", &[]).unwrap_err();
-        assert!(err.contains("empty"));
-    }
-
-    #[test]
-    fn command_rejects_duplicates() {
-        let taken = vec!["uv sync".to_string()];
-        let err = validate_command("uv sync", &taken).unwrap_err();
-        assert!(err.contains("already"));
     }
 }

@@ -172,9 +172,8 @@ fn dispatch_menu<F>(ops: Vec<MenuOp>, mut handler: F) -> Result<ExitCode>
 where
     F: FnMut(MenuOp) -> Result<ExitCode>,
 {
-    let len = ops.len();
     let selected = Select::new("What would you like to do?", ops)
-        .with_starting_cursor(0_usize.min(len.saturating_sub(1)))
+        .with_starting_cursor(0)
         .with_help_message("↑↓ navigate · enter to select · Esc to cancel")
         .prompt();
 

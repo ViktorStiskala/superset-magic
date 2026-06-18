@@ -3,23 +3,6 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
-/// Outcome of inspecting the working tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Mode {
-    /// Main checkout, on the main branch. Allowed to write `.superset/`.
-    Bootstrap { repo_root: PathBuf },
-    /// Linked worktree, or main checkout on a non-main branch.
-    /// Reads `main_checkout/.superset/setup_config.json` and copies files
-    /// into `cwd_root`.
-    Apply {
-        cwd_root: PathBuf,
-        main_checkout: PathBuf,
-    },
-    /// Unrecoverable state — e.g. detached HEAD in the main checkout or
-    /// cwd outside any repository.
-    Error(String),
-}
-
 /// Spawn `git` with the given args and capture the full `Output`. Used
 /// by `git` and `git_optional`, which differ only in how they interpret
 /// a non-zero exit.
@@ -103,11 +86,6 @@ pub fn main_checkout_root(cwd_root: &Path) -> Result<PathBuf> {
         .with_context(|| format!("could not canonicalize {}", parent.display()))
 }
 
-/// Branch HEAD points at in `path`. Returns `None` on detached HEAD.
-pub fn current_branch_in(path: &Path) -> Result<Option<String>> {
-    git_optional(&["symbolic-ref", "--short", "HEAD"], Some(path))
-}
-
 /// `"main"` when a local `refs/heads/main` exists, else `"master"` when it
 /// does, else an error.
 pub fn main_branch_name(main_root: &Path) -> Result<String> {
@@ -132,52 +110,13 @@ pub fn main_branch_name(main_root: &Path) -> Result<String> {
     )
 }
 
-/// Top-level decision: Bootstrap vs Apply vs Error.
-pub fn probe(cwd: &Path) -> Result<Mode> {
-    let repo_root = match cwd_repo_root(cwd) {
-        Ok(r) => r,
-        Err(_) => {
-            return Ok(Mode::Error(format!(
-                "not inside a git repository: {}",
-                cwd.display()
-            )))
-        }
-    };
-    let worktree = is_worktree(&repo_root)?;
-    let main_checkout = main_checkout_root(&repo_root)?;
-
-    if worktree {
-        return Ok(Mode::Apply {
-            cwd_root: repo_root,
-            main_checkout,
-        });
-    }
-
-    let branch = match current_branch_in(&repo_root)? {
-        Some(b) => b,
-        None => return Ok(Mode::Error(
-            "detached HEAD in the main checkout: cannot decide between bootstrap and apply mode"
-                .to_string(),
-        )),
-    };
-    let main_name = main_branch_name(&main_checkout)?;
-    if branch == main_name {
-        Ok(Mode::Bootstrap { repo_root })
-    } else {
-        Ok(Mode::Apply {
-            cwd_root: repo_root,
-            main_checkout,
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Mutating operations, used by the bootstrap final-action step.
+// Mutating operations, used by the migration/init final-action step.
 // ---------------------------------------------------------------------------
 
 /// `git add -- <p>` for each path in `paths` that exists on disk under
 /// `repo_root`. Missing paths are silently skipped so the same call works
-/// across "with .envrc" and "no .envrc" runs.
+/// whether or not optional paths are present.
 pub fn stage_paths(repo_root: &Path, paths: &[&str]) -> Result<()> {
     for p in paths {
         let abs = repo_root.join(p);
@@ -484,94 +423,6 @@ mod tests {
         run(&["add", "."], dir.path());
         run(&["commit", "-q", "-m", "init"], dir.path());
         dir
-    }
-
-    #[test]
-    fn main_checkout_on_main_is_bootstrap() {
-        let dir = init_repo("main");
-        let root = dir.path().canonicalize().unwrap();
-        match probe(&root).unwrap() {
-            Mode::Bootstrap { repo_root } => assert_eq!(repo_root, root),
-            other => panic!("expected Bootstrap, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn main_checkout_master_fallback_is_bootstrap() {
-        let dir = init_repo("master");
-        let root = dir.path().canonicalize().unwrap();
-        match probe(&root).unwrap() {
-            Mode::Bootstrap { repo_root } => assert_eq!(repo_root, root),
-            other => panic!("expected Bootstrap, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn feature_branch_in_main_checkout_is_apply() {
-        let dir = init_repo("main");
-        run(&["switch", "-q", "-c", "feature/x"], dir.path());
-        let root = dir.path().canonicalize().unwrap();
-        match probe(&root).unwrap() {
-            Mode::Apply {
-                cwd_root,
-                main_checkout,
-            } => {
-                assert_eq!(cwd_root, root);
-                assert_eq!(main_checkout, root);
-            }
-            other => panic!("expected Apply, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn linked_worktree_is_apply() {
-        let dir = init_repo("main");
-        let wt = tempfile::tempdir().unwrap();
-        let wt_path = wt.path().join("wt");
-        run(
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "feature/wt",
-                wt_path.to_str().unwrap(),
-            ],
-            dir.path(),
-        );
-        let main_root = dir.path().canonicalize().unwrap();
-        let wt_root = wt_path.canonicalize().unwrap();
-        match probe(&wt_root).unwrap() {
-            Mode::Apply {
-                cwd_root,
-                main_checkout,
-            } => {
-                assert_eq!(cwd_root, wt_root);
-                assert_eq!(main_checkout, main_root);
-            }
-            other => panic!("expected Apply, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn detached_head_in_main_checkout_is_error() {
-        let dir = init_repo("main");
-        let sha = git(&["rev-parse", "HEAD"], Some(dir.path())).unwrap();
-        run(&["checkout", "-q", "--detach", &sha], dir.path());
-        let root = dir.path().canonicalize().unwrap();
-        match probe(&root).unwrap() {
-            Mode::Error(msg) => assert!(msg.contains("detached"), "msg: {msg}"),
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn outside_repo_is_error() {
-        let dir = tempfile::tempdir().unwrap();
-        match probe(dir.path()).unwrap() {
-            Mode::Error(msg) => assert!(msg.contains("not inside a git repository")),
-            other => panic!("expected Error, got {other:?}"),
-        }
     }
 
     // ── Reverse-sync probes (U11) ───────────────────────────────────────────

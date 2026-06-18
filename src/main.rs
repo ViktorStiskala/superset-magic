@@ -1,18 +1,16 @@
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 mod apply;
 mod cli;
-mod exec;
 mod git;
 mod gitignore;
 mod menu;
 mod migrate;
 mod pattern;
-mod repo_detect;
 mod repo_scan;
 mod reverse_sync;
 mod style;
@@ -50,9 +48,9 @@ pub fn should_run_update_gate(cmd: Command, guard_active: bool) -> bool {
 fn run() -> Result<ExitCode> {
     style::init();
     // Composition order: style::init (above) → parse argv → [help check] →
-    // [auto-update gate for Bare/Sync] → git::probe → dispatch.
-    // Parsing and the help response happen before the git probe and the gate
-    // so `--help` answers instantly without a network call.
+    // [auto-update gate for Bare/Sync] → dispatch (menu / sync / update).
+    // Parsing and the help response happen before the gate so `--help`
+    // answers instantly without a network call.
     let args: Vec<String> = env::args().skip(1).collect();
     match cli::parse(&args) {
         Parsed::Help => {
@@ -249,145 +247,6 @@ fn update_flow() -> Result<ExitCode> {
     }
 }
 
-/// Picker-output `setup` array consumer side. Reads the main checkout's
-/// `config.json`, prints a description of what will execute, asks the
-/// user to confirm, and runs the commands (or the `setup.sh` fallback).
-/// File copy has already completed at this point; declining or failing
-/// the setup step does not roll it back.
-///
-/// `bootstrap_flow`/`apply_flow` that called this have been removed in U10 (now
-/// superseded by the menu + U9 init/migrate + U4 sync). This function and
-/// `print_exec_event` are kept with `#[allow(dead_code)]` for U13 to clean up
-/// along with the rest of the setup.sh path.
-#[allow(dead_code)] // removed in U13
-fn run_setup_step(workspace_root: &Path, main_checkout: &Path) -> Result<()> {
-    let main_config = match superset_files::load_config(main_checkout) {
-        Ok(opt) => opt,
-        Err(err) => {
-            println!();
-            println!(
-                "{}",
-                style::warn(format!(
-                    "Could not read .superset/config.json in main checkout: {err:#}\nFile copy completed; skipping setup execution."
-                ))
-            );
-            return Ok(());
-        }
-    };
-
-    let setup_sh_path = main_checkout.join(".superset/setup.sh");
-    let setup_sh_present = setup_sh_path.is_file();
-
-    enum Plan {
-        RunCommands(Vec<String>),
-        RunSetupSh(PathBuf),
-        Skip(&'static str),
-    }
-
-    let plan = match main_config {
-        Some(cfg) if !cfg.setup.is_empty() => Plan::RunCommands(cfg.setup),
-        Some(_) if setup_sh_present => Plan::RunSetupSh(setup_sh_path),
-        Some(_) => Plan::Skip("No setup commands configured."),
-        None if setup_sh_present => Plan::RunSetupSh(setup_sh_path),
-        None => Plan::Skip(
-            "No .superset/config.json or .superset/setup.sh in main checkout; nothing to run.",
-        ),
-    };
-
-    if let Plan::Skip(msg) = plan {
-        println!();
-        println!("{}", style::info(msg));
-        return Ok(());
-    }
-
-    println!();
-    style::print_section("Setup commands");
-
-    // Print bullets (readable) + the exact shell invocation (the contract).
-    let (bullets, invocation) = match &plan {
-        Plan::RunCommands(cmds) => (cmds.clone(), exec::invocation_preview(cmds)),
-        Plan::RunSetupSh(p) => {
-            let line = format!("bash {}", p.display());
-            (vec![line.clone()], line)
-        }
-        Plan::Skip(_) => unreachable!(),
-    };
-
-    ui::print_pattern_list(&bullets);
-    println!();
-    println!(
-        "{}",
-        style::info(format!("Will run as: {invocation}"))
-    );
-    println!(
-        "{}",
-        style::info(format!("Working directory: {}", workspace_root.display()))
-    );
-    println!(
-        "{}",
-        style::info(
-            "File copy is already complete. Declining leaves files in place; commands will not run."
-        )
-    );
-    println!(
-        "{}",
-        style::info("Env vars exposed to commands: SUPERSET_ROOT_PATH, SUPERSET_WORKSPACE_PATH")
-    );
-    println!();
-
-    if !ui::confirm_run_setup_commands()? {
-        println!(
-            "{}",
-            style::info("Skipped setup commands. Files are in place; run setup manually when ready.")
-        );
-        return Ok(());
-    }
-
-    println!();
-    let status = match plan {
-        Plan::RunCommands(cmds) => {
-            exec::run(workspace_root, main_checkout, &cmds, print_exec_event)?
-        }
-        Plan::RunSetupSh(p) => {
-            exec::run_setup_sh(workspace_root, main_checkout, &p, print_exec_event)?
-        }
-        Plan::Skip(_) => unreachable!(),
-    };
-
-    if status.success() {
-        println!();
-        println!("{}", style::ok("Setup complete."));
-        Ok(())
-    } else {
-        bail!(
-            "Setup failed (exit {}). The file copy completed and is not rolled back. \
-Fix the issue, then either run the setup commands directly or re-run \
-`superset-setup` and decline the file-copy step.",
-            exec::format_exit(status)
-        );
-    }
-}
-
-#[allow(dead_code)] // removed in U13
-fn print_exec_event(ev: &exec::Event) {
-    match ev {
-        exec::Event::Begin { display } => {
-            println!("{}", style::info(format!("Running: {display}")));
-        }
-        exec::Event::Complete { status } => {
-            // Eager non-zero surface; the `run_setup_step` caller adds the
-            // longer recovery message when it bails. Success path stays
-            // quiet so the caller's "Setup complete." reads cleanly.
-            if !status.success() {
-                println!(
-                    "{}",
-                    style::warn(format!("Setup exit: {}", exec::format_exit(*status)))
-                );
-            }
-        }
-    }
-}
-
 fn print_event(ev: &Event) {
     match ev {
         Event::Copy { rel } => {
@@ -423,6 +282,7 @@ fn main() -> ExitCode {
 mod sync_tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use tempfile::TempDir;
 

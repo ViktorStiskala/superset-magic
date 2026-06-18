@@ -1,8 +1,9 @@
 # ss-magic
 
-Interactive Rust CLI that bootstraps the monorepo's Superset workspace
-contract in the main checkout and applies the configured file copies
-from inside a linked worktree.
+Self-updating Rust CLI for the Superset workspace contract. It keeps
+per-developer files (env files, secrets, local overrides) in sync between
+a repo's main checkout and its linked worktrees, and bootstraps/migrates
+the `.superset/` contract a repo needs for Superset.
 
 ## Install
 
@@ -11,94 +12,66 @@ make install
 ```
 
 Builds via `cargo install --path .` and drops `ss-magic` in
-`$CARGO_HOME/bin` (usually `~/.cargo/bin`).
+`$CARGO_HOME/bin` (usually `~/.cargo/bin`). Released builds are also
+published to GitHub Releases; `ss-magic` self-updates from there (see
+[Self-update](#self-update)).
 
-## Modes
+## Commands
 
-The mode is chosen automatically based on where you run it from.
+```
+ss-magic            # interactive operation menu (location-aware)
+ss-magic sync       # non-interactive forward copy: main → current worktree
+ss-magic update     # force a self-update to the latest release
+ss-magic --help     # usage
+```
 
-### Bootstrap mode (main checkout, on `main`)
+The bare invocation opens a menu whose options depend on where you run it:
 
-Writes the `.superset/` contract at the repo root:
+- **Main checkout** — init the contract, migrate an old `setup.sh` layout,
+  or edit the synced-files config.
+- **Worktree** — forward sync (main → here), or reverse sync (push
+  untracked files from here back to main).
 
-- `.superset/setup.sh` — always overwritten with the embedded canonical
-  body (source: `projects/superset-setup/assets/setup.sh`).
-- `.superset/config.json` — always rewritten in bootstrap mode from the
-  setup-commands picker output. `teardown` and `run` arrays are preserved
-  verbatim from the existing file when present, or default to empty.
-- `.superset/setup_config.json` — rewritten from your multi-select.
+Nothing runs until you pick it; Esc / Ctrl-C leaves the tree untouched.
 
-Two pickers run back-to-back during bootstrap. The first selects files
-to copy on `superset apply` (writes `setup_config.json`); the second
-selects setup commands to run on `superset apply` (writes the `setup`
-array in `config.json`).
+## The `.superset/` contract
 
-Both pickers are action loops. Every row is an action — pressing Enter
-on it does one definite thing:
+A repo using ss-magic carries:
 
-- A row (`[x] .env`, `[ ] pnpm -r install`) toggles its checkbox and
-  re-renders, leaving the cursor on the same row.
-- `+ Add new pattern…` / `+ Add new command…` opens a text prompt; on
-  confirm the entry is inserted above the sentinel as a checked row
-  (deselect later if you change your mind).
-- `✔ Done` commits the checked rows and continues.
+- `.superset/config.json` — Superset-owned `{ setup, teardown, run }`.
+  Its `setup` array runs `./.superset/magic.sh sync` during workspace
+  creation. `teardown` and `run` are preserved verbatim by ss-magic.
+- `.superset/magic.sh` — the committed wrapper Superset invokes. It runs
+  `command -v ss-magic` then `exec ss-magic "$@"` (propagating the
+  binary's real exit code); if the binary is absent it prints a bold-red
+  install hint and exits 0, so Superset's setup pipeline is never blocked.
+- `.superset/magic.json` — committed `{ files: [pattern, ...] }`. The glob
+  patterns of files to sync from main into each worktree.
+- `.superset/magic.local.json` — gitignored local overlay of the same
+  shape. Patterns here are unioned with `magic.json` (de-duped,
+  `magic.json` order first) at sync time, so a developer can add
+  machine-specific patterns without committing them.
 
-The patterns picker's row set is the four preconfigured patterns
-(`.env`, `**/.env`, `.env.local`, `**/.dev.vars`) plus any existing
-custom patterns already in `setup_config.json` (preselected). Each row
-is preselected when its pattern matches at least one file under the
-repo root, or when it's already present in `setup_config.json`. Rows
-with zero current filesystem matches carry a dim orange `(no matches)`
-suffix.
+`magic.json` itself is tracked and travels via git; `magic.local.json` is
+ignored (ss-magic bootstraps it and adds the `.gitignore` entry).
+`.superset/magic.local.json` is a default `magic.json` pattern, so the
+local overlay is itself copied into each worktree.
 
-The setup-commands picker's row set is a fixed preconfigured list —
-`./.superset/setup.sh`, `pnpm -r install`, `pnpm -r run cf-typegen`,
-`npm ci`, `yarn install --frozen-lockfile`, `uv sync` — plus any
-existing custom entries already in `config.json`'s `setup` array
-(preselected). Each row is preselected when its detection signal trips
-or when it's already present in `setup`. Detection reads root
-lockfiles (`pnpm-lock.yaml` → pnpm; `package-lock.json` → npm;
-`yarn.lock` → yarn; `pnpm` wins when JS lockfiles coexist; `uv.lock` →
-`uv sync`) plus the root `package.json` `scripts` map for
-`cf-typegen`. Rows that didn't trip detection carry a dim orange
-`(not detected)` suffix. `./.superset/setup.sh` is treated as detected
-by default (deselectable).
+## Forward sync (`ss-magic sync`)
 
-Inline validation on the pattern text prompt rejects absolute paths,
-`..` segments, uncompilable globs, and duplicates with a one-line
-reason. Custom patterns use the same glob syntax as `setup.sh` (`*`,
-`?`, `[abc]`, `**` for any depth). The command text prompt rejects
-only empty strings and duplicates — no shell-syntax checks.
+Non-interactive, files-only, main → current worktree:
 
-The CLI captures every decision (multi-select selection, the `.envrc`
-choice, and the finishing action) before writing anything to the
-working tree. Writes are staged in a tempdir as the prompts run and
-copied into `.superset/` and `.envrc` only after the finishing action
-prompt completes. Ctrl-C / Esc at any prompt leaves the working tree
-untouched.
+1. Resolve the main checkout root (parent of `git --git-common-dir`).
+2. Require `.superset/magic.json` there (hard error, non-zero exit, if
+   absent or malformed — a visible failure beats a silent no-copy inside
+   Superset setup).
+3. Load the overlaid config (`magic.json` + `magic.local.json`) from main.
+4. Copy every matching file into the current working tree.
 
-When `.env` exists at the repo root and `.envrc` does not, the tool
-offers to create `.envrc` with the body `dotenv_if_exists` (compatible
-with `direnv`).
+No git/gh operations, no setup commands — setup commands live in
+Superset's own `config.json` and are run by Superset.
 
-After files are written you pick a finishing action:
-
-1. Commit and push to main branch (`origin/main`).
-2. Create feature branch (`chore/superset-setup-YYYYMMDD-HHMMSS`),
-   commit, push, then `gh pr create --fill --base main`.
-3. Done for now (no git operations).
-
-If nothing on disk changed (edit-mode re-run with the same selections),
-the commit step is skipped automatically.
-
-### Apply mode (worktree or non-main branch)
-
-Loads the main checkout's `.superset/setup_config.json` and copies the
-configured files into the current working tree, then offers to run the
-setup commands from the main checkout's `.superset/config.json`. Never
-writes inside the worktree's `.superset/` and never invokes git or `gh`.
-
-Glob semantics mirror `.superset/setup.sh` exactly:
+Glob semantics:
 
 - Absolute patterns (`/etc/foo`) and patterns containing a `..` segment
   are rejected (counted as skipped).
@@ -109,87 +82,89 @@ Glob semantics mirror `.superset/setup.sh` exactly:
 - Matched directories are copied recursively.
 - Existing files in the destination are overwritten.
 
-After the file copy completes, apply mode reads
-`<main_checkout>/.superset/config.json` and offers to run the `setup`
-array as one ` && `-joined shell invocation. The confirm-before-run
-prompt shows:
+The forward sync is also offered from the worktree menu, because main may
+have gained files since the worktree was created.
 
-- A bulleted list of the commands.
-- The exact shell invocation that will execute (e.g.,
-  `/bin/zsh -lc "pnpm install && uv sync"`).
-- The working directory (the worktree being applied into).
-- A note that the file copy has already completed; declining setup
-  leaves the files in place but skips the commands.
-- The env vars exposed to commands: `SUPERSET_ROOT_PATH` (main checkout
-  absolute path) and `SUPERSET_WORKSPACE_PATH` (worktree absolute path).
+## Reverse sync (worktree → main)
 
-**Shell.** Commands run under `$SHELL -lc` so shell rc files are sourced
-and nvm / pnpm / asdf / mise / pyenv shims land on `PATH`. When `$SHELL`
-is unset the executor falls back to `/bin/sh -c` (no `-l`, because POSIX
-`sh` does not support `-l`).
+From a worktree menu, push **git-untracked** files matching the overlaid
+patterns back to the main checkout. Tracked files are excluded — they
+reach main via merge. The flow:
 
-**Empty array.** When `config.json` is absent or its `setup` array is
-empty, the executor offers to run `<main_checkout>/.superset/setup.sh`
-directly via `bash <path>` (no shell wrapping — paths with spaces are
-safe).
+- Builds a diff-aware picker of differing / worktree-only candidates, each
+  with a "show diff" action (paged via `git diff --no-index`).
+- On copy: creates missing parent dirs in main; a candidate that already
+  exists in main requires a per-file diff + explicit confirm before
+  overwrite.
+- Gitignore-safety: if a copied path isn't already gitignored in main,
+  ss-magic copies the worktree's covering `.gitignore` rule (resolved via
+  `git check-ignore -v --no-index`) into main's root `.gitignore`
+  (creating it if absent), falling back to the literal path when no
+  covering rule exists. This is the guard that prevents a reverse-synced
+  secret (e.g. `.dev.vars`) from becoming committable in main.
 
-**`SUPERSET_WORKSPACE_NAME` divergence.** The upstream Electron app
-injects `SUPERSET_WORKSPACE_NAME` from its workspace database. This Rust
-CLI has no equivalent and does not inject the variable. Setup scripts
-that reference it will need modification.
+Declining at the picker leaves main fully untouched.
 
-**Failure.** A non-zero exit fails the CLI with a message naming the
-exit code. The file copy is NOT rolled back. Recovery: fix the issue,
-then either run the failing commands directly in the worktree, or
-re-run `ss-magic` and decline the file-copy step on the second
-prompt so you only re-run setup.
+## Init / migration (main checkout)
 
-**Side effects to be aware of.** Setup commands may write outside the
-worktree (e.g., into `$SUPERSET_ROOT_PATH`) and may spawn backgrounded
-daemons (`docker compose up -d`, `pnpm dev &`) that outlive the CLI.
-Both match upstream and are by design.
+From the main-checkout menu, ss-magic branches on `config.json`'s `setup`:
 
-**Trust.** The file copy lands `.superset/` content from the worktree's
-branch onto your main checkout *before* the setup-confirm prompt. Only
-apply branches whose `.superset/` contents you trust — declining setup
-does not undo the file copy.
+- An entry referencing the old `./.superset/setup.sh` → **migrate**:
+  rename `setup_config.json` → `magic.json`, write `magic.sh`, replace the
+  `setup.sh` entry in place with `./.superset/magic.sh sync`, delete
+  `setup.sh`, bootstrap `magic.local.json` + its `.gitignore` entry.
+- A `magic.sh` / `ss-magic` marker only → **edit config**.
+- Neither marker (or absent `config.json`) → **init** the contract.
+
+All changes are staged into a tempdir and materialized only after the
+finishing-action prompt returns a non-cancel choice, so picking "done" or
+aborting leaves the old layout intact — never a half-migrated tree.
+Migration warns that worktrees created before the migration keep the old
+`setup.sh` / `setup_config.json` and should be recreated.
+
+After files are staged you pick a finishing action:
+
+1. Commit and push to the main branch.
+2. Create a feature branch, commit, push, then `gh pr create --fill`.
+3. Done for now (no git operations).
+
+If nothing on disk changed, the commit step is skipped automatically.
+
+## Self-update
+
+Every invocation (except the explicit `update` subcommand's own path)
+runs a cheap, daily-cached check for a newer GitHub release:
+
+- The version cache lives in the OS cache dir; if it's fresh (< 24 h) no
+  network call is made.
+- Otherwise `GET /releases/latest` runs with an ETag and a 5 s timeout.
+  Any offline / non-200 / timeout response falls through silently on the
+  installed version.
+- When a newer release is found, ss-magic acquires an advisory lock
+  (skip-on-contention), downloads to a sibling temp file, verifies the
+  SHA-256 against the GitHub asset digest, atomically swaps the running
+  binary, then re-execs the original command on the new binary and blocks
+  until it finishes (propagating its exit code).
+
+The gate runs on `bare`, `sync`, and `update` — including the
+non-interactive `sync` inside Superset's pipeline. The bounded timeouts
+and block-until-child contract keep this reach from ever slowing or
+breaking an unattended caller.
+
+Escape hatches:
+
+- `SS_MAGIC_NO_UPDATE=1` — skip the update check entirely.
+- `SS_MAGIC_UPDATED=1` — set internally on the re-exec'd child to prevent
+  re-check loops.
+- `ss-magic update` — force a check regardless of the 24 h cache and
+  report the resulting version or "already latest".
 
 ## Environment
 
 - `NO_COLOR` — set to disable ANSI color output. Stdout is also checked
   for TTY support and color is auto-disabled when piping.
-
-## Re-run behavior
-
-Bootstrap mode is safe to re-run. `.superset/setup.sh` is always
-overwritten with the embedded canonical body. `.superset/config.json`
-is always rewritten from the merged Config — the picker selection
-drives `setup`, while `teardown` and `run` are preserved verbatim from
-the existing file. `.superset/setup_config.json` is rewritten from your
-new selection, with non-preconfigured entries preserved verbatim.
-
-A re-run whose `config.json` byte-output matches the existing file
-emits a "Setup commands unchanged" info line. A malformed pre-existing
-`config.json` is a hard error (same surface as `setup_config.json`).
-A re-run with no changes skips the commit step.
-
-Apply-mode re-runs after a failed setup re-prompt for the file copy
-first. If you've started fixing things locally in the worktree,
-**decline the file-copy prompt on the re-run** so your edits aren't
-clobbered — then accept the setup-confirm prompt to retry the
-commands.
-
-## Commands
-
-The bare invocation chooses bootstrap or apply mode automatically based
-on where you run it (see Modes below). Two non-interactive subcommands
-are also available:
-
-- `ss-magic sync` — non-interactive forward file copy (main → current
-  worktree).
-- `ss-magic update` — force a self-update to the latest release.
-
-Run `ss-magic --help` for the full list.
+- `PAGER` — pager for reverse-sync diffs (default `less -R`).
+- `SS_MAGIC_NO_UPDATE` — disable the self-update gate.
 
 ## Make targets
 

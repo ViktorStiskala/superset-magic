@@ -1,8 +1,9 @@
-//! Apply mode: read the main checkout's `setup_config.json` and copy the
-//! configured files into the current worktree. Re-implements `setup.sh`'s
-//! semantics in Rust so users don't need bash 4 + jq.
+//! The file-copy engine: expand glob/literal patterns and copy the matched
+//! files from a source tree into a destination worktree. Used by `ss-magic
+//! sync` (patterns from `magic.json`) and by reverse sync. Re-implements the
+//! original `setup.sh`'s expansion semantics in Rust (no bash 4 + jq needed).
 //!
-//! Parity surface with `setup.sh`:
+//! Expansion semantics (carried over from the original `setup.sh`):
 //!
 //! - Reject absolute patterns and patterns containing a `..` segment.
 //! - Literal patterns must exist; missing literal → counted skip.
@@ -17,12 +18,11 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use globset::{Glob, GlobMatcher};
 use walkdir::WalkDir;
 
 use crate::pattern::{self, SyntaxError};
-use crate::superset_files::{self, SetupConfig};
 
 /// Directory names that drop matches at any depth, matching `setup.sh`.
 const DEFAULT_EXCLUDES: [&str; 2] = ["node_modules", ".venv"];
@@ -89,19 +89,6 @@ pub enum Event {
         /// skips, relative path for per-file skips.
         label: String,
     },
-}
-
-/// Load the main checkout's `setup_config.json`, with a tailored error
-/// when the file is absent — the user should run bootstrap mode first.
-pub fn load_main_config(main_root: &Path) -> Result<SetupConfig> {
-    match superset_files::load_setup_config(main_root)? {
-        Some(cfg) => Ok(cfg),
-        None => bail!(
-            "no `.superset/setup_config.json` in {}; run `superset-setup` from the main \
-             checkout on the main branch to bootstrap it first",
-            main_root.display()
-        ),
-    }
 }
 
 /// Apply `patterns` from `src` into `dest`, calling `on_event` for each
@@ -485,18 +472,6 @@ mod tests {
         assert_eq!(summary.copied, 1);
         assert_eq!(summary.skipped, 1);
         assert!(dest.path().join(".env").is_file());
-    }
-
-    #[test]
-    fn missing_main_config_has_helpful_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = load_main_config(dir.path()).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("setup_config.json"));
-        assert!(
-            msg.contains("bootstrap") || msg.contains("main checkout"),
-            "expected hint mentioning bootstrap/main checkout, got: {msg}"
-        );
     }
 
     // ── Characterization tests: pin engine semantics before config source changes ──
