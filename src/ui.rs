@@ -364,8 +364,11 @@ pub fn pick_reverse_sync(
             .map(|(label, action)| LabeledAction { label, action })
             .collect();
 
+        // Clamp to the actual option count (self-correcting if the row→option
+        // expansion ever changes) per the action-loop pattern doc.
+        let last_idx = options.len().saturating_sub(1);
         let chosen = Select::new("Untracked files to push back to main:", options)
-            .with_starting_cursor(cursor.min(rows.len() * 2))
+            .with_starting_cursor(cursor.min(last_idx))
             .with_help_message(
                 "↑↓ navigate · enter to toggle / show diff / push · Esc to cancel (main untouched)",
             )

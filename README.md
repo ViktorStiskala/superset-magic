@@ -22,8 +22,15 @@ published to GitHub Releases; `ss-magic` self-updates from there (see
 ss-magic            # interactive operation menu (location-aware)
 ss-magic sync       # non-interactive forward copy: main → current worktree
 ss-magic update     # force a self-update to the latest release
+ss-magic init [PATTERN...]   # non-interactively seed .superset (magic.json
+                             # layout); extra args become magic.json `files`
 ss-magic --help     # usage
 ```
+
+`ss-magic init` is the scriptable form of the interactive init: it writes the
+`.superset/` contract without prompts (for CI / automated provisioning) and
+leaves the changes uncommitted on disk. `SS_MAGIC_NO_UPDATE=1` disables the
+auto-update check for any invocation.
 
 The bare invocation opens a menu whose options depend on where you run it:
 

@@ -306,9 +306,13 @@ pub fn copy_into_repo(stage_root: &Path, repo_root: &Path, delete: &[&str]) -> R
     let stage_dir = stage_root.join(SUPERSET_DIR);
     let real_dir = repo_root.join(SUPERSET_DIR);
 
-    // Copy every regular file in the staged `.superset/` directory. The
-    // staged tree is flat (no subdirectories under `.superset/`), matching
-    // both the old-layout and migration staging callers.
+    // Collect the staged files (the tree is flat — no subdirectories under
+    // `.superset/`), then copy them with `config.json` LAST. config.json is
+    // the file Superset reads to locate the wrapper, so writing it last means
+    // a mid-copy failure can never leave config.json pointing at a `magic.sh`
+    // that hasn't been written yet — no half-migrated tree with a live pointer
+    // to a missing target.
+    let mut staged: Vec<(std::ffi::OsString, std::path::PathBuf)> = Vec::new();
     let entries = fs::read_dir(&stage_dir)
         .with_context(|| format!("reading staged dir {}", stage_dir.display()))?;
     for entry in entries {
@@ -316,19 +320,18 @@ pub fn copy_into_repo(stage_root: &Path, repo_root: &Path, delete: &[&str]) -> R
         let file_type = entry
             .file_type()
             .with_context(|| format!("stat {}", entry.path().display()))?;
-        if !file_type.is_file() {
-            continue;
+        if file_type.is_file() {
+            staged.push((entry.file_name(), entry.path()));
         }
-        let name = entry.file_name();
-        let src = entry.path();
-        let dst = real_dir.join(&name);
-        fs::copy(&src, &dst)
+    }
+    // false (every other file) sorts before true (config.json) → config last.
+    staged.sort_by_key(|(name, _)| name.as_os_str() == std::ffi::OsStr::new(CONFIG_JSON));
+    for (name, src) in &staged {
+        let dst = real_dir.join(name);
+        fs::copy(src, &dst)
             .with_context(|| format!("copy {} → {}", src.display(), dst.display()))?;
         // Keep shell wrappers executable.
-        if Path::new(&name)
-            .extension()
-            .is_some_and(|ext| ext == "sh")
-        {
+        if Path::new(name).extension().is_some_and(|ext| ext == "sh") {
             chmod_executable(&dst)?;
         }
     }

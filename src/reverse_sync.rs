@@ -179,9 +179,29 @@ where
     let main_path = main_root.join(rel);
     let wt_path = worktree_root.join(rel);
 
-    // 2. Overwrite gate — only when the path already exists in main.
-    if main_path.exists() && !overwrite(rel)? {
+    // 2. Overwrite gate — only when the path already exists in main. Snapshot
+    //    main's metadata first so we can detect a concurrent edit between the
+    //    diff/confirm and the copy (TOCTOU guard).
+    let pre_meta = fs::metadata(&main_path).ok();
+    if pre_meta.is_some() && !overwrite(rel)? {
         return Ok(CopyOutcome::SkippedOverwriteDeclined);
+    }
+    // 2b. If main's file changed (size or mtime) while the user reviewed the
+    //     diff, their confirmation was against stale content — skip rather than
+    //     clobber the concurrent edit. Checked before any mutation, so a skip
+    //     leaves main (and its .gitignore) fully untouched.
+    if let (Some(before), Ok(now)) = (&pre_meta, fs::metadata(&main_path)) {
+        if before.len() != now.len() || before.modified().ok() != now.modified().ok() {
+            eprintln!(
+                "{}",
+                crate::style::warn(format!(
+                    "{} changed in main since the diff was shown — skipped to avoid \
+                     clobbering a concurrent edit.",
+                    rel.display()
+                ))
+            );
+            return Ok(CopyOutcome::SkippedOverwriteDeclined);
+        }
     }
 
     // 3. Parent dirs in main.
@@ -358,34 +378,8 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::{Command, Stdio};
+    use crate::test_support::git_run;
     use tempfile::TempDir;
-
-    // ── Git test helpers (mirror git.rs / main.rs sync_tests) ───────────────
-
-    fn git_run(args: &[&str], cwd: &Path) {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            // Isolate from machine-level git config (e.g. commit.gpgsign=true).
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-            .env("GIT_CONFIG_VALUE_0", "false")
-            .stdout(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed in {}:\n{}",
-            cwd.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
 
     fn init_main_repo() -> TempDir {
         let dir = tempfile::tempdir().unwrap();

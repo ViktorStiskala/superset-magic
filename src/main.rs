@@ -17,6 +17,8 @@ mod style;
 mod superset_files;
 mod ui;
 mod update;
+#[cfg(test)]
+mod test_support;
 
 use crate::apply::{Event, SkipReason};
 use crate::cli::{Command, Parsed};
@@ -65,6 +67,9 @@ fn run() -> Result<ExitCode> {
             eprintln!("{}", cli::usage());
             Ok(ExitCode::from(2))
         }
+        // Non-interactive init (AN1): seed the layout from CLI patterns. Not
+        // gated — one-time setup shouldn't depend on a network round-trip.
+        Parsed::Init(patterns) => init_noninteractive(&patterns),
         Parsed::Command(cmd) => {
             // U8: run the daily-cache auto-update gate before any work for
             // `Bare` and `Sync`. On a "newer" verdict, `auto_update` swaps the
@@ -75,6 +80,26 @@ fn run() -> Result<ExitCode> {
                 update::auto_update();
             }
             dispatch(cmd)
+        }
+    }
+}
+
+/// Non-interactive `ss-magic init [PATTERN...]` (AN1): seed the magic.json
+/// layout from CLI-supplied patterns without the TUI, so automation (CI,
+/// Superset provisioning) can bootstrap a repo. Operates on the current
+/// checkout root.
+fn init_noninteractive(patterns: &[String]) -> Result<ExitCode> {
+    let cwd = env::current_dir().context("getting current directory")?;
+    match git::cwd_repo_root(&cwd) {
+        Ok(repo_root) => migrate::run_init_noninteractive(&repo_root, patterns),
+        Err(err) => {
+            eprintln!(
+                "{}",
+                style::err(format!(
+                    "error: `ss-magic init` must run inside a git repository: {err:#}"
+                ))
+            );
+            Ok(ExitCode::from(1))
         }
     }
 }
@@ -275,9 +300,9 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod sync_tests {
     use super::*;
+    use crate::test_support::git_run;
     use std::fs;
     use std::path::PathBuf;
-    use std::process::{Command, Stdio};
     use tempfile::TempDir;
 
     /// Convert `ExitCode` to u8 for assertions.
@@ -291,35 +316,6 @@ mod sync_tests {
             // assert `!= 0` this is sufficient; we only ever return 0 or 1.
             1
         }
-    }
-
-    // ── Git helpers (mirroring git.rs test helpers) ────────────────────────
-
-    fn git_run(args: &[&str], cwd: &Path) {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            // Disable GPG signing and isolate from global git config so tests
-            // don't depend on machine-level settings (e.g. commit.gpgsign=true).
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_COUNT", "2")
-            .env("GIT_CONFIG_KEY_0", "user.email")
-            .env("GIT_CONFIG_VALUE_0", "test@example.com")
-            .env("GIT_CONFIG_KEY_1", "commit.gpgsign")
-            .env("GIT_CONFIG_VALUE_1", "false")
-            .stdout(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed in {}:\n{}",
-            cwd.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
     }
 
     /// Initialise a bare-ish main repo with one initial commit.

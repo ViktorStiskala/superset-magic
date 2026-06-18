@@ -45,6 +45,12 @@ const SETUP_SH_MARKER: &str = "setup.sh";
 
 /// The wrapper invocation written into `config.json` `setup` by migration
 /// and init. Superset reads this array verbatim during workspace creation.
+///
+/// NOTE the coupling: `magic.sh` is a pure pass-through (`exec ss-magic "$@"`),
+/// so the `sync` subcommand is injected by THIS entry, not by the wrapper. A
+/// future change that made `magic.sh` inject `sync` itself would have to drop
+/// `sync` from this constant in lockstep, or the binary would receive
+/// `sync sync`.
 pub const MAGIC_WRAPPER_ENTRY: &str = "./.superset/magic.sh sync";
 
 /// Relative path of the retired `setup.sh`, deleted on migration.
@@ -421,6 +427,49 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
     execute_final_action(repo_root, action, INIT_COMMIT_MESSAGE, "chore/ss-magic-init-")
 }
 
+/// Non-interactive init for automation (`ss-magic init [PATTERN...]`, AN1):
+/// write the magic.json layout from `patterns` without the TUI pickers or the
+/// finishing-action prompt. Files land on disk uncommitted (equivalent to the
+/// interactive "Done" action); no git operations run. Patterns are seeded into
+/// `magic.json` `files` alongside the defaults (`.superset/magic.local.json`),
+/// deduped. An existing `magic.local.json` is preserved, not clobbered.
+pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<ExitCode> {
+    let files = init_magic_files(patterns);
+
+    let staging = tempfile::Builder::new()
+        .prefix("ss-magic-init-")
+        .tempdir()
+        .context("creating init staging tempdir")?;
+    let stage_root = staging.path();
+    superset_files::write_magic_json(stage_root, &files)?;
+    superset_files::write_magic_sh(stage_root)?;
+    let existing = superset_files::load_config(repo_root)?;
+    let merged = superset_files::merge_setup_into_config(
+        existing.as_ref(),
+        vec![MAGIC_WRAPPER_ENTRY.to_string()],
+    );
+    superset_files::write_config_json(stage_root, &merged)?;
+    let had_local = repo_root.join(".superset/magic.local.json").exists();
+    if !had_local {
+        superset_files::bootstrap_magic_local_json(stage_root)?;
+    }
+
+    superset_files::copy_into_repo(stage_root, repo_root, &[])?;
+    gitignore::ensure_entry(repo_root, MAGIC_LOCAL_REL)?;
+
+    println!("{}", style::ok("Wrote .superset/magic.json"));
+    println!("{}", style::ok("Wrote .superset/magic.sh"));
+    println!("{}", style::ok("Wrote .superset/config.json"));
+    if !had_local {
+        println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
+    }
+    println!(
+        "{}",
+        style::info("Done. Changes are on disk; run `git status` to review.")
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Run the finishing action chosen at the prompt (Done = changes on disk, not
 /// committed; Commit/Branch stage + commit + push/PR). `commit_message` and
 /// `branch_prefix` are passed by the caller so migrate and init commit with
@@ -633,6 +682,25 @@ mod tests {
     fn migrated_setup_lone_setup_sh_becomes_wrapper() {
         let old = vec!["./.superset/setup.sh".to_string()];
         assert_eq!(migrated_setup(&old), vec![MAGIC_WRAPPER_ENTRY.to_string()]);
+    }
+
+    /// Two raw setup.sh entries, no pre-existing wrapper: the FIRST becomes the
+    /// wrapper in place, the SECOND is dropped (no duplicate wrapper), and the
+    /// intervening command keeps its position.
+    #[test]
+    fn migrated_setup_two_raw_setup_sh_keeps_wrapper_once() {
+        let old = vec![
+            "./.superset/setup.sh".to_string(),
+            "uv sync".to_string(),
+            "./.superset/setup.sh".to_string(),
+        ];
+        let new = migrated_setup(&old);
+        assert_eq!(
+            new,
+            vec![MAGIC_WRAPPER_ENTRY.to_string(), "uv sync".to_string()],
+            "first setup.sh → wrapper, second dropped, command preserved"
+        );
+        assert_eq!(new.iter().filter(|e| *e == MAGIC_WRAPPER_ENTRY).count(), 1);
     }
 
     // ── stage_migration: file transforms (no UI) ────────────────────────────
@@ -931,6 +999,62 @@ mod tests {
             files,
             vec![".superset/magic.local.json".to_string(), ".env".to_string()],
             "magic.local.json must not be duplicated"
+        );
+    }
+
+    /// Non-interactive init (AN1) writes the full layout from CLI patterns
+    /// (no TUI, no git): magic.json (defaults + patterns), magic.sh,
+    /// config.json (setup → wrapper), magic.local.json, and the gitignore entry.
+    #[test]
+    fn run_init_noninteractive_writes_layout_from_patterns() {
+        let repo = fresh();
+        run_init_noninteractive(repo.path(), &["**/.env".to_string()]).unwrap();
+
+        let dot = repo.path().join(".superset");
+        assert!(dot.join("magic.json").is_file());
+        assert!(dot.join("magic.sh").is_file());
+        assert!(dot.join("config.json").is_file());
+        assert!(dot.join("magic.local.json").is_file());
+
+        let magic = superset_files::load_overlaid(repo.path()).unwrap().unwrap();
+        assert!(magic.files.contains(&"**/.env".to_string()));
+        assert!(magic
+            .files
+            .contains(&".superset/magic.local.json".to_string()));
+
+        let cfg = superset_files::load_config(repo.path()).unwrap().unwrap();
+        assert_eq!(cfg.setup, vec![MAGIC_WRAPPER_ENTRY.to_string()]);
+
+        let gi = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+        assert!(gi.lines().any(|l| l == MAGIC_LOCAL_REL));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dot.join("magic.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755, "magic.sh must be 0755");
+        }
+    }
+
+    /// Non-interactive init preserves a pre-existing magic.local.json (same
+    /// guard as the interactive path).
+    #[test]
+    fn run_init_noninteractive_preserves_existing_magic_local_json() {
+        let repo = fresh();
+        fs::create_dir_all(repo.path().join(".superset")).unwrap();
+        let custom = "{\n  \"files\": [\"x/**\"]\n}\n";
+        fs::write(repo.path().join(".superset/magic.local.json"), custom).unwrap();
+
+        run_init_noninteractive(repo.path(), &[]).unwrap();
+
+        let after =
+            fs::read_to_string(repo.path().join(".superset/magic.local.json")).unwrap();
+        assert_eq!(
+            after, custom,
+            "init must not clobber an existing magic.local.json"
         );
     }
 

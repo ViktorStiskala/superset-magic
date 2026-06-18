@@ -27,6 +27,10 @@ pub enum Command {
 pub enum Parsed {
     /// Run this command.
     Command(Command),
+    /// Non-interactive `init [PATTERN...]`: seed the magic.json layout from the
+    /// given file patterns without the TUI. Carried separately from `Command`
+    /// (which stays `Copy`) and handled before the update gate.
+    Init(Vec<String>),
     /// `--help`/`-h` was requested; print usage and exit 0.
     Help,
     /// An unrecognized subcommand; the string is the offending token. The
@@ -42,6 +46,8 @@ Commands:
   (none)    Open the interactive operation menu
   sync      Non-interactive forward file copy (main → current worktree)
   update    Force a self-update to the latest release
+  init      Initialize .superset (magic.json layout) non-interactively;
+            optional file-pattern args become magic.json `files`
 
 Options:
   -h, --help    Print this help";
@@ -61,7 +67,7 @@ pub fn usage() -> &'static str {
 /// flags are skipped while scanning for the subcommand (none are defined
 /// today, but this keeps `ss-magic --foo sync` from mis-selecting `--foo`).
 pub fn parse(args: &[String]) -> Parsed {
-    for arg in args {
+    for (i, arg) in args.iter().enumerate() {
         if arg == "-h" || arg == "--help" {
             return Parsed::Help;
         }
@@ -72,6 +78,14 @@ pub fn parse(args: &[String]) -> Parsed {
         return match arg.as_str() {
             "sync" => Parsed::Command(Command::Sync),
             "update" => Parsed::Command(Command::Update),
+            // Positional args after `init` become magic.json file patterns.
+            "init" => Parsed::Init(
+                args[i + 1..]
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .cloned()
+                    .collect(),
+            ),
             other => Parsed::Error(other.to_string()),
         };
     }
@@ -152,6 +166,22 @@ mod tests {
         assert_eq!(
             parse(&argv(&["sync", "extra"])),
             Parsed::Command(Command::Sync)
+        );
+    }
+
+    #[test]
+    fn init_with_no_patterns_yields_empty_init() {
+        assert_eq!(parse(&argv(&["init"])), Parsed::Init(vec![]));
+    }
+
+    #[test]
+    fn init_collects_positional_patterns() {
+        assert_eq!(
+            parse(&argv(&["init", "**/.env", "apps/*/.dev.vars"])),
+            Parsed::Init(vec![
+                "**/.env".to_string(),
+                "apps/*/.dev.vars".to_string()
+            ])
         );
     }
 }

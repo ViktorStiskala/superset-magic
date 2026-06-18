@@ -391,37 +391,17 @@ pub fn timestamp_branch_suffix() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::git_run;
     use std::fs;
     use tempfile::TempDir;
 
-    fn run(args: &[&str], cwd: &Path) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            // Isolate from machine-level git config (e.g. commit.gpgsign=true)
-            // so commits don't intermittently fail on a slow/absent gpg agent.
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-            .env("GIT_CONFIG_VALUE_0", "false")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?} failed in {}", cwd.display());
-    }
-
     fn init_repo(initial_branch: &str) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
-        run(&["init", "-q", "-b", initial_branch], dir.path());
+        git_run(&["init", "-q", "-b", initial_branch], dir.path());
         // empty commit so the branch exists as a ref
         fs::write(dir.path().join("README.md"), "hi").unwrap();
-        run(&["add", "."], dir.path());
-        run(&["commit", "-q", "-m", "init"], dir.path());
+        git_run(&["add", "."], dir.path());
+        git_run(&["commit", "-q", "-m", "init"], dir.path());
         dir
     }
 
@@ -448,7 +428,7 @@ mod tests {
         write(root, "ignored.txt", "nope\n");
         // The .gitignore itself is untracked here, so it would also show up.
         // Track it to keep the assertion focused on the data files.
-        run(&["add", ".gitignore"], root);
+        git_run(&["add", ".gitignore"], root);
 
         let mut got: Vec<String> = untracked_files(root)
             .unwrap()

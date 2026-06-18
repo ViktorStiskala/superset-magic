@@ -72,8 +72,7 @@ pub fn ensure_entry(git_root: &Path, line: &str) -> Result<()> {
 /// rather than hand-parsing `.gitignore` files, so nested `.gitignore`s,
 /// inherited rules, and git's full match semantics are respected. A negation
 /// rule (`!…`) is reported as `None` by the underlying probe.
-// consumed by U11 (reverse sync gitignore safety); wired into the menu by U10
-#[allow(dead_code)]
+// consumed by reverse sync (gitignore safety), reachable via the worktree menu
 pub fn find_covering_rule(worktree_root: &Path, rel: &Path) -> Result<Option<String>> {
     git::check_ignore_pattern(worktree_root, rel)
 }

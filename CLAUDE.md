@@ -77,8 +77,10 @@ interactive layer:
 - `cli.rs` — hand-rolled arg parser (no `clap`). `parse(&[String]) ->
   Parsed` selects `Command::{Bare, Sync, Update}` from the first non-flag
   arg (absent → `Bare`), short-circuits `--help`/`-h` to `Parsed::Help`,
-  and returns `Parsed::Error(token)` for an unknown subcommand. Pure and
-  unit-testable without spawning the process.
+  and returns `Parsed::Error(token)` for an unknown subcommand.
+  `init [PATTERN...]` parses to `Parsed::Init(patterns)` (carried apart
+  from the `Copy` `Command` enum). Pure and unit-testable without
+  spawning the process.
 - `menu.rs` — bare-invocation operation menu. Location-gated: main
   checkout offers init / migrate / edit config; a worktree offers
   forward sync / reverse sync. Routes selections to their handlers via
@@ -87,7 +89,9 @@ interactive layer:
   `setup` (old `setup.sh` reference → migrate; `magic.sh` marker →
   normal; neither → init). Stages renames/writes/deletes into a tempdir
   and materializes via `copy_into_repo` only after the finishing-action
-  prompt.
+  prompt. `run_init_noninteractive` is the TUI-free init behind
+  `ss-magic init` (writes the layout from CLI patterns, no prompt, not
+  gated by auto-update).
 - `reverse_sync.rs` — push git-untracked worktree files matching the
   overlaid patterns back to main, with a diff-aware picker,
   parent-dir creation, and gitignore-safety (`gitignore.rs`).
