@@ -2,6 +2,7 @@
 name = "ss-magic"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/ViktorStiskala/superset-magic"
 
 [[bin]]
 name = "ss-magic"
