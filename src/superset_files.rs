@@ -214,6 +214,19 @@ pub fn load_config(root: &Path) -> Result<Option<Config>> {
     })
 }
 
+/// Load just `magic.json` (the committed base) from `root/.superset/`.
+/// `Ok(None)` when the file is absent; error when it exists but cannot be
+/// parsed. Does NOT read or merge `magic.local.json` — use [`load_overlaid`]
+/// when you want the full union.
+pub fn load_magic_json(root: &Path) -> Result<Option<MagicConfig>> {
+    read_json::<MagicConfig>(&superset_dir(root).join(MAGIC_JSON)).with_context(|| {
+        format!(
+            "reading {}",
+            superset_dir(root).join(MAGIC_JSON).display()
+        )
+    })
+}
+
 /// Load just `setup_config.json` from `root/.superset/`. `Ok(None)` when
 /// the file is absent; error when it exists but cannot be parsed.
 pub fn load_setup_config(root: &Path) -> Result<Option<SetupConfig>> {

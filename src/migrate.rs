@@ -283,6 +283,55 @@ fn init_magic_files(chosen: &[String]) -> Vec<String> {
     files
 }
 
+/// Build the picker `(options, preselected_indices)` for `run_init`, factored
+/// out so it can be unit-tested without driving the interactive prompt.
+///
+/// `existing_magic_files` is the `files` array from the base `magic.json`
+/// on disk (empty slice for a first-time init).  `fs_match` must be aligned
+/// to `repo_scan::OPTIONS` (one `bool` per entry, `true` = filesystem hit).
+///
+/// Rules:
+/// - Options = `repo_scan::OPTIONS` + any CUSTOM patterns in
+///   `existing_magic_files` that are not already in `repo_scan::OPTIONS`
+///   (computed via `superset_files::existing_unknown_entries`).
+/// - Preconfigured `OPTIONS` rows are preselected when there is a filesystem
+///   hit **OR** the pattern is already present in `existing_magic_files`.
+/// - Custom rows are always preselected (they came from the existing config).
+pub fn build_pattern_options(
+    existing_magic_files: &[String],
+    fs_match: &[bool],
+) -> (Vec<String>, Vec<usize>) {
+    use crate::repo_scan::OPTIONS;
+    use crate::superset_files::existing_unknown_entries;
+
+    debug_assert_eq!(
+        fs_match.len(),
+        OPTIONS.len(),
+        "fs_match must be aligned to repo_scan::OPTIONS"
+    );
+
+    // Custom patterns = those in existing magic.json not in OPTIONS.
+    let custom = existing_unknown_entries(existing_magic_files, &OPTIONS);
+
+    let mut options: Vec<String> = OPTIONS.iter().map(|s| s.to_string()).collect();
+    options.extend(custom.iter().cloned());
+
+    let mut preselected: Vec<usize> = Vec::new();
+    // Preconfigured OPTIONS: preselect on fs hit OR already in existing config.
+    for (i, opt) in OPTIONS.iter().enumerate() {
+        let in_existing = existing_magic_files.iter().any(|f| f == opt);
+        if fs_match[i] || in_existing {
+            preselected.push(i);
+        }
+    }
+    // Custom entries start after OPTIONS; always preselected.
+    for i in 0..custom.len() {
+        preselected.push(OPTIONS.len() + i);
+    }
+
+    (options, preselected)
+}
+
 /// Interactive first-time init of the NEW layout (R10, AE5). Main-checkout-only.
 ///
 /// Reuses the patterns picker (`ui::pick_patterns`), seeds `magic.json`'s
@@ -290,6 +339,10 @@ fn init_magic_files(chosen: &[String]) -> Vec<String> {
 /// `magic.sh`, sets `config.json` `setup` to the wrapper entry, and bootstraps
 /// `magic.local.json` + gitignore. Stage → prompt → materialize, same as
 /// migration.
+///
+/// When an existing `magic.json` is present (edit-config path, `Branch::Normal`),
+/// custom patterns are preserved in the picker and preselected so they survive
+/// a rewrite.
 pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode> {
     style::print_section("Initialize .superset (magic layout)");
     println!(
@@ -298,13 +351,20 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
     );
 
     // ---- Capture decisions. Nothing written to repo_root yet. ----
-    let mut options: Vec<String> = crate::repo_scan::OPTIONS.iter().map(|s| s.to_string()).collect();
-    // Preselect filesystem hits among the preconfigured patterns.
-    let pattern_strs: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
-    let fs_match = crate::repo_scan::matches_for_patterns(repo_root, &pattern_strs)?;
-    let preselected: Vec<usize> = (0..options.len()).filter(|&i| fs_match[i]).collect();
+
+    // Read existing base magic.json (absent → empty). Custom patterns are
+    // preserved via build_pattern_options so they survive an edit-config rewrite.
+    let existing_magic_files: Vec<String> = superset_files::load_magic_json(repo_root)?
+        .map(|m| m.files)
+        .unwrap_or_default();
+
+    // Precompute filesystem hits for the preconfigured OPTIONS.
+    let options_strs: Vec<&str> = crate::repo_scan::OPTIONS.to_vec();
+    let fs_match = crate::repo_scan::matches_for_patterns(repo_root, &options_strs)?;
+
+    let (options, preselected) = build_pattern_options(&existing_magic_files, &fs_match);
+
     let chosen = ui::pick_patterns(&options, &preselected, repo_root)?;
-    options.clear(); // not needed past this point
 
     // magic.json files = default_magic_files() + chosen (deduped, defaults first).
     let files = init_magic_files(&chosen);
@@ -845,5 +905,138 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(staged_magic.files.is_empty());
+    }
+
+    // ── build_pattern_options ───────────────────────────────────────────────
+
+    /// Helper: all-false fs_match vector (no filesystem hits).
+    fn no_fs_hits() -> Vec<bool> {
+        vec![false; crate::repo_scan::OPTIONS.len()]
+    }
+
+    /// First-time init (no existing magic.json) → only OPTIONS, preselect only
+    /// fs hits (none here). Regression: no extra entries, no spurious preselects.
+    #[test]
+    fn build_pattern_options_first_time_init_empty_existing() {
+        let (options, preselected) = build_pattern_options(&[], &no_fs_hits());
+        // Options must be exactly the preconfigured OPTIONS.
+        let expected_opts: Vec<String> =
+            crate::repo_scan::OPTIONS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(options, expected_opts, "first-time init must yield only OPTIONS");
+        assert!(
+            preselected.is_empty(),
+            "no fs hits, no existing — nothing preselected; got: {preselected:?}"
+        );
+    }
+
+    /// First-time init with a filesystem hit: that OPTIONS index is preselected.
+    #[test]
+    fn build_pattern_options_first_time_init_with_fs_hit() {
+        // Simulate a hit on OPTIONS[1] = "**/.env".
+        let mut fs_match = no_fs_hits();
+        fs_match[1] = true;
+        let (options, preselected) = build_pattern_options(&[], &fs_match);
+        assert_eq!(options.len(), crate::repo_scan::OPTIONS.len());
+        assert_eq!(preselected, vec![1], "only the fs-hit index must be preselected");
+    }
+
+    /// A preconfigured OPTION already in magic.json is preselected even
+    /// without a filesystem hit.
+    #[test]
+    fn build_pattern_options_preconfigured_in_existing_preselected_without_fs_hit() {
+        // ".env" is OPTIONS[0]; mark it as present in the existing magic.json.
+        let existing = vec![".env".to_string()];
+        let (options, preselected) = build_pattern_options(&existing, &no_fs_hits());
+        assert_eq!(options.len(), crate::repo_scan::OPTIONS.len());
+        assert!(
+            preselected.contains(&0),
+            "OPTIONS[0] (.env) is in existing magic.json → must be preselected; got {preselected:?}"
+        );
+        // Custom count is zero — no extra options appended.
+        assert_eq!(
+            options.len(),
+            crate::repo_scan::OPTIONS.len(),
+            "no custom patterns → options length must equal OPTIONS.len()"
+        );
+    }
+
+    /// Existing custom patterns appear in options after OPTIONS and are always
+    /// preselected.
+    #[test]
+    fn build_pattern_options_custom_patterns_appended_and_preselected() {
+        let existing = vec![
+            "apps/*/.env".to_string(),
+            "packages/**/.dev.vars".to_string(),
+        ];
+        let (options, preselected) = build_pattern_options(&existing, &no_fs_hits());
+
+        let opts_len = crate::repo_scan::OPTIONS.len();
+        // Custom entries appended after the four OPTIONS.
+        assert_eq!(
+            options.len(),
+            opts_len + 2,
+            "two custom patterns must be appended"
+        );
+        assert_eq!(options[opts_len], "apps/*/.env");
+        assert_eq!(options[opts_len + 1], "packages/**/.dev.vars");
+
+        // Both custom indices are preselected.
+        assert!(
+            preselected.contains(&opts_len),
+            "first custom pattern must be preselected"
+        );
+        assert!(
+            preselected.contains(&(opts_len + 1)),
+            "second custom pattern must be preselected"
+        );
+    }
+
+    /// A pattern in existing magic.json that IS a preconfigured OPTION is NOT
+    /// double-counted as a custom entry (it goes into the OPTIONS preselection
+    /// path, not into the custom tail).
+    #[test]
+    fn build_pattern_options_preconfigured_not_duplicated_as_custom() {
+        // "**/.env" is OPTIONS[1]. It must NOT appear again as a custom entry.
+        let existing = vec!["**/.env".to_string(), "apps/*/.secrets".to_string()];
+        let (options, preselected) = build_pattern_options(&existing, &no_fs_hits());
+
+        let opts_len = crate::repo_scan::OPTIONS.len();
+        // Only one custom pattern (apps/*/.secrets); "**/.env" is an OPTION.
+        assert_eq!(
+            options.len(),
+            opts_len + 1,
+            "only one custom entry expected; got options: {options:?}"
+        );
+        assert_eq!(options[opts_len], "apps/*/.secrets");
+
+        // OPTIONS[1] ("**/.env") is preselected (from existing), not at opts_len.
+        assert!(preselected.contains(&1), "OPTIONS[1] must be preselected");
+        assert!(
+            preselected.contains(&opts_len),
+            "custom 'apps/*/.secrets' must be preselected"
+        );
+    }
+
+    /// Combined: fs hit on one OPTION, existing config has that same OPTION plus
+    /// a custom pattern. Both preselected, custom appended, no duplication.
+    #[test]
+    fn build_pattern_options_combined_fs_hit_and_existing() {
+        // OPTIONS[0] = ".env" has a filesystem hit and is also in existing.
+        let mut fs_match = no_fs_hits();
+        fs_match[0] = true;
+        let existing = vec![".env".to_string(), "custom/secret".to_string()];
+        let (options, preselected) = build_pattern_options(&existing, &fs_match);
+
+        let opts_len = crate::repo_scan::OPTIONS.len();
+        assert_eq!(options.len(), opts_len + 1, "one custom entry expected");
+        assert_eq!(options[opts_len], "custom/secret");
+
+        // OPTIONS[0] preselected (fs hit + in existing — still just one entry).
+        assert_eq!(
+            preselected.iter().filter(|&&i| i == 0).count(),
+            1,
+            "OPTIONS[0] must appear exactly once in preselected"
+        );
+        assert!(preselected.contains(&opts_len), "custom must be preselected");
     }
 }
