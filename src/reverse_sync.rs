@@ -190,12 +190,15 @@ where
             .with_context(|| format!("creating parent dirs for {}", main_path.display()))?;
     }
 
-    // 4. Copy worktree → main.
+    // 4. Gitignore safety BEFORE the copy — guarantee `rel` is ignored in main
+    //    first, so a git failure here never leaves the (often secret) bytes on
+    //    disk un-ignored. `git check-ignore` matches patterns regardless of
+    //    whether the file exists yet, so checking before the copy is sound.
+    let appended_gitignore = ensure_gitignored_in_main(worktree_root, main_root, rel)?;
+
+    // 5. Copy worktree → main.
     fs::copy(&wt_path, &main_path)
         .with_context(|| format!("copy {} → {}", wt_path.display(), main_path.display()))?;
-
-    // 5. Gitignore safety.
-    let appended_gitignore = ensure_gitignored_in_main(worktree_root, main_root, rel)?;
 
     Ok(CopyOutcome::Copied { appended_gitignore })
 }
@@ -219,16 +222,30 @@ fn ensure_gitignored_in_main(
         return Ok(false);
     }
 
-    // Prefer the worktree's covering rule; fall back to the literal path.
-    let rule = match gitignore::find_covering_rule(worktree_root, rel)? {
-        Some(pattern) => pattern,
-        None => rel
-            .to_str()
-            .with_context(|| format!("non-UTF-8 path: {}", rel.display()))?
-            .to_string(),
-    };
+    let literal = rel
+        .to_str()
+        .with_context(|| format!("non-UTF-8 path: {}", rel.display()))?
+        .to_string();
 
-    gitignore::ensure_entry(main_root, &rule)?;
+    // Prefer the worktree's covering rule (it generalizes protection, e.g.
+    // `**/.dev.vars`). But a directory-anchored rule (e.g. `/.dev.vars` from
+    // `apps/api/.gitignore`) does NOT match once appended to main's ROOT
+    // `.gitignore`. So append it, then VERIFY it actually ignores `rel`; if it
+    // doesn't, fall back to the literal repo-relative path, which is always
+    // anchored at the root and therefore always matches. The secret MUST end
+    // up ignored in main — this is the secret-leak boundary.
+    if let Some(pattern) = gitignore::find_covering_rule(worktree_root, rel)? {
+        gitignore::ensure_entry(main_root, &pattern)?;
+        if git::is_ignored(main_root, rel)? {
+            return Ok(true);
+        }
+    }
+
+    gitignore::ensure_entry(main_root, &literal)?;
+    debug_assert!(
+        git::is_ignored(main_root, rel).unwrap_or(false),
+        "literal-path fallback must leave the path ignored in main"
+    );
     Ok(true)
 }
 
@@ -591,6 +608,41 @@ mod tests {
         assert!(
             gi.contains("secrets/api.key"),
             "literal path must be appended when no covering rule; got: {gi:?}"
+        );
+    }
+
+    /// Regression (secret-leak boundary): when the worktree ignores the secret
+    /// via a SUBDIR-anchored rule (`/.dev.vars` in `apps/api/.gitignore`),
+    /// copying that bare rule into main's ROOT `.gitignore` would NOT match
+    /// `apps/api/.dev.vars`. The verify-then-fallback must detect that and
+    /// append the literal repo-relative path so the secret ends up actually
+    /// ignored in main.
+    #[test]
+    fn copy_falls_back_to_literal_when_covering_rule_is_subdir_anchored() {
+        let main = init_main_repo();
+        let (_wt, wt) = make_worktree(main.path());
+
+        // `/.dev.vars` is anchored to apps/api/, not the repo root.
+        write(&wt, "apps/api/.gitignore", "/.dev.vars\n");
+        git_run(&["add", "apps/api/.gitignore"], &wt);
+        write(&wt, "apps/api/.dev.vars", "SECRET=1\n");
+
+        let outcome = copy_candidate_into_main(
+            &wt,
+            main.path(),
+            Path::new("apps/api/.dev.vars"),
+            |_| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(outcome, CopyOutcome::Copied { appended_gitignore: true });
+
+        // The secret MUST be ignored in main regardless of which rule landed —
+        // this is the boundary the fix protects.
+        assert!(
+            git::is_ignored(main.path(), Path::new("apps/api/.dev.vars")).unwrap(),
+            "subdir-anchored covering rule must fall back to the literal path so \
+             the secret is actually ignored in main; .gitignore: {:?}",
+            fs::read_to_string(main.path().join(".gitignore")).ok()
         );
     }
 

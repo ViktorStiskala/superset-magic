@@ -86,19 +86,13 @@ fn dispatch(cmd: Command) -> Result<ExitCode> {
     let cwd = env::current_dir().context("getting current directory")?;
     match cmd {
         Command::Bare => menu::run(&cwd),
-        Command::Sync => sync_flow(&cwd),
+        Command::Sync => run_sync_flow(&cwd),
         Command::Update => update_flow(),
     }
 }
 
-/// Public entry point for the forward-sync engine, called by [`menu`] when
-/// the user selects "Forward sync" from the worktree menu. Delegates to
-/// [`sync_core`] with the standard event printer.
-pub fn run_sync_flow(cwd: &Path) -> Result<ExitCode> {
-    sync_core(cwd, print_event)
-}
-
 /// Non-interactive forward file copy: main checkout → current working tree.
+/// Handler for `ss-magic sync` and the worktree menu's "Forward sync".
 ///
 /// Resolves the main checkout root, verifies `.superset/magic.json` exists
 /// there, loads the overlaid config (magic.json + magic.local.json), then
@@ -109,7 +103,7 @@ pub fn run_sync_flow(cwd: &Path) -> Result<ExitCode> {
 /// - Cannot resolve the main checkout root (not in a git repo, or git fails).
 /// - `.superset/magic.json` absent in the resolved main root.
 /// - Malformed `magic.json` or `magic.local.json` in the main root.
-fn sync_flow(cwd: &Path) -> Result<ExitCode> {
+pub fn run_sync_flow(cwd: &Path) -> Result<ExitCode> {
     sync_core(cwd, print_event)
 }
 

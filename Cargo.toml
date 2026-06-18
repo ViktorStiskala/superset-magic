@@ -27,3 +27,8 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+
+# cargo-dist builds release archives with `--profile dist`; inherit the
+# size-optimized release profile so distributed binaries match local ones.
+[profile.dist]
+inherits = "release"

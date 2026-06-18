@@ -183,7 +183,11 @@ fn stage_migration(repo_root: &Path, stage_root: &Path, existing: &Config) -> Re
     superset_files::write_config_json(stage_root, &merged)?;
 
     // magic.local.json bootstrap (in the stage so it materializes atomically).
-    superset_files::bootstrap_magic_local_json(stage_root)?;
+    // Guard against clobbering a pre-existing repo magic.local.json (gitignored,
+    // therefore unrecoverable) on the rare old-layout repo that already has one.
+    if !repo_root.join(".superset/magic.local.json").exists() {
+        superset_files::bootstrap_magic_local_json(stage_root)?;
+    }
 
     Ok(())
 }
@@ -253,7 +257,7 @@ and must be recreated."
     println!("{}", style::ok("Removed .superset/setup.sh"));
     println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
 
-    execute_final_action(repo_root, action)
+    execute_final_action(repo_root, action, MIGRATE_COMMIT_MESSAGE, "chore/ss-magic-migrate-")
 }
 
 /// Remove the retired `setup_config.json` from the repo after `magic.json`
@@ -392,7 +396,13 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
     let merged =
         superset_files::merge_setup_into_config(existing, vec![MAGIC_WRAPPER_ENTRY.to_string()]);
     superset_files::write_config_json(stage_root, &merged)?;
-    superset_files::bootstrap_magic_local_json(stage_root)?;
+    // Only seed magic.local.json when the repo doesn't already have one — it's
+    // gitignored (unrecoverable), so staging the empty template would clobber a
+    // user's existing local overlay when this flow runs as edit-config.
+    let had_local = repo_root.join(".superset/magic.local.json").exists();
+    if !had_local {
+        superset_files::bootstrap_magic_local_json(stage_root)?;
+    }
 
     // ---- Materialize. ----
     superset_files::copy_into_repo(stage_root, repo_root, &[])?;
@@ -402,16 +412,25 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
     println!("{}", style::ok("Wrote .superset/magic.json"));
     println!("{}", style::ok("Wrote .superset/magic.sh"));
     println!("{}", style::ok("Wrote .superset/config.json"));
-    println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
+    if had_local {
+        println!("{}", style::info("Kept existing .superset/magic.local.json"));
+    } else {
+        println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
+    }
 
-    execute_final_action(repo_root, action)
+    execute_final_action(repo_root, action, INIT_COMMIT_MESSAGE, "chore/ss-magic-init-")
 }
 
-/// Run the finishing action chosen at the prompt. Mirrors
-/// `main::execute_final_action` (Done = changes on disk, not committed;
-/// Commit/Branch stage + commit + push/PR). Duplicated here rather than
-/// shared to keep U9 self-contained; U10 may unify them.
-fn execute_final_action(repo_root: &Path, action: FinalAction) -> Result<ExitCode> {
+/// Run the finishing action chosen at the prompt (Done = changes on disk, not
+/// committed; Commit/Branch stage + commit + push/PR). `commit_message` and
+/// `branch_prefix` are passed by the caller so migrate and init commit with
+/// their own message/branch naming rather than sharing one.
+fn execute_final_action(
+    repo_root: &Path,
+    action: FinalAction,
+    commit_message: &str,
+    branch_prefix: &str,
+) -> Result<ExitCode> {
     match action {
         FinalAction::Done => {
             println!(
@@ -429,7 +448,7 @@ fn execute_final_action(repo_root: &Path, action: FinalAction) -> Result<ExitCod
                 );
                 return Ok(ExitCode::SUCCESS);
             }
-            git::commit(repo_root, MIGRATE_COMMIT_MESSAGE)?;
+            git::commit(repo_root, commit_message)?;
             let main_branch = git::main_branch_name(repo_root)?;
             git::push(repo_root, "origin", &main_branch)?;
             println!("{}", style::ok(format!("Pushed to origin/{main_branch}")));
@@ -447,9 +466,9 @@ fn execute_final_action(repo_root: &Path, action: FinalAction) -> Result<ExitCod
                 return Ok(ExitCode::SUCCESS);
             }
             let suffix = git::timestamp_branch_suffix()?;
-            let branch = format!("chore/ss-magic-migrate-{suffix}");
+            let branch = format!("{branch_prefix}{suffix}");
             git::create_branch(repo_root, &branch)?;
-            git::commit(repo_root, MIGRATE_COMMIT_MESSAGE)?;
+            git::commit(repo_root, commit_message)?;
             git::push_upstream(repo_root, "origin", &branch)?;
             if !git::gh_available() {
                 println!(
@@ -476,6 +495,7 @@ fn execute_final_action(repo_root: &Path, action: FinalAction) -> Result<ExitCod
 }
 
 const MIGRATE_COMMIT_MESSAGE: &str = "chore(superset): migrate to ss-magic layout";
+const INIT_COMMIT_MESSAGE: &str = "chore(superset): initialize ss-magic layout";
 
 #[cfg(test)]
 mod tests {
@@ -700,6 +720,38 @@ mod tests {
         // .gitignore now ignores magic.local.json.
         let gi = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
         assert!(gi.lines().any(|l| l == MAGIC_LOCAL_REL));
+    }
+
+    /// Regression: a pre-existing magic.local.json (gitignored, therefore
+    /// unrecoverable) must NOT be clobbered by the empty bootstrap template —
+    /// the guard skips staging it so materialization leaves the user's local
+    /// overlay intact. (Mirrors the same guard in run_init/edit-config.)
+    #[test]
+    fn migration_preserves_existing_magic_local_json() {
+        let repo = fresh();
+        seed_old_layout(repo.path());
+        let custom = "{\n  \"files\": [\"custom/**\"]\n}\n";
+        fs::write(repo.path().join(".superset/magic.local.json"), custom).unwrap();
+        let existing = superset_files::load_config(repo.path()).unwrap().unwrap();
+
+        let stage = fresh();
+        stage_migration(repo.path(), stage.path(), &existing).unwrap();
+
+        // The guard kept magic.local.json OUT of the stage.
+        assert!(
+            !stage.path().join(".superset/magic.local.json").exists(),
+            "existing repo magic.local.json must not be re-staged as the empty template"
+        );
+
+        superset_files::copy_into_repo(stage.path(), repo.path(), &[SETUP_SH_REL]).unwrap();
+
+        // The user's custom overlay survived migration.
+        let after =
+            fs::read_to_string(repo.path().join(".superset/magic.local.json")).unwrap();
+        assert_eq!(
+            after, custom,
+            "migration must not clobber an existing magic.local.json"
+        );
     }
 
     /// Both-markers-present old config → migration still strips setup.sh and

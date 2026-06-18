@@ -159,24 +159,42 @@ impl Spawner for ProcessSpawner {
 ///
 /// Resolves the target via [`std::env::current_exe`] (R18: never `argv[0]`),
 /// passes the original args (`args_os().skip(1)`), and delegates the actual
-/// spawn+wait to `spawner` so it's testable. On a spawn failure (e.g. the
-/// freshly swapped binary won't exec) we fall back to exit 0 rather than
-/// crashing — the swap itself succeeded, so the work the caller asked for is
-/// best-effort skipped but not reported as a failure of *this* process.
+/// spawn+wait to `spawner` so it's testable.
+///
+/// On the happy path it propagates the child's exit code. If the binary was
+/// swapped but the new binary can't be resolved or re-executed, the work the
+/// caller asked for did NOT run — so we exit NON-ZERO with a diagnostic rather
+/// than silently exiting 0. A silent exit-0 would tell an unattended caller
+/// (e.g. Superset running `magic.sh sync`) that the sync succeeded when it
+/// never ran; a visible failure is the honest, recoverable outcome.
 ///
 /// This never returns: it terminates via [`std::process::exit`].
 pub fn reexec_and_exit<S: Spawner>(spawner: &S) -> ! {
     let (exe, args) = match reexec_target() {
         Ok(t) => t,
-        // Can't resolve our own path → nothing safe to re-exec; the swap is
-        // done, so exit cleanly and let the next invocation run the new binary.
-        Err(_) => std::process::exit(0),
+        Err(e) => {
+            eprintln!(
+                "{}",
+                crate::style::err(format!(
+                    "error: self-update replaced the binary but could not resolve the new \
+                     executable to run ({e}); the requested work did NOT run. Re-run ss-magic."
+                ))
+            );
+            std::process::exit(1);
+        }
     };
     match spawner.spawn_and_wait(&exe, &args) {
         Ok(code) => std::process::exit(propagate_code(code)),
-        // Spawning the swapped binary failed; don't surface a hard error for a
-        // successful swap. The new binary is installed for next time.
-        Err(_) => std::process::exit(0),
+        Err(e) => {
+            eprintln!(
+                "{}",
+                crate::style::err(format!(
+                    "error: self-update replaced the binary but re-executing it failed ({e}); \
+                     the requested work did NOT run. Re-run ss-magic."
+                ))
+            );
+            std::process::exit(1);
+        }
     }
 }
 
@@ -370,6 +388,12 @@ fn run_self_update(target_tag: Option<&str>) -> Result<Option<String>, Box<dyn s
         .repo_owner(owner)
         .repo_name(repo)
         .bin_name(BIN_NAME)
+        // cargo-dist nests the binary inside a `<bin>-<target>/` directory in
+        // the release tarball (verified: `ss-magic-aarch64-apple-darwin/ss-magic`).
+        // self_update defaults `bin_path_in_archive` to the bare bin name, which
+        // would fail extraction and silently report UpToDate, so set it to match
+        // cargo-dist's layout. self_update substitutes `{{ bin }}`/`{{ target }}`.
+        .bin_path_in_archive("{{ bin }}-{{ target }}/{{ bin }}")
         .current_version(env!("CARGO_PKG_VERSION"))
         .no_confirm(true)
         .show_output(false)

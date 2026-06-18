@@ -91,10 +91,19 @@ interactive layer:
 - `reverse_sync.rs` — push git-untracked worktree files matching the
   overlaid patterns back to main, with a diff-aware picker,
   parent-dir creation, and gitignore-safety (`gitignore.rs`).
+- `gitignore.rs` — `.gitignore` helpers at a git root: `ensure_entry`
+  appends a line iff no exact match exists (creates the file if absent,
+  never reorders); `find_covering_rule` resolves the rule covering a path
+  via `git check-ignore -v` (negations excluded). Used by `migrate.rs`
+  (bootstrap) and `reverse_sync.rs` (secret-safety; verified-then-literal
+  fallback so a copied secret is always ignored in main).
 - `update/` — every-invocation self-update: `check.rs` does the
   daily-cached GitHub latest check (ureq, ETag, 5 s timeout, silent
-  fall-through); `apply.rs` does the fd-lock / download / SHA-256 verify
-  / atomic swap / spawn-and-wait re-exec via the `self_update` crate.
+  fall-through); `apply.rs` does the fd-lock / download / atomic swap /
+  spawn-and-wait re-exec via the `self_update` crate. Integrity rests on
+  TLS + cargo-dist checksums (no SHA-256-vs-asset-digest check — see the
+  KTD5 conformance notes in `update/apply.rs`); `bin_path_in_archive`
+  matches cargo-dist's `<bin>-<target>/` tarball layout.
 - `main.rs` — composes everything: `style::init` → `cli::parse` →
   [auto-update gate for `Bare`/`Sync`] → `dispatch`. `Bare` routes to
   `menu::run`; `Sync` runs the non-interactive forward copy
