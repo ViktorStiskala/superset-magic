@@ -7,14 +7,42 @@ the `.superset/` contract a repo needs for Superset.
 
 ## Install
 
+### Released build (recommended — macOS & Linux)
+
+Install the latest release with the one-line installer:
+
 ```sh
-make install
+curl -sSfL https://github.com/ViktorStiskala/superset-magic/releases/latest/download/ss-magic-installer.sh | sh
 ```
 
-Builds via `cargo install --path .` and drops `ss-magic` in
-`$CARGO_HOME/bin` (usually `~/.cargo/bin`). Released builds are also
-published to GitHub Releases; `ss-magic` self-updates from there (see
-[Self-update](#self-update)).
+It fetches the right prebuilt binary for your platform and puts `ss-magic` on
+your `PATH`. From then on the binary keeps itself current — see
+[Self-update](#self-update).
+
+Prefer to download by hand? Grab the archive for your platform plus its
+`.sha256` from the
+[latest release](https://github.com/ViktorStiskala/superset-magic/releases/latest),
+verify the checksum, extract, and move `ss-magic` onto your `PATH`.
+
+**Supported platforms:** macOS (Apple Silicon and Intel) and Linux (x86-64 and
+arm64). Windows is not in the release matrix yet.
+
+### From source
+
+With a Rust toolchain (via `rustup`):
+
+```sh
+cargo install --git https://github.com/ViktorStiskala/superset-magic
+```
+
+…or from a clone of this repo:
+
+```sh
+make install   # cargo install --path .
+```
+
+Both drop `ss-magic` in `$CARGO_HOME/bin` (usually `~/.cargo/bin`). ss-magic is
+not yet published to crates.io.
 
 ## Commands
 
@@ -148,10 +176,12 @@ runs a cheap, daily-cached check for a newer GitHub release:
   Any offline / non-200 / timeout response falls through silently on the
   installed version.
 - When a newer release is found, ss-magic acquires an advisory lock
-  (skip-on-contention), downloads to a sibling temp file, verifies the
-  SHA-256 against the GitHub asset digest, atomically swaps the running
-  binary, then re-execs the original command on the new binary and blocks
-  until it finishes (propagating its exit code).
+  (skip-on-contention), downloads the release archive over TLS, atomically
+  swaps the running binary, then re-execs the original command on the new
+  binary and blocks until it finishes (propagating its exit code). Integrity
+  rests on the TLS-authenticated GitHub download plus cargo-dist's published
+  per-archive checksums; there is no separate SHA-256-vs-GitHub-digest check,
+  and binary signing is a deferred future item.
 
 The gate runs on `bare`, `sync`, and `update` — including the
 non-interactive `sync` inside Superset's pipeline. The bounded timeouts

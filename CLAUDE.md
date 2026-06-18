@@ -14,6 +14,11 @@ make clean     # cargo clean
 
 Rust toolchain is provided by `rustup` (cargo on `~/.cargo/bin`).
 
+Release binaries are published to GitHub Releases via cargo-dist
+(`dist-workspace.toml`); the binary self-updates from there. End-user install
+instructions (the installer script, prebuilt-binary download, and from-source
+builds) live in README.md.
+
 ## Architecture
 
 Layered to keep the pure logic unit-testable in isolation from the
