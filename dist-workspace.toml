@@ -1,0 +1,31 @@
+# cargo-dist workspace configuration
+# https://opensource.axo.dev/cargo-dist/
+[workspace]
+members = ["cargo:."]
+
+[dist]
+# dist version this config was generated for
+cargo-dist-version = "0.32.0"
+
+# CI backends
+ci = "github"
+
+# Build targets: macOS (arm + x86) + Linux (arm + x86). Windows deferred per plan Scope Boundaries.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+# Installers
+installers = ["shell"]
+
+# Unix archive format must be .tar.gz — self_update is built with archive-tar + compression-flate2 (gzip).
+# cargo-dist 0.32 defaults to .tar.xz on unix; override to .tar.gz so self_update extraction succeeds.
+unix-archive = ".tar.gz"
+
+# We own the self-update path (self_update crate, U7); do not install cargo-dist's axoupdater.
+install-updater = false
+
+# Plain vX.Y.Z tag trigger — standalone single-package repo, no tag namespace needed.

@@ -101,11 +101,15 @@ Implementation units below trace to these same IDs.
   released by the kernel on crash, so stale locks are structurally impossible;
   add an mtime-based TTL (≥ 60 s, strictly greater than download+verify+rename)
   only as defense-in-depth.
-- KTD5. **Atomic-swap contract.** Download to a sibling temp file on the same
-  filesystem as the binary, verify SHA-256 against the GitHub asset `digest`
-  field (exposed since June 2025), and only then `rename()` over the running
-  binary (`self-replace` semantics, used transitively by `self_update`). Any
-  failure deletes the temp file and leaves the original untouched.
+- KTD5. **Atomic-swap contract.** Download (under a bounded read/connect
+  timeout) to a sibling temp file created mode 0600 on the same filesystem as the
+  binary, verify SHA-256 against the GitHub asset `digest` field (exposed since
+  June 2025), `chmod 0755`, and only then `rename()` over the running binary
+  (`self-replace` semantics, used transitively by `self_update`). Any failure —
+  including a download timeout — deletes the temp file and leaves the original
+  untouched, falling through silently to the installed version. Mode 0600 during
+  the download/verify window keeps the in-flight executable from being
+  world-readable in the shared cache dir.
 - KTD6. **Loop guard via env var.** Set `SS_MAGIC_UPDATED=1` on the re-exec'd
   child; the update check returns early when it sees the marker. Also honor a
   documented `SS_MAGIC_NO_UPDATE=1` opt-out.
@@ -136,9 +140,11 @@ Implementation units below trace to these same IDs.
 - KTD10. **Reverse sync moves git-untracked files only.** Candidates = files
   matching the worktree's overlaid patterns that are git-untracked (tracked
   files reach main via merge). On copy: create missing parent dirs in main; if a
-  copied path isn't gitignored in main, append its full relative path to main's
-  root `.gitignore` (creating the file if absent) rather than parsing inherited
-  rules; a candidate that already exists in main requires a per-file diff +
+  copied path isn't gitignored in main, copy the worktree `.gitignore` rule that
+  covers it (resolved via `git check-ignore -v --no-index`) into main's root
+  `.gitignore` (creating the file if absent), falling back to the literal
+  relative path only when no covering rule exists — per origin R25; a candidate
+  that already exists in main requires a per-file diff +
   confirm before overwrite.
 
 ### Packaging & dependencies
@@ -220,7 +226,7 @@ flowchart TB
   I -->|decline| K[skip this file]
   J --> L{path gitignored in main?}
   L -->|yes| M[done]
-  L -->|no| N[append full relative path<br/>to main root .gitignore<br/>create if absent]
+  L -->|no| N[copy worktree's covering .gitignore rule<br/>to main root .gitignore<br/>literal path if none; create if absent]
   N --> M
 ```
 
@@ -250,8 +256,8 @@ src/
 assets/
   magic.sh             # NEW: wrapper (embedded via include_str!)
   setup.sh             # REMOVED in U13
-dist-workspace.toml    # NEW (U11)
-.github/workflows/release.yml  # NEW, cargo-dist generated (U11)
+dist-workspace.toml    # NEW (U12)
+.github/workflows/release.yml  # NEW, cargo-dist generated (U12)
 ```
 
 The tree is a scope declaration; the implementer may adjust module boundaries.
@@ -261,7 +267,9 @@ Per-unit `Files:` lists are authoritative.
 
 ## Implementation Units
 
-Grouped into phases by dependency. U-IDs are stable.
+Grouped into phases by dependency; ordering is enforced *between* phases, while
+within a phase a unit's explicit `Dependencies` still constrain build order
+(e.g., in Phase D, U11 is built before U10). U-IDs are stable.
 
 ### Phase A — Foundation & config
 
@@ -432,8 +440,12 @@ Grouped into phases by dependency. U-IDs are stable.
 - **Approach:** Acquire `fd-lock` `try_write()` on a cache-dir lock file;
   contention → skip (proceed current). Treat a lock file older than the TTL
   (≥ 60 s) as stale and reclaim. Inside the lock, run the `self_update` GitHub
-  path (download → SHA-256 verify against asset digest → `self-replace` atomic
-  swap to a sibling temp then rename). Drop the lock, then spawn
+  path: download (under a bounded read/connect timeout) to a sibling temp file
+  created mode 0600 → SHA-256 verify against asset digest → `chmod 0755` →
+  `self-replace` atomic rename over self. On a download timeout/offline, delete
+  the temp file and fall through silently to the installed version (mirroring the
+  U6 check's 5 s posture) so an unattended caller is never blocked indefinitely.
+  Drop the lock, then spawn
   `current_exe()` with `args_os().skip(1)` and `SS_MAGIC_UPDATED=1`, `wait()`,
   and `exit(status.code().unwrap_or(1))`. `ss-magic update` bypasses the cache
   (force check) and reports the resulting version or "already latest".
@@ -449,6 +461,8 @@ Grouped into phases by dependency. U-IDs are stable.
   - Re-exec target is `current_exe()` (absolute), not `argv[0]`.
   - Child exit code (incl. non-zero) propagates; signal-kill maps to 1.
   - `ss-magic update` with no newer release reports "already latest".
+  - `ss-magic update` on a *fresh* cache still re-checks (daily-cache gate
+    bypassed), confirming the force path is not gated by the 24 h TTL.
 - **Verification:** lock/skip, loop-guard, and exit propagation covered by
   tests; manual smoke against a real release confirms swap + re-exec.
 
@@ -460,7 +474,10 @@ Grouped into phases by dependency. U-IDs are stable.
 - **Files:** `src/main.rs`.
 - **Approach:** At startup, unless `SS_MAGIC_UPDATED`/`SS_MAGIC_NO_UPDATE` is
   set, run check (U6); on "newer" run apply+re-exec (U7), which terminates this
-  process. Otherwise continue to bare/sync/update. Applies uniformly so
+  process. The explicit `update` subcommand bypasses this daily-cache gate
+  entirely and routes straight to U7's forced check (so `ss-magic update` always
+  re-checks even on a fresh cache); the gate's cached path governs only bare and
+  `sync`. Otherwise continue to bare/sync/update. Applies uniformly so
   `magic.sh sync` from Superset also self-updates.
 - **Test scenarios:**
   - Covers AE3. With a stubbed "newer + spawn", the parent blocks in `wait()`
@@ -482,10 +499,21 @@ Grouped into phases by dependency. U-IDs are stable.
   `magic.json`, write `magic.sh` (U5), set `setup` to `./.superset/magic.sh
   sync` replacing the `setup.sh` entry in place (preserve order, preserve
   `teardown`/`run`), delete `setup.sh`, bootstrap `magic.local.json` + gitignore
-  (U3). Idempotent re-run reports nothing changed. All changes flow through the
-  existing finishing-action prompt; nothing auto-committed.
+  (U3). **Stage every rename/delete/write into a tempdir** (mirroring bootstrap)
+  and materialize via `copy_into_repo` only after the finishing-action prompt
+  returns a non-cancel choice, so picking "done" or aborting leaves the old
+  layout intact on disk — never a half-migrated tree. Idempotent re-run reports
+  nothing changed. As part of the change summary shown *before* the
+  finishing-action prompt, print a bold-orange (`style::warn`) advisory that
+  worktrees created before migration keep the old `setup.sh`/`setup_config.json`
+  and must be recreated. All changes flow through the existing finishing-action
+  prompt; nothing auto-committed.
 - **Patterns to follow:** `merge_setup_into_config` preservation and the staged
-  tempdir → `copy_into_repo` materialization in `main.rs`.
+  tempdir → `copy_into_repo` materialization in `main.rs`. The reuse is
+  structural, not call-as-is: `copy_into_repo` currently hardcodes `fs::copy` of
+  `setup.sh`/`setup_config.json`, so rework it to materialize `magic.sh` (0755) +
+  `magic.json` (and update its `MaterializeReport`/doc comment) before the
+  migration staging tree can use it.
 - **Test scenarios:**
   - Covers AE5. `setup` references neither marker → init path taken.
   - Covers AE6. Already-migrated repo → no renames/deletes, marker not
@@ -494,6 +522,12 @@ Grouped into phases by dependency. U-IDs are stable.
     `teardown`/`run` preserved, order otherwise intact.
   - Both markers present → migrate wins; `setup.sh` entry stripped, wrapper kept.
   - Malformed `config.json` → hard error naming the path (not treated as init).
+  - "Done"/cancel at the finishing-action prompt → tempdir discarded; on-disk
+    `setup.sh`/`setup_config.json` remain intact (no half-migrated tree).
+  - `copy_into_repo` materializes `magic.sh` (0755) + `magic.json`, not the
+    legacy filenames.
+  - Completing a migration prints the stale-worktree advisory before the
+    finishing-action prompt.
 - **Verification:** branch table exercised by tests; migrated `.superset/`
   matches the new contract.
 
@@ -501,7 +535,9 @@ Grouped into phases by dependency. U-IDs are stable.
 
 - **Goal:** Replace location-auto dispatch with an explicit operation menu.
 - **Requirements:** R2 (origin).
-- **Dependencies:** U4, U9, U11.
+- **Dependencies:** U4, U9, U11. U11 precedes U10 in build order even though it
+  appears later in this document — the menu routes worktree selections into
+  reverse sync, so the reverse-sync handler must exist first.
 - **Files:** `src/menu.rs` (new), `src/main.rs`, `src/ui.rs`.
 - **Approach:** Bare invocation lists location-appropriate operations via the
   existing `pick_with_actions` driver, then routes to a submenu. Main checkout:
@@ -531,19 +567,32 @@ Grouped into phases by dependency. U-IDs are stable.
   `src/gitignore.rs`, `src/ui.rs`.
 - **Approach:** Candidates = files matching the worktree's overlaid patterns
   that are git-untracked in the worktree (incl. `magic.local.json`); tracked
-  files are excluded (merge handles them). Build a diff-aware picker (action-loop
-  reuse) listing differing/worktree-only candidates, each with a "show diff"
-  action shelling to `diff` with color. On confirm, copy into main: create
-  missing parent dirs; if a copied path isn't gitignored in main, append its
-  full relative path to main's root `.gitignore` (create if absent) — do not
-  parse inherited rules; a candidate that already exists in main requires a
-  per-file diff + explicit confirm before overwrite. Decline → main untouched.
+  files are excluded (merge handles them). If the candidate set is empty, print a
+  gray `style::info` line ("No untracked files match the configured patterns.")
+  and return to the menu without opening the picker. Otherwise build a diff-aware
+  picker (action-loop reuse) listing differing/worktree-only candidates, each
+  with a "show diff" action shelling to `git diff --no-index --color=auto <main>
+  <worktree>` piped to `$PAGER` (default `less -R`) so the diff isn't buried by
+  the picker re-render — `git` is already a hard dependency and ships a portable
+  colored differ (`diff --color` is GNU-only and absent on macOS BSD diff). On
+  confirm, copy into main: create missing parent dirs; if a copied path isn't
+  gitignored in main, copy the worktree `.gitignore` rule that covers it
+  (resolved via `git check-ignore -v --no-index`) into main's root `.gitignore`
+  (create if absent), falling back to the literal relative path only when no
+  covering rule exists (per origin R25) — do not hand-parse inherited rules; a
+  candidate that already exists in main requires a per-file diff + explicit
+  confirm before overwrite. Decline → main untouched.
 - **Patterns to follow:** `git.rs` shell-out via `git_raw`; `pick_with_actions`;
-  `apply.rs` directory-create + copy semantics.
+  `apply.rs` directory-create + copy semantics. Expose `apply.rs`'s pattern
+  expansion (currently the private `expand_patterns`) as a public matcher
+  returning the matched relative paths, and have reverse sync copy only the
+  user-selected untracked subset itself — `apply::run` copies every match
+  unconditionally and offers no filtered-subset seam.
 - **Test scenarios:**
   - Covers AE9. Untracked `apps/api/.dev.vars` is offered, tracked `magic.json`
     is not; on copy, `apps/api/` is created in main and the path is ensured in
-    main's `.gitignore` (line appended when absent).
+    main's `.gitignore` (its covering rule, or the literal path if none, appended
+    when absent).
   - Worktree-only (new) file appears as a candidate; identical files are hidden.
   - Candidate already gitignored in main via an exact line → no duplicate line.
   - Candidate exists in main → diff shown, requires per-file confirm; decline
@@ -551,6 +600,8 @@ Grouped into phases by dependency. U-IDs are stable.
   - `magic.local.json` flows through the same path (no special-casing) and lands
     gitignored.
   - Decline at the picker → main fully untouched.
+  - No untracked candidates after filtering → info line printed, picker not
+    opened, main untouched.
 - **Verification:** reverse sync copies only selected untracked files, never
   leaks a secret unignored, and never silently overwrites.
 
@@ -620,9 +671,10 @@ relevant test scenarios above.
   this is the cross-system interface the change touches.
 - **Every-invocation update reach.** The auto-update gate runs on bare, `sync`,
   and `update`, including the non-interactive `sync` inside Superset's pipeline
-  and any CI/script that calls it. The 5 s timeout, silent fall-through, and
-  block-until-child-finishes contract exist so this reach never slows or breaks
-  an unattended caller; `SS_MAGIC_NO_UPDATE=1` is the documented escape hatch.
+  and any CI/script that calls it. The 5 s check timeout, the bounded download
+  timeout (both with silent fall-through), and the block-until-child-finishes
+  contract exist so this reach never slows or breaks an unattended caller;
+  `SS_MAGIC_NO_UPDATE=1` is the documented escape hatch.
 - **Secret-safety boundary.** Reverse sync is the one path that writes untracked
   (often secret) files into the main checkout. Its gitignore-safety step is the
   guard preventing a reverse-synced `.dev.vars` from becoming committable in

@@ -1,8 +1,9 @@
-//! Apply mode: read the main checkout's `setup_config.json` and copy the
-//! configured files into the current worktree. Re-implements `setup.sh`'s
-//! semantics in Rust so users don't need bash 4 + jq.
+//! The file-copy engine: expand glob/literal patterns and copy the matched
+//! files from a source tree into a destination worktree. Used by `ss-magic
+//! sync` (patterns from `magic.json`) and by reverse sync. Re-implements the
+//! original `setup.sh`'s expansion semantics in Rust (no bash 4 + jq needed).
 //!
-//! Parity surface with `setup.sh`:
+//! Expansion semantics (carried over from the original `setup.sh`):
 //!
 //! - Reject absolute patterns and patterns containing a `..` segment.
 //! - Literal patterns must exist; missing literal → counted skip.
@@ -17,12 +18,11 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use globset::{Glob, GlobMatcher};
 use walkdir::WalkDir;
 
 use crate::pattern::{self, SyntaxError};
-use crate::superset_files::{self, SetupConfig};
 
 /// Directory names that drop matches at any depth, matching `setup.sh`.
 const DEFAULT_EXCLUDES: [&str; 2] = ["node_modules", ".venv"];
@@ -91,19 +91,6 @@ pub enum Event {
     },
 }
 
-/// Load the main checkout's `setup_config.json`, with a tailored error
-/// when the file is absent — the user should run bootstrap mode first.
-pub fn load_main_config(main_root: &Path) -> Result<SetupConfig> {
-    match superset_files::load_setup_config(main_root)? {
-        Some(cfg) => Ok(cfg),
-        None => bail!(
-            "no `.superset/setup_config.json` in {}; run `superset-setup` from the main \
-             checkout on the main branch to bootstrap it first",
-            main_root.display()
-        ),
-    }
-}
-
 /// Apply `patterns` from `src` into `dest`, calling `on_event` for each
 /// copy and skip. Returns the final `Summary`.
 pub fn run<F>(src: &Path, dest: &Path, patterns: &[String], mut on_event: F) -> Result<Summary>
@@ -170,6 +157,24 @@ where
         }
     }
     Ok(summary)
+}
+
+/// Public matcher: expand `patterns` against `root` and return the deduped
+/// list of relative paths that match, applying the SAME semantics as
+/// [`run`]'s copy phase (syntax checks via `pattern::check_syntax`, glob/
+/// literal expansion, `DEFAULT_EXCLUDES` dropped at any depth, de-dupe by
+/// relative path) — but WITHOUT copying anything.
+///
+/// This is the seam reverse sync (U11) uses: `run` copies every match
+/// unconditionally and offers no filtered-subset hook, so reverse sync needs
+/// the raw matched paths to intersect with the untracked set and copy only
+/// the user-selected subset itself. Skip events (bad glob, no-match, excluded)
+/// are swallowed here — the caller only wants the resulting paths.
+// consumed by U11 (reverse sync candidate computation)
+#[allow(dead_code)]
+pub fn match_paths(root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {
+    let mut sink = |_: &Event| {};
+    expand_patterns(root, patterns, &mut sink)
 }
 
 /// Expand `patterns` against `src`, emitting skip events through
@@ -469,15 +474,132 @@ mod tests {
         assert!(dest.path().join(".env").is_file());
     }
 
+    // ── Characterization tests: pin engine semantics before config source changes ──
+
+    /// `**` depth: a `**/<name>` pattern must match at any nesting depth,
+    /// including deep (3+ levels) and shallow (1 level).
     #[test]
-    fn missing_main_config_has_helpful_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = load_main_config(dir.path()).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("setup_config.json"));
+    fn double_glob_matches_at_any_depth() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(src.path(), ".dev.vars", "root");
+        write(src.path(), "apps/api/.dev.vars", "l1");
+        write(src.path(), "apps/api/nested/deep/.dev.vars", "deep");
+        let (summary, events) = collect(src.path(), dest.path(), &["**/.dev.vars"]);
+        assert!(dest.path().join(".dev.vars").is_file(), "root-level match");
         assert!(
-            msg.contains("bootstrap") || msg.contains("main checkout"),
-            "expected hint mentioning bootstrap/main checkout, got: {msg}"
+            dest.path().join("apps/api/.dev.vars").is_file(),
+            "one-level match"
+        );
+        assert!(
+            dest.path().join("apps/api/nested/deep/.dev.vars").is_file(),
+            "deep match"
+        );
+        assert_eq!(summary.copied, 3, "all three depths must be copied");
+        assert_eq!(
+            copy_events_of(&events).len(),
+            3,
+            "three Copy events expected"
+        );
+    }
+
+    /// `.venv` exclusion: matches inside a `.venv` dir at any depth are
+    /// silently dropped (non-fatal, not counted).
+    #[test]
+    fn venv_matches_are_dropped() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(src.path(), "apps/api/.env", "ok");
+        write(src.path(), ".venv/lib/python3.11/.env", "drop");
+        write(src.path(), "packages/foo/.venv/pyvenv.cfg", "drop");
+        let (summary, events) = collect(src.path(), dest.path(), &["**/.env", "**/*.cfg"]);
+        assert!(
+            dest.path().join("apps/api/.env").is_file(),
+            "real .env must be copied"
+        );
+        assert!(
+            !dest.path().join(".venv/lib/python3.11/.env").exists(),
+            ".venv/.env must be excluded"
+        );
+        assert!(
+            !dest.path()
+                .join("packages/foo/.venv/pyvenv.cfg")
+                .exists(),
+            ".venv/*.cfg must be excluded"
+        );
+        assert_eq!(summary.copied, 1, "only the real .env is copied");
+        assert_eq!(summary.skipped, 0, "excluded items must not count");
+        let skips = skip_events_of(&events);
+        assert!(
+            skips
+                .iter()
+                .filter(|(r, _)| matches!(r, SkipReason::Excluded))
+                .count()
+                >= 2,
+            "expected at least two Excluded skip events, got: {skips:?}"
+        );
+    }
+
+    /// Characterization: `*` in globset matches path separators (unlike POSIX shell
+    /// glob). `apps/*/.env` therefore matches both `apps/api/.env` AND
+    /// `apps/api/nested/.env`. This pins the engine semantics so callers don't
+    /// silently rely on `*` = "one component only".
+    #[test]
+    fn single_star_matches_across_path_separators_in_globset() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(src.path(), "apps/api/.env", "ok");
+        write(src.path(), "apps/api/nested/.env", "nested");
+        // globset's `*` is NOT literal-separator-aware by default, so
+        // `apps/*/.env` matches paths at any depth below `apps/` ending in `/.env`.
+        let (summary, _) = collect(src.path(), dest.path(), &["apps/*/.env"]);
+        assert!(
+            dest.path().join("apps/api/.env").is_file(),
+            "direct child must match"
+        );
+        assert!(
+            dest.path().join("apps/api/nested/.env").is_file(),
+            "globset `*` crosses path separators — nested path also matches"
+        );
+        assert_eq!(summary.copied, 2);
+    }
+
+    /// Directory copies via `apps/*/config` pattern: the directory itself is
+    /// matched (not its entries), so all files inside are copied recursively.
+    #[test]
+    fn matched_directory_is_copied_recursively() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(src.path(), "apps/api/config/a.toml", "a");
+        write(src.path(), "apps/api/config/sub/b.toml", "b");
+        let (summary, _) = collect(src.path(), dest.path(), &["apps/api/config"]);
+        assert!(
+            dest.path().join("apps/api/config/a.toml").is_file(),
+            "top-level file in dir"
+        );
+        assert!(
+            dest.path().join("apps/api/config/sub/b.toml").is_file(),
+            "nested file in dir"
+        );
+        // The directory itself is one matched entry; its contents are copied
+        // recursively — summary.copied == 1 (the dir match), not 2 (the files).
+        assert_eq!(summary.copied, 1, "directory counts as one copy event");
+        assert_eq!(summary.skipped, 0);
+    }
+
+    /// De-duplication: a path matched by two different patterns appears only once.
+    #[test]
+    fn duplicate_match_across_patterns_is_deduplicated() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(src.path(), ".env", "x");
+        // Both patterns match `.env`.
+        let (summary, events) = collect(src.path(), dest.path(), &[".env", "**/.env"]);
+        assert_eq!(summary.copied, 1, ".env must be copied exactly once");
+        assert_eq!(
+            copy_events_of(&events).len(),
+            1,
+            "only one Copy event for a deduped match"
         );
     }
 }

@@ -4,14 +4,16 @@
 //! the shapes the rest of the binary expects.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use inquire::validator::Validation;
 use inquire::{Confirm, CustomUserError, Select, Text};
 
+use crate::git;
 use crate::pattern;
 use crate::repo_scan;
+use crate::reverse_sync::DiffStatus;
 use crate::style;
 
 /// One of the three finishing actions offered at the end of bootstrap.
@@ -202,10 +204,10 @@ where
     Ok(answer.map(|s| s.trim().to_string()))
 }
 
-/// Pick the patterns the user wants written to `setup_config.json`.
+/// Pick the patterns the user wants written to `magic.json`.
 ///
 /// `options` carries the four preconfigured patterns followed by any
-/// existing custom patterns from `setup_config.json` (use
+/// existing custom patterns from `magic.json` (use
 /// [`super::superset_files::existing_unknown_entries`] to compute the
 /// tail). `preselected` is the set of indices that should start checked.
 /// `repo_root` is needed to compute filesystem-match status for the
@@ -239,7 +241,7 @@ pub fn pick_patterns(
         help: "↑↓ navigate, enter to toggle / add / confirm",
         add_row_label: "+ Add new pattern…",
         add_prompt_label: "New pattern (Esc to cancel):",
-        add_prompt_help: "e.g. `apps/*/.env` — same glob syntax as setup.sh",
+        add_prompt_help: "e.g. `apps/*/.env` — standard glob syntax",
         cancel_context: "pattern selection cancelled",
         add_cancel_context: "custom pattern prompt cancelled",
     };
@@ -247,44 +249,6 @@ pub fn pick_patterns(
         let matched = repo_scan::pattern_matches_any(&repo_root, s)?;
         Ok(if matched { None } else { Some("(no matches)") })
     })
-}
-
-/// Pick the setup commands written into `.superset/config.json`'s `setup`
-/// array. `options` is `repo_detect::OPTIONS` extended with any existing
-/// unknown entries from the current `config.json`. `preselected` carries
-/// the indices that start checked (detected commands plus any already in
-/// the current setup array). `detected[i]` drives the dim `(not detected)`
-/// suffix on rows the repo-scan didn't trip.
-pub fn pick_setup_commands(
-    options: &[String],
-    preselected: &[usize],
-    detected: &[bool],
-) -> Result<Vec<String>> {
-    let rows: Vec<Row> = options
-        .iter()
-        .enumerate()
-        .map(|(i, raw)| Row {
-            raw: raw.clone(),
-            checked: preselected.contains(&i),
-            dim_suffix: if detected[i] {
-                None
-            } else {
-                Some("(not detected)")
-            },
-        })
-        .collect();
-
-    const STRINGS: PickerStrings = PickerStrings {
-        prompt: "Setup commands to run on `superset apply`:",
-        help: "↑↓ navigate, enter to toggle / add / confirm",
-        add_row_label: "+ Add new command…",
-        add_prompt_label: "New command (Esc to cancel):",
-        add_prompt_help:
-            "e.g. make setup or ./scripts/build.sh — runs from the workspace root on superset apply",
-        cancel_context: "setup command selection cancelled",
-        add_cancel_context: "custom command prompt cancelled",
-    };
-    pick_with_actions(&STRINGS, rows, validate_command, |_| Ok(None))
 }
 
 /// Validate a single user-entered pattern. Wraps `pattern::check_syntax`
@@ -295,53 +259,6 @@ fn validate_pattern(pattern_str: &str, taken: &[String]) -> std::result::Result<
         return Err(format!("`{pattern_str}` is already in the list"));
     }
     Ok(())
-}
-
-/// Validate a single user-entered setup command. The caller trims the
-/// input before invoking; the validator rejects empty strings and
-/// duplicates of any already-taken row. No shell-syntax checks beyond that.
-fn validate_command(cmd: &str, taken: &[String]) -> std::result::Result<(), String> {
-    if cmd.is_empty() {
-        return Err("command is empty".to_string());
-    }
-    if taken.iter().any(|c| c == cmd) {
-        return Err(format!("`{cmd}` is already in the list"));
-    }
-    Ok(())
-}
-
-/// Yes/No on writing `.envrc` (default Yes).
-pub fn confirm_envrc() -> Result<bool> {
-    Confirm::new("Create `.envrc` with `dotenv_if_exists`?")
-        .with_default(true)
-        .with_help_message("direnv will auto-load `.env` for shells entering this directory")
-        .prompt()
-        .context(".envrc prompt cancelled")
-}
-
-/// Yes/No on copying configured files into `dest` from `src` (default Yes).
-pub fn confirm_apply(src: &Path, dest: &Path) -> Result<bool> {
-    let msg = format!(
-        "Copy configured files from {} into {}?",
-        src.display(),
-        dest.display(),
-    );
-    Confirm::new(&msg)
-        .with_default(true)
-        .prompt()
-        .context("apply confirm cancelled")
-}
-
-/// Yes/No on running the setup commands shown above the prompt (default
-/// Yes). The caller prints the banner, the bullet list, the invocation
-/// preview, the working directory, and the no-rollback note before
-/// calling this — the prompt itself is just the Y/N gate.
-pub fn confirm_run_setup_commands() -> Result<bool> {
-    Confirm::new("Run setup commands?")
-        .with_default(true)
-        .with_help_message("Y to run · N to skip (files stay copied)")
-        .prompt()
-        .context("setup run confirm cancelled")
 }
 
 /// Final action picker after bootstrap finishes writing files.
@@ -362,6 +279,181 @@ pub fn print_pattern_list(patterns: &[String]) {
     for p in patterns {
         println!("  {}", style::info(format!("• {p}")));
     }
+}
+
+// ── Reverse-sync picker (U11) ────────────────────────────────────────────────
+
+/// One action in the reverse-sync action loop. Mirrors the `pick_with_actions`
+/// pattern (every row is one Enter-action), with an extra per-row "show diff"
+/// action so the user can inspect a candidate against main without committing.
+#[derive(Clone)]
+enum ReverseAction {
+    /// Toggle a candidate's checkbox (index into the offered slice).
+    Toggle { idx: usize },
+    /// Show the diff of a candidate against main, paged.
+    ShowDiff { idx: usize },
+    /// Commit the current selection.
+    Done,
+}
+
+/// One row's display state in the reverse-sync picker.
+struct ReverseRow {
+    rel: PathBuf,
+    status: DiffStatus,
+    checked: bool,
+}
+
+fn reverse_row_label(row: &ReverseRow) -> String {
+    let mark = if row.checked { "[x]" } else { "[ ]" };
+    let tag = match row.status {
+        DiffStatus::WorktreeOnly => style::ok("(new)"),
+        DiffStatus::Differs => style::warn("(differs)"),
+        // Identical rows are filtered out before reaching the picker.
+        DiffStatus::Identical => style::info("(identical)"),
+    };
+    format!("{} {}  {}", mark, row.rel.display(), tag)
+}
+
+/// Diff-aware reverse-sync picker (R24). `offered` is the differing /
+/// worktree-only candidate set (identical files already filtered out). Returns
+/// the user-selected subset of relative paths (empty when the user confirms
+/// with nothing checked or cancels).
+///
+/// Every row is one Enter-action: toggle, "show diff" (paged via
+/// [`git::diff_no_index_paged`]), or "✔ Push selected". This is the
+/// interactive / manual-smoke surface; the copy logic it feeds is unit-tested
+/// in `reverse_sync`.
+///
+/// Cancelling the prompt (Esc/Ctrl-C) propagates as an error context so the
+/// caller leaves main untouched.
+// consumed by reverse_sync::run; manual-smoke (no unit test)
+pub fn pick_reverse_sync(
+    worktree_root: &Path,
+    main_root: &Path,
+    offered: &[(PathBuf, DiffStatus)],
+) -> Result<Vec<PathBuf>> {
+    let mut rows: Vec<ReverseRow> = offered
+        .iter()
+        .map(|(rel, status)| ReverseRow {
+            rel: rel.clone(),
+            status: *status,
+            checked: false,
+        })
+        .collect();
+
+    // Start on the first row.
+    let mut cursor: usize = 0;
+
+    loop {
+        // Build the action list: per-row Toggle + ShowDiff, then Done.
+        let mut actions: Vec<ReverseAction> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            actions.push(ReverseAction::Toggle { idx: i });
+            labels.push(reverse_row_label(row));
+            actions.push(ReverseAction::ShowDiff { idx: i });
+            labels.push(format!("    {}", style::info("↳ show diff")));
+        }
+        actions.push(ReverseAction::Done);
+        labels.push(style::ok("✔ Push selected").to_string());
+
+        // inquire wants Display options; wrap (label, action) in a tiny struct.
+        let options: Vec<LabeledAction> = labels
+            .into_iter()
+            .zip(actions)
+            .map(|(label, action)| LabeledAction { label, action })
+            .collect();
+
+        // Clamp to the actual option count (self-correcting if the row→option
+        // expansion ever changes) per the action-loop pattern doc.
+        let last_idx = options.len().saturating_sub(1);
+        let chosen = Select::new("Untracked files to push back to main:", options)
+            .with_starting_cursor(cursor.min(last_idx))
+            .with_help_message(
+                "↑↓ navigate · enter to toggle / show diff / push · Esc to cancel (main untouched)",
+            )
+            .prompt()
+            .context("reverse sync selection cancelled")?;
+
+        match chosen.action {
+            ReverseAction::Toggle { idx } => {
+                rows[idx].checked = !rows[idx].checked;
+                cursor = idx * 2;
+            }
+            ReverseAction::ShowDiff { idx } => {
+                let rel = &rows[idx].rel;
+                show_candidate_diff(worktree_root, main_root, rel)?;
+                cursor = idx * 2 + 1;
+            }
+            ReverseAction::Done => {
+                return Ok(rows
+                    .into_iter()
+                    .filter(|r| r.checked)
+                    .map(|r| r.rel)
+                    .collect());
+            }
+        }
+    }
+}
+
+/// inquire `Select` option pairing a rendered label with its action.
+struct LabeledAction {
+    label: String,
+    action: ReverseAction,
+}
+
+impl fmt::Display for LabeledAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+/// Show the diff of a candidate against main, paged. For a worktree-only
+/// (new) file there is nothing in main to diff against — print a note instead
+/// of shelling out (git diff --no-index against a missing path is noisy).
+fn show_candidate_diff(worktree_root: &Path, main_root: &Path, rel: &Path) -> Result<()> {
+    let main_path = main_root.join(rel);
+    let wt_path = worktree_root.join(rel);
+    if !main_path.exists() {
+        println!(
+            "{}",
+            style::info(format!(
+                "{} does not exist in main yet — it will be created.",
+                rel.display()
+            ))
+        );
+        return Ok(());
+    }
+    git::diff_no_index_paged(&main_path, &wt_path)
+}
+
+/// Per-file overwrite confirm with a diff (R26, KTD10): a candidate that
+/// already EXISTS in main must show a diff and require explicit confirmation
+/// before its bytes are overwritten. Returns `Ok(true)` to overwrite,
+/// `Ok(false)` to keep main's copy. Declining leaves main intact.
+///
+/// Used as the `overwrite` decision seam passed to
+/// `reverse_sync::copy_candidate_into_main`. Manual-smoke (interactive).
+// consumed by reverse_sync::run
+pub fn confirm_overwrite_with_diff(
+    worktree_root: &Path,
+    main_root: &Path,
+    rel: &Path,
+) -> Result<bool> {
+    println!();
+    println!(
+        "{}",
+        style::warn(format!(
+            "{} already exists in main. Review the diff before overwriting:",
+            rel.display()
+        ))
+    );
+    show_candidate_diff(worktree_root, main_root, rel)?;
+    Confirm::new(&format!("Overwrite main's copy of {}?", rel.display()))
+        .with_default(false)
+        .with_help_message("N keeps main's copy untouched")
+        .prompt()
+        .context("overwrite confirm cancelled")
 }
 
 #[cfg(test)]
@@ -412,28 +504,5 @@ mod tests {
     fn validate_rejects_empty() {
         let err = validate_pattern("", &[]).unwrap_err();
         assert!(err.contains("empty"));
-    }
-
-    #[test]
-    fn command_accepts_typical_shell_string() {
-        validate_command("pnpm -r install", &[]).unwrap();
-    }
-
-    #[test]
-    fn command_accepts_single_token() {
-        validate_command("make", &[]).unwrap();
-    }
-
-    #[test]
-    fn command_rejects_empty() {
-        let err = validate_command("", &[]).unwrap_err();
-        assert!(err.contains("empty"));
-    }
-
-    #[test]
-    fn command_rejects_duplicates() {
-        let taken = vec!["uv sync".to_string()];
-        let err = validate_command("uv sync", &taken).unwrap_err();
-        assert!(err.contains("already"));
     }
 }
