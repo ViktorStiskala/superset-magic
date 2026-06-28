@@ -186,6 +186,9 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git init failed in {}", root.display());
+        // Don't let the dev's global `.env`/`.dev.vars` ignore leak into these
+        // check-ignore assertions — each test repo owns its ignore truth.
+        crate::test_support::neutralize_global_excludes(root);
     }
 
     /// A glob rule covering the path is returned as the glob, NOT the literal

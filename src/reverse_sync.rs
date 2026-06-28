@@ -12,9 +12,12 @@
 //!
 //! Candidates are files that BOTH match the worktree's overlaid patterns
 //! (`magic.json` + `magic.local.json`, via [`apply::match_paths`]) AND are
-//! git-untracked in the worktree (`git ls-files --others --exclude-standard`).
-//! Tracked files are EXCLUDED — they reach main through a normal merge. This
-//! naturally includes `magic.local.json` (gitignored ⇒ untracked) with no
+//! git-untracked in the worktree (`git ls-files --others`, via
+//! [`git::untracked_files`]). "Untracked" INCLUDES gitignored files — that is
+//! the point: the files reverse sync pushes are secrets (`.env`, `.dev.vars`,
+//! the gitignored `magic.local.json`), and those are gitignored by definition.
+//! Tracked files are EXCLUDED — they reach main through a normal merge. So
+//! `magic.local.json` (gitignored ⇒ untracked) flows through with no
 //! special-casing.
 //!
 //! ## Structure: testable logic vs interactive TUI
@@ -99,17 +102,28 @@ pub fn compute_candidates(worktree_root: &Path) -> Result<Vec<PathBuf>> {
     }
 
     let matched = apply::match_paths(worktree_root, &cfg.files)?;
-    let untracked = git::untracked_files(worktree_root)?;
+    if matched.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    // Intersect: keep matched paths that are also untracked. `untracked` is
-    // small enough that a HashSet is overkill; build one anyway for clarity
-    // and O(1) lookup.
-    let untracked_set: std::collections::HashSet<&Path> =
-        untracked.iter().map(|p| p.as_path()).collect();
+    // Ask git which of the matched paths are untracked, scoping the probe to
+    // those paths (pathspecs) rather than listing every untracked file in the
+    // tree. `git ls-files --others` (no `--exclude-standard`) would otherwise
+    // walk every gitignored directory (`target/`, `node_modules/`, …) on each
+    // reverse sync; restricting it to the matched paths makes it an index
+    // lookup. `untracked` is therefore already ≈ the candidate set — but we
+    // still intersect with `matched` so a matched DIRECTORY (whose pathspec
+    // expands to its untracked inner files) contributes nothing: reverse sync
+    // copies single files, never directories.
+    let pathspecs: Vec<&str> = matched.iter().filter_map(|p| p.to_str()).collect();
+    let untracked = git::untracked_files(worktree_root, &pathspecs)?;
 
-    let mut out: Vec<PathBuf> = matched
+    let matched_set: std::collections::HashSet<&Path> =
+        matched.iter().map(|p| p.as_path()).collect();
+
+    let mut out: Vec<PathBuf> = untracked
         .into_iter()
-        .filter(|rel| untracked_set.contains(rel.as_path()))
+        .filter(|rel| matched_set.contains(rel.as_path()))
         .filter(|rel| is_safe_rel(rel))
         .collect();
 
@@ -384,6 +398,7 @@ mod tests {
     fn init_main_repo() -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         git_run(&["init", "-q", "-b", "main"], dir.path());
+        crate::test_support::neutralize_global_excludes(dir.path());
         fs::write(dir.path().join("README.md"), "hi").unwrap();
         git_run(&["add", "."], dir.path());
         git_run(&["commit", "-q", "-m", "init"], dir.path());
@@ -502,6 +517,144 @@ mod tests {
         assert!(
             !rels(&cands).contains(&"tracked.env".to_string()),
             "modified-but-tracked file must NOT be a candidate; got {cands:?}"
+        );
+    }
+
+    /// Regression: a GITIGNORED untracked secret that matches the patterns MUST
+    /// be a candidate. The whole point of reverse sync is pushing gitignored
+    /// secrets; a probe carrying `--exclude-standard` dropped exactly these, so
+    /// the candidate set was always empty in a real repo. Covers AE9 (candidate
+    /// side) for the realistic gitignored shape.
+    #[test]
+    fn gitignored_secret_is_a_candidate() {
+        let main = init_main_repo();
+        let (_wt, wt) = make_worktree(main.path());
+
+        // Worktree gitignores the secret via a glob (tracked .gitignore).
+        write(&wt, ".gitignore", "**/.dev.vars\n");
+        git_run(&["add", ".gitignore"], &wt);
+        // magic.json matches the secret; the secret is present and gitignored.
+        write_magic(&wt, &["**/.dev.vars"]);
+        write(&wt, "apps/api/.dev.vars", "SECRET=1\n");
+
+        // Sanity: the secret really is ignored in the worktree.
+        assert!(
+            git::is_ignored(&wt, Path::new("apps/api/.dev.vars")).unwrap(),
+            "test precondition: secret must be gitignored in the worktree"
+        );
+
+        let cands = rels(&compute_candidates(&wt).unwrap());
+        assert!(
+            cands.contains(&"apps/api/.dev.vars".to_string()),
+            "gitignored untracked secret MUST be a candidate; got {cands:?}"
+        );
+    }
+
+    /// The gitignored `.superset/magic.local.json` (the canonical bootstrap
+    /// shape — it is gitignored, not merely un-added) MUST be a candidate when
+    /// matched and untracked. Same defect class as the secret above.
+    #[test]
+    fn gitignored_magic_local_json_is_a_candidate() {
+        let main = init_main_repo();
+        let (_wt, wt) = make_worktree(main.path());
+
+        write(&wt, ".gitignore", ".superset/magic.local.json\n");
+        git_run(&["add", ".gitignore"], &wt);
+        write_magic(&wt, &[".superset/magic.local.json"]);
+        write(&wt, ".superset/magic.local.json", "{\"files\":[]}\n");
+
+        assert!(
+            git::is_ignored(&wt, Path::new(".superset/magic.local.json")).unwrap(),
+            "test precondition: magic.local.json must be gitignored in the worktree"
+        );
+
+        let cands = rels(&compute_candidates(&wt).unwrap());
+        assert!(
+            cands.contains(&".superset/magic.local.json".to_string()),
+            "gitignored magic.local.json MUST be a candidate; got {cands:?}"
+        );
+    }
+
+    /// Guard for the broadened probe: a file that matches a pattern AND is
+    /// gitignored but is also TRACKED (force-added past .gitignore) is still
+    /// excluded — tracked files reach main via merge. Confirms the fix did not
+    /// start pulling tracked files into the candidate set.
+    #[test]
+    fn modified_tracked_secret_is_not_a_candidate() {
+        let main = init_main_repo();
+        let (_wt, wt) = make_worktree(main.path());
+
+        write(&wt, ".gitignore", "**/.dev.vars\n");
+        git_run(&["add", ".gitignore"], &wt);
+        write_magic(&wt, &["**/.dev.vars"]);
+        write(&wt, "apps/api/.dev.vars", "ORIG=1\n");
+        // Precondition: the secret is genuinely gitignored, so a non-vacuous
+        // "not a candidate" below is owed to its TRACKED state, not to the
+        // gitignore/pattern setup silently failing.
+        assert!(
+            git::is_ignored(&wt, Path::new("apps/api/.dev.vars")).unwrap(),
+            "precondition: secret must be gitignored before force-adding"
+        );
+        // Force-add past the gitignore so the secret is TRACKED, then commit.
+        git_run(&["add", "-f", "apps/api/.dev.vars"], &wt);
+        git_run(&["commit", "-q", "-m", "track secret"], &wt);
+        // Modify it without committing — still tracked.
+        write(&wt, "apps/api/.dev.vars", "CHANGED=1\n");
+
+        let cands = rels(&compute_candidates(&wt).unwrap());
+        assert!(
+            !cands.contains(&"apps/api/.dev.vars".to_string()),
+            "tracked (even gitignored, even modified) file must NOT be a candidate; got {cands:?}"
+        );
+    }
+
+    /// A secret whose entire parent DIRECTORY is gitignored (e.g. `secrets/`) —
+    /// the realistic "ignored secrets dir" shape — is still a candidate.
+    #[test]
+    fn secret_in_gitignored_directory_is_a_candidate() {
+        let main = init_main_repo();
+        let (_wt, wt) = make_worktree(main.path());
+
+        write(&wt, ".gitignore", "secrets/\n");
+        git_run(&["add", ".gitignore"], &wt);
+        write_magic(&wt, &["secrets/api.key"]);
+        write(&wt, "secrets/api.key", "KEY=1\n");
+
+        assert!(
+            git::is_ignored(&wt, Path::new("secrets/api.key")).unwrap(),
+            "precondition: secret must be gitignored via the directory rule"
+        );
+
+        let cands = rels(&compute_candidates(&wt).unwrap());
+        assert!(
+            cands.contains(&"secrets/api.key".to_string()),
+            "secret inside a gitignored directory MUST be a candidate; got {cands:?}"
+        );
+    }
+
+    /// DEFAULT_EXCLUDES (`node_modules`) are dropped by the matcher, so an
+    /// untracked secret under `node_modules/` never becomes a candidate even
+    /// though `git ls-files --others` would see it. Locks the two-layer
+    /// protection: matcher exclude + pathspec-scoped intersection.
+    #[test]
+    fn node_modules_secret_is_not_a_candidate() {
+        let main = init_main_repo();
+        let (_wt, wt) = make_worktree(main.path());
+
+        write(&wt, ".gitignore", "**/.dev.vars\n");
+        git_run(&["add", ".gitignore"], &wt);
+        write_magic(&wt, &["**/.dev.vars"]);
+        write(&wt, "apps/api/.dev.vars", "REAL=1\n");
+        write(&wt, "node_modules/pkg/.dev.vars", "VENDORED=1\n");
+
+        let cands = rels(&compute_candidates(&wt).unwrap());
+        assert!(
+            cands.contains(&"apps/api/.dev.vars".to_string()),
+            "real secret must be a candidate; got {cands:?}"
+        );
+        assert!(
+            !cands.contains(&"node_modules/pkg/.dev.vars".to_string()),
+            "node_modules secret must be excluded by DEFAULT_EXCLUDES; got {cands:?}"
         );
     }
 
