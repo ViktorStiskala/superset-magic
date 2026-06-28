@@ -139,6 +139,13 @@ binary is the sole file-copy implementation.)
 - Tests use `tempfile` + shell-invoked `git init` / `git worktree add`.
   Final-action git ops and the interactive menu/pickers have no unit
   tests — validated by manual smoke.
+- Always bump the crate version (`version` in `Cargo.toml`, and the
+  matching `ss-magic` entry in `Cargo.lock`) on any change that alters
+  CLI behavior — a fix, a new/changed command or flag, or different
+  output. The binary self-updates from GitHub Releases keyed on version
+  (see Build), so a stale version means users never receive the change.
+  Bug fixes bump patch; new/changed user-visible behavior bumps minor
+  (pre-1.0).
 
 ## Documented Solutions
 
@@ -146,3 +153,7 @@ binary is the sole file-copy implementation.)
 practices, design patterns, workflow learnings), organized by category
 with YAML frontmatter (`module`, `tags`, `problem_type`, `component`).
 Relevant when implementing or debugging in documented areas.
+
+`CONCEPTS.md` (repo root) — shared domain vocabulary (the sync model:
+main checkout, forward/reverse sync, sync patterns, candidates).
+Relevant when orienting to the codebase or discussing domain concepts.
