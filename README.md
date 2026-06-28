@@ -123,8 +123,11 @@ have gained files since the worktree was created.
 ## Reverse sync (worktree → main)
 
 From a worktree menu, push **git-untracked** files matching the overlaid
-patterns back to the main checkout. Tracked files are excluded — they
-reach main via merge. The flow:
+patterns back to the main checkout. "Untracked" includes **gitignored**
+files — that is the point, since the files worth pushing are secrets like
+`.env` / `.dev.vars` (and the gitignored `magic.local.json`), which never
+merge via git. Tracked files are excluded — they reach main via merge.
+The flow:
 
 - Builds a diff-aware picker of differing / worktree-only candidates, each
   with a "show diff" action (paged via `git diff --no-index`).

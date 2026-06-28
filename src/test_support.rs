@@ -10,6 +10,25 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// Neutralize the developer's GLOBAL git ignore for a freshly-initialized test
+/// repo by pointing its local `core.excludesFile` at an empty source
+/// (`/dev/null`).
+///
+/// Without this, a global excludes file (commonly `~/.config/git/ignore`
+/// listing `.env` / `.dev.vars`) leaks into `git check-ignore` and `git
+/// ls-files` and silently breaks the reverse-sync / gitignore tests, which
+/// assume each test repo's own `.gitignore` is the *only* ignore source.
+/// `core.excludesFile` lives in the shared (common) config, so calling this on
+/// the main repo also covers any linked worktree created from it. Call right
+/// after `git init`. Uses `/dev/null` as the empty source — Unix-only, like the
+/// rest of this test suite (shell `git`, `chmod 0755`, `magic.sh`).
+pub fn neutralize_global_excludes(repo_root: &Path) {
+    git_run(
+        &["config", "--local", "core.excludesFile", "/dev/null"],
+        repo_root,
+    );
+}
+
 /// Run `git <args>` in `cwd` with an isolated identity + config and assert it
 /// succeeds. On failure the panic message carries git's stderr.
 pub fn git_run(args: &[&str], cwd: &Path) {

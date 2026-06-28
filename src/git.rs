@@ -199,22 +199,35 @@ pub fn pr_create(repo_root: &Path, base: &str) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 /// Repo-relative paths of files that are git-UNTRACKED in the working tree
-/// rooted at `repo_root`. Runs `git ls-files --others --exclude-standard`,
-/// which lists untracked files honoring `.gitignore`/exclude rules (so an
-/// ignored, untracked file is NOT returned) but excludes tracked files.
+/// rooted at `repo_root`, optionally restricted to `pathspecs`.
 ///
-/// Output is one repo-relative path per line, in git's own porcelain form
+/// Runs `git ls-files --others -z -- [pathspecs…]`, which lists untracked
+/// files — INCLUDING gitignored ones — while excluding tracked files. When
+/// `pathspecs` is empty the whole working tree is listed; when it carries
+/// paths, git reports only the untracked files matching those pathspecs. For
+/// exact file paths that is an index lookup, so git does NOT descend into
+/// unrelated gitignored directories (`target/`, `node_modules/`) — the caller
+/// passes its already-matched paths to keep this off the hot path.
+///
+/// Including gitignored files is deliberate and load-bearing: reverse sync
+/// pushes untracked SECRETS (`.env`, `.dev.vars`, the gitignored
+/// `magic.local.json`), and those are gitignored by definition. Adding
+/// `--exclude-standard` here would drop exactly the files reverse sync must
+/// find, making the candidate set always empty in any repo that gitignores its
+/// secrets. `git ls-files` reports files, never directory entries — even a
+/// directory pathspec expands to the untracked files within it.
+///
+/// Output is one repo-relative path per entry, in git's own porcelain form
 /// (forward slashes, relative to `repo_root`). Empty output → empty vector.
 /// Paths with a leading `..` or that are absolute are defensively dropped —
 /// `git ls-files` never emits such paths from the repo root, but reverse
 /// sync intersects this set with the (already-validated) pattern matcher and
 /// must never let a path escape the tree.
 // consumed by U11 (reverse sync candidates); wired into the menu by U10
-pub fn untracked_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
-    let out = git(
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-        Some(repo_root),
-    )?;
+pub fn untracked_files(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<PathBuf>> {
+    let mut args: Vec<&str> = vec!["ls-files", "--others", "-z", "--"];
+    args.extend_from_slice(pathspecs);
+    let out = git(&args, Some(repo_root))?;
     // `-z` gives NUL-separated, unquoted paths so filenames with spaces or
     // special characters survive intact (the default output quotes them).
     // `git`'s trim() above strips a trailing NUL, so split on NUL and drop
@@ -398,6 +411,7 @@ mod tests {
     fn init_repo(initial_branch: &str) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         git_run(&["init", "-q", "-b", initial_branch], dir.path());
+        crate::test_support::neutralize_global_excludes(dir.path());
         // empty commit so the branch exists as a ref
         fs::write(dir.path().join("README.md"), "hi").unwrap();
         git_run(&["add", "."], dir.path());
@@ -413,24 +427,26 @@ mod tests {
         fs::write(p, body).unwrap();
     }
 
-    /// `untracked_files` lists untracked-but-not-ignored files and excludes
-    /// both tracked files and gitignored files.
+    /// `untracked_files` lists every untracked file — INCLUDING gitignored
+    /// ones — and excludes only tracked files. Including ignored files is the
+    /// behavior reverse sync depends on: the secrets it pushes are gitignored.
     #[test]
-    fn untracked_files_lists_only_untracked_unignored() {
+    fn untracked_files_lists_untracked_including_ignored() {
         let dir = init_repo("main");
         let root = dir.path();
         // tracked file (README.md committed by init_repo).
         // untracked, not ignored:
-        write(root, "apps/api/.dev.vars", "SECRET=1\n");
         write(root, "new.txt", "hi\n");
-        // untracked, but ignored:
-        write(root, ".gitignore", "ignored.txt\n");
+        // untracked AND gitignored (the secret-file shape reverse sync targets):
+        write(root, ".gitignore", "**/.dev.vars\nignored.txt\n");
+        write(root, "apps/api/.dev.vars", "SECRET=1\n");
         write(root, "ignored.txt", "nope\n");
         // The .gitignore itself is untracked here, so it would also show up.
         // Track it to keep the assertion focused on the data files.
         git_run(&["add", ".gitignore"], root);
 
-        let mut got: Vec<String> = untracked_files(root)
+        // Empty pathspecs → list the whole tree.
+        let mut got: Vec<String> = untracked_files(root, &[])
             .unwrap()
             .iter()
             .map(|p| p.to_string_lossy().to_string())
@@ -439,16 +455,44 @@ mod tests {
 
         assert!(
             got.contains(&"apps/api/.dev.vars".to_string()),
-            "untracked secret must be listed; got {got:?}"
+            "gitignored untracked secret MUST be listed; got {got:?}"
+        );
+        assert!(
+            got.contains(&"ignored.txt".to_string()),
+            "gitignored untracked file MUST be listed; got {got:?}"
         );
         assert!(got.contains(&"new.txt".to_string()), "got {got:?}");
         assert!(
             !got.contains(&"README.md".to_string()),
             "tracked file must NOT be listed; got {got:?}"
         );
-        assert!(
-            !got.contains(&"ignored.txt".to_string()),
-            "gitignored file must NOT be listed; got {got:?}"
+    }
+
+    /// Pathspecs scope the probe: a gitignored secret reachable via an explicit
+    /// pathspec is listed (incl. one whose whole parent DIRECTORY is ignored),
+    /// while untracked files NOT named by a pathspec are omitted — so git never
+    /// has to walk unrelated ignored trees. Pins the perf-scoping behavior
+    /// reverse sync relies on.
+    #[test]
+    fn untracked_files_scopes_to_pathspecs_and_includes_ignored() {
+        let dir = init_repo("main");
+        let root = dir.path();
+        // `secrets/` is gitignored as a whole DIRECTORY; `noise/` is unrelated.
+        write(root, ".gitignore", "secrets/\nnoise/\n");
+        git_run(&["add", ".gitignore"], root);
+        write(root, "secrets/api.key", "KEY=1\n"); // gitignored via dir rule
+        write(root, "noise/junk.bin", "x\n"); // untracked, not named below
+
+        let got: Vec<String> = untracked_files(root, &["secrets/api.key"])
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(
+            got,
+            vec!["secrets/api.key".to_string()],
+            "pathspec must list the dir-ignored secret and nothing outside the pathspec; got {got:?}"
         );
     }
 

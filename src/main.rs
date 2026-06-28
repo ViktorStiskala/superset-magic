@@ -322,6 +322,7 @@ mod sync_tests {
     fn init_main_repo(branch: &str) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         git_run(&["init", "-q", "-b", branch], dir.path());
+        crate::test_support::neutralize_global_excludes(dir.path());
         fs::write(dir.path().join("README.md"), "hi").unwrap();
         git_run(&["add", "."], dir.path());
         git_run(&["commit", "-q", "-m", "init"], dir.path());

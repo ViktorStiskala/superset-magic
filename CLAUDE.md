@@ -26,7 +26,9 @@ interactive layer:
 
 - `git.rs` — read-only probes (`is_worktree`, `main_checkout_root`,
   `cwd_repo_root`, `main_branch_name`, plus the reverse-sync probes
-  `untracked_files`, `is_ignored`, `check_ignore_pattern`,
+  `untracked_files` (`git ls-files --others` — untracked *including*
+  gitignored, since reverse sync pushes gitignored secrets),
+  `is_ignored`, `check_ignore_pattern`,
   `diff_no_index_paged`) and mutating primitives (`stage_paths`,
   `commit`, `push`, `push_upstream`, `create_branch`, `pr_create`,
   `timestamp_branch_suffix`, `gh_available`). All `git`/`gh` invocations
