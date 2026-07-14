@@ -49,6 +49,7 @@ not yet published to crates.io.
 ```
 ss-magic            # interactive operation menu (location-aware)
 ss-magic sync       # non-interactive forward copy: main → current worktree
+ss-magic pack       # archive the configured files into ss-magic-files.tar.bz2
 ss-magic update     # force a self-update to the latest release
 ss-magic init [PATTERN...]   # non-interactively seed .superset (magic.json
                              # layout); extra args become magic.json `files`
@@ -66,6 +67,8 @@ The bare invocation opens a menu whose options depend on where you run it:
   or edit the synced-files config.
 - **Worktree** — forward sync (main → here), or reverse sync (push
   untracked files from here back to main).
+- **Pack** is offered wherever an initialized `magic.json` exists (any
+  worktree, or the main checkout once set up).
 
 Nothing runs until you pick it; Esc / Ctrl-C leaves the tree untouched.
 
@@ -143,6 +146,33 @@ The flow:
 
 Declining at the picker leaves main fully untouched.
 
+## Pack (`ss-magic pack`)
+
+Snapshot the files defined by the config into a single portable archive —
+useful for backup, transfer to a new machine, or handing the bundle to a
+teammate. Non-interactive, and also offered from the menu wherever an
+initialized `magic.json` exists. The flow, all relative to the current git
+repo root:
+
+1. Resolve the current repo root; require `.superset/magic.json` there
+   (hard error, non-zero exit, if absent or malformed).
+2. Load the overlaid config (`magic.json` + `magic.local.json`) and expand
+   the patterns with the same glob semantics as forward sync (absolute /
+   `..` rejected, `node_modules` / `.venv` excluded, matched directories
+   included recursively, de-duped).
+3. Write every match — preserving its repo-relative path — into
+   `ss-magic-files.tar.bz2` at the git root. Compression is bzip2; the
+   archive is a standard `.tar.bz2` any `tar` can read.
+
+The archive is built to a temp file and atomically renamed into place, and
+never packs itself (a stale `ss-magic-files.tar.bz2` at the root is
+excluded even if a broad pattern would match it). Symlinks are stored as
+symlink entries, never followed — a matched link (even to a directory) is
+recorded as a link, so it can't pull in a target outside the repo. An empty
+config, no matches, or a match set that contains nothing packable is a
+success with no archive written — and an existing archive is left untouched
+rather than replaced by an empty one.
+
 ## Init / migration (main checkout)
 
 From the main-checkout menu, ss-magic branches on `config.json`'s `setup`:
@@ -186,7 +216,8 @@ runs a cheap, daily-cached check for a newer GitHub release:
   per-archive checksums; there is no separate SHA-256-vs-GitHub-digest check,
   and binary signing is a deferred future item.
 
-The gate runs on `bare`, `sync`, and `update` — including the
+The daily-cache gate runs on `bare`, `sync`, and `pack` (the `update`
+subcommand forces its own self-update path instead) — including the
 non-interactive `sync` inside Superset's pipeline. The bounded timeouts
 and block-until-child contract keep this reach from ever slowing or
 breaking an unattended caller.

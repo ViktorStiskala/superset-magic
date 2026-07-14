@@ -90,7 +90,9 @@ interactive layer:
   spawning the process.
 - `menu.rs` — bare-invocation operation menu. Location-gated: main
   checkout offers init / migrate / edit config; a worktree offers
-  forward sync / reverse sync. Routes selections to their handlers via
+  forward sync / reverse sync. `Pack` is offered wherever an initialized
+  `magic.json` exists (any worktree, or main on a `Normal` branch), so it
+  appears in both location lists. Routes selections to their handlers via
   the `Select` driver; Esc/Ctrl-C is inert.
 - `migrate.rs` — detect + migrate/init branching off `config.json`'s
   `setup` (old `setup.sh` reference → migrate; `magic.sh` marker →
@@ -102,6 +104,22 @@ interactive layer:
 - `reverse_sync.rs` — push git-untracked worktree files matching the
   overlaid patterns back to main, with a diff-aware picker,
   parent-dir creation, and gitignore-safety (`gitignore.rs`).
+- `pack.rs` — `ss-magic pack`: expand the overlaid `magic.json` patterns
+  against the current git repo root (via `apply::match_paths`) and write
+  the matches — repo-relative — into `ss-magic-files.tar.bz2` at that root.
+  Everything (config source, match target, archive destination) is the one
+  `cwd_repo_root`. `pack_core(cwd, on_event)` mirrors `main::sync_core`'s
+  control flow (resolve root → probe magic.json → load overlaid → empty
+  guard → work) and emits a `PackEvent` stream. `write_archive` tars into a
+  bzip2 stream (`bzip2` crate, pure-Rust `libbz2-rs-sys` backend — no C
+  toolchain) via a `NamedTempFile` in the root, then persists atomically.
+  Safety: it never packs the output archive into itself (nor a `.` match that
+  resolves to the repo root); it classifies each match with
+  `symlink_metadata` (no-follow) so a matched symlink — including one to a
+  directory — is stored as a single symlink entry rather than followed
+  (`Path::is_dir()` would follow it and archive the target tree); and it
+  discards the temp file without touching an existing archive when nothing was
+  actually added, so a prior good backup is never replaced by an empty tarball.
 - `gitignore.rs` — `.gitignore` helpers at a git root: `ensure_entry`
   appends a line iff no exact match exists (creates the file if absent,
   never reorders); `find_covering_rule` resolves the rule covering a path
@@ -116,9 +134,10 @@ interactive layer:
   KTD5 conformance notes in `update/apply.rs`); `bin_path_in_archive`
   matches cargo-dist's `<bin>-<target>/` tarball layout.
 - `main.rs` — composes everything: `style::init` → `cli::parse` →
-  [auto-update gate for `Bare`/`Sync`] → `dispatch`. `Bare` routes to
+  [auto-update gate for `Bare`/`Sync`/`Pack`] → `dispatch`. `Bare` routes to
   `menu::run`; `Sync` runs the non-interactive forward copy
-  (`sync_core`); `Update` forces a self-update. `print_event` renders
+  (`sync_core`); `Pack` runs `pack::pack_core` (`run_pack_flow` +
+  `print_pack_event`); `Update` forces a self-update. `print_event` renders
   the `apply::Event` stream.
 
 ## Source of truth for magic.sh
@@ -146,6 +165,19 @@ binary is the sole file-copy implementation.)
   (see Build), so a stale version means users never receive the change.
   Bug fixes bump patch; new/changed user-visible behavior bumps minor
   (pre-1.0).
+- After every implementation change, update `CLAUDE.md` and `README.md`
+  to match the current state before the change is considered done. A
+  new/changed command, flag, module, or behavior must be reflected in the
+  README (command list + relevant prose) and in this doc's Architecture +
+  Conventions sections — the two docs are expected to describe the code as
+  it is now, not as it was.
+- `.cursor/BUGBOT.md` holds the Cursor Bugbot review rules. It must stay
+  **self-contained**: it cannot reference this `CLAUDE.md`,
+  `docs/solutions/`, `.cursor/rules`, or any skill/rule — restate the
+  relevant conventions inline instead. Keep it **synchronised on every
+  change**: whenever a convention here or a behavior in the code changes,
+  update `.cursor/BUGBOT.md` in the same change so its rules never describe
+  stale conventions.
 
 ## Documented Solutions
 

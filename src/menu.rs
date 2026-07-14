@@ -47,6 +47,10 @@ pub enum MenuOp {
     ForwardSync,
     /// Worktree: push git-untracked files back to main.
     ReverseSync,
+    /// Archive the configured files into `ss-magic-files.tar.bz2` at the git
+    /// root. Offered wherever an initialized `magic.json` exists (any worktree,
+    /// or the main checkout on a Normal branch).
+    Pack,
 }
 
 impl fmt::Display for MenuOp {
@@ -57,6 +61,7 @@ impl fmt::Display for MenuOp {
             MenuOp::EditConfig => "Edit synced files (magic.json)",
             MenuOp::ForwardSync => "Forward sync (copy files from main to this worktree)",
             MenuOp::ReverseSync => "Reverse sync (push untracked files to main)",
+            MenuOp::Pack => "Pack configured files into ss-magic-files.tar.bz2",
         };
         f.write_str(label)
     }
@@ -76,21 +81,25 @@ pub enum Location {
 /// Pure helper: given a location and a branch decision (irrelevant for a
 /// worktree), return the ordered list of [`MenuOp`]s to offer.
 ///
+/// `Pack` is offered wherever an initialized `magic.json` exists — any worktree,
+/// and the main checkout on a `Normal` branch. `Init`/`Migrate` branches have no
+/// `magic.json` yet, so `Pack` would have nothing to archive there.
+///
 /// Truth table:
 ///
 /// | Location  | Branch            | Ops                                    |
 /// |-----------|-------------------|----------------------------------------|
-/// | Worktree  | (any)             | `[ForwardSync, ReverseSync]`           |
+/// | Worktree  | (any)             | `[ForwardSync, ReverseSync, Pack]`     |
 /// | Main      | `Branch::Migrate` | `[Migrate]`                            |
 /// | Main      | `Branch::Init`    | `[Init]`                               |
-/// | Main      | `Branch::Normal`  | `[EditConfig]`                         |
+/// | Main      | `Branch::Normal`  | `[EditConfig, Pack]`                   |
 pub fn operations_for(location: Location, branch: Branch) -> Vec<MenuOp> {
     match location {
-        Location::Worktree => vec![MenuOp::ForwardSync, MenuOp::ReverseSync],
+        Location::Worktree => vec![MenuOp::ForwardSync, MenuOp::ReverseSync, MenuOp::Pack],
         Location::Main => match branch {
             Branch::Migrate => vec![MenuOp::Migrate],
             Branch::Init => vec![MenuOp::Init],
-            Branch::Normal => vec![MenuOp::EditConfig],
+            Branch::Normal => vec![MenuOp::EditConfig, MenuOp::Pack],
         },
     }
 }
@@ -137,7 +146,8 @@ pub fn run(cwd: &Path) -> Result<ExitCode> {
         dispatch_menu(ops, |op| match op {
             MenuOp::ForwardSync => forward_sync_in_worktree(cwd),
             MenuOp::ReverseSync => reverse_sync::run(&cwd_root, &main_root),
-            _ => unreachable!("worktree only offers ForwardSync/ReverseSync"),
+            MenuOp::Pack => crate::run_pack_flow(cwd),
+            _ => unreachable!("worktree only offers ForwardSync/ReverseSync/Pack"),
         })
     } else {
         // Main checkout path: read config.json to detect the branch.
@@ -161,7 +171,8 @@ pub fn run(cwd: &Path) -> Result<ExitCode> {
             MenuOp::Migrate => migrate::run_migrate(&repo_root, config.as_ref().unwrap()),
             MenuOp::Init => migrate::run_init(&repo_root, config.as_ref()),
             MenuOp::EditConfig => edit_config(&repo_root, config.as_ref()),
-            _ => unreachable!("main checkout only offers Migrate/Init/EditConfig"),
+            MenuOp::Pack => crate::run_pack_flow(&repo_root),
+            _ => unreachable!("main checkout only offers Migrate/Init/EditConfig/Pack"),
         })
     }
 }
@@ -223,16 +234,16 @@ mod tests {
 
     // ── operations_for: location gating ──────────────────────────────────────
 
-    /// Worktree always gets ForwardSync + ReverseSync, regardless of the
+    /// Worktree always gets ForwardSync + ReverseSync + Pack, regardless of the
     /// branch value passed (branch is irrelevant for a worktree).
     #[test]
-    fn worktree_ops_are_forward_and_reverse_sync() {
+    fn worktree_ops_are_forward_and_reverse_sync_and_pack() {
         for branch in [Branch::Init, Branch::Migrate, Branch::Normal] {
             let ops = operations_for(Location::Worktree, branch);
             assert_eq!(
                 ops,
-                vec![MenuOp::ForwardSync, MenuOp::ReverseSync],
-                "worktree branch={branch:?} must offer ForwardSync + ReverseSync"
+                vec![MenuOp::ForwardSync, MenuOp::ReverseSync, MenuOp::Pack],
+                "worktree branch={branch:?} must offer ForwardSync + ReverseSync + Pack"
             );
         }
     }
@@ -269,32 +280,46 @@ mod tests {
         assert_eq!(ops, vec![MenuOp::Init]);
     }
 
-    /// Branch::Normal → exactly [EditConfig].
+    /// Branch::Normal → [EditConfig, Pack].
     #[test]
-    fn normal_branch_offers_edit_config_op() {
+    fn normal_branch_offers_edit_config_and_pack() {
         let ops = operations_for(Location::Main, Branch::Normal);
-        assert_eq!(ops, vec![MenuOp::EditConfig]);
+        assert_eq!(ops, vec![MenuOp::EditConfig, MenuOp::Pack]);
+    }
+
+    /// Pack is offered where magic.json exists: any worktree, and Main+Normal.
+    /// It is NOT offered on the un-initialized Init/Migrate branches.
+    #[test]
+    fn pack_offered_only_where_magic_json_exists() {
+        assert!(operations_for(Location::Worktree, Branch::Normal).contains(&MenuOp::Pack));
+        assert!(operations_for(Location::Main, Branch::Normal).contains(&MenuOp::Pack));
+        assert!(!operations_for(Location::Main, Branch::Init).contains(&MenuOp::Pack));
+        assert!(!operations_for(Location::Main, Branch::Migrate).contains(&MenuOp::Pack));
     }
 
     // ── Invariant: every op belongs to exactly one location ──────────────────
 
-    /// Main-checkout ops are a subset of {Migrate, Init, EditConfig}.
+    /// Location-specific ops must not overlap. `Pack` is intentionally shared
+    /// across both locations (offered wherever magic.json exists), so it is
+    /// excluded from the disjointness invariant.
     #[test]
     fn main_checkout_ops_are_main_only() {
         let main_ops: std::collections::HashSet<MenuOp> =
             [Branch::Migrate, Branch::Init, Branch::Normal]
                 .iter()
                 .flat_map(|&b| operations_for(Location::Main, b))
+                .filter(|op| *op != MenuOp::Pack)
                 .collect();
         let worktree_ops: std::collections::HashSet<MenuOp> =
             operations_for(Location::Worktree, Branch::Init)
                 .into_iter()
+                .filter(|op| *op != MenuOp::Pack)
                 .collect();
-        // The two sets must be disjoint.
+        // The two sets must be disjoint (ignoring the shared Pack op).
         let overlap: Vec<_> = main_ops.intersection(&worktree_ops).collect();
         assert!(
             overlap.is_empty(),
-            "main-only and worktree-only ops must not overlap; overlap={overlap:?}"
+            "location-specific ops must not overlap; overlap={overlap:?}"
         );
     }
 }
