@@ -68,7 +68,7 @@ not yet published to crates.io.
 ```
 ss-magic            # interactive operation menu (location-aware)
 ss-magic sync       # non-interactive forward copy: main → current worktree
-ss-magic pack       # archive the configured files into ss-magic-files.tar.bz2
+ss-magic pack       # archive the configured files into ss-magic-<repo>.tar.bz2
 ss-magic update     # force a self-update to the latest release
 ss-magic init [PATTERN...]   # non-interactively seed .superset (magic.json
                              # layout); extra args become magic.json `files`
@@ -180,11 +180,23 @@ repo root:
    `..` rejected, `node_modules` / `.venv` excluded, matched directories
    included recursively, de-duped).
 3. Write every match — preserving its repo-relative path — into
-   `ss-magic-files.tar.bz2` at the git root. Compression is bzip2; the
+   `ss-magic-<repo>.tar.bz2` at the git root. Compression is bzip2; the
    archive is a standard `.tar.bz2` any `tar` can read.
 
+The archive name identifies the repo: with an `origin` remote it is derived
+from the normalized remote URL — `ss-magic-viktorstiskala_upx-cz.tar.bz2`
+for `github.com/ViktorStiskala/upx.cz`, identical whether origin uses
+`https://`, `ssh://`, or the `git@host:` form (GitLab nested groups keep
+every path segment). Without an origin, the primary worktree's directory
+basename is used instead (`ss-magic-upx-cz.tar.bz2` for a checkout at
+`.../upx.cz`). After packing, ss-magic prints the `tar -xjvf` extraction
+command and copies the archive's full path to the clipboard (`pbcopy`,
+`wl-copy`, `xclip`, or `xsel`, whichever is available — "full path copied
+to clipboard" confirms it).
+
 The archive is built to a temp file and atomically renamed into place, and
-never packs itself (a stale `ss-magic-files.tar.bz2` at the root is
+never packs itself (a stale archive at the root — current or pre-0.3
+`ss-magic-files.tar.bz2` name — is
 excluded even if a broad pattern would match it). Symlinks are stored as
 symlink entries, never followed — a matched link (even to a directory) is
 recorded as a link, so it can't pull in a target outside the repo. An empty

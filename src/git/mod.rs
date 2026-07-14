@@ -90,6 +90,12 @@ pub fn main_checkout_root(cwd_root: &Path) -> Result<PathBuf> {
         .with_context(|| format!("could not canonicalize {}", parent.display()))
 }
 
+/// URL of the `origin` remote, or `None` when no origin is configured
+/// (remote config is shared, so this works from linked worktrees too).
+pub fn origin_url(cwd_root: &Path) -> Result<Option<String>> {
+    git_optional(&["remote", "get-url", "origin"], Some(cwd_root))
+}
+
 /// `"main"` when a local `refs/heads/main` exists, else `"master"` when it
 /// does, else an error.
 pub fn main_branch_name(main_root: &Path) -> Result<String> {

@@ -16,8 +16,9 @@
 //! The control flow deliberately mirrors `main::sync_core`: resolve root →
 //! probe `magic.json` → load overlaid config → empty-guard → do work.
 
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{ExitCode, Stdio};
 
 use anyhow::{Context, Result};
 use bzip2::write::BzEncoder;
@@ -28,8 +29,127 @@ use crate::sync::apply;
 use crate::git;
 use crate::tui::style;
 
-/// Name of the archive written at the git root.
-pub const PACK_FILE_NAME: &str = "ss-magic-files.tar.bz2";
+/// Fixed archive name written by pack before 0.3. Still excluded from matches
+/// so a stale pre-0.3 archive at the root is never packed into a new one.
+pub const LEGACY_PACK_FILE_NAME: &str = "ss-magic-files.tar.bz2";
+
+/// Archive file name for `root`: `ss-magic-<stem>.tar.bz2`.
+///
+/// The stem is derived from the `origin` remote when one is configured
+/// (normalized so every URL form of the same repo yields the same name), and
+/// falls back to the primary (main) worktree directory's basename otherwise —
+/// e.g. `ss-magic-viktorstiskala_upx-cz.tar.bz2` for any origin form of
+/// `github.com/ViktorStiskala/upx.cz`, or `ss-magic-upx-cz.tar.bz2` for an
+/// origin-less checkout at `.../upx.cz`. A last-resort `files` stem preserves
+/// the legacy name shape when neither source yields usable characters.
+pub fn archive_file_name(root: &Path) -> String {
+    let stem = git::origin_url(root)
+        .ok()
+        .flatten()
+        .and_then(|url| stem_from_origin(&url))
+        .or_else(|| {
+            let main_root = git::main_checkout_root(root).unwrap_or_else(|_| root.to_path_buf());
+            main_root
+                .file_name()
+                .map(|n| sanitize_segment(&n.to_string_lossy()))
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "files".to_string());
+    format!("ss-magic-{stem}.tar.bz2")
+}
+
+/// Normalize a git remote URL into a filename stem.
+///
+/// Strips the scheme (`https://`, `ssh://`, `git://`, …), userinfo, host, and
+/// port; drops a trailing `.git`; lowercases; maps every non-alphanumeric run
+/// inside a path segment to a single `-`; joins path segments with `_`. The
+/// scp-like form (`git@host:owner/repo`) and a scheme form of the same remote
+/// produce identical stems, and nested paths (GitLab groups) keep every
+/// segment: `gitlab.com/group/sub/repo` → `group_sub_repo`. A local-path
+/// origin (no host) contributes only its final segment. Returns `None` when
+/// nothing usable remains.
+fn stem_from_origin(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    // Split off the scheme, then the host: with a scheme the host ends at the
+    // first `/`; without one, the scp-like `[user@]host:path` uses the first
+    // `:`. Neither → a local path, where only the basename identifies the repo.
+    let path = if let Some(i) = url.find("://") {
+        url[i + 3..].split_once('/')?.1
+    } else if let Some((_host, path)) = url.split_once(':') {
+        path
+    } else {
+        url.rsplit('/').next().unwrap_or(url)
+    };
+    let path = path
+        .trim_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or_else(|| path.trim_matches('/'));
+
+    let segments: Vec<String> = path
+        .split('/')
+        .map(sanitize_segment)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return None;
+    }
+    Some(segments.join("_"))
+}
+
+/// Lowercase `seg` and collapse every run of non-alphanumeric characters
+/// (dots, spaces, unicode, …) into a single `-`, trimming the edges — so a
+/// repo named `upx.cz` becomes `upx-cz`. `_` is reserved as the segment
+/// joiner, so it too maps to `-` here.
+fn sanitize_segment(seg: &str) -> String {
+    let mut out = String::with_capacity(seg.len());
+    let mut pending_dash = false;
+    for ch in seg.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            pending_dash = true;
+        }
+    }
+    out
+}
+
+/// Copy `text` to the system clipboard by piping it to the first available
+/// clipboard tool (`pbcopy` on macOS; `wl-copy`/`xclip`/`xsel` on Linux).
+/// Returns whether a tool accepted the text. Deliberately *not* called from
+/// `pack_core` — it is a rendering-layer side effect (`main.rs`), so the pure
+/// engine and its tests never touch the user's clipboard.
+pub fn copy_to_clipboard(text: &str) -> bool {
+    const TOOLS: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for (tool, args) in TOOLS {
+        let child = std::process::Command::new(tool)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else { continue }; // tool not installed
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            continue;
+        };
+        let wrote = stdin.write_all(text.as_bytes()).is_ok();
+        drop(stdin); // close the pipe so the tool can exit
+        match child.wait() {
+            Ok(status) if wrote && status.success() => return true,
+            _ => continue,
+        }
+    }
+    false
+}
 
 /// Per-entry event emitted while building the archive. Callers convert these to
 /// user-facing output (`main.rs`) or assertions (tests) — same closure-driven
@@ -38,6 +158,10 @@ pub const PACK_FILE_NAME: &str = "ss-magic-files.tar.bz2";
 pub enum PackEvent {
     /// A file or directory was added to the archive at `rel`.
     Add { rel: PathBuf },
+    /// The archive was written and persisted: `count` entries at `out_path`.
+    /// The rendering layer owns the summary line, the `tar` extraction hint,
+    /// and the clipboard copy of the archive's real path.
+    Done { out_path: PathBuf, count: usize },
 }
 
 /// Core pack flow, shared by `ss-magic pack` and the interactive menu.
@@ -99,11 +223,16 @@ where
 
     // 6. Never pack the output archive into itself (KTD3): drop a match equal
     //    to the archive name at the repo root, so a broad user pattern like
-    //    `*.bz2` can't recurse the archive. Also drop any match that resolves to
-    //    the repo root itself (a `.` pattern): `append_dir_all(".", root)` would
-    //    walk the whole tree live — including the in-progress temp archive and
-    //    `.git` — corrupting the archive and bypassing the self-exclusion guard.
-    rels.retain(|r| r != Path::new(PACK_FILE_NAME) && !is_repo_root_rel(r));
+    //    `*.bz2` can't recurse the archive — covering both the derived name and
+    //    a stale pre-0.3 `ss-magic-files.tar.bz2`. Also drop any match that
+    //    resolves to the repo root itself (a `.` pattern): `append_dir_all(".",
+    //    root)` would walk the whole tree live — including the in-progress temp
+    //    archive and `.git` — corrupting the archive and bypassing the
+    //    self-exclusion guard.
+    let file_name = archive_file_name(&root);
+    rels.retain(|r| {
+        r != Path::new(&file_name) && r != Path::new(LEGACY_PACK_FILE_NAME) && !is_repo_root_rel(r)
+    });
 
     // 7. Nothing left to archive after filtering → success, no archive written.
     if rels.is_empty() {
@@ -114,8 +243,8 @@ where
         return Ok(ExitCode::SUCCESS);
     }
 
-    // 8. Build the archive at <root>/ss-magic-files.tar.bz2.
-    let out_path = root.join(PACK_FILE_NAME);
+    // 8. Build the archive at <root>/<derived name> (see `archive_file_name`).
+    let out_path = root.join(&file_name);
     let count = match write_archive(&root, &rels, &out_path, &mut on_event) {
         Ok(n) => n,
         Err(err) => {
@@ -134,14 +263,9 @@ where
         return Ok(ExitCode::SUCCESS);
     }
 
-    println!();
-    println!(
-        "{}",
-        style::ok(format!(
-            "Packed {count} entries → {}",
-            out_path.display()
-        ))
-    );
+    // Summary rendering (count line, tar hint, clipboard copy) is the
+    // caller's job — tests collect this event without side effects.
+    on_event(&PackEvent::Done { out_path, count });
     Ok(ExitCode::SUCCESS)
 }
 

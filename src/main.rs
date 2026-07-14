@@ -162,6 +162,31 @@ fn print_pack_event(ev: &pack::PackEvent) {
         pack::PackEvent::Add { rel } => {
             println!("{}", tui::style::info(format!("Added: {}", rel.display())));
         }
+        pack::PackEvent::Done { out_path, count } => {
+            let name = out_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| out_path.display().to_string());
+            // Prefer the canonical path for both display and clipboard so the
+            // copied value works from anywhere, not just the repo root.
+            let real = out_path
+                .canonicalize()
+                .unwrap_or_else(|_| out_path.clone());
+            println!();
+            println!(
+                "{}",
+                tui::style::ok(format!("Packed {count} entries → {}", real.display()))
+            );
+            println!(
+                "{}",
+                tui::style::info(format!(
+                    "Extract into a repo root with: tar -xjvf {name} -C /path/to/repo"
+                ))
+            );
+            if pack::copy_to_clipboard(&real.display().to_string()) {
+                println!("{}", tui::style::info("full path copied to clipboard"));
+            }
+        }
     }
 }
 

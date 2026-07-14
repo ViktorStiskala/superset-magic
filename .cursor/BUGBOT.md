@@ -112,9 +112,16 @@ committable and must never leak.
   or a new archive-building path that omits it. Note `Path::is_file()` follows
   symlinks, so a top-level `is_file()` guard does NOT substitute for this.
 - **Pack must never archive itself or the whole tree.** `pack_core` drops any
-  match equal to the output name `ss-magic-files.tar.bz2` and any match that
-  resolves to the repo root itself (a `.` pattern) before archiving. Flag
-  removal of either guard.
+  match equal to the derived output name (`pack::archive_file_name` — from the
+  normalized `origin` remote, falling back to the primary worktree basename),
+  any match equal to the legacy `ss-magic-files.tar.bz2` name, and any match
+  that resolves to the repo root itself (a `.` pattern) before archiving. Flag
+  removal of any of these guards.
+- **Clipboard stays out of the pack engine.** The archive-path clipboard copy
+  (`pack::copy_to_clipboard`) and the extraction-hint output hang off
+  `PackEvent::Done` in `main.rs`'s rendering layer. Flag any clipboard or
+  extra printing side effect added inside `pack_core`/`write_archive` — tests
+  drive those directly and must never mutate the developer's clipboard.
 - **Pack classifies matches with `symlink_metadata` (lstat), not `is_dir()`.**
   `Path::is_dir()`/`is_file()` follow symlinks, so a matched symlink to a
   directory would make `append_dir_all` walk the link's TARGET tree (outside

@@ -118,15 +118,25 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   parent-dir creation, and gitignore-safety (`git/gitignore.rs`).
 - `pack.rs` — `ss-magic pack`: expand the overlaid `magic.json` patterns
   against the current git repo root (via `sync/apply.rs`'s `match_paths`) and
-  write the matches — repo-relative — into `ss-magic-files.tar.bz2` at that
-  root. Everything (config source, match target, archive destination) is the
+  write the matches — repo-relative — into `ss-magic-<repo>.tar.bz2` at that
+  root. `archive_file_name` derives `<repo>` from the normalized `origin`
+  remote (scheme/userinfo/host stripped, segments sanitized and joined with
+  `_` — identical for ssh/https/scp forms; nested GitLab groups keep all
+  segments), falling back to the primary worktree basename, then `files`.
+  A successful pack emits `PackEvent::Done { out_path, count }`; the
+  rendering layer (`main.rs::print_pack_event`) owns the summary line, the
+  `tar -xjvf` extraction hint, and `copy_to_clipboard` (pbcopy/wl-copy/
+  xclip/xsel) of the archive's canonical path — clipboard is deliberately
+  outside `pack_core` so tests never touch the user's clipboard.
+  Everything (config source, match target, archive destination) is the
   one `cwd_repo_root`. `pack_core(cwd, on_event)` mirrors `main::sync_core`'s
   control flow (resolve root → probe magic.json → load overlaid → empty
   guard → work) and emits a `PackEvent` stream. `write_archive` tars into a
   bzip2 stream (`bzip2` crate, pure-Rust `libbz2-rs-sys` backend — no C
   toolchain) via a `NamedTempFile` in the root, then persists atomically.
-  Safety: it never packs the output archive into itself (nor a `.` match that
-  resolves to the repo root); it classifies each match with
+  Safety: it never packs the output archive into itself — the derived name
+  and the legacy `ss-magic-files.tar.bz2` are both excluded (nor a `.` match
+  that resolves to the repo root); it classifies each match with
   `symlink_metadata` (no-follow) so a matched symlink — including one to a
   directory — is stored as a single symlink entry rather than followed
   (`Path::is_dir()` would follow it and archive the target tree); and it

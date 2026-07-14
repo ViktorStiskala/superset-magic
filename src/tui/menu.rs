@@ -47,9 +47,11 @@ pub enum MenuOp {
     ForwardSync,
     /// Worktree: push git-untracked files back to main.
     ReverseSync,
-    /// Archive the configured files into `ss-magic-files.tar.bz2` at the git
-    /// root. Offered wherever an initialized `magic.json` exists (any worktree,
-    /// or the main checkout on a Normal branch).
+    /// Archive the configured files into `ss-magic-<repo>.tar.bz2` at the git
+    /// root (name derived from the normalized `origin` remote, falling back to
+    /// the primary worktree basename — see `pack::archive_file_name`). Offered
+    /// wherever an initialized `magic.json` exists (any worktree, or the main
+    /// checkout on a Normal branch).
     Pack,
 }
 
@@ -61,7 +63,7 @@ impl fmt::Display for MenuOp {
             MenuOp::EditConfig => "Edit synced files (magic.json)",
             MenuOp::ForwardSync => "Forward sync (copy files from main to this worktree)",
             MenuOp::ReverseSync => "Reverse sync (push untracked files to main)",
-            MenuOp::Pack => "Pack configured files into ss-magic-files.tar.bz2",
+            MenuOp::Pack => "Pack configured files into a tar.bz2 archive",
         };
         f.write_str(label)
     }

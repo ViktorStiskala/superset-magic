@@ -36,10 +36,10 @@ fn write_file(root: &Path, rel: &str, body: &str) {
     fs::write(p, body).unwrap();
 }
 
-/// Decompress `<root>/ss-magic-files.tar.bz2` and return the set of file
+/// Decompress `<root>/<derived archive name>` and return the set of file
 /// entry paths (directories are represented by their contained files).
 fn archive_entries(root: &Path) -> BTreeSet<String> {
-    let f = fs::File::open(root.join(PACK_FILE_NAME)).unwrap();
+    let f = fs::File::open(root.join(archive_file_name(root))).unwrap();
     let dec = bzip2::read::BzDecoder::new(f);
     let mut ar = tar::Archive::new(dec);
     let mut out = BTreeSet::new();
@@ -56,7 +56,7 @@ fn archive_entries(root: &Path) -> BTreeSet<String> {
 
 /// Read a single file's bytes out of the archive.
 fn archive_read(root: &Path, rel: &str) -> Option<String> {
-    let f = fs::File::open(root.join(PACK_FILE_NAME)).unwrap();
+    let f = fs::File::open(root.join(archive_file_name(root))).unwrap();
     let dec = bzip2::read::BzDecoder::new(f);
     let mut ar = tar::Archive::new(dec);
     for entry in ar.entries().unwrap() {
@@ -82,7 +82,7 @@ fn packs_literal_file_with_matching_bytes() {
     let code = pack_core(repo.path(), |_| {}).unwrap();
     assert!(exit_ok(code), "pack_core must succeed");
     assert!(
-        repo.path().join(PACK_FILE_NAME).is_file(),
+        repo.path().join(archive_file_name(repo.path())).is_file(),
         "archive must exist at git root"
     );
     assert_eq!(archive_read(repo.path(), ".env").as_deref(), Some("FOO=1\n"));
@@ -148,7 +148,11 @@ fn add_events_emitted_per_entry() {
     let mut events: Vec<PackEvent> = Vec::new();
     let code = pack_core(repo.path(), |e| events.push(e.clone())).unwrap();
     assert!(exit_ok(code));
-    assert_eq!(events.len(), 2, "one Add event per entry, got {events:?}");
+    let adds = events
+        .iter()
+        .filter(|e| matches!(e, PackEvent::Add { .. }))
+        .count();
+    assert_eq!(adds, 2, "one Add event per entry, got {events:?}");
 }
 
 // ── Excludes inherited from match_paths ─────────────────────────────────
@@ -185,7 +189,7 @@ fn empty_files_writes_no_archive() {
     let code = pack_core(repo.path(), |_| {}).unwrap();
     assert!(exit_ok(code), "empty files is success");
     assert!(
-        !repo.path().join(PACK_FILE_NAME).exists(),
+        !repo.path().join(archive_file_name(repo.path())).exists(),
         "no archive when files is empty"
     );
 }
@@ -199,7 +203,7 @@ fn no_matches_writes_no_archive() {
     let code = pack_core(repo.path(), |_| {}).unwrap();
     assert!(exit_ok(code));
     assert!(
-        !repo.path().join(PACK_FILE_NAME).exists(),
+        !repo.path().join(archive_file_name(repo.path())).exists(),
         "no archive when nothing matches"
     );
 }
@@ -254,7 +258,7 @@ fn symlink_in_matched_dir_is_not_dereferenced() {
     // The real file is packed as a normal file...
     assert!(archive_entries(repo.path()).contains("bundle/real.txt"));
     // ...and the secret bytes must NOT appear anywhere as file content.
-    let f = fs::File::open(repo.path().join(PACK_FILE_NAME)).unwrap();
+    let f = fs::File::open(repo.path().join(archive_file_name(repo.path()))).unwrap();
     let mut ar = tar::Archive::new(bzip2::read::BzDecoder::new(f));
     for entry in ar.entries().unwrap() {
         let mut entry = entry.unwrap();
@@ -313,7 +317,7 @@ fn top_level_symlink_dir_is_not_followed() {
         "symlink target tree must not be archived, got {entries:?}"
     );
     // `linkdir` itself is stored as a symlink entry, not a directory.
-    let f = fs::File::open(repo.path().join(PACK_FILE_NAME)).unwrap();
+    let f = fs::File::open(repo.path().join(archive_file_name(repo.path()))).unwrap();
     let mut ar = tar::Archive::new(bzip2::read::BzDecoder::new(f));
     let mut saw_symlink = false;
     for entry in ar.entries().unwrap() {
@@ -337,7 +341,7 @@ fn top_level_symlink_dir_is_not_followed() {
 #[test]
 fn write_archive_skips_vanished_entry_and_preserves_existing() {
     let repo = init_repo();
-    let out = repo.path().join(PACK_FILE_NAME);
+    let out = repo.path().join(archive_file_name(repo.path()));
     // A pre-existing "good backup" that must survive intact.
     fs::write(&out, b"GOODBACKUP").unwrap();
     // A rel that does not exist on disk (vanished between match and pack).
@@ -374,7 +378,7 @@ fn dot_pattern_resolving_to_root_is_dropped() {
         "`.` must not pack the whole tree, got {entries:?}"
     );
     assert!(
-        !entries.contains(PACK_FILE_NAME),
+        !entries.contains(&archive_file_name(repo.path())),
         "archive must not contain itself, got {entries:?}"
     );
 }
@@ -388,14 +392,145 @@ fn does_not_pack_the_archive_into_itself() {
     write_magic(repo.path(), &["**/*.bz2", ".env"]);
     write_file(repo.path(), ".env", "x");
     // Simulate a leftover archive from a prior run.
-    fs::write(repo.path().join(PACK_FILE_NAME), "stale").unwrap();
+    fs::write(repo.path().join(archive_file_name(repo.path())), "stale").unwrap();
 
     let code = pack_core(repo.path(), |_| {}).unwrap();
     assert!(exit_ok(code));
     let entries = archive_entries(repo.path());
     assert!(
-        !entries.contains(PACK_FILE_NAME),
+        !entries.contains(&archive_file_name(repo.path())),
         "archive must not contain itself, got {entries:?}"
     );
     assert!(entries.contains(".env"), "real match still packed, got {entries:?}");
+}
+
+// ── Legacy-name exclusion ───────────────────────────────────────────────
+
+/// A stale pre-0.3 `ss-magic-files.tar.bz2` at the root must not be swept
+/// into the new (derived-name) archive by a broad pattern.
+#[test]
+fn does_not_pack_a_stale_legacy_archive() {
+    let repo = init_repo();
+    write_magic(repo.path(), &["**/*.bz2", ".env"]);
+    write_file(repo.path(), ".env", "x");
+    fs::write(repo.path().join(LEGACY_PACK_FILE_NAME), "stale").unwrap();
+
+    let code = pack_core(repo.path(), |_| {}).unwrap();
+    assert!(exit_ok(code));
+    let entries = archive_entries(repo.path());
+    assert!(
+        !entries.contains(LEGACY_PACK_FILE_NAME),
+        "legacy archive must be excluded, got {entries:?}"
+    );
+}
+
+// ── Done event ──────────────────────────────────────────────────────────
+
+/// A successful pack emits exactly one `Done` event carrying the archive
+/// path and the entry count — the seam the rendering layer (summary line,
+/// tar hint, clipboard copy) hangs off.
+#[test]
+fn done_event_carries_out_path_and_count() {
+    let repo = init_repo();
+    write_magic(repo.path(), &[".env", ".dev.vars"]);
+    write_file(repo.path(), ".env", "a");
+    write_file(repo.path(), ".dev.vars", "b");
+
+    let mut done: Vec<(PathBuf, usize)> = Vec::new();
+    let code = pack_core(repo.path(), |ev| {
+        if let PackEvent::Done { out_path, count } = ev {
+            done.push((out_path.clone(), *count));
+        }
+    })
+    .unwrap();
+    assert!(exit_ok(code));
+    assert_eq!(done.len(), 1, "exactly one Done event");
+    let (out_path, count) = &done[0];
+    assert_eq!(*count, 2);
+    assert!(out_path.is_file(), "Done.out_path must exist on disk");
+    assert_eq!(
+        out_path.file_name().unwrap().to_string_lossy(),
+        archive_file_name(repo.path()),
+    );
+}
+
+// ── Archive naming: origin normalization ────────────────────────────────
+
+/// Every URL form of the same remote must normalize to the same stem
+/// (example from the spec: github.com/ViktorStiskala/upx.cz).
+#[test]
+fn origin_forms_normalize_identically() {
+    let expect = Some("viktorstiskala_upx-cz".to_string());
+    for url in [
+        "https://github.com/ViktorStiskala/upx.cz.git",
+        "https://github.com/ViktorStiskala/upx.cz",
+        "git@github.com:ViktorStiskala/upx.cz.git",
+        "ssh://git@github.com/ViktorStiskala/upx.cz.git",
+        "ssh://git@github.com:22/ViktorStiskala/upx.cz",
+        "git://github.com/ViktorStiskala/upx.cz.git",
+        "https://github.com/ViktorStiskala/upx.cz/",
+    ] {
+        assert_eq!(stem_from_origin(url), expect, "url: {url}");
+    }
+}
+
+/// Nested paths (GitLab groups) keep every segment, joined with `_`.
+#[test]
+fn nested_group_origin_keeps_all_segments() {
+    assert_eq!(
+        stem_from_origin("https://gitlab.com/group/sub.group/repo.git"),
+        Some("group_sub-group_repo".to_string())
+    );
+    assert_eq!(
+        stem_from_origin("git@gitlab.com:group/sub/repo.git"),
+        Some("group_sub_repo".to_string())
+    );
+}
+
+/// A local-path origin contributes only its final segment; junk-only input
+/// yields None.
+#[test]
+fn local_and_degenerate_origins() {
+    assert_eq!(
+        stem_from_origin("/srv/git/upx.cz.git"),
+        Some("upx-cz".to_string())
+    );
+    assert_eq!(stem_from_origin(""), None);
+    assert_eq!(stem_from_origin("https://github.com/"), None);
+}
+
+/// Segment sanitization: lowercase, non-alphanumeric runs collapse to one
+/// `-`, edges trimmed, `_` reserved for the joiner.
+#[test]
+fn sanitize_segment_rules() {
+    assert_eq!(sanitize_segment("ViktorStiskala"), "viktorstiskala");
+    assert_eq!(sanitize_segment("upx.cz"), "upx-cz");
+    assert_eq!(sanitize_segment("my_repo..name"), "my-repo-name");
+    assert_eq!(sanitize_segment(".env"), "env");
+    assert_eq!(sanitize_segment("---"), "");
+}
+
+/// With an origin configured, the archive name comes from the normalized
+/// remote; without one it falls back to the primary worktree basename.
+#[test]
+fn archive_name_prefers_origin_and_falls_back_to_basename() {
+    let repo = init_repo();
+    let base = sanitize_segment(
+        &repo.path().canonicalize().unwrap().file_name().unwrap().to_string_lossy(),
+    );
+    assert_eq!(
+        archive_file_name(repo.path()),
+        format!("ss-magic-{base}.tar.bz2"),
+        "no origin -> primary worktree basename"
+    );
+
+    git_run(
+        &["remote", "add", "origin", "git@github.com:ViktorStiskala/upx.cz.git"],
+        repo.path(),
+    );
+    assert_eq!(
+        archive_file_name(repo.path()),
+        "ss-magic-viktorstiskala_upx-cz.tar.bz2",
+        "origin present -> normalized remote"
+    );
 }
