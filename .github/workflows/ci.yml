@@ -37,6 +37,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # This job gates releases (release.yml custom-ci); a wedged run must fail
+    # fast instead of stalling PRs and tags for GitHub's 360-minute default.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
         with:
