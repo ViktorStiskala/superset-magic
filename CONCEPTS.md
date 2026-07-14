@@ -30,6 +30,13 @@ reach the shared checkout, since they cannot travel through a git merge. Only
 untracked files move; tracked files reach the main checkout through a normal
 merge.
 
+### Pack
+Bundling the files matching the sync patterns from the current git repo root
+into a single `ss-magic-files.tar.bz2` archive at that root, preserving each
+file's repo-relative path. A third operation on the sync patterns alongside
+forward and reverse sync — a portable snapshot of the configured file set (for
+backup, machine transfer, or handoff) rather than a copy between trees.
+
 ### Candidate
 A worktree file eligible for reverse sync: it matches the sync patterns and is
 git-untracked (whether or not it is gitignored). Tracked files are never
