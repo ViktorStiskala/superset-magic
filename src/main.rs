@@ -10,6 +10,7 @@ mod git;
 mod gitignore;
 mod menu;
 mod migrate;
+mod pack;
 mod pattern;
 mod repo_scan;
 mod reverse_sync;
@@ -28,23 +29,27 @@ use crate::cli::{Command, Parsed};
 ///
 /// Truth table:
 ///
-/// | cmd            | guard_active | result |
-/// |----------------|--------------|--------|
-/// | `Bare`         | false        | true   |
-/// | `Sync`         | false        | true   |
-/// | `Update`       | false        | false  |
-/// | `Bare`/`Sync`  | true         | false  |
-/// | `Update`       | true         | false  |
+/// | cmd                 | guard_active | result |
+/// |---------------------|--------------|--------|
+/// | `Bare`              | false        | true   |
+/// | `Sync`              | false        | true   |
+/// | `Pack`              | false        | true   |
+/// | `Update`            | false        | false  |
+/// | `Bare`/`Sync`/`Pack`| true         | false  |
+/// | `Update`            | true         | false  |
 ///
 /// `Command::Update` always bypasses the gate — it routes to the force path
 /// (U7's `update_command`) which is NOT gated by the 24h cache. When the loop
 /// guard is active (`SS_MAGIC_UPDATED` or `SS_MAGIC_NO_UPDATE` is set) the
 /// gate never fires regardless of command, preventing re-exec loops (AE4).
+///
+/// `Command::Pack` is gated alongside `Bare`/`Sync`: it is a non-interactive
+/// "do work" command like `sync`, so gating keeps pack users self-updating.
 pub fn should_run_update_gate(cmd: Command, guard_active: bool) -> bool {
     if guard_active {
         return false;
     }
-    matches!(cmd, Command::Bare | Command::Sync)
+    matches!(cmd, Command::Bare | Command::Sync | Command::Pack)
 }
 
 fn run() -> Result<ExitCode> {
@@ -112,7 +117,58 @@ fn dispatch(cmd: Command) -> Result<ExitCode> {
     match cmd {
         Command::Bare => menu::run(&cwd),
         Command::Sync => run_sync_flow(&cwd),
+        Command::Pack => run_pack_flow(&cwd),
         Command::Update => update_flow(),
+    }
+}
+
+/// Probe `<root>/.superset/magic.json` and load the overlaid config, printing a
+/// styled error and returning the exit code on absence or malformation. Shared
+/// by the forward-sync (`sync_core`) and pack (`pack::pack_core`) flows so the
+/// "magic.json absent/malformed" error path lives in exactly one place.
+///
+/// `Ok(None)` from `load_overlaid` means the file vanished between the probe and
+/// the load (a race) — reported the same as absent.
+pub fn load_magic_or_exit(root: &Path) -> std::result::Result<superset_files::MagicConfig, ExitCode> {
+    let magic_json_path = root.join(".superset/magic.json");
+    let absent = || {
+        eprintln!(
+            "{}",
+            style::err(format!(
+                "error: no `.superset/magic.json` in {}; expected {}",
+                root.display(),
+                magic_json_path.display()
+            ))
+        );
+        ExitCode::from(1)
+    };
+
+    if !magic_json_path.is_file() {
+        return Err(absent());
+    }
+    match superset_files::load_overlaid(root) {
+        Ok(Some(cfg)) => Ok(cfg),
+        Ok(None) => Err(absent()),
+        Err(err) => {
+            eprintln!("{}", style::err(format!("error: {err:#}")));
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+/// Non-interactive pack: archive the files defined by the overlaid `magic.json`
+/// into `ss-magic-files.tar.bz2` at the git root. Handler for `ss-magic pack`
+/// and the interactive menu's "Pack" operation. Delegates to `pack::pack_core`
+/// with the stdout event printer.
+pub fn run_pack_flow(cwd: &Path) -> Result<ExitCode> {
+    pack::pack_core(cwd, print_pack_event)
+}
+
+fn print_pack_event(ev: &pack::PackEvent) {
+    match ev {
+        pack::PackEvent::Add { rel } => {
+            println!("{}", style::info(format!("Added: {}", rel.display())));
+        }
     }
 }
 
@@ -167,41 +223,10 @@ where
         }
     };
 
-    // 3. Probe for magic.json — hard error when absent.
-    let magic_json_path = main_root.join(".superset/magic.json");
-    if !magic_json_path.is_file() {
-        eprintln!(
-            "{}",
-            style::err(format!(
-                "error: no `.superset/magic.json` in {}; expected {}",
-                main_root.display(),
-                magic_json_path.display()
-            ))
-        );
-        return Ok(ExitCode::from(1));
-    }
-
-    // 4. Load overlaid config — propagates parse errors as non-zero exit.
-    let cfg = match superset_files::load_overlaid(&main_root) {
-        Ok(Some(c)) => c,
-        Ok(None) => {
-            // load_overlaid returns None when magic.json is absent; we probed
-            // above so this branch means the probe and the load raced — treat
-            // it the same as absent.
-            eprintln!(
-                "{}",
-                style::err(format!(
-                    "error: no `.superset/magic.json` in {}; expected {}",
-                    main_root.display(),
-                    magic_json_path.display()
-                ))
-            );
-            return Ok(ExitCode::from(1));
-        }
-        Err(err) => {
-            eprintln!("{}", style::err(format!("error: {err:#}")));
-            return Ok(ExitCode::from(1));
-        }
+    // 3-4. Probe + load the overlaid magic.json (hard error on absent/malformed).
+    let cfg = match load_magic_or_exit(&main_root) {
+        Ok(c) => c,
+        Err(code) => return Ok(code),
     };
 
     // 5. Empty files list → nothing to do, success.
@@ -554,6 +579,24 @@ mod update_gate_tests {
         assert!(
             should_run_update_gate(Command::Sync, false),
             "Sync + guard inactive → gate must fire"
+        );
+    }
+
+    /// Pack command + no guard → gate fires (gated like Sync).
+    #[test]
+    fn pack_no_guard_gate_fires() {
+        assert!(
+            should_run_update_gate(Command::Pack, false),
+            "Pack + guard inactive → gate must fire"
+        );
+    }
+
+    /// Pack + guard active → gate does NOT fire.
+    #[test]
+    fn pack_guard_active_gate_does_not_fire() {
+        assert!(
+            !should_run_update_gate(Command::Pack, true),
+            "Pack + guard active → gate must not fire"
         );
     }
 

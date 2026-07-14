@@ -1,10 +1,11 @@
-//! Hand-rolled argument parsing for the three `ss-magic` entry points.
+//! Hand-rolled argument parsing for the `ss-magic` entry points.
 //!
-//! Three entry points don't justify pulling in `clap`, so this is a tiny
-//! parser over `std::env::args`: the first non-flag token selects `sync` or
-//! `update`; its absence falls through to the interactive (bare) mode.
-//! `--help`/`-h` short-circuits to a help request, and any unrecognized
-//! subcommand is an error carrying the same usage text the help path prints.
+//! A handful of entry points don't justify pulling in `clap`, so this is a tiny
+//! parser over `std::env::args`: the first non-flag token selects `sync`,
+//! `pack`, `update`, or `init`; its absence falls through to the interactive
+//! (bare) mode. `--help`/`-h` short-circuits to a help request, and any
+//! unrecognized subcommand is an error carrying the same usage text the help
+//! path prints.
 //!
 //! The parser is split from `main.rs` so it's unit-testable without spawning
 //! the process: `parse(&[String]) -> Parsed` takes argv (sans program name)
@@ -17,6 +18,9 @@ pub enum Command {
     Bare,
     /// Non-interactive forward file copy, main → current worktree.
     Sync,
+    /// Non-interactive pack: archive the configured files into a tar.bz2 at the
+    /// git root.
+    Pack,
     /// Force a self-update.
     Update,
 }
@@ -45,6 +49,8 @@ Usage: ss-magic [COMMAND]
 Commands:
   (none)    Open the interactive operation menu
   sync      Non-interactive forward file copy (main → current worktree)
+  pack      Archive the configured files into ss-magic-files.tar.bz2 at the
+            git root
   update    Force a self-update to the latest release
   init      Initialize .superset (magic.json layout) non-interactively;
             optional file-pattern args become magic.json `files`
@@ -77,6 +83,7 @@ pub fn parse(args: &[String]) -> Parsed {
         }
         return match arg.as_str() {
             "sync" => Parsed::Command(Command::Sync),
+            "pack" => Parsed::Command(Command::Pack),
             "update" => Parsed::Command(Command::Update),
             // Positional args after `init` become magic.json file patterns.
             "init" => Parsed::Init(
@@ -108,6 +115,16 @@ mod tests {
     #[test]
     fn update_token_dispatches_to_update() {
         assert_eq!(parse(&argv(&["update"])), Parsed::Command(Command::Update));
+    }
+
+    #[test]
+    fn pack_token_dispatches_to_pack() {
+        assert_eq!(parse(&argv(&["pack"])), Parsed::Command(Command::Pack));
+    }
+
+    #[test]
+    fn help_mentions_pack() {
+        assert!(usage().contains("pack"), "usage should mention pack");
     }
 
     #[test]
@@ -144,6 +161,8 @@ mod tests {
     fn help_wins_over_a_following_subcommand() {
         // A help flag short-circuits even when a subcommand follows it.
         assert_eq!(parse(&argv(&["--help", "sync"])), Parsed::Help);
+        // Same precedence for the `pack` token (plan U3).
+        assert_eq!(parse(&argv(&["--help", "pack"])), Parsed::Help);
     }
 
     #[test]
