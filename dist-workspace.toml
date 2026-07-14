@@ -22,6 +22,13 @@ install-updater = false
 # plan-phase job. build-local-artifacts depends on it, so red tests mean no
 # artifacts are ever built (and hence nothing can be published).
 plan-jobs = ["./ci"]
+# Attest the per-target release archives (Sigstore/SLSA provenance via
+# actions/attest). Default phase (build-local-artifacts) is deliberate:
+# it signs same-job build output before it transits Actions artifact
+# storage; the installer script and checksum files are NOT attested at
+# this phase. Changing the phase is a security decision — see
+# docs/plans/2026-07-14-002-feat-release-artifact-attestations-plan.md.
+github-attestations = true
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 
