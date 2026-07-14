@@ -150,7 +150,8 @@ pub fn load_magic_or_exit(root: &Path) -> std::result::Result<workspace::superse
 }
 
 /// Non-interactive pack: archive the files defined by the overlaid `magic.json`
-/// into `ss-magic-files.tar.bz2` at the git root. Handler for `ss-magic pack`
+/// into `ss-magic-<repo>.tar.bz2` at the git root (name derived from the
+/// normalized origin remote). Handler for `ss-magic pack`
 /// and the interactive menu's "Pack" operation. Delegates to `pack::pack_core`
 /// with the stdout event printer.
 pub fn run_pack_flow(cwd: &Path) -> Result<ExitCode> {

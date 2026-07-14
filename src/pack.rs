@@ -1,7 +1,8 @@
 //! The pack engine: expand the sync patterns from the overlaid `magic.json`,
 //! collect every matching file/directory from the current git repo root, and
 //! write them — preserving repo-relative structure — into a single
-//! `ss-magic-files.tar.bz2` at the git root.
+//! `ss-magic-<repo>.tar.bz2` at the git root (name derived by
+//! [`archive_file_name`]).
 //!
 //! This reuses the existing seams verbatim:
 //! - [`git::cwd_repo_root`] resolves the repo root (config source, match target,
@@ -78,12 +79,10 @@ fn stem_from_origin(url: &str) -> Option<String> {
     } else if let Some((_host, path)) = url.split_once(':') {
         path
     } else {
-        url.rsplit('/').next().unwrap_or(url)
+        url.rfind('/').map_or(url, |i| &url[i + 1..])
     };
-    let path = path
-        .trim_matches('/')
-        .strip_suffix(".git")
-        .unwrap_or_else(|| path.trim_matches('/'));
+    let trimmed = path.trim_matches('/');
+    let path = trimmed.strip_suffix(".git").unwrap_or(trimmed);
 
     let segments: Vec<String> = path
         .split('/')
@@ -168,7 +167,7 @@ pub enum PackEvent {
 ///
 /// Resolves the current repo root, verifies `.superset/magic.json` exists there,
 /// loads the overlaid config, expands the patterns against that root, and writes
-/// the matched files into `<root>/ss-magic-files.tar.bz2` with repo-relative
+/// the matched files into `<root>/ss-magic-<repo>.tar.bz2` (see [`archive_file_name`]) with repo-relative
 /// paths. Extracted as `pack_core` (taking an `on_event` closure) so tests can
 /// collect events without side effects on stdout.
 ///
