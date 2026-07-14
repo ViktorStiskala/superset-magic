@@ -15,7 +15,16 @@ make clean     # cargo clean
 Rust toolchain is provided by `rustup` (cargo on `~/.cargo/bin`).
 
 Release binaries are published to GitHub Releases via cargo-dist
-(`dist-workspace.toml`); the binary self-updates from there. End-user install
+(`dist-workspace.toml`); the binary self-updates from there. The per-target
+release archives are attested (cargo-dist `github-attestations` →
+`actions/attest` in `build-local-artifacts`, Sigstore/Rekor provenance;
+user-facing verification via `gh attestation verify` — see README). The
+self-update path is unchanged and still trusts TLS + cargo-dist checksums,
+not attestations. Note the attesting build job necessarily runs third-party
+build scripts with `id-token: write` live — inherent to the feature; the
+default (build-local) phase is deliberate because it signs same-job build
+output before artifacts transit Actions storage, and changing the phase is a
+security decision. End-user install
 instructions (the installer script, prebuilt-binary download, and from-source
 builds) live in README.md.
 

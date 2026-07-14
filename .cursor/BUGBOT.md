@@ -234,6 +234,15 @@ minor (pre-1.0). Flag a behavior-changing PR that does not bump both
   `dist-workspace.toml`. Flag hand edits to the generated
   `.github/workflows/release.yml` (regenerate with the pinned `dist` version
   instead) and flag `allow-dirty = ["ci"]` additions.
+- Release archives are attested (`github-attestations = true` in
+  `dist-workspace.toml` → `actions/attest` in the release workflow's
+  build-local-artifacts job, signing same-job build output before it
+  transits Actions artifact storage). Flag removal of the
+  `github-attestations` key, removal of the attest step, or a
+  `github-attestations-phase` change away from `build-local-artifacts` —
+  a host/announce-phase attest signs a `download-artifact` merge directory
+  that any job in the run can inject into, so a phase change requires
+  explicit security review, not routine approval.
 
 ## Documentation Sync (REQUIRED)
 
