@@ -124,6 +124,16 @@ where
         }
     };
 
+    // Every match was a special/vanished entry — write_archive wrote nothing
+    // and left any existing archive untouched. Don't claim "Packed 0 entries".
+    if count == 0 {
+        println!(
+            "{}",
+            style::info("No packable files remained — nothing to pack.")
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
     println!();
     println!(
         "{}",
@@ -144,8 +154,13 @@ fn is_repo_root_rel(rel: &Path) -> bool {
 
 /// Tar + bzip2-compress `rels` (repo-relative) from `root` into `out_path`,
 /// writing to a temp file in `root` first and atomically renaming on success
-/// (KTD3). Directories are added recursively; non-file/non-dir entries are
-/// skipped. Returns the number of top-level entries added.
+/// (KTD3). Real directories are added recursively; a matched symlink is stored
+/// as a single symlink entry (never followed); special files (sockets/fifos)
+/// and entries that vanished after expansion are skipped. Returns the number of
+/// entries added. When nothing was added (every match was special/vanished),
+/// the temp file is discarded and `out_path` is left untouched — see the
+/// `count == 0` guard — so a prior good archive is never replaced by an empty
+/// one, and the caller gets `0`.
 fn write_archive<F>(
     root: &Path,
     rels: &[PathBuf],
@@ -174,17 +189,33 @@ where
 
         for rel in rels {
             let abs = root.join(rel);
-            if abs.is_dir() {
+            // Classify by `symlink_metadata` (lstat — does NOT follow the
+            // link). A matched entry that is itself a symlink is stored as a
+            // single symlink entry and never followed: `Path::is_dir()` would
+            // follow it, so a symlink to a directory would make
+            // `append_dir_all` walk (and archive) the link's target tree,
+            // pulling files outside the repo. `follow_symlinks(false)` only
+            // governs symlinks encountered *during* a directory walk, not one
+            // used as the walk root — this is the top-level analogue.
+            let file_type = match std::fs::symlink_metadata(&abs) {
+                Ok(m) => m.file_type(),
+                // Vanished between expansion and packing — skip.
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                builder
+                    .append_path_with_name(&abs, rel)
+                    .with_context(|| format!("adding symlink {} to archive", rel.display()))?;
+            } else if file_type.is_dir() {
                 builder
                     .append_dir_all(rel, &abs)
                     .with_context(|| format!("adding directory {} to archive", rel.display()))?;
-            } else if abs.is_file() {
+            } else if file_type.is_file() {
                 builder
                     .append_path_with_name(&abs, rel)
                     .with_context(|| format!("adding file {} to archive", rel.display()))?;
             } else {
-                // Symlink/special or vanished between match and pack — skip,
-                // mirroring `apply`'s pragmatic file-vs-dir posture.
+                // Socket / fifo / other special file — skip.
                 continue;
             }
             on_event(&PackEvent::Add { rel: rel.clone() });
@@ -194,6 +225,13 @@ where
         // Finalize both layers: tar footer, then flush the bzip2 stream.
         let enc = builder.into_inner().context("finalizing tar stream")?;
         enc.finish().context("finalizing bzip2 stream")?;
+    }
+
+    // Nothing was actually archived (every match was a special/vanished
+    // entry): drop the temp file and leave any existing archive untouched,
+    // rather than replacing a prior good backup with an empty tarball.
+    if count == 0 {
+        return Ok(0);
     }
 
     // Ensure bytes hit disk before the rename, then persist atomically.
@@ -493,6 +531,71 @@ mod tests {
         let code = pack_core(repo.path(), |_| {}).unwrap();
         assert!(exit_ok(code), "broken symlink must not abort the pack");
         assert!(archive_entries(repo.path()).contains("bundle/real.txt"));
+    }
+
+    /// A top-level matched entry that is a symlink to a directory must be
+    /// stored as a symlink entry, NOT followed — otherwise `append_dir_all`
+    /// would walk the link target's tree and pull files outside the repo in.
+    #[cfg(unix)]
+    #[test]
+    fn top_level_symlink_dir_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let repo = init_repo();
+        // An outside directory whose files must NOT end up in the archive.
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(outside.path().join("sub")).unwrap();
+        fs::write(outside.path().join("sub/outside_secret.txt"), "LEAK\n").unwrap();
+        // A top-level match that is a symlink pointing at that outside dir.
+        symlink(outside.path(), repo.path().join("linkdir")).unwrap();
+        write_magic(repo.path(), &["linkdir", ".env"]);
+        write_file(repo.path(), ".env", "x");
+
+        let code = pack_core(repo.path(), |_| {}).unwrap();
+        assert!(exit_ok(code));
+        let entries = archive_entries(repo.path());
+        assert!(entries.contains(".env"), "real match still packed, got {entries:?}");
+        assert!(
+            !entries.iter().any(|e| e.contains("outside_secret.txt")),
+            "symlink target tree must not be archived, got {entries:?}"
+        );
+        // `linkdir` itself is stored as a symlink entry, not a directory.
+        let f = fs::File::open(repo.path().join(PACK_FILE_NAME)).unwrap();
+        let mut ar = tar::Archive::new(bzip2::read::BzDecoder::new(f));
+        let mut saw_symlink = false;
+        for entry in ar.entries().unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().unwrap().to_string_lossy() == "linkdir" {
+                assert!(
+                    entry.header().entry_type().is_symlink(),
+                    "linkdir must be a symlink entry, not a followed directory"
+                );
+                saw_symlink = true;
+            }
+        }
+        assert!(saw_symlink, "linkdir must appear in the archive as a symlink");
+    }
+
+    // ── Empty-archive guard (no clobber when nothing was added) ─────────────
+
+    /// When every entry is skipped (here: a path that vanished after
+    /// expansion), write_archive must add nothing AND leave any existing
+    /// archive untouched — never replace a good backup with an empty tarball.
+    #[test]
+    fn write_archive_skips_vanished_entry_and_preserves_existing() {
+        let repo = init_repo();
+        let out = repo.path().join(PACK_FILE_NAME);
+        // A pre-existing "good backup" that must survive intact.
+        fs::write(&out, b"GOODBACKUP").unwrap();
+        // A rel that does not exist on disk (vanished between match and pack).
+        let rels = vec![PathBuf::from("gone.txt")];
+
+        let n = write_archive(repo.path(), &rels, &out, &mut |_| {}).unwrap();
+        assert_eq!(n, 0, "a vanished entry adds nothing");
+        assert_eq!(
+            fs::read(&out).unwrap(),
+            b"GOODBACKUP",
+            "existing archive must be preserved, not clobbered by an empty one"
+        );
     }
 
     // ── Repo-root (`.`) guard ───────────────────────────────────────────────
