@@ -1,3 +1,7 @@
+// Git plumbing: probes + mutating primitives (this file) and .gitignore
+// helpers (gitignore submodule).
+pub(crate) mod gitignore;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 

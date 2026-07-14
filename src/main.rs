@@ -4,24 +4,17 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
-mod apply;
 mod cli;
 mod git;
-mod gitignore;
-mod menu;
-mod migrate;
 mod pack;
-mod pattern;
-mod repo_scan;
-mod reverse_sync;
-mod style;
-mod superset_files;
-mod ui;
+mod sync;
+mod tui;
 mod update;
+mod workspace;
 #[cfg(test)]
 mod test_support;
 
-use crate::apply::{Event, SkipReason};
+use crate::sync::apply::{Event, SkipReason};
 use crate::cli::{Command, Parsed};
 
 /// Pure gate-decision helper (U8, AE3). Returns `true` when the auto-update
@@ -53,8 +46,8 @@ pub fn should_run_update_gate(cmd: Command, guard_active: bool) -> bool {
 }
 
 fn run() -> Result<ExitCode> {
-    style::init();
-    // Composition order: style::init (above) → parse argv → [help check] →
+    tui::style::init();
+    // Composition order: tui::style::init (above) → parse argv → [help check] →
     // [auto-update gate for Bare/Sync] → dispatch (menu / sync / update).
     // Parsing and the help response happen before the gate so `--help`
     // answers instantly without a network call.
@@ -67,7 +60,7 @@ fn run() -> Result<ExitCode> {
         Parsed::Error(token) => {
             eprintln!(
                 "{}",
-                style::err(format!("error: unknown command `{token}`"))
+                tui::style::err(format!("error: unknown command `{token}`"))
             );
             eprintln!("{}", cli::usage());
             Ok(ExitCode::from(2))
@@ -96,11 +89,11 @@ fn run() -> Result<ExitCode> {
 fn init_noninteractive(patterns: &[String]) -> Result<ExitCode> {
     let cwd = env::current_dir().context("getting current directory")?;
     match git::cwd_repo_root(&cwd) {
-        Ok(repo_root) => migrate::run_init_noninteractive(&repo_root, patterns),
+        Ok(repo_root) => workspace::migrate::run_init_noninteractive(&repo_root, patterns),
         Err(err) => {
             eprintln!(
                 "{}",
-                style::err(format!(
+                tui::style::err(format!(
                     "error: `ss-magic init` must run inside a git repository: {err:#}"
                 ))
             );
@@ -115,7 +108,7 @@ fn init_noninteractive(patterns: &[String]) -> Result<ExitCode> {
 fn dispatch(cmd: Command) -> Result<ExitCode> {
     let cwd = env::current_dir().context("getting current directory")?;
     match cmd {
-        Command::Bare => menu::run(&cwd),
+        Command::Bare => tui::menu::run(&cwd),
         Command::Sync => run_sync_flow(&cwd),
         Command::Pack => run_pack_flow(&cwd),
         Command::Update => update_flow(),
@@ -129,12 +122,12 @@ fn dispatch(cmd: Command) -> Result<ExitCode> {
 ///
 /// `Ok(None)` from `load_overlaid` means the file vanished between the probe and
 /// the load (a race) — reported the same as absent.
-pub fn load_magic_or_exit(root: &Path) -> std::result::Result<superset_files::MagicConfig, ExitCode> {
+pub fn load_magic_or_exit(root: &Path) -> std::result::Result<workspace::superset_files::MagicConfig, ExitCode> {
     let magic_json_path = root.join(".superset/magic.json");
     let absent = || {
         eprintln!(
             "{}",
-            style::err(format!(
+            tui::style::err(format!(
                 "error: no `.superset/magic.json` in {}; expected {}",
                 root.display(),
                 magic_json_path.display()
@@ -146,11 +139,11 @@ pub fn load_magic_or_exit(root: &Path) -> std::result::Result<superset_files::Ma
     if !magic_json_path.is_file() {
         return Err(absent());
     }
-    match superset_files::load_overlaid(root) {
+    match workspace::superset_files::load_overlaid(root) {
         Ok(Some(cfg)) => Ok(cfg),
         Ok(None) => Err(absent()),
         Err(err) => {
-            eprintln!("{}", style::err(format!("error: {err:#}")));
+            eprintln!("{}", tui::style::err(format!("error: {err:#}")));
             Err(ExitCode::from(1))
         }
     }
@@ -167,7 +160,7 @@ pub fn run_pack_flow(cwd: &Path) -> Result<ExitCode> {
 fn print_pack_event(ev: &pack::PackEvent) {
     match ev {
         pack::PackEvent::Add { rel } => {
-            println!("{}", style::info(format!("Added: {}", rel.display())));
+            println!("{}", tui::style::info(format!("Added: {}", rel.display())));
         }
     }
 }
@@ -177,7 +170,7 @@ fn print_pack_event(ev: &pack::PackEvent) {
 ///
 /// Resolves the main checkout root, verifies `.superset/magic.json` exists
 /// there, loads the overlaid config (magic.json + magic.local.json), then
-/// runs the existing `apply::run` engine into `cwd`. No git/gh operations,
+/// runs the existing `sync::apply::run` engine into `cwd`. No git/gh operations,
 /// no setup commands.
 ///
 /// Hard errors (non-zero exit):
@@ -200,7 +193,7 @@ where
         Err(err) => {
             eprintln!(
                 "{}",
-                style::err(format!(
+                tui::style::err(format!(
                     "error: cannot resolve git repo root from {}: {err:#}",
                     cwd.display()
                 ))
@@ -215,7 +208,7 @@ where
         Err(err) => {
             eprintln!(
                 "{}",
-                style::err(format!(
+                tui::style::err(format!(
                     "error: cannot resolve main checkout root: {err:#}"
                 ))
             );
@@ -233,16 +226,16 @@ where
     if cfg.files.is_empty() {
         println!(
             "{}",
-            style::info("magic.json `files` is empty — nothing to sync.")
+            tui::style::info("magic.json `files` is empty — nothing to sync.")
         );
         return Ok(ExitCode::SUCCESS);
     }
 
     // 6. Run the apply engine: main_root → cwd_root.
-    let summary = match apply::run(&main_root, &cwd_root, &cfg.files, on_event) {
+    let summary = match sync::apply::run(&main_root, &cwd_root, &cfg.files, on_event) {
         Ok(s) => s,
         Err(err) => {
-            eprintln!("{}", style::err(format!("error: {err:#}")));
+            eprintln!("{}", tui::style::err(format!("error: {err:#}")));
             return Ok(ExitCode::from(1));
         }
     };
@@ -253,9 +246,9 @@ where
     );
     println!();
     if summary.skipped == 0 {
-        println!("{}", style::ok(line));
+        println!("{}", tui::style::ok(line));
     } else {
-        println!("{}", style::warn(line));
+        println!("{}", tui::style::warn(line));
     }
 
     Ok(ExitCode::SUCCESS)
@@ -269,20 +262,20 @@ where
 /// auto-update gate (U8), this does not re-exec — the update itself is the
 /// requested work.
 fn update_flow() -> Result<ExitCode> {
-    style::print_section("Self-update");
+    tui::style::print_section("Self-update");
     match update::update_command() {
         update::UpdateReport::Updated { version } => {
-            println!("{}", style::ok(format!("Updated to v{version}.")));
+            println!("{}", tui::style::ok(format!("Updated to v{version}.")));
             Ok(ExitCode::SUCCESS)
         }
         update::UpdateReport::AlreadyLatest => {
-            println!("{}", style::info("Already on the latest release."));
+            println!("{}", tui::style::info("Already on the latest release."));
             Ok(ExitCode::SUCCESS)
         }
         update::UpdateReport::Skipped => {
             println!(
                 "{}",
-                style::warn(
+                tui::style::warn(
                     "Another update is already in progress; skipped. Try again in a moment."
                 )
             );
@@ -294,19 +287,19 @@ fn update_flow() -> Result<ExitCode> {
 fn print_event(ev: &Event) {
     match ev {
         Event::Copy { rel } => {
-            println!("{}", style::info(format!("Copied: {}", rel.display())));
+            println!("{}", tui::style::info(format!("Copied: {}", rel.display())));
         }
         Event::Skip { reason, label } => {
             let line = format!("Skipped ({}): {label}", reason.label());
             if matches!(reason, SkipReason::Excluded) {
-                println!("{}", style::info(line));
+                println!("{}", tui::style::info(line));
             } else if matches!(reason, SkipReason::NoMatches) {
                 // Default color, like setup.sh.
                 println!("{line}");
             } else if reason.counts() {
-                eprintln!("{}", style::err(line));
+                eprintln!("{}", tui::style::err(line));
             } else {
-                eprintln!("{}", style::warn(line));
+                eprintln!("{}", tui::style::warn(line));
             }
         }
     }
@@ -316,7 +309,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("{}", style::err(format!("error: {err:#}")));
+            eprintln!("{}", tui::style::err(format!("error: {err:#}")));
             ExitCode::from(1)
         }
     }
@@ -358,7 +351,7 @@ mod sync_tests {
     fn write_magic(root: &Path, patterns: &[&str]) {
         fs::create_dir_all(root.join(".superset")).unwrap();
         let files: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
-        let cfg = superset_files::MagicConfig { files };
+        let cfg = workspace::superset_files::MagicConfig { files };
         let body = format!("{}\n", serde_json::to_string_pretty(&cfg).unwrap());
         fs::write(root.join(".superset/magic.json"), body).unwrap();
     }
@@ -484,7 +477,7 @@ mod sync_tests {
         write_magic(main.path(), &[]);
 
         let (_wt, wt_root) = make_worktree(main.path());
-        let mut events: Vec<apply::Event> = Vec::new();
+        let mut events: Vec<sync::apply::Event> = Vec::new();
         let code = sync_core(&wt_root, |e| events.push(e.clone())).unwrap();
         assert_eq!(exit_code_to_u8(code), 0);
         assert!(events.is_empty(), "no events when files is empty");
@@ -560,7 +553,8 @@ mod sync_tests {
 /// and exit-with-child-code behavior is seam-tested in U7 (update/apply.rs).
 #[cfg(test)]
 mod update_gate_tests {
-    use super::*;
+    use crate::cli::Command;
+    use crate::should_run_update_gate;
 
     // ── Gate fires for Bare / Sync when guard is inactive ───────────────────
 

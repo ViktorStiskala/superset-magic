@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// during migration (U9) and bootstrap. Delegates to `ss-magic` via `exec`
 /// when the binary is available; otherwise prints an install hint and exits 0
 /// so Superset's setup pipeline continues uninterrupted.
-pub const MAGIC_SH: &str = include_str!("../assets/magic.sh");
+pub const MAGIC_SH: &str = include_str!("../../assets/magic.sh");
 
 const SUPERSET_DIR: &str = ".superset";
 const CONFIG_JSON: &str = "config.json";

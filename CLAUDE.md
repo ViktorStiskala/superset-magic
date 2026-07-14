@@ -22,9 +22,12 @@ builds) live in README.md.
 ## Architecture
 
 Layered to keep the pure logic unit-testable in isolation from the
-interactive layer:
+interactive layer. Source is grouped by purpose: `git/` (git plumbing),
+`sync/` (the sync engine), `tui/` (interactive layer), `workspace/`
+(`.superset` contract I/O + lifecycle), `update/` (self-update), with
+`main.rs` and `cli.rs` at the root:
 
-- `git.rs` — read-only probes (`is_worktree`, `main_checkout_root`,
+- `git/mod.rs` — read-only probes (`is_worktree`, `main_checkout_root`,
   `cwd_repo_root`, `main_branch_name`, plus the reverse-sync probes
   `untracked_files` (`git ls-files --others` — untracked *including*
   gitignored, since reverse sync pushes gitignored secrets),
@@ -36,7 +39,7 @@ interactive layer:
   `git` and `git_optional` are thin one-liners on top. (The bare
   location-auto `probe`/`Mode` dispatch was removed in U13 — routing is
   now the menu via `is_worktree` + `main_checkout_root`.)
-- `superset_files.rs` — `.superset/{config.json, magic.sh, magic.json,
+- `workspace/superset_files.rs` — `.superset/{config.json, magic.sh, magic.json,
   magic.local.json}` I/O (plus the legacy `setup_config.json` reader).
   `load_config` reads Superset-owned `config.json`;
   `merge_setup_into_config` builds a new `Config` from a new `setup`
@@ -52,26 +55,26 @@ interactive layer:
   materializes the staged `.superset/` tree atomically (files always
   overwritten — preservation happens upstream of the write; `*.sh` are
   chmod 0755'd; a `delete` set strips the retired `setup.sh`).
-- `repo_scan.rs` — `matches_for_patterns(root, &[&str])` walks the
+- `sync/repo_scan.rs` — `matches_for_patterns(root, &[&str])` walks the
   working tree once with a multi-pattern `GlobSet` and returns a bool
   vector aligned to the input. `pattern_matches_any` is the single-
   pattern shortcut used when the user adds a custom pattern in the
   bootstrap picker.
-- `pattern.rs` — shared syntax checks for both the apply/sync
+- `sync/pattern.rs` — shared syntax checks for both the apply/sync
   expansion path and the picker UI validator: `has_glob_meta`,
   `has_parent_segment`, `SyntaxError`, `check_syntax`. One source of
   truth for "is this pattern structurally valid".
-- `apply.rs` — the glob/exclude/copy engine reused by forward `sync`
+- `sync/apply.rs` — the glob/exclude/copy engine reused by forward `sync`
   (and, via `match_paths`, by reverse sync). Delegates syntax checks to
   `pattern::check_syntax`. Emits an `Event` stream via a caller-supplied
   closure so tests can collect events while production prints them.
   (`load_main_config`, the old interactive apply path, was removed in
   U13.)
-- `style.rs` — palette (gray info, bold green ok, bold orange/xterm 208
+- `tui/style.rs` — palette (gray info, bold green ok, bold orange/xterm 208
   warn, bold red err, bold cyan header). One `OnceLock<bool>` captures
   the color decision (NO_COLOR + supports-color). `inquire`'s global
   `RenderConfig` is installed from the same palette.
-- `ui.rs` — `inquire` wrappers. `pick_with_actions` is the shared
+- `tui/ui.rs` — `inquire` wrappers. `pick_with_actions` is the shared
   `Select`-loop driver behind `pick_patterns`; the shared `Row` shape
   carries `dim_suffix: Option<&'static str>` for the `(no matches)`
   flag. `pick_final_action`, `print_pattern_list`, `validate_pattern`
@@ -88,27 +91,27 @@ interactive layer:
   `init [PATTERN...]` parses to `Parsed::Init(patterns)` (carried apart
   from the `Copy` `Command` enum). Pure and unit-testable without
   spawning the process.
-- `menu.rs` — bare-invocation operation menu. Location-gated: main
+- `tui/menu.rs` — bare-invocation operation menu. Location-gated: main
   checkout offers init / migrate / edit config; a worktree offers
   forward sync / reverse sync. `Pack` is offered wherever an initialized
   `magic.json` exists (any worktree, or main on a `Normal` branch), so it
   appears in both location lists. Routes selections to their handlers via
   the `Select` driver; Esc/Ctrl-C is inert.
-- `migrate.rs` — detect + migrate/init branching off `config.json`'s
+- `workspace/migrate.rs` — detect + migrate/init branching off `config.json`'s
   `setup` (old `setup.sh` reference → migrate; `magic.sh` marker →
   normal; neither → init). Stages renames/writes/deletes into a tempdir
   and materializes via `copy_into_repo` only after the finishing-action
   prompt. `run_init_noninteractive` is the TUI-free init behind
   `ss-magic init` (writes the layout from CLI patterns, no prompt, not
   gated by auto-update).
-- `reverse_sync.rs` — push git-untracked worktree files matching the
+- `sync/reverse_sync.rs` — push git-untracked worktree files matching the
   overlaid patterns back to main, with a diff-aware picker,
-  parent-dir creation, and gitignore-safety (`gitignore.rs`).
+  parent-dir creation, and gitignore-safety (`git/gitignore.rs`).
 - `pack.rs` — `ss-magic pack`: expand the overlaid `magic.json` patterns
-  against the current git repo root (via `apply::match_paths`) and write
-  the matches — repo-relative — into `ss-magic-files.tar.bz2` at that root.
-  Everything (config source, match target, archive destination) is the one
-  `cwd_repo_root`. `pack_core(cwd, on_event)` mirrors `main::sync_core`'s
+  against the current git repo root (via `sync/apply.rs`'s `match_paths`) and
+  write the matches — repo-relative — into `ss-magic-files.tar.bz2` at that
+  root. Everything (config source, match target, archive destination) is the
+  one `cwd_repo_root`. `pack_core(cwd, on_event)` mirrors `main::sync_core`'s
   control flow (resolve root → probe magic.json → load overlaid → empty
   guard → work) and emits a `PackEvent` stream. `write_archive` tars into a
   bzip2 stream (`bzip2` crate, pure-Rust `libbz2-rs-sys` backend — no C
@@ -120,25 +123,25 @@ interactive layer:
   (`Path::is_dir()` would follow it and archive the target tree); and it
   discards the temp file without touching an existing archive when nothing was
   actually added, so a prior good backup is never replaced by an empty tarball.
-- `gitignore.rs` — `.gitignore` helpers at a git root: `ensure_entry`
+- `git/gitignore.rs` — `.gitignore` helpers at a git root: `ensure_entry`
   appends a line iff no exact match exists (creates the file if absent,
   never reorders); `find_covering_rule` resolves the rule covering a path
-  via `git check-ignore -v` (negations excluded). Used by `migrate.rs`
-  (bootstrap) and `reverse_sync.rs` (secret-safety; verified-then-literal
+  via `git check-ignore -v` (negations excluded). Used by `workspace/migrate.rs`
+  (bootstrap) and `sync/reverse_sync.rs` (secret-safety; verified-then-literal
   fallback so a copied secret is always ignored in main).
 - `update/` — every-invocation self-update: `check.rs` does the
   daily-cached GitHub latest check (ureq, ETag, 5 s timeout, silent
-  fall-through); `apply.rs` does the fd-lock / download / atomic swap /
+  fall-through); `update/apply.rs` does the fd-lock / download / atomic swap /
   spawn-and-wait re-exec via the `self_update` crate. Integrity rests on
   TLS + cargo-dist checksums (no SHA-256-vs-asset-digest check — see the
   KTD5 conformance notes in `update/apply.rs`); `bin_path_in_archive`
   matches cargo-dist's `<bin>-<target>/` tarball layout.
-- `main.rs` — composes everything: `style::init` → `cli::parse` →
+- `main.rs` — composes everything: `tui::style::init` → `cli::parse` →
   [auto-update gate for `Bare`/`Sync`/`Pack`] → `dispatch`. `Bare` routes to
-  `menu::run`; `Sync` runs the non-interactive forward copy
+  `tui::menu::run`; `Sync` runs the non-interactive forward copy
   (`sync_core`); `Pack` runs `pack::pack_core` (`run_pack_flow` +
   `print_pack_event`); `Update` forces a self-update. `print_event` renders
-  the `apply::Event` stream.
+  the `sync::apply::Event` stream.
 
 ## Source of truth for magic.sh
 
@@ -154,7 +157,7 @@ binary is the sole file-copy implementation.)
 - Glob semantics (originally derived from the retired `setup.sh`):
   absolute / `..` rejected, literals must exist, glob-zero-match
   non-fatal, `DEFAULT_EXCLUDES` (`node_modules`, `.venv`) drop matches at
-  any depth. Now owned by `apply.rs` + `pattern.rs`.
+  any depth. Now owned by `sync/apply.rs` + `sync/pattern.rs`.
 - Tests use `tempfile` + shell-invoked `git init` / `git worktree add`.
   Final-action git ops and the interactive menu/pickers have no unit
   tests — validated by manual smoke.

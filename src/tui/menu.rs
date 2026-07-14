@@ -27,10 +27,10 @@ use anyhow::Result;
 use inquire::Select;
 
 use crate::git;
-use crate::migrate::{self, Branch};
-use crate::reverse_sync;
-use crate::style;
-use crate::superset_files;
+use crate::workspace::migrate::{self, Branch};
+use crate::sync::reverse_sync;
+use crate::tui::style;
+use crate::workspace::superset_files;
 
 // ── Operation enum ────────────────────────────────────────────────────────────
 

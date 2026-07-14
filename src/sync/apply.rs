@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use globset::{Glob, GlobMatcher};
 use walkdir::WalkDir;
 
-use crate::pattern::{self, SyntaxError};
+use crate::sync::pattern::{self, SyntaxError};
 
 /// Directory names that drop matches at any depth, matching `setup.sh`.
 const DEFAULT_EXCLUDES: [&str; 2] = ["node_modules", ".venv"];

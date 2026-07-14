@@ -37,11 +37,11 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
-use crate::apply;
+use crate::sync::apply;
 use crate::git;
-use crate::gitignore;
-use crate::style;
-use crate::superset_files;
+use crate::git::gitignore;
+use crate::tui::style;
+use crate::workspace::superset_files;
 
 /// Whether a candidate differs from main (and should be offered in the picker)
 /// or is identical (and is hidden — nothing to push). R24.
@@ -208,7 +208,7 @@ where
         if before.len() != now.len() || before.modified().ok() != now.modified().ok() {
             eprintln!(
                 "{}",
-                crate::style::warn(format!(
+                crate::tui::style::warn(format!(
                     "{} changed in main since the diff was shown — skipped to avoid \
                      clobbering a concurrent edit.",
                     rel.display()
@@ -337,7 +337,7 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
 
     // Hand off to the interactive picker. Selection + per-file overwrite
     // confirm live in `ui`; copying flows through `copy_candidate_into_main`.
-    let selected = crate::ui::pick_reverse_sync(worktree_root, main_root, &offered)?;
+    let selected = crate::tui::ui::pick_reverse_sync(worktree_root, main_root, &offered)?;
     if selected.is_empty() {
         println!();
         println!("{}", style::info("Nothing selected — main untouched."));
@@ -350,7 +350,7 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
         let main_root_for_overwrite = main_root.to_path_buf();
         let wt_root_for_overwrite = worktree_root.to_path_buf();
         let outcome = copy_candidate_into_main(worktree_root, main_root, rel, |rel| {
-            crate::ui::confirm_overwrite_with_diff(
+            crate::tui::ui::confirm_overwrite_with_diff(
                 &wt_root_for_overwrite,
                 &main_root_for_overwrite,
                 rel,

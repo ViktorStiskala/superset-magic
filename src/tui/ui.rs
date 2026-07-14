@@ -11,10 +11,10 @@ use inquire::validator::Validation;
 use inquire::{Confirm, CustomUserError, Select, Text};
 
 use crate::git;
-use crate::pattern;
-use crate::repo_scan;
-use crate::reverse_sync::DiffStatus;
-use crate::style;
+use crate::sync::pattern;
+use crate::sync::repo_scan;
+use crate::sync::reverse_sync::DiffStatus;
+use crate::tui::style;
 
 /// One of the three finishing actions offered at the end of bootstrap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

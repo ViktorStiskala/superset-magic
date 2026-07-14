@@ -34,10 +34,10 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 
 use crate::git;
-use crate::gitignore;
-use crate::superset_files::{self, Config};
-use crate::style;
-use crate::ui::{self, FinalAction};
+use crate::git::gitignore;
+use crate::workspace::superset_files::{self, Config};
+use crate::tui::style;
+use crate::tui::ui::{self, FinalAction};
 
 /// Marker substring identifying the retired `setup.sh` reference in a
 /// `config.json` `setup` entry (e.g. `./.superset/setup.sh`).
@@ -311,8 +311,8 @@ pub fn build_pattern_options(
     existing_magic_files: &[String],
     fs_match: &[bool],
 ) -> (Vec<String>, Vec<usize>) {
-    use crate::repo_scan::OPTIONS;
-    use crate::superset_files::existing_unknown_entries;
+    use crate::sync::repo_scan::OPTIONS;
+    use crate::workspace::superset_files::existing_unknown_entries;
 
     debug_assert_eq!(
         fs_match.len(),
@@ -369,8 +369,8 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
         .unwrap_or_default();
 
     // Precompute filesystem hits for the preconfigured OPTIONS.
-    let options_strs: Vec<&str> = crate::repo_scan::OPTIONS.to_vec();
-    let fs_match = crate::repo_scan::matches_for_patterns(repo_root, &options_strs)?;
+    let options_strs: Vec<&str> = crate::sync::repo_scan::OPTIONS.to_vec();
+    let fs_match = crate::sync::repo_scan::matches_for_patterns(repo_root, &options_strs)?;
 
     let (options, preselected) = build_pattern_options(&existing_magic_files, &fs_match);
 
@@ -1087,7 +1087,7 @@ mod tests {
 
     /// Helper: all-false fs_match vector (no filesystem hits).
     fn no_fs_hits() -> Vec<bool> {
-        vec![false; crate::repo_scan::OPTIONS.len()]
+        vec![false; crate::sync::repo_scan::OPTIONS.len()]
     }
 
     /// First-time init (no existing magic.json) → only OPTIONS, preselect only
@@ -1097,7 +1097,7 @@ mod tests {
         let (options, preselected) = build_pattern_options(&[], &no_fs_hits());
         // Options must be exactly the preconfigured OPTIONS.
         let expected_opts: Vec<String> =
-            crate::repo_scan::OPTIONS.iter().map(|s| s.to_string()).collect();
+            crate::sync::repo_scan::OPTIONS.iter().map(|s| s.to_string()).collect();
         assert_eq!(options, expected_opts, "first-time init must yield only OPTIONS");
         assert!(
             preselected.is_empty(),
@@ -1112,7 +1112,7 @@ mod tests {
         let mut fs_match = no_fs_hits();
         fs_match[1] = true;
         let (options, preselected) = build_pattern_options(&[], &fs_match);
-        assert_eq!(options.len(), crate::repo_scan::OPTIONS.len());
+        assert_eq!(options.len(), crate::sync::repo_scan::OPTIONS.len());
         assert_eq!(preselected, vec![1], "only the fs-hit index must be preselected");
     }
 
@@ -1123,7 +1123,7 @@ mod tests {
         // ".env" is OPTIONS[0]; mark it as present in the existing magic.json.
         let existing = vec![".env".to_string()];
         let (options, preselected) = build_pattern_options(&existing, &no_fs_hits());
-        assert_eq!(options.len(), crate::repo_scan::OPTIONS.len());
+        assert_eq!(options.len(), crate::sync::repo_scan::OPTIONS.len());
         assert!(
             preselected.contains(&0),
             "OPTIONS[0] (.env) is in existing magic.json → must be preselected; got {preselected:?}"
@@ -1131,7 +1131,7 @@ mod tests {
         // Custom count is zero — no extra options appended.
         assert_eq!(
             options.len(),
-            crate::repo_scan::OPTIONS.len(),
+            crate::sync::repo_scan::OPTIONS.len(),
             "no custom patterns → options length must equal OPTIONS.len()"
         );
     }
@@ -1146,7 +1146,7 @@ mod tests {
         ];
         let (options, preselected) = build_pattern_options(&existing, &no_fs_hits());
 
-        let opts_len = crate::repo_scan::OPTIONS.len();
+        let opts_len = crate::sync::repo_scan::OPTIONS.len();
         // Custom entries appended after the four OPTIONS.
         assert_eq!(
             options.len(),
@@ -1176,7 +1176,7 @@ mod tests {
         let existing = vec!["**/.env".to_string(), "apps/*/.secrets".to_string()];
         let (options, preselected) = build_pattern_options(&existing, &no_fs_hits());
 
-        let opts_len = crate::repo_scan::OPTIONS.len();
+        let opts_len = crate::sync::repo_scan::OPTIONS.len();
         // Only one custom pattern (apps/*/.secrets); "**/.env" is an OPTION.
         assert_eq!(
             options.len(),
@@ -1203,7 +1203,7 @@ mod tests {
         let existing = vec![".env".to_string(), "custom/secret".to_string()];
         let (options, preselected) = build_pattern_options(&existing, &fs_match);
 
-        let opts_len = crate::repo_scan::OPTIONS.len();
+        let opts_len = crate::sync::repo_scan::OPTIONS.len();
         assert_eq!(options.len(), opts_len + 1, "one custom entry expected");
         assert_eq!(options[opts_len], "custom/secret");
 

@@ -175,7 +175,7 @@ pub fn reexec_and_exit<S: Spawner>(spawner: &S) -> ! {
         Err(e) => {
             eprintln!(
                 "{}",
-                crate::style::err(format!(
+                crate::tui::style::err(format!(
                     "error: self-update replaced the binary but could not resolve the new \
                      executable to run ({e}); the requested work did NOT run. Re-run ss-magic."
                 ))
@@ -188,7 +188,7 @@ pub fn reexec_and_exit<S: Spawner>(spawner: &S) -> ! {
         Err(e) => {
             eprintln!(
                 "{}",
-                crate::style::err(format!(
+                crate::tui::style::err(format!(
                     "error: self-update replaced the binary but re-executing it failed ({e}); \
                      the requested work did NOT run. Re-run ss-magic."
                 ))

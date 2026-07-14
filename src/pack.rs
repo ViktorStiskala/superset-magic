@@ -24,9 +24,9 @@ use bzip2::write::BzEncoder;
 use bzip2::Compression;
 use tempfile::NamedTempFile;
 
-use crate::apply;
+use crate::sync::apply;
 use crate::git;
-use crate::style;
+use crate::tui::style;
 
 /// Name of the archive written at the git root.
 pub const PACK_FILE_NAME: &str = "ss-magic-files.tar.bz2";
@@ -245,7 +245,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::superset_files;
+    use crate::workspace::superset_files;
     use crate::test_support::git_run;
     use std::collections::BTreeSet;
     use std::fs;
