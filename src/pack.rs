@@ -1,7 +1,8 @@
 //! The pack engine: expand the sync patterns from the overlaid `magic.json`,
 //! collect every matching file/directory from the current git repo root, and
 //! write them — preserving repo-relative structure — into a single
-//! `ss-magic-files.tar.bz2` at the git root.
+//! `ss-magic-<repo>.tar.bz2` at the git root (name derived by
+//! [`archive_file_name`]).
 //!
 //! This reuses the existing seams verbatim:
 //! - [`git::cwd_repo_root`] resolves the repo root (config source, match target,
@@ -16,20 +17,144 @@
 //! The control flow deliberately mirrors `main::sync_core`: resolve root →
 //! probe `magic.json` → load overlaid config → empty-guard → do work.
 
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{ExitCode, Stdio};
 
 use anyhow::{Context, Result};
 use bzip2::write::BzEncoder;
 use bzip2::Compression;
 use tempfile::NamedTempFile;
 
-use crate::apply;
+use crate::sync::apply;
 use crate::git;
-use crate::style;
+use crate::tui::style;
 
-/// Name of the archive written at the git root.
-pub const PACK_FILE_NAME: &str = "ss-magic-files.tar.bz2";
+/// Archive file name for `root`: `ss-magic-<stem>.tar.bz2`.
+///
+/// The stem is derived from the `origin` remote when one is configured
+/// (normalized so every URL form of the same repo yields the same name), and
+/// falls back to the primary (main) worktree directory's basename otherwise —
+/// e.g. `ss-magic-viktorstiskala_upx-cz.tar.bz2` for any origin form of
+/// `github.com/ViktorStiskala/upx.cz`, or `ss-magic-upx-cz.tar.bz2` for an
+/// origin-less checkout at `.../upx.cz`. A last-resort `files` stem preserves
+/// the legacy name shape when neither source yields usable characters.
+pub fn archive_file_name(root: &Path) -> String {
+    let stem = git::origin_url(root)
+        .ok()
+        .flatten()
+        .and_then(|url| stem_from_origin(&url))
+        .or_else(|| {
+            let main_root = git::main_checkout_root(root).unwrap_or_else(|_| root.to_path_buf());
+            main_root
+                .file_name()
+                .map(|n| sanitize_segment(&n.to_string_lossy()))
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "files".to_string());
+    format!("ss-magic-{stem}.tar.bz2")
+}
+
+/// Normalize a git remote URL into a filename stem.
+///
+/// Strips the scheme (`https://`, `ssh://`, `git://`, …), userinfo, host, and
+/// port; drops a trailing `.git`; lowercases; maps every non-alphanumeric run
+/// inside a path segment to a single `-`; joins path segments with `_`. The
+/// scp-like form (`git@host:owner/repo`) and a scheme form of the same remote
+/// produce identical stems, and nested paths (GitLab groups) keep every
+/// segment: `gitlab.com/group/sub/repo` → `group_sub_repo`. A local-path
+/// origin — bare (`/srv/git/repo.git`) or `file://` — contributes only its
+/// final segment, so local directory hierarchies never leak into the archive
+/// name. Returns `None` when nothing usable remains.
+fn stem_from_origin(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    // Split off the scheme, then the host: with a scheme the host ends at the
+    // first `/`; without one, the scp-like `[user@]host:path` uses the first
+    // `:`. A `file://` or bare local path has no host — only the basename
+    // identifies the repo (the rest is local filesystem hierarchy).
+    let path = if let Some(rest) = url.strip_prefix("file://") {
+        final_segment(rest)
+    } else if let Some(i) = url.find("://") {
+        url[i + 3..].split_once('/')?.1
+    } else if let Some((_host, path)) = url.split_once(':') {
+        path
+    } else {
+        final_segment(url)
+    };
+    let trimmed = path.trim_matches('/');
+    let path = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+
+    let segments: Vec<String> = path
+        .split('/')
+        .map(sanitize_segment)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return None;
+    }
+    Some(segments.join("_"))
+}
+
+/// Final `/`-separated segment of a path-like string (the whole string when
+/// it contains no `/`).
+fn final_segment(s: &str) -> &str {
+    s.rfind('/').map_or(s, |i| &s[i + 1..])
+}
+
+/// Lowercase `seg` and collapse every run of non-alphanumeric characters
+/// (dots, spaces, unicode, …) into a single `-`, trimming the edges — so a
+/// repo named `upx.cz` becomes `upx-cz`. `_` is reserved as the segment
+/// joiner, so it too maps to `-` here.
+fn sanitize_segment(seg: &str) -> String {
+    let mut out = String::with_capacity(seg.len());
+    let mut pending_dash = false;
+    for ch in seg.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            pending_dash = true;
+        }
+    }
+    out
+}
+
+/// Copy `text` to the system clipboard by piping it to the first available
+/// clipboard tool (`pbcopy` on macOS; `wl-copy`/`xclip`/`xsel` on Linux).
+/// Returns whether a tool accepted the text. Deliberately *not* called from
+/// `pack_core` — it is a rendering-layer side effect (`main.rs`), so the pure
+/// engine and its tests never touch the user's clipboard.
+pub fn copy_to_clipboard(text: &str) -> bool {
+    const TOOLS: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for (tool, args) in TOOLS {
+        let child = std::process::Command::new(tool)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else { continue }; // tool not installed
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            continue;
+        };
+        let wrote = stdin.write_all(text.as_bytes()).is_ok();
+        drop(stdin); // close the pipe so the tool can exit
+        match child.wait() {
+            Ok(status) if wrote && status.success() => return true,
+            _ => continue,
+        }
+    }
+    false
+}
 
 /// Per-entry event emitted while building the archive. Callers convert these to
 /// user-facing output (`main.rs`) or assertions (tests) — same closure-driven
@@ -38,13 +163,17 @@ pub const PACK_FILE_NAME: &str = "ss-magic-files.tar.bz2";
 pub enum PackEvent {
     /// A file or directory was added to the archive at `rel`.
     Add { rel: PathBuf },
+    /// The archive was written and persisted: `count` entries at `out_path`.
+    /// The rendering layer owns the summary line, the `tar` extraction hint,
+    /// and the clipboard copy of the archive's real path.
+    Done { out_path: PathBuf, count: usize },
 }
 
 /// Core pack flow, shared by `ss-magic pack` and the interactive menu.
 ///
 /// Resolves the current repo root, verifies `.superset/magic.json` exists there,
 /// loads the overlaid config, expands the patterns against that root, and writes
-/// the matched files into `<root>/ss-magic-files.tar.bz2` with repo-relative
+/// the matched files into `<root>/ss-magic-<repo>.tar.bz2` (see [`archive_file_name`]) with repo-relative
 /// paths. Extracted as `pack_core` (taking an `on_event` closure) so tests can
 /// collect events without side effects on stdout.
 ///
@@ -97,13 +226,18 @@ where
         }
     };
 
-    // 6. Never pack the output archive into itself (KTD3): drop a match equal
-    //    to the archive name at the repo root, so a broad user pattern like
-    //    `*.bz2` can't recurse the archive. Also drop any match that resolves to
-    //    the repo root itself (a `.` pattern): `append_dir_all(".", root)` would
-    //    walk the whole tree live — including the in-progress temp archive and
-    //    `.git` — corrupting the archive and bypassing the self-exclusion guard.
-    rels.retain(|r| r != Path::new(PACK_FILE_NAME) && !is_repo_root_rel(r));
+    // 6. Never pack a pack archive into itself (KTD3): drop every root-level
+    //    match shaped `ss-magic-*.tar.bz2`, so a broad user pattern like
+    //    `*.bz2` can't recurse the output — covering the current derived name,
+    //    the pre-0.3 fixed `ss-magic-files.tar.bz2`, AND archives left under a
+    //    *previous* derived name (the origin remote can change between packs;
+    //    a stale snapshot of secrets must never nest into a new archive). Also
+    //    drop any match that resolves to the repo root itself (a `.` pattern):
+    //    `append_dir_all(".", root)` would walk the whole tree live — including
+    //    the in-progress temp archive and `.git` — corrupting the archive and
+    //    bypassing the self-exclusion guard.
+    let file_name = archive_file_name(&root);
+    rels.retain(|r| !is_pack_archive_rel(r) && !is_repo_root_rel(r));
 
     // 7. Nothing left to archive after filtering → success, no archive written.
     if rels.is_empty() {
@@ -114,8 +248,8 @@ where
         return Ok(ExitCode::SUCCESS);
     }
 
-    // 8. Build the archive at <root>/ss-magic-files.tar.bz2.
-    let out_path = root.join(PACK_FILE_NAME);
+    // 8. Build the archive at <root>/<derived name> (see `archive_file_name`).
+    let out_path = root.join(&file_name);
     let count = match write_archive(&root, &rels, &out_path, &mut on_event) {
         Ok(n) => n,
         Err(err) => {
@@ -134,15 +268,26 @@ where
         return Ok(ExitCode::SUCCESS);
     }
 
-    println!();
-    println!(
-        "{}",
-        style::ok(format!(
-            "Packed {count} entries → {}",
-            out_path.display()
-        ))
-    );
+    // Summary rendering (count line, tar hint, clipboard copy) is the
+    // caller's job — tests collect this event without side effects.
+    on_event(&PackEvent::Done { out_path, count });
     Ok(ExitCode::SUCCESS)
+}
+
+/// Whether a relative match is a pack archive at the repo root — any
+/// root-level `ss-magic-*.tar.bz2`, which covers the current derived name,
+/// the legacy fixed name, and archives produced under a previous derived name
+/// (origin remotes change). Deeper matches (`sub/ss-magic-x.tar.bz2`) are not
+/// pack outputs and stay packable.
+fn is_pack_archive_rel(rel: &Path) -> bool {
+    let root_level = rel
+        .parent()
+        .is_none_or(|p| p.as_os_str().is_empty());
+    root_level
+        && rel
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("ss-magic-") && n.ends_with(".tar.bz2"))
 }
 
 /// Whether a relative match resolves to the repo root itself — i.e. every
@@ -243,406 +388,4 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::superset_files;
-    use crate::test_support::git_run;
-    use std::collections::BTreeSet;
-    use std::fs;
-    use std::io::Read;
-    use std::process::ExitCode;
-    use tempfile::TempDir;
-
-    fn exit_ok(code: ExitCode) -> bool {
-        code == ExitCode::SUCCESS
-    }
-
-    /// Init a git repo with one commit so `cwd_repo_root` resolves.
-    fn init_repo() -> TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        git_run(&["init", "-q", "-b", "main"], dir.path());
-        crate::test_support::neutralize_global_excludes(dir.path());
-        fs::write(dir.path().join("README.md"), "hi").unwrap();
-        git_run(&["add", "."], dir.path());
-        git_run(&["commit", "-q", "-m", "init"], dir.path());
-        dir
-    }
-
-    fn write_magic(root: &Path, patterns: &[&str]) {
-        fs::create_dir_all(root.join(".superset")).unwrap();
-        let files: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
-        let cfg = superset_files::MagicConfig { files };
-        let body = format!("{}\n", serde_json::to_string_pretty(&cfg).unwrap());
-        fs::write(root.join(".superset/magic.json"), body).unwrap();
-    }
-
-    fn write_file(root: &Path, rel: &str, body: &str) {
-        let p = root.join(rel);
-        fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(p, body).unwrap();
-    }
-
-    /// Decompress `<root>/ss-magic-files.tar.bz2` and return the set of file
-    /// entry paths (directories are represented by their contained files).
-    fn archive_entries(root: &Path) -> BTreeSet<String> {
-        let f = fs::File::open(root.join(PACK_FILE_NAME)).unwrap();
-        let dec = bzip2::read::BzDecoder::new(f);
-        let mut ar = tar::Archive::new(dec);
-        let mut out = BTreeSet::new();
-        for entry in ar.entries().unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path().unwrap().to_string_lossy().to_string();
-            // Record only file entries (skip bare directory headers).
-            if entry.header().entry_type().is_file() {
-                out.insert(path);
-            }
-        }
-        out
-    }
-
-    /// Read a single file's bytes out of the archive.
-    fn archive_read(root: &Path, rel: &str) -> Option<String> {
-        let f = fs::File::open(root.join(PACK_FILE_NAME)).unwrap();
-        let dec = bzip2::read::BzDecoder::new(f);
-        let mut ar = tar::Archive::new(dec);
-        for entry in ar.entries().unwrap() {
-            let mut entry = entry.unwrap();
-            let path = entry.path().unwrap().to_string_lossy().to_string();
-            if path == rel {
-                let mut s = String::new();
-                entry.read_to_string(&mut s).unwrap();
-                return Some(s);
-            }
-        }
-        None
-    }
-
-    // ── Happy paths ────────────────────────────────────────────────────────
-
-    #[test]
-    fn packs_literal_file_with_matching_bytes() {
-        let repo = init_repo();
-        write_magic(repo.path(), &[".env"]);
-        write_file(repo.path(), ".env", "FOO=1\n");
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(exit_ok(code), "pack_core must succeed");
-        assert!(
-            repo.path().join(PACK_FILE_NAME).is_file(),
-            "archive must exist at git root"
-        );
-        assert_eq!(archive_read(repo.path(), ".env").as_deref(), Some("FOO=1\n"));
-    }
-
-    #[test]
-    fn packs_glob_matches_at_depth() {
-        let repo = init_repo();
-        write_magic(repo.path(), &["**/.dev.vars"]);
-        write_file(repo.path(), "apps/api/.dev.vars", "A=1\n");
-        write_file(repo.path(), "apps/web/.dev.vars", "B=2\n");
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(exit_ok(code));
-        let entries = archive_entries(repo.path());
-        assert!(entries.contains("apps/api/.dev.vars"), "got {entries:?}");
-        assert!(entries.contains("apps/web/.dev.vars"), "got {entries:?}");
-    }
-
-    #[test]
-    fn preserves_repo_relative_structure_not_flattened_or_absolute() {
-        let repo = init_repo();
-        write_magic(repo.path(), &["**/.env"]);
-        write_file(repo.path(), "a/b/c/.env", "DEEP=1\n");
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(exit_ok(code));
-        let entries = archive_entries(repo.path());
-        assert!(
-            entries.contains("a/b/c/.env"),
-            "path must be repo-relative and nested, got {entries:?}"
-        );
-        assert!(
-            !entries.iter().any(|e| e.starts_with('/')),
-            "no absolute paths in archive, got {entries:?}"
-        );
-    }
-
-    #[test]
-    fn packs_matched_directory_recursively() {
-        let repo = init_repo();
-        write_magic(repo.path(), &["apps/api/config"]);
-        write_file(repo.path(), "apps/api/config/a.toml", "a");
-        write_file(repo.path(), "apps/api/config/sub/b.toml", "b");
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(exit_ok(code));
-        let entries = archive_entries(repo.path());
-        assert!(entries.contains("apps/api/config/a.toml"), "got {entries:?}");
-        assert!(
-            entries.contains("apps/api/config/sub/b.toml"),
-            "got {entries:?}"
-        );
-    }
-
-    #[test]
-    fn add_events_emitted_per_entry() {
-        let repo = init_repo();
-        write_magic(repo.path(), &[".env", "config.toml"]);
-        write_file(repo.path(), ".env", "x");
-        write_file(repo.path(), "config.toml", "y");
-
-        let mut events: Vec<PackEvent> = Vec::new();
-        let code = pack_core(repo.path(), |e| events.push(e.clone())).unwrap();
-        assert!(exit_ok(code));
-        assert_eq!(events.len(), 2, "one Add event per entry, got {events:?}");
-    }
-
-    // ── Excludes inherited from match_paths ─────────────────────────────────
-
-    #[test]
-    fn excludes_node_modules_and_venv() {
-        let repo = init_repo();
-        write_magic(repo.path(), &["**/.env"]);
-        write_file(repo.path(), "apps/api/.env", "ok\n");
-        write_file(repo.path(), "node_modules/pkg/.env", "drop\n");
-        write_file(repo.path(), ".venv/lib/.env", "drop\n");
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(exit_ok(code));
-        let entries = archive_entries(repo.path());
-        assert!(entries.contains("apps/api/.env"), "got {entries:?}");
-        assert!(
-            !entries.iter().any(|e| e.contains("node_modules")),
-            "node_modules must be excluded, got {entries:?}"
-        );
-        assert!(
-            !entries.iter().any(|e| e.contains(".venv")),
-            ".venv must be excluded, got {entries:?}"
-        );
-    }
-
-    // ── Empty / error paths ─────────────────────────────────────────────────
-
-    #[test]
-    fn empty_files_writes_no_archive() {
-        let repo = init_repo();
-        write_magic(repo.path(), &[]);
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(exit_ok(code), "empty files is success");
-        assert!(
-            !repo.path().join(PACK_FILE_NAME).exists(),
-            "no archive when files is empty"
-        );
-    }
-
-    #[test]
-    fn no_matches_writes_no_archive() {
-        let repo = init_repo();
-        // Pattern is valid but nothing on disk matches.
-        write_magic(repo.path(), &["**/.env"]);
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(exit_ok(code));
-        assert!(
-            !repo.path().join(PACK_FILE_NAME).exists(),
-            "no archive when nothing matches"
-        );
-    }
-
-    #[test]
-    fn missing_magic_json_is_hard_error() {
-        let repo = init_repo();
-        // No magic.json written.
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(!exit_ok(code), "must exit non-zero when magic.json absent");
-    }
-
-    #[test]
-    fn malformed_magic_json_is_hard_error() {
-        let repo = init_repo();
-        fs::create_dir_all(repo.path().join(".superset")).unwrap();
-        fs::write(repo.path().join(".superset/magic.json"), "{bad json").unwrap();
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(!exit_ok(code), "must exit non-zero on malformed magic.json");
-    }
-
-    #[test]
-    fn outside_git_repo_is_hard_error() {
-        let dir = tempfile::tempdir().unwrap();
-        // No git init.
-        let code = pack_core(dir.path(), |_| {}).unwrap();
-        assert!(!exit_ok(code), "must exit non-zero when not in a git repo");
-    }
-
-    // ── Symlink safety (must not dereference — mirrors apply.rs) ─────────────
-
-    /// A symlink inside a matched directory pointing OUTSIDE the repo must be
-    /// stored as a symlink entry, never dereferenced — otherwise the target's
-    /// bytes (e.g. a secret) leak into the archive.
-    #[cfg(unix)]
-    #[test]
-    fn symlink_in_matched_dir_is_not_dereferenced() {
-        use std::os::unix::fs::symlink;
-        let repo = init_repo();
-        write_magic(repo.path(), &["bundle"]);
-        // A secret living outside the repo root.
-        let outside = tempfile::tempdir().unwrap();
-        let secret = outside.path().join("secret.txt");
-        fs::write(&secret, "TOPSECRET\n").unwrap();
-        // A matched directory containing a real file and a symlink to the secret.
-        write_file(repo.path(), "bundle/real.txt", "ok\n");
-        symlink(&secret, repo.path().join("bundle/leak")).unwrap();
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(exit_ok(code));
-        // The real file is packed as a normal file...
-        assert!(archive_entries(repo.path()).contains("bundle/real.txt"));
-        // ...and the secret bytes must NOT appear anywhere as file content.
-        let f = fs::File::open(repo.path().join(PACK_FILE_NAME)).unwrap();
-        let mut ar = tar::Archive::new(bzip2::read::BzDecoder::new(f));
-        for entry in ar.entries().unwrap() {
-            let mut entry = entry.unwrap();
-            if entry.path().unwrap().to_string_lossy() == "bundle/leak" {
-                assert!(
-                    entry.header().entry_type().is_symlink(),
-                    "leak must be a symlink entry, not a dereferenced file"
-                );
-            }
-            if entry.header().entry_type().is_file() {
-                let mut s = String::new();
-                entry.read_to_string(&mut s).unwrap();
-                assert!(!s.contains("TOPSECRET"), "secret bytes leaked into archive");
-            }
-        }
-    }
-
-    /// A broken symlink inside a matched directory must not abort the pack.
-    #[cfg(unix)]
-    #[test]
-    fn broken_symlink_in_matched_dir_does_not_abort() {
-        use std::os::unix::fs::symlink;
-        let repo = init_repo();
-        write_magic(repo.path(), &["bundle"]);
-        write_file(repo.path(), "bundle/real.txt", "ok\n");
-        symlink("does/not/exist", repo.path().join("bundle/dangling")).unwrap();
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(exit_ok(code), "broken symlink must not abort the pack");
-        assert!(archive_entries(repo.path()).contains("bundle/real.txt"));
-    }
-
-    /// A top-level matched entry that is a symlink to a directory must be
-    /// stored as a symlink entry, NOT followed — otherwise `append_dir_all`
-    /// would walk the link target's tree and pull files outside the repo in.
-    #[cfg(unix)]
-    #[test]
-    fn top_level_symlink_dir_is_not_followed() {
-        use std::os::unix::fs::symlink;
-        let repo = init_repo();
-        // An outside directory whose files must NOT end up in the archive.
-        let outside = tempfile::tempdir().unwrap();
-        fs::create_dir_all(outside.path().join("sub")).unwrap();
-        fs::write(outside.path().join("sub/outside_secret.txt"), "LEAK\n").unwrap();
-        // A top-level match that is a symlink pointing at that outside dir.
-        symlink(outside.path(), repo.path().join("linkdir")).unwrap();
-        write_magic(repo.path(), &["linkdir", ".env"]);
-        write_file(repo.path(), ".env", "x");
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(exit_ok(code));
-        let entries = archive_entries(repo.path());
-        assert!(entries.contains(".env"), "real match still packed, got {entries:?}");
-        assert!(
-            !entries.iter().any(|e| e.contains("outside_secret.txt")),
-            "symlink target tree must not be archived, got {entries:?}"
-        );
-        // `linkdir` itself is stored as a symlink entry, not a directory.
-        let f = fs::File::open(repo.path().join(PACK_FILE_NAME)).unwrap();
-        let mut ar = tar::Archive::new(bzip2::read::BzDecoder::new(f));
-        let mut saw_symlink = false;
-        for entry in ar.entries().unwrap() {
-            let entry = entry.unwrap();
-            if entry.path().unwrap().to_string_lossy() == "linkdir" {
-                assert!(
-                    entry.header().entry_type().is_symlink(),
-                    "linkdir must be a symlink entry, not a followed directory"
-                );
-                saw_symlink = true;
-            }
-        }
-        assert!(saw_symlink, "linkdir must appear in the archive as a symlink");
-    }
-
-    // ── Empty-archive guard (no clobber when nothing was added) ─────────────
-
-    /// When every entry is skipped (here: a path that vanished after
-    /// expansion), write_archive must add nothing AND leave any existing
-    /// archive untouched — never replace a good backup with an empty tarball.
-    #[test]
-    fn write_archive_skips_vanished_entry_and_preserves_existing() {
-        let repo = init_repo();
-        let out = repo.path().join(PACK_FILE_NAME);
-        // A pre-existing "good backup" that must survive intact.
-        fs::write(&out, b"GOODBACKUP").unwrap();
-        // A rel that does not exist on disk (vanished between match and pack).
-        let rels = vec![PathBuf::from("gone.txt")];
-
-        let n = write_archive(repo.path(), &rels, &out, &mut |_| {}).unwrap();
-        assert_eq!(n, 0, "a vanished entry adds nothing");
-        assert_eq!(
-            fs::read(&out).unwrap(),
-            b"GOODBACKUP",
-            "existing archive must be preserved, not clobbered by an empty one"
-        );
-    }
-
-    // ── Repo-root (`.`) guard ───────────────────────────────────────────────
-
-    /// A `.` pattern resolves to the repo root; it must be dropped rather than
-    /// packing the whole tree (and the in-progress temp archive) into itself.
-    #[test]
-    fn dot_pattern_resolving_to_root_is_dropped() {
-        let repo = init_repo();
-        write_magic(repo.path(), &[".", ".env"]);
-        write_file(repo.path(), ".env", "x");
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(exit_ok(code));
-        let entries = archive_entries(repo.path());
-        // The real match is still packed...
-        assert!(entries.contains(".env"), "got {entries:?}");
-        // ...but nothing from the `.` (whole-tree) walk: no .git, no README, and
-        // crucially no temp-archive bytes recursed in.
-        assert!(
-            !entries.iter().any(|e| e.starts_with(".git/") || e == "README.md"),
-            "`.` must not pack the whole tree, got {entries:?}"
-        );
-        assert!(
-            !entries.contains(PACK_FILE_NAME),
-            "archive must not contain itself, got {entries:?}"
-        );
-    }
-
-    // ── Self-exclusion (KTD3) ───────────────────────────────────────────────
-
-    #[test]
-    fn does_not_pack_the_archive_into_itself() {
-        let repo = init_repo();
-        // A broad pattern that would otherwise match a stale archive at root.
-        write_magic(repo.path(), &["**/*.bz2", ".env"]);
-        write_file(repo.path(), ".env", "x");
-        // Simulate a leftover archive from a prior run.
-        fs::write(repo.path().join(PACK_FILE_NAME), "stale").unwrap();
-
-        let code = pack_core(repo.path(), |_| {}).unwrap();
-        assert!(exit_ok(code));
-        let entries = archive_entries(repo.path());
-        assert!(
-            !entries.contains(PACK_FILE_NAME),
-            "archive must not contain itself, got {entries:?}"
-        );
-        assert!(entries.contains(".env"), "real match still packed, got {entries:?}");
-    }
-}
+mod tests;

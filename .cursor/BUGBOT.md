@@ -28,7 +28,7 @@ Releases. Tests use `tempfile` + shell-invoked `git init` / `git worktree add`.
 - **All `git` and `gh` interaction shells out via `std::process::Command`** —
   there is NO `git2`/`libgit2`. Flag any addition of `git2`, `gix`, or another
   git-binding crate to `Cargo.toml`. The shared entry point is the `git_raw`
-  helper in `src/git.rs` (surfaces stderr verbatim); `git` and `git_optional`
+  helper in `src/git/mod.rs` (surfaces stderr verbatim); `git` and `git_optional`
   are thin one-liners on top. Flag new git/gh calls that spawn `Command`
   directly instead of routing through these helpers.
 - **The CLI arg parser is hand-rolled in `src/cli.rs`** — there is NO `clap`.
@@ -41,23 +41,23 @@ Releases. Tests use `tempfile` + shell-invoked `git init` / `git worktree add`.
 The codebase is deliberately layered so the pure logic is unit-testable in
 isolation from the interactive TUI. Preserve this boundary.
 
-- Pure/testable modules: `git.rs` (probes + mutating primitives), `cli.rs`
-  (arg parsing), `pattern.rs` (glob syntax checks), `apply.rs` (glob/copy
-  engine), `superset_files.rs` (`.superset/` I/O), `repo_scan.rs` (working-tree
-  scan), `gitignore.rs` (`.gitignore` helpers).
-- Interactive/side-effecting: `menu.rs`, `ui.rs` (`inquire` wrappers),
-  `style.rs` (palette), the finishing-action prompts in `migrate.rs` /
-  `reverse_sync.rs`.
-- `main.rs` composes: `style::init` → `cli::parse` → [auto-update gate for
+- Pure/testable modules: `git/mod.rs` (probes + mutating primitives), `cli.rs`
+  (arg parsing), `sync/pattern.rs` (glob syntax checks), `sync/apply.rs` (glob/copy
+  engine), `workspace/superset_files.rs` (`.superset/` I/O), `sync/repo_scan.rs` (working-tree
+  scan), `git/gitignore.rs` (`.gitignore` helpers).
+- Interactive/side-effecting: `tui/menu.rs`, `tui/ui.rs` (`inquire` wrappers),
+  `tui/style.rs` (palette), the finishing-action prompts in `workspace/migrate.rs` /
+  `sync/reverse_sync.rs`.
+- `main.rs` composes: `tui::style::init` → `cli::parse` → [auto-update gate for
   `Bare`/`Sync`/`Pack`] → `dispatch`.
 
 Flag business/pure logic (glob expansion, config merge, path resolution) added
-directly into `menu.rs`/`ui.rs`/`main.rs` instead of a testable module, and
+directly into `tui/menu.rs`/`tui/ui.rs`/`main.rs` instead of a testable module, and
 flag interactive `inquire` calls introduced into the pure modules.
 
 ## The Event-Stream Pattern
 
-`apply.rs` (`run`) and `pack.rs` (`pack_core`) emit a stream of typed events
+`sync/apply.rs` (`run`) and `pack.rs` (`pack_core`) emit a stream of typed events
 (`apply::Event`, `pack::PackEvent`) through a **caller-supplied closure**, so
 tests can collect events while production (`main.rs`) prints them. Flag new
 engine code that prints directly to stdout/stderr (`println!`/`eprintln!`)
@@ -65,7 +65,7 @@ from inside the pure engine instead of emitting an event — that breaks the
 test seam. User-facing rendering belongs in `main.rs`'s `print_event` /
 `print_pack_event`.
 
-## Glob and Path Semantics (owned by `apply.rs` + `pattern.rs`)
+## Glob and Path Semantics (owned by `sync/apply.rs` + `sync/pattern.rs`)
 
 `pattern::check_syntax` is the single source of truth for "is this pattern
 structurally valid". The engine's rules:
@@ -84,7 +84,7 @@ structurally valid". The engine's rules:
   introduce code that assumes `*` matches a single path component.
 
 Flag any second, divergent glob/exclude implementation — expansion must go
-through `apply.rs` (`run`/`match_paths`) and syntax checks through
+through `sync/apply.rs` (`run`/`match_paths`) and syntax checks through
 `pattern::check_syntax`.
 
 ## Security: Secret Handling and Gitignore Safety
@@ -93,15 +93,15 @@ The files this tool moves are secrets. The main-checkout copy must never become
 committable and must never leak.
 
 - **Reverse sync moves git-untracked (including gitignored) files** from a
-  worktree back to the main checkout (`git ls-files --others` in `git.rs`;
-  `reverse_sync.rs`). When a copied path is not already gitignored in the main
+  worktree back to the main checkout (`git ls-files --others` in `git/mod.rs`;
+  `sync/reverse_sync.rs`). When a copied path is not already gitignored in the main
   checkout, `ss-magic` copies the covering `.gitignore` rule (resolved via
   `git check-ignore -v`, negations excluded) into main's root `.gitignore`,
   falling back to the literal path when no covering rule exists
-  (`gitignore.rs`). Flag any reverse-sync change that writes a secret into the
+  (`git/gitignore.rs`). Flag any reverse-sync change that writes a secret into the
   main checkout WITHOUT ensuring it is gitignored there, or that removes the
   verified-then-literal fallback.
-- `gitignore.rs::ensure_entry` appends a line only if no exact match exists,
+- `git/gitignore.rs::ensure_entry` appends a line only if no exact match exists,
   creates the file if absent, and never reorders. Flag changes that reorder or
   dedupe existing `.gitignore` content.
 - **Pack must not dereference symlinks.** `pack::write_archive` sets
@@ -111,10 +111,18 @@ committable and must never leak.
   hard-aborts on a broken link. Flag any removal of `follow_symlinks(false)`,
   or a new archive-building path that omits it. Note `Path::is_file()` follows
   symlinks, so a top-level `is_file()` guard does NOT substitute for this.
-- **Pack must never archive itself or the whole tree.** `pack_core` drops any
-  match equal to the output name `ss-magic-files.tar.bz2` and any match that
-  resolves to the repo root itself (a `.` pattern) before archiving. Flag
-  removal of either guard.
+- **Pack must never archive itself or the whole tree.** `pack_core` drops
+  every root-level match shaped `ss-magic-*.tar.bz2` (covering the current
+  derived name from `pack::archive_file_name`, the legacy fixed
+  `ss-magic-files.tar.bz2`, and archives left under a previous derived name
+  after an origin change) and any match that resolves to the repo root itself
+  (a `.` pattern) before archiving. Deeper `ss-magic-*.tar.bz2` files are user
+  data and stay packable. Flag removal or narrowing of any of these guards.
+- **Clipboard stays out of the pack engine.** The archive-path clipboard copy
+  (`pack::copy_to_clipboard`) and the extraction-hint output hang off
+  `PackEvent::Done` in `main.rs`'s rendering layer. Flag any clipboard or
+  extra printing side effect added inside `pack_core`/`write_archive` — tests
+  drive those directly and must never mutate the developer's clipboard.
 - **Pack classifies matches with `symlink_metadata` (lstat), not `is_dir()`.**
   `Path::is_dir()`/`is_file()` follow symlinks, so a matched symlink to a
   directory would make `append_dir_all` walk the link's TARGET tree (outside
@@ -125,29 +133,30 @@ committable and must never leak.
   follow links) instead of `symlink_metadata`.
 - **Pack must not write an empty archive or clobber a good one.** When nothing
   is actually added (every match was a special file or vanished after
-  expansion), `write_archive` must discard the temp file and leave any existing
-  `ss-magic-files.tar.bz2` untouched — never rename an empty tarball over a
+  expansion), `write_archive` must discard the temp file and leave any
+  existing archive (the derived `ss-magic-<repo>.tar.bz2`) untouched —
+  never rename an empty tarball over a
   prior good backup, and never report "Packed 0 entries" as success. Flag a
   pack path that persists the temp archive when the added count is zero.
 - Overwrite safety: reverse sync requires a per-file diff + explicit user
   confirmation before overwriting a file that already exists in the main
-  checkout (`ui.rs::confirm_overwrite_with_diff`). Flag a reverse-sync path
+  checkout (`tui/ui.rs::confirm_overwrite_with_diff`). Flag a reverse-sync path
   that overwrites an existing main-checkout file without that confirm.
 
 ## Filesystem Writes: Atomic Staging
 
 - `.superset/` materialisation stages the whole tree in a tempdir and copies it
   into place only after the user confirms the finishing action
-  (`superset_files::copy_into_repo`, driven by `migrate.rs`). `*.sh` files are
+  (`superset_files::copy_into_repo`, driven by `workspace/migrate.rs`). `*.sh` files are
   chmod `0755`; a `delete` set strips retired files (e.g. the old `setup.sh`).
   Flag partial in-place writes to `.superset/` that bypass this staging.
 - `pack::write_archive` writes the archive to a `NamedTempFile` in the git root
   and renames it into place atomically only after the tar+bzip2 stream is fully
   finalised (`into_inner()` then `finish()`). Flag an archive path that writes
-  the final `ss-magic-files.tar.bz2` directly, or that renames before both
-  stream layers are flushed.
+  the final archive (the derived `ss-magic-<repo>.tar.bz2`) directly, or that
+  renames before both stream layers are flushed.
 
-## Config Files (`superset_files.rs`)
+## Config Files (`workspace/superset_files.rs`)
 
 - `config.json` is Superset-owned (`{ setup, teardown, run }`);
   `merge_setup_into_config` builds a new `Config` from a new `setup` array
@@ -191,13 +200,13 @@ embedded source of truth).
 
 ## Style / Output
 
-- All colored output goes through `style.rs` (gray info, bold green ok, bold
+- All colored output goes through `tui/style.rs` (gray info, bold green ok, bold
   orange warn, bold red err, bold cyan header). The color decision (NO_COLOR +
   supports-color) is captured once in a `OnceLock<bool>`. Flag raw ANSI escape
-  codes emitted outside `style.rs`, or output that ignores the NO_COLOR
+  codes emitted outside `tui/style.rs`, or output that ignores the NO_COLOR
   decision.
 - Interactive prompts must be inert on Esc / Ctrl-C (leave the tree untouched
-  and exit success) — `menu.rs` and the pickers follow this. Flag an
+  and exit success) — `tui/menu.rs` and the pickers follow this. Flag an
   interactive path where cancellation mutates the filesystem.
 
 ## Version Bump Discipline (REQUIRED)
@@ -213,8 +222,8 @@ minor (pre-1.0). Flag a behavior-changing PR that does not bump both
 ## Test Requirements
 
 - Tests use `tempfile` for scratch trees and shell-invoked `git init` /
-  `git worktree add` for git fixtures. Pure modules (`cli.rs`, `pattern.rs`,
-  `apply.rs`, `pack.rs`, `superset_files.rs`, `git.rs` probes, `menu.rs`
+  `git worktree add` for git fixtures. Pure modules (`cli.rs`, `sync/pattern.rs`,
+  `sync/apply.rs`, `pack.rs`, `workspace/superset_files.rs`, `git/mod.rs` probes, `tui/menu.rs`
   routing via `operations_for`) have unit tests; the interactive
   menu/pickers and final-action git ops are validated by manual smoke, not
   unit tests.
@@ -224,6 +233,25 @@ minor (pre-1.0). Flag a behavior-changing PR that does not bump both
   paths, exclusions). Flag a behavior-adding PR to a pure module with no test
   changes.
 - Bug fixes SHOULD include a test that reproduces the issue before the fix.
+- Test layout: every module declares `#[cfg(test)] mod tests;` with the body
+  in a dedicated child file (`<module>/tests.rs`); crate-root tests and shared
+  helpers live in `src/tests/` (`sync.rs`, `update_gate.rs`, `support.rs`).
+  Flag a PR that adds an inline `mod tests { ... }` block to a source file
+  instead of a sibling test file.
+- CI (`.github/workflows/ci.yml`) runs `cargo test --locked` on every PR
+  commit and gates cargo-dist releases via `plan-jobs` in
+  `dist-workspace.toml`. Flag hand edits to the generated
+  `.github/workflows/release.yml` (regenerate with the pinned `dist` version
+  instead) and flag `allow-dirty = ["ci"]` additions.
+- Release archives are attested (`github-attestations = true` in
+  `dist-workspace.toml` → `actions/attest` in the release workflow's
+  build-local-artifacts job, signing same-job build output before it
+  transits Actions artifact storage). Flag removal of the
+  `github-attestations` key, removal of the attest step, or a
+  `github-attestations-phase` change away from `build-local-artifacts` —
+  a host/announce-phase attest signs a `download-artifact` merge directory
+  that any job in the run can inject into, so a phase change requires
+  explicit security review, not routine approval.
 
 ## Documentation Sync (REQUIRED)
 

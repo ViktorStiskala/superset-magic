@@ -32,10 +32,13 @@ merge.
 
 ### Pack
 Bundling the files matching the sync patterns from the current git repo root
-into a single `ss-magic-files.tar.bz2` archive at that root, preserving each
-file's repo-relative path. A third operation on the sync patterns alongside
-forward and reverse sync — a portable snapshot of the configured file set (for
-backup, machine transfer, or handoff) rather than a copy between trees.
+into a single `ss-magic-<repo>.tar.bz2` archive at that root, preserving each
+file's repo-relative path. The `<repo>` stem is derived from the normalized
+`origin` remote (owner/path segments joined with `_`), falling back to the
+primary worktree's basename when no origin exists. A third operation on the
+sync patterns alongside forward and reverse sync — a portable snapshot of the
+configured file set (for backup, machine transfer, or handoff) rather than a
+copy between trees.
 
 ### Candidate
 A worktree file eligible for reverse sync: it matches the sync patterns and is
