@@ -7,6 +7,10 @@ use std::io::Read;
 use std::process::ExitCode;
 use tempfile::TempDir;
 
+/// Fixed archive name written by pack before 0.3 — covered by the root-level
+/// `ss-magic-*.tar.bz2` exclusion class; kept here as a regression fixture.
+const LEGACY_PACK_FILE_NAME: &str = "ss-magic-files.tar.bz2";
+
 fn exit_ok(code: ExitCode) -> bool {
     code == ExitCode::SUCCESS
 }
@@ -532,5 +536,76 @@ fn archive_name_prefers_origin_and_falls_back_to_basename() {
         archive_file_name(repo.path()),
         "ss-magic-viktorstiskala_upx-cz.tar.bz2",
         "origin present -> normalized remote"
+    );
+}
+
+/// An archive left under a *previous* derived name (the origin changed
+/// between packs) must not be swept into the new archive by a broad pattern
+/// — same KTD3 class as the current-name and legacy-name guards.
+#[test]
+fn does_not_pack_an_archive_from_a_previous_origin() {
+    let repo = init_repo();
+    write_magic(repo.path(), &["**/*.bz2", ".env"]);
+    write_file(repo.path(), ".env", "x");
+    git_run(
+        &["remote", "add", "origin", "git@github.com:alice/old-name.git"],
+        repo.path(),
+    );
+    let code = pack_core(repo.path(), |_| {}).unwrap();
+    assert!(exit_ok(code));
+    let old_archive = archive_file_name(repo.path());
+    assert!(repo.path().join(&old_archive).is_file());
+
+    // Origin changes; the next pack derives a different name.
+    git_run(
+        &["remote", "set-url", "origin", "git@github.com:bob/new-name.git"],
+        repo.path(),
+    );
+    let code = pack_core(repo.path(), |_| {}).unwrap();
+    assert!(exit_ok(code));
+    let new_archive = archive_file_name(repo.path());
+    assert_ne!(old_archive, new_archive);
+    let entries = archive_entries(repo.path());
+    assert!(
+        !entries.contains(&old_archive),
+        "previous-origin archive must be excluded, got {entries:?}"
+    );
+    assert!(entries.contains(".env"), "real match still packed");
+}
+
+/// Deeper ss-magic-*.tar.bz2 files are not pack outputs and stay packable;
+/// only root-level ones are excluded.
+#[test]
+fn nested_ss_magic_archives_are_still_packable() {
+    let repo = init_repo();
+    write_magic(repo.path(), &["**/*.bz2"]);
+    write_file(repo.path(), "backups/ss-magic-old.tar.bz2", "nested");
+
+    let code = pack_core(repo.path(), |_| {}).unwrap();
+    assert!(exit_ok(code));
+    let entries = archive_entries(repo.path());
+    assert!(
+        entries.contains("backups/ss-magic-old.tar.bz2"),
+        "nested archive is user data, got {entries:?}"
+    );
+}
+
+/// `file://` origins are local paths: only the final segment names the repo,
+/// identical to the equivalent bare path — local directory hierarchy must
+/// never leak into the archive name.
+#[test]
+fn file_scheme_origin_uses_only_the_final_segment() {
+    assert_eq!(
+        stem_from_origin("file:///srv/git/upx.cz.git"),
+        Some("upx-cz".to_string())
+    );
+    assert_eq!(
+        stem_from_origin("file:///srv/git/upx.cz.git"),
+        stem_from_origin("/srv/git/upx.cz.git"),
+    );
+    assert_eq!(
+        stem_from_origin("file:///Users/alice/client/repo.git"),
+        Some("repo".to_string()),
+        "local hierarchy must not leak into the name"
     );
 }

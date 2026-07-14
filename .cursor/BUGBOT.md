@@ -111,12 +111,13 @@ committable and must never leak.
   hard-aborts on a broken link. Flag any removal of `follow_symlinks(false)`,
   or a new archive-building path that omits it. Note `Path::is_file()` follows
   symlinks, so a top-level `is_file()` guard does NOT substitute for this.
-- **Pack must never archive itself or the whole tree.** `pack_core` drops any
-  match equal to the derived output name (`pack::archive_file_name` — from the
-  normalized `origin` remote, falling back to the primary worktree basename),
-  any match equal to the legacy `ss-magic-files.tar.bz2` name, and any match
-  that resolves to the repo root itself (a `.` pattern) before archiving. Flag
-  removal of any of these guards.
+- **Pack must never archive itself or the whole tree.** `pack_core` drops
+  every root-level match shaped `ss-magic-*.tar.bz2` (covering the current
+  derived name from `pack::archive_file_name`, the legacy fixed
+  `ss-magic-files.tar.bz2`, and archives left under a previous derived name
+  after an origin change) and any match that resolves to the repo root itself
+  (a `.` pattern) before archiving. Deeper `ss-magic-*.tar.bz2` files are user
+  data and stay packable. Flag removal or narrowing of any of these guards.
 - **Clipboard stays out of the pack engine.** The archive-path clipboard copy
   (`pack::copy_to_clipboard`) and the extraction-hint output hang off
   `PackEvent::Done` in `main.rs`'s rendering layer. Flag any clipboard or
@@ -132,8 +133,9 @@ committable and must never leak.
   follow links) instead of `symlink_metadata`.
 - **Pack must not write an empty archive or clobber a good one.** When nothing
   is actually added (every match was a special file or vanished after
-  expansion), `write_archive` must discard the temp file and leave any existing
-  `ss-magic-files.tar.bz2` untouched — never rename an empty tarball over a
+  expansion), `write_archive` must discard the temp file and leave any
+  existing archive (the derived `ss-magic-<repo>.tar.bz2`) untouched —
+  never rename an empty tarball over a
   prior good backup, and never report "Packed 0 entries" as success. Flag a
   pack path that persists the temp archive when the added count is zero.
 - Overwrite safety: reverse sync requires a per-file diff + explicit user
@@ -151,8 +153,8 @@ committable and must never leak.
 - `pack::write_archive` writes the archive to a `NamedTempFile` in the git root
   and renames it into place atomically only after the tar+bzip2 stream is fully
   finalised (`into_inner()` then `finish()`). Flag an archive path that writes
-  the final `ss-magic-files.tar.bz2` directly, or that renames before both
-  stream layers are flushed.
+  the final archive (the derived `ss-magic-<repo>.tar.bz2`) directly, or that
+  renames before both stream layers are flushed.
 
 ## Config Files (`workspace/superset_files.rs`)
 

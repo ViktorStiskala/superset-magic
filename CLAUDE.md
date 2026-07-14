@@ -37,7 +37,8 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
 `main.rs` and `cli.rs` at the root:
 
 - `git/mod.rs` — read-only probes (`is_worktree`, `main_checkout_root`,
-  `cwd_repo_root`, `main_branch_name`, plus the reverse-sync probes
+  `cwd_repo_root`, `main_branch_name`, `origin_url` (backs pack's
+  repo-derived archive naming), plus the reverse-sync probes
   `untracked_files` (`git ls-files --others` — untracked *including*
   gitignored, since reverse sync pushes gitignored secrets),
   `is_ignored`, `check_ignore_pattern`,
@@ -94,7 +95,7 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   `docs/solutions/design-patterns/inquire-action-loop-2026-05-26.md`
   for why the pickers are `Select` loops rather than a `MultiSelect`.
 - `cli.rs` — hand-rolled arg parser (no `clap`). `parse(&[String]) ->
-  Parsed` selects `Command::{Bare, Sync, Update}` from the first non-flag
+  Parsed` selects `Command::{Bare, Sync, Pack, Update}` from the first non-flag
   arg (absent → `Bare`), short-circuits `--help`/`-h` to `Parsed::Help`,
   and returns `Parsed::Error(token)` for an unknown subcommand.
   `init [PATTERN...]` parses to `Parsed::Init(patterns)` (carried apart
@@ -134,9 +135,10 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   guard → work) and emits a `PackEvent` stream. `write_archive` tars into a
   bzip2 stream (`bzip2` crate, pure-Rust `libbz2-rs-sys` backend — no C
   toolchain) via a `NamedTempFile` in the root, then persists atomically.
-  Safety: it never packs the output archive into itself — the derived name
-  and the legacy `ss-magic-files.tar.bz2` are both excluded (nor a `.` match
-  that resolves to the repo root); it classifies each match with
+  Safety: it never packs a pack archive into itself — every root-level
+  `ss-magic-*.tar.bz2` match is excluded (current derived name, legacy fixed
+  name, and archives from a previous origin's name; nor a `.` match that
+  resolves to the repo root); it classifies each match with
   `symlink_metadata` (no-follow) so a matched symlink — including one to a
   directory — is stored as a single symlink entry rather than followed
   (`Path::is_dir()` would follow it and archive the target tree); and it

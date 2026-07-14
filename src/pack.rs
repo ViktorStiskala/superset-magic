@@ -30,10 +30,6 @@ use crate::sync::apply;
 use crate::git;
 use crate::tui::style;
 
-/// Fixed archive name written by pack before 0.3. Still excluded from matches
-/// so a stale pre-0.3 archive at the root is never packed into a new one.
-pub const LEGACY_PACK_FILE_NAME: &str = "ss-magic-files.tar.bz2";
-
 /// Archive file name for `root`: `ss-magic-<stem>.tar.bz2`.
 ///
 /// The stem is derived from the `origin` remote when one is configured
@@ -67,19 +63,23 @@ pub fn archive_file_name(root: &Path) -> String {
 /// scp-like form (`git@host:owner/repo`) and a scheme form of the same remote
 /// produce identical stems, and nested paths (GitLab groups) keep every
 /// segment: `gitlab.com/group/sub/repo` → `group_sub_repo`. A local-path
-/// origin (no host) contributes only its final segment. Returns `None` when
-/// nothing usable remains.
+/// origin — bare (`/srv/git/repo.git`) or `file://` — contributes only its
+/// final segment, so local directory hierarchies never leak into the archive
+/// name. Returns `None` when nothing usable remains.
 fn stem_from_origin(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches('/');
     // Split off the scheme, then the host: with a scheme the host ends at the
     // first `/`; without one, the scp-like `[user@]host:path` uses the first
-    // `:`. Neither → a local path, where only the basename identifies the repo.
-    let path = if let Some(i) = url.find("://") {
+    // `:`. A `file://` or bare local path has no host — only the basename
+    // identifies the repo (the rest is local filesystem hierarchy).
+    let path = if let Some(rest) = url.strip_prefix("file://") {
+        final_segment(rest)
+    } else if let Some(i) = url.find("://") {
         url[i + 3..].split_once('/')?.1
     } else if let Some((_host, path)) = url.split_once(':') {
         path
     } else {
-        url.rfind('/').map_or(url, |i| &url[i + 1..])
+        final_segment(url)
     };
     let trimmed = path.trim_matches('/');
     let path = trimmed.strip_suffix(".git").unwrap_or(trimmed);
@@ -93,6 +93,12 @@ fn stem_from_origin(url: &str) -> Option<String> {
         return None;
     }
     Some(segments.join("_"))
+}
+
+/// Final `/`-separated segment of a path-like string (the whole string when
+/// it contains no `/`).
+fn final_segment(s: &str) -> &str {
+    s.rfind('/').map_or(s, |i| &s[i + 1..])
 }
 
 /// Lowercase `seg` and collapse every run of non-alphanumeric characters
@@ -220,18 +226,18 @@ where
         }
     };
 
-    // 6. Never pack the output archive into itself (KTD3): drop a match equal
-    //    to the archive name at the repo root, so a broad user pattern like
-    //    `*.bz2` can't recurse the archive — covering both the derived name and
-    //    a stale pre-0.3 `ss-magic-files.tar.bz2`. Also drop any match that
-    //    resolves to the repo root itself (a `.` pattern): `append_dir_all(".",
-    //    root)` would walk the whole tree live — including the in-progress temp
-    //    archive and `.git` — corrupting the archive and bypassing the
-    //    self-exclusion guard.
+    // 6. Never pack a pack archive into itself (KTD3): drop every root-level
+    //    match shaped `ss-magic-*.tar.bz2`, so a broad user pattern like
+    //    `*.bz2` can't recurse the output — covering the current derived name,
+    //    the pre-0.3 fixed `ss-magic-files.tar.bz2`, AND archives left under a
+    //    *previous* derived name (the origin remote can change between packs;
+    //    a stale snapshot of secrets must never nest into a new archive). Also
+    //    drop any match that resolves to the repo root itself (a `.` pattern):
+    //    `append_dir_all(".", root)` would walk the whole tree live — including
+    //    the in-progress temp archive and `.git` — corrupting the archive and
+    //    bypassing the self-exclusion guard.
     let file_name = archive_file_name(&root);
-    rels.retain(|r| {
-        r != Path::new(&file_name) && r != Path::new(LEGACY_PACK_FILE_NAME) && !is_repo_root_rel(r)
-    });
+    rels.retain(|r| !is_pack_archive_rel(r) && !is_repo_root_rel(r));
 
     // 7. Nothing left to archive after filtering → success, no archive written.
     if rels.is_empty() {
@@ -266,6 +272,22 @@ where
     // caller's job — tests collect this event without side effects.
     on_event(&PackEvent::Done { out_path, count });
     Ok(ExitCode::SUCCESS)
+}
+
+/// Whether a relative match is a pack archive at the repo root — any
+/// root-level `ss-magic-*.tar.bz2`, which covers the current derived name,
+/// the legacy fixed name, and archives produced under a previous derived name
+/// (origin remotes change). Deeper matches (`sub/ss-magic-x.tar.bz2`) are not
+/// pack outputs and stay packable.
+fn is_pack_archive_rel(rel: &Path) -> bool {
+    let root_level = rel
+        .parent()
+        .is_none_or(|p| p.as_os_str().is_empty());
+    root_level
+        && rel
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("ss-magic-") && n.ends_with(".tar.bz2"))
 }
 
 /// Whether a relative match resolves to the repo root itself — i.e. every

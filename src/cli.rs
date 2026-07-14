@@ -49,8 +49,8 @@ Usage: ss-magic [COMMAND]
 Commands:
   (none)    Open the interactive operation menu
   sync      Non-interactive forward file copy (main → current worktree)
-  pack      Archive the configured files into ss-magic-files.tar.bz2 at the
-            git root
+  pack      Archive the configured files into ss-magic-<repo>.tar.bz2 at the
+            git root (name derived from the origin remote)
   update    Force a self-update to the latest release
   init      Initialize .superset (magic.json layout) non-interactively;
             optional file-pattern args become magic.json `files`
