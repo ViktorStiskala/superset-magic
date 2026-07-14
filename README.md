@@ -29,7 +29,7 @@ arm64). Windows is not in the release matrix yet.
 
 ### Verify a release
 
-Releases from v0.2.0 onward attest the platform archives (`ss-magic-<target>.tar.gz`)
+Releases after v0.2.0 attest the platform archives (`ss-magic-<target>.tar.gz`)
 with signed build provenance. This repo is public, so attestations are recorded
 in Sigstore's public [Rekor](https://docs.sigstore.dev/logging/overview/)
 transparency log. Verify a downloaded archive with the
