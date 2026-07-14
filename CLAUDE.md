@@ -161,6 +161,12 @@ binary is the sole file-copy implementation.)
 - Tests use `tempfile` + shell-invoked `git init` / `git worktree add`.
   Final-action git ops and the interactive menu/pickers have no unit
   tests — validated by manual smoke.
+- Test layout: each module declares `#[cfg(test)] mod tests;` with the
+  body in a sibling child file (`<module>/tests.rs`), keeping private-item
+  access. Crate-root tests and shared helpers live in `src/tests/`
+  (`sync.rs`, `update_gate.rs`, `support.rs`). CI (`.github/workflows/
+  ci.yml`) runs the suite on every PR commit and gates cargo-dist releases
+  via `plan-jobs` (see dist-workspace.toml).
 - Always bump the crate version (`version` in `Cargo.toml`, and the
   matching `ss-magic` entry in `Cargo.lock`) on any change that alters
   CLI behavior — a fix, a new/changed command or flag, or different
