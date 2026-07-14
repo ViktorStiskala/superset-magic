@@ -166,8 +166,12 @@ repo root:
 
 The archive is built to a temp file and atomically renamed into place, and
 never packs itself (a stale `ss-magic-files.tar.bz2` at the root is
-excluded even if a broad pattern would match it). An empty config or no
-matches is a success with no archive written.
+excluded even if a broad pattern would match it). Symlinks are stored as
+symlink entries, never followed — a matched link (even to a directory) is
+recorded as a link, so it can't pull in a target outside the repo. An empty
+config, no matches, or a match set that contains nothing packable is a
+success with no archive written — and an existing archive is left untouched
+rather than replaced by an empty one.
 
 ## Init / migration (main checkout)
 

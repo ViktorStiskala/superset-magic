@@ -112,8 +112,14 @@ interactive layer:
   control flow (resolve root → probe magic.json → load overlaid → empty
   guard → work) and emits a `PackEvent` stream. `write_archive` tars into a
   bzip2 stream (`bzip2` crate, pure-Rust `libbz2-rs-sys` backend — no C
-  toolchain) via a `NamedTempFile` in the root, then persists atomically;
-  it never packs the output archive into itself.
+  toolchain) via a `NamedTempFile` in the root, then persists atomically.
+  Safety: it never packs the output archive into itself (nor a `.` match that
+  resolves to the repo root); it classifies each match with
+  `symlink_metadata` (no-follow) so a matched symlink — including one to a
+  directory — is stored as a single symlink entry rather than followed
+  (`Path::is_dir()` would follow it and archive the target tree); and it
+  discards the temp file without touching an existing archive when nothing was
+  actually added, so a prior good backup is never replaced by an empty tarball.
 - `gitignore.rs` — `.gitignore` helpers at a git root: `ensure_entry`
   appends a line iff no exact match exists (creates the file if absent,
   never reorders); `find_covering_rule` resolves the rule covering a path
@@ -159,6 +165,19 @@ binary is the sole file-copy implementation.)
   (see Build), so a stale version means users never receive the change.
   Bug fixes bump patch; new/changed user-visible behavior bumps minor
   (pre-1.0).
+- After every implementation change, update `CLAUDE.md` and `README.md`
+  to match the current state before the change is considered done. A
+  new/changed command, flag, module, or behavior must be reflected in the
+  README (command list + relevant prose) and in this doc's Architecture +
+  Conventions sections — the two docs are expected to describe the code as
+  it is now, not as it was.
+- `.cursor/BUGBOT.md` holds the Cursor Bugbot review rules. It must stay
+  **self-contained**: it cannot reference this `CLAUDE.md`,
+  `docs/solutions/`, `.cursor/rules`, or any skill/rule — restate the
+  relevant conventions inline instead. Keep it **synchronised on every
+  change**: whenever a convention here or a behavior in the code changes,
+  update `.cursor/BUGBOT.md` in the same change so its rules never describe
+  stale conventions.
 
 ## Documented Solutions
 
