@@ -1,0 +1,6 @@
+{
+  "files": [
+    ".superset/magic.local.json",
+    ".compound-engineering/config.local.yaml"
+  ]
+}

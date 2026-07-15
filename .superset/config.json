@@ -1,0 +1,7 @@
+{
+  "setup": [
+    "./.superset/magic.sh sync"
+  ],
+  "teardown": [],
+  "run": []
+}
