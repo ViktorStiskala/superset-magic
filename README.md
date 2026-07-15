@@ -142,9 +142,9 @@ ss-magic init '.env' '**/.dev.vars' 'config/local/*'
 Quote glob patterns so your shell doesn't expand them before ss-magic sees
 them. The non-interactive init leaves the generated files uncommitted on disk.
 
-Once the contract is committed, every worktree created through Superset gets
-the matching files copied in automatically. In a worktree created any other
-way, run `ss-magic sync` yourself.
+Once the contract is committed, every worktree created through Superset.sh app
+gets the matching files copied in automatically. In a worktree created any
+other way, run `ss-magic sync` yourself.
 
 ## Commands
 
@@ -206,7 +206,7 @@ If nothing on disk changed, the commit step is skipped automatically.
 
 ### `ss-magic sync` — forward sync (main → worktree)
 
-Non-interactive, files-only — the command the Superset setup hook runs:
+Non-interactive, files-only — the command the Superset app setup hook runs:
 
 1. Resolve the main checkout root (parent of `git --git-common-dir`).
 2. Require `.superset/magic.json` there (hard error, non-zero exit, if absent
