@@ -255,11 +255,14 @@ minor (pre-1.0). Flag a behavior-changing PR that does not bump both
 
 ## Documentation Sync (REQUIRED)
 
-`README.md` (user-facing) and `CLAUDE.md` (architecture/conventions) must
-reflect the current state after every implementation change — a new command,
-flag, module, or changed behavior. Flag a behavior- or architecture-changing PR
-that leaves `README.md` or `CLAUDE.md` describing the old state (e.g. a new
-subcommand not listed in the README command list or the `main.rs`/`cli.rs`
-descriptions, or a new module absent from the `CLAUDE.md` architecture list).
+`README.md` (user-facing), `CONTRIBUTING.md` (contributor-facing: from-source
+builds, tests, PR expectations, release/versioning), and `CLAUDE.md`
+(architecture/conventions) must reflect the current state after every
+implementation change — a new command, flag, module, or changed behavior. Flag
+a behavior- or architecture-changing PR that leaves any of them describing the
+old state (e.g. a new subcommand not listed in the README command list or the
+`main.rs`/`cli.rs` descriptions, a changed build/test/release workflow not
+reflected in `CONTRIBUTING.md`, or a new module absent from the `CLAUDE.md`
+architecture list).
 This `.cursor/BUGBOT.md` must likewise be re-synchronised whenever the
 conventions above change.

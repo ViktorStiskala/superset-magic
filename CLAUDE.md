@@ -25,8 +25,9 @@ build scripts with `id-token: write` live — inherent to the feature; the
 default (build-local) phase is deliberate because it signs same-job build
 output before artifacts transit Actions storage, and changing the phase is a
 security decision. End-user install
-instructions (the installer script, prebuilt-binary download, and from-source
-builds) live in README.md.
+instructions (the installer script and prebuilt-binary download) live in
+README.md; from-source builds and the rest of the contributor docs (tests,
+PR expectations, release/versioning) live in CONTRIBUTING.md.
 
 ## Architecture
 
@@ -199,8 +200,9 @@ binary is the sole file-copy implementation.)
   to match the current state before the change is considered done. A
   new/changed command, flag, module, or behavior must be reflected in the
   README (command list + relevant prose) and in this doc's Architecture +
-  Conventions sections — the two docs are expected to describe the code as
-  it is now, not as it was.
+  Conventions sections; `CONTRIBUTING.md` must likewise be updated when
+  build, test, or release-workflow facts change — the docs are expected to
+  describe the code as it is now, not as it was.
 - `.cursor/BUGBOT.md` holds the Cursor Bugbot review rules. It must stay
   **self-contained**: it cannot reference this `CLAUDE.md`,
   `docs/solutions/`, `.cursor/rules`, or any skill/rule — restate the
