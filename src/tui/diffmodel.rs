@@ -170,6 +170,22 @@ fn segs_from_strings<'s>(strings: impl Iterator<Item = (bool, Cow<'s, str>)>) ->
     segs
 }
 
+/// Compute the folded context-gap bookkeeping shared by [`side_by_side`] and
+/// [`unified`]: whether `group` starts after `prev_end` (and by how much), and
+/// the updated `prev_end` cursor for the next group.
+///
+/// Returns `(None, prev_end)` unchanged for a `group` with no ops (defensive —
+/// `grouped_ops` should never yield an empty group; the caller's per-op loop
+/// is then a no-op too, so this never masks a skipped group).
+fn fold_gap(group: &[similar::DiffOp], prev_end: usize) -> (Option<usize>, usize) {
+    let (Some(first), Some(last)) = (group.first(), group.last()) else {
+        return (None, prev_end);
+    };
+    let start = first.old_range().start;
+    let gap = (start > prev_end).then_some(start - prev_end);
+    (gap, last.old_range().end)
+}
+
 /// Build the two-column side-by-side model for `local` vs `main`, folding
 /// unchanged runs to `context` lines around each change.
 ///
@@ -184,14 +200,11 @@ pub fn side_by_side(local: &str, main: &str, context: usize) -> Vec<DiffRow> {
     let mut prev_end = 0usize;
 
     for group in diff.grouped_ops(context) {
-        let (Some(first), Some(last)) = (group.first(), group.last()) else {
-            continue;
-        };
-        let start = first.old_range().start;
-        if start > prev_end {
-            rows.push(fold_row(start - prev_end));
+        let (gap, new_prev_end) = fold_gap(&group, prev_end);
+        if let Some(n) = gap {
+            rows.push(fold_row(n));
         }
-        prev_end = last.old_range().end;
+        prev_end = new_prev_end;
 
         for op in &group {
             match op.tag() {
@@ -282,19 +295,16 @@ pub fn unified(local: &str, main: &str, context: usize) -> Vec<UnifiedRow> {
     let mut prev_end = 0usize;
 
     for group in diff.grouped_ops(context) {
-        let (Some(first), Some(last)) = (group.first(), group.last()) else {
-            continue;
-        };
-        let start = first.old_range().start;
-        if start > prev_end {
+        let (gap, new_prev_end) = fold_gap(&group, prev_end);
+        if let Some(n) = gap {
             rows.push(UnifiedRow {
                 old_no: None,
                 new_no: None,
-                tag: UnifiedTag::Fold(start - prev_end),
+                tag: UnifiedTag::Fold(n),
                 segs: Vec::new(),
             });
         }
-        prev_end = last.old_range().end;
+        prev_end = new_prev_end;
 
         for op in &group {
             for change in diff.iter_inline_changes(op) {

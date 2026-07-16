@@ -336,16 +336,21 @@ fn apply_push_overwrites_main_and_backs_up_old_bytes() {
     write(main.path(), "config.env", "MAIN_OLD=1\n");
     write(&wt, "config.env", "WT_NEW=1\n");
 
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
     let res = applied(
         apply_decision(
-            &wt,
-            main.path(),
-            backups.path(),
-            TS,
+            &ctx,
             Path::new("config.env"),
             &Decision::Push,
-            meta(&wt.join("config.env")),
-            meta(&main.path().join("config.env")),
+            Baseline {
+                wt: meta(&wt.join("config.env")),
+                main: meta(&main.path().join("config.env")),
+            },
         )
         .unwrap(),
     );
@@ -374,16 +379,21 @@ fn apply_push_to_new_main_path_creates_and_gitignores_without_backup() {
 
     write(&wt, "apps/api/.dev.vars", "SECRET=1\n");
 
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
     let res = applied(
         apply_decision(
-            &wt,
-            main.path(),
-            backups.path(),
-            TS,
+            &ctx,
             Path::new("apps/api/.dev.vars"),
             &Decision::Push,
-            meta(&wt.join("apps/api/.dev.vars")),
-            meta(&main.path().join("apps/api/.dev.vars")),
+            Baseline {
+                wt: meta(&wt.join("apps/api/.dev.vars")),
+                main: meta(&main.path().join("apps/api/.dev.vars")),
+            },
         )
         .unwrap(),
     );
@@ -408,16 +418,21 @@ fn apply_pull_overwrites_worktree_and_backs_up_its_old_bytes() {
     write(main.path(), "config.env", "MAIN_SIDE=1\n");
     write(&wt, "config.env", "WT_OLD=1\n");
 
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
     let res = applied(
         apply_decision(
-            &wt,
-            main.path(),
-            backups.path(),
-            TS,
+            &ctx,
             Path::new("config.env"),
             &Decision::Pull,
-            meta(&wt.join("config.env")),
-            meta(&main.path().join("config.env")),
+            Baseline {
+                wt: meta(&wt.join("config.env")),
+                main: meta(&main.path().join("config.env")),
+            },
         )
         .unwrap(),
     );
@@ -444,16 +459,21 @@ fn apply_merge_writes_assembled_to_both_and_backs_up_both() {
     write(&wt, "config.env", "WT_ORIG=1\n");
 
     let merged = "ASSEMBLED=1\n".to_string();
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
     let res = applied(
         apply_decision(
-            &wt,
-            main.path(),
-            backups.path(),
-            TS,
+            &ctx,
             Path::new("config.env"),
             &Decision::Merge(merged.clone()),
-            meta(&wt.join("config.env")),
-            meta(&main.path().join("config.env")),
+            Baseline {
+                wt: meta(&wt.join("config.env")),
+                main: meta(&main.path().join("config.env")),
+            },
         )
         .unwrap(),
     );
@@ -504,15 +524,20 @@ fn apply_skips_when_target_changed_since_review() {
         mtime: None,
     });
 
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
     let outcome = apply_decision(
-        &wt,
-        main.path(),
-        backups.path(),
-        TS,
+        &ctx,
         Path::new("config.env"),
         &Decision::Push,
-        meta(&wt.join("config.env")),
-        stale_main,
+        Baseline {
+            wt: meta(&wt.join("config.env")),
+            main: stale_main,
+        },
     )
     .unwrap();
 
@@ -547,16 +572,21 @@ fn apply_applies_when_baseline_matches_current() {
     write(main.path(), "config.env", "MAIN_ORIG=1\n");
     write(&wt, "config.env", "WT_NEW=1\n");
 
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
     let res = applied(
         apply_decision(
-            &wt,
-            main.path(),
-            backups.path(),
-            TS,
+            &ctx,
             Path::new("config.env"),
             &Decision::Push,
-            meta(&wt.join("config.env")),
-            meta(&main.path().join("config.env")),
+            Baseline {
+                wt: meta(&wt.join("config.env")),
+                main: meta(&main.path().join("config.env")),
+            },
         )
         .unwrap(),
     );
@@ -584,15 +614,20 @@ fn apply_skips_when_target_appeared_after_review() {
     // main did NOT hold the file at review time, but it appears before apply.
     write(main.path(), "config.env", "APPEARED=1\n");
 
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
     let outcome = apply_decision(
-        &wt,
-        main.path(),
-        backups.path(),
-        TS,
+        &ctx,
         Path::new("config.env"),
         &Decision::Push,
-        meta(&wt.join("config.env")),
-        None, // review-time baseline: main absent
+        Baseline {
+            wt: meta(&wt.join("config.env")),
+            main: None, // review-time baseline: main absent
+        },
     )
     .unwrap();
 
@@ -620,15 +655,20 @@ fn apply_undecided_is_skipped() {
     write(main.path(), "config.env", "MAIN=1\n");
     write(&wt, "config.env", "WT=1\n");
 
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
     let outcome = apply_decision(
-        &wt,
-        main.path(),
-        backups.path(),
-        TS,
+        &ctx,
         Path::new("config.env"),
         &Decision::Undecided,
-        meta(&wt.join("config.env")),
-        meta(&main.path().join("config.env")),
+        Baseline {
+            wt: meta(&wt.join("config.env")),
+            main: meta(&main.path().join("config.env")),
+        },
     )
     .unwrap();
 

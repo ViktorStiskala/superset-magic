@@ -282,21 +282,19 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
     let backups_root = worktree_root.join(".superset/backups");
     gitignore::ensure_entry(worktree_root, ".superset/backups/")?;
 
+    let ctx = ApplyContext {
+        worktree_root,
+        main_root,
+        backups_root: &backups_root,
+        ts: &ts,
+    };
+
     let mut applied = 0usize;
     let mut skipped = 0usize;
     let mut all_backups: Vec<PathBuf> = Vec::new();
     for (rel, decision) in &decisions {
-        let (wt_baseline, main_baseline) = baseline.get(rel).cloned().unwrap_or((None, None));
-        match apply_decision(
-            worktree_root,
-            main_root,
-            &backups_root,
-            &ts,
-            rel,
-            decision,
-            wt_baseline,
-            main_baseline,
-        )? {
+        let (wt, main) = baseline.get(rel).cloned().unwrap_or((None, None));
+        match apply_decision(&ctx, rel, decision, Baseline { wt, main })? {
             ApplyOutcome::Applied(result) => {
                 applied += 1;
                 let dir = match result.direction {
@@ -498,30 +496,61 @@ fn write_bytes(target: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Back up `target` to `dest` iff `guard` is [`Guard::Unchanged`] — the "back
+/// up the losing bytes before a safe overwrite" rule shared by every
+/// destructive-overwrite site in [`apply_decision`]. A no-op (`Ok(None)`) for
+/// [`Guard::Missing`] (no prior bytes to lose) — the caller has already bailed
+/// out on [`Guard::Changed`] before reaching here.
+fn backup_if_unchanged(target: &Path, guard: Guard, dest: &Path) -> Result<Option<PathBuf>> {
+    if matches!(guard, Guard::Unchanged) {
+        Ok(Some(backup(target, dest)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// The per-batch context threaded through every [`apply_decision`] call: the
+/// two tree roots and the shared backup destination for the batch.
+pub struct ApplyContext<'a> {
+    /// The worktree root (reverse-sync source for `Push`, destination for `Pull`).
+    pub worktree_root: &'a Path,
+    /// The main checkout root (reverse-sync destination for `Push`, source for
+    /// `Pull`, and the secret-safety boundary).
+    pub main_root: &'a Path,
+    /// Root directory backups are written under (gitignored in the worktree).
+    pub backups_root: &'a Path,
+    /// The batch's single timestamp, shared by every backup path in the run.
+    pub ts: &'a str,
+}
+
+/// One file's review-time metadata baseline for [`apply_decision`]'s TOCTOU
+/// guard, one side each — see [`check_target`].
+pub struct Baseline {
+    /// The worktree side's metadata at review time (`None` if it didn't exist).
+    pub wt: Option<FileMeta>,
+    /// The main side's metadata at review time (`None` if it didn't exist).
+    pub main: Option<FileMeta>,
+}
+
 /// Apply one cockpit [`Decision`] for `rel`, safely (KD4, R13–R15).
 ///
 /// Safety order: an unsafe `rel` bails; an [`Decision::Undecided`] is a no-op
 /// skip; every destructive overwrite of an existing target is guarded against
-/// its review-time baseline (`wt_baseline` for the worktree side, `main_baseline`
-/// for the main side — each captured by [`meta_of`] before the cockpit opened)
-/// and its losing bytes are backed up under `backups_root` (via
-/// [`backup_rel_path`]) BEFORE the write; every write into main is preceded by
-/// [`ensure_gitignored_in_main`] so a git failure never leaves un-ignored secret
-/// bytes on disk. `Merge` writes the assembled text to BOTH sides (distinct
-/// `local/`+`main/` backup dirs so neither original is lost). A target that no
-/// longer matches its baseline (edited, created, or deleted since review) yields
-/// [`ApplyOutcome::Skipped`] with nothing written — no overwrite and no partial
-/// backup.
-#[allow(clippy::too_many_arguments)]
+/// its review-time baseline (`baseline.wt` for the worktree side,
+/// `baseline.main` for the main side — each captured by [`meta_of`] before the
+/// cockpit opened) and its losing bytes are backed up under `ctx.backups_root`
+/// (via [`backup_rel_path`]) BEFORE the write; every write into main is
+/// preceded by [`ensure_gitignored_in_main`] so a git failure never leaves
+/// un-ignored secret bytes on disk. `Merge` writes the assembled text to BOTH
+/// sides (distinct `local/`+`main/` backup dirs so neither original is lost).
+/// A target that no longer matches its baseline (edited, created, or deleted
+/// since review) yields [`ApplyOutcome::Skipped`] with nothing written — no
+/// overwrite and no partial backup.
 pub fn apply_decision(
-    worktree_root: &Path,
-    main_root: &Path,
-    backups_root: &Path,
-    ts: &str,
+    ctx: &ApplyContext,
     rel: &Path,
     decision: &Decision,
-    wt_baseline: Option<FileMeta>,
-    main_baseline: Option<FileMeta>,
+    baseline: Baseline,
 ) -> Result<ApplyOutcome> {
     // Universal path-safety guard (defense-in-depth) — reject anything that
     // could escape a tree.
@@ -538,21 +567,21 @@ pub fn apply_decision(
         Decision::Undecided => Ok(ApplyOutcome::Skipped("undecided".to_string())),
 
         Decision::Push => {
-            let source = worktree_root.join(rel);
-            let target = main_root.join(rel); // main is the destination
-            let guard = check_target(&target, main_baseline.as_ref());
+            let source = ctx.worktree_root.join(rel);
+            let target = ctx.main_root.join(rel); // main is the destination
+            let guard = check_target(&target, baseline.main.as_ref());
             if matches!(guard, Guard::Changed) {
                 return Ok(ApplyOutcome::Skipped(changed_reason()));
             }
             let mut backups = Vec::new();
-            if matches!(guard, Guard::Unchanged) {
-                backups.push(backup(
-                    &target,
-                    &backups_root.join(backup_rel_path(ts, rel)),
-                )?);
-            }
+            backups.extend(backup_if_unchanged(
+                &target,
+                guard,
+                &ctx.backups_root.join(backup_rel_path(ctx.ts, rel)),
+            )?);
             // Secret-safety BEFORE the bytes land in main.
-            let gitignore_appended = ensure_gitignored_in_main(worktree_root, main_root, rel)?;
+            let gitignore_appended =
+                ensure_gitignored_in_main(ctx.worktree_root, ctx.main_root, rel)?;
             let bytes = fs::read(&source)
                 .with_context(|| format!("reading worktree file {}", source.display()))?;
             write_bytes(&target, &bytes)?;
@@ -564,19 +593,18 @@ pub fn apply_decision(
         }
 
         Decision::Pull => {
-            let source = main_root.join(rel);
-            let target = worktree_root.join(rel); // worktree is the destination
-            let guard = check_target(&target, wt_baseline.as_ref());
+            let source = ctx.main_root.join(rel);
+            let target = ctx.worktree_root.join(rel); // worktree is the destination
+            let guard = check_target(&target, baseline.wt.as_ref());
             if matches!(guard, Guard::Changed) {
                 return Ok(ApplyOutcome::Skipped(changed_reason()));
             }
             let mut backups = Vec::new();
-            if matches!(guard, Guard::Unchanged) {
-                backups.push(backup(
-                    &target,
-                    &backups_root.join(backup_rel_path(ts, rel)),
-                )?);
-            }
+            backups.extend(backup_if_unchanged(
+                &target,
+                guard,
+                &ctx.backups_root.join(backup_rel_path(ctx.ts, rel)),
+            )?);
             // No gitignore step — the worktree side is not the secret boundary.
             let bytes = fs::read(&source)
                 .with_context(|| format!("reading main file {}", source.display()))?;
@@ -589,37 +617,40 @@ pub fn apply_decision(
         }
 
         Decision::Merge(text) => {
-            let wt_target = worktree_root.join(rel);
-            let main_target = main_root.join(rel);
+            let wt_target = ctx.worktree_root.join(rel);
+            let main_target = ctx.main_root.join(rel);
             // Baseline-check BOTH sides first so a skip writes nothing at all
             // (no partial backup either).
-            let wt_guard = check_target(&wt_target, wt_baseline.as_ref());
+            let wt_guard = check_target(&wt_target, baseline.wt.as_ref());
             if matches!(wt_guard, Guard::Changed) {
                 return Ok(ApplyOutcome::Skipped(changed_reason()));
             }
-            let main_guard = check_target(&main_target, main_baseline.as_ref());
+            let main_guard = check_target(&main_target, baseline.main.as_ref());
             if matches!(main_guard, Guard::Changed) {
                 return Ok(ApplyOutcome::Skipped(changed_reason()));
             }
             // Back up whichever side exists, under distinct dirs so the same
             // `rel` on both sides does not collide to one backup file.
             let mut backups = Vec::new();
-            if matches!(wt_guard, Guard::Unchanged) {
-                backups.push(backup(
-                    &wt_target,
-                    &backups_root.join("local").join(backup_rel_path(ts, rel)),
-                )?);
-            }
-            if matches!(main_guard, Guard::Unchanged) {
-                backups.push(backup(
-                    &main_target,
-                    &backups_root.join("main").join(backup_rel_path(ts, rel)),
-                )?);
-            }
+            backups.extend(backup_if_unchanged(
+                &wt_target,
+                wt_guard,
+                &ctx.backups_root
+                    .join("local")
+                    .join(backup_rel_path(ctx.ts, rel)),
+            )?);
+            backups.extend(backup_if_unchanged(
+                &main_target,
+                main_guard,
+                &ctx.backups_root
+                    .join("main")
+                    .join(backup_rel_path(ctx.ts, rel)),
+            )?);
             // Write the assembled text to the worktree, then — secret-safe —
             // to main.
             write_bytes(&wt_target, text.as_bytes())?;
-            let gitignore_appended = ensure_gitignored_in_main(worktree_root, main_root, rel)?;
+            let gitignore_appended =
+                ensure_gitignored_in_main(ctx.worktree_root, ctx.main_root, rel)?;
             write_bytes(&main_target, text.as_bytes())?;
             Ok(ApplyOutcome::Applied(ApplyResult {
                 direction: WriteDirection::MergeBoth,

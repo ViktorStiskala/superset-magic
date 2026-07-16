@@ -396,7 +396,7 @@ fn build_new(wt_path: &Path) -> Result<FileDiff> {
     } else {
         let wt_bytes = fs::read(wt_path)
             .with_context(|| format!("reading worktree file {}", wt_path.display()))?;
-        match classify_content_owned(&wt_bytes) {
+        match diffmodel::classify_content(&wt_bytes) {
             ContentKind::Text(s) => Some(s),
             _ => None,
         }
@@ -450,16 +450,11 @@ fn file_state(status: DiffStatus) -> FileState {
     }
 }
 
-/// Thin owned wrapper around [`diffmodel::classify_content`].
-fn classify_content_owned(bytes: &[u8]) -> ContentKind {
-    diffmodel::classify_content(bytes)
-}
-
 /// Choose the diff view for a two-sided file (R8/R9): binary or oversized on
 /// either side degrades to a whole-file notice; otherwise a text diff.
 fn build_text_diff(wt_bytes: &[u8], main_bytes: &[u8]) -> FileDiff {
-    let wt = classify_content_owned(wt_bytes);
-    let main = classify_content_owned(main_bytes);
+    let wt = diffmodel::classify_content(wt_bytes);
+    let main = diffmodel::classify_content(main_bytes);
     if matches!(wt, ContentKind::Binary) || matches!(main, ContentKind::Binary) {
         return FileDiff::Binary {
             note: binary_note(wt_bytes, main_bytes),
