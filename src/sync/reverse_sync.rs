@@ -339,8 +339,9 @@ fn apply_timestamp() -> String {
 // pull / merge) to disk: a path-safety guard, a TOCTOU re-check that skips on a
 // concurrent edit, a timestamped pre-write backup of the losing bytes, and
 // `ensure_gitignored_in_main` BEFORE any secret bytes land in main. Driven by
-// [`run`] with the decisions returned from the cockpit. (The `Decision::Merge`
-// arm stays unexercised until the interactive-merge phase.)
+// [`run`] with the decisions returned from the cockpit, including the
+// `Decision::Merge` produced by the cockpit's interactive-merge overlay, whose
+// assembled bytes this seam writes to BOTH sides.
 
 /// Which direction (and how many sides) an applied decision wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -149,6 +149,18 @@ committable and must never leak.
   TTY and writes nothing then. Flag a reverse-sync path that overwrites an
   existing file without a backup, applies an `Undecided` file, skips the batched
   confirm, or falls through to writing files when there is no TTY.
+- Interactive merge: pressing `m` on a DIFFERING TEXT file opens a per-hunk
+  overlay (`Mode::Merge`) that assembles bytes with `merge::merge_segments` +
+  `merge::assemble` and, on `Enter`, records `Decision::Merge(assembled)`; `Esc`
+  leaves the file's decision unchanged. `m` MUST be a no-op (never entering the
+  overlay) for binary / oversized / worktree-only files — interactive merge is
+  unavailable there. A `Merge` decision overwrites BOTH the worktree and main,
+  so the batched confirm must list it as a destructive write and `apply_decision`
+  must back up whichever side exists before writing (distinct `local/` + `main/`
+  backup dirs) and run `ensure_gitignored_in_main` before the main-side write.
+  Flag an `m` handler that opens the overlay for a non-text/new file, a merge
+  apply that overwrites either side without a backup, or a main-side merge write
+  that skips the gitignore-safety step.
 
 ## Filesystem Writes: Atomic Staging
 

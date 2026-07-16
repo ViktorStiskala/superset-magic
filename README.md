@@ -32,10 +32,10 @@ file set:
 - **Reverse sync** (interactive menu) — reconcile git-untracked files that
   changed or appeared in a worktree against the main checkout, through a
   full-screen merge cockpit: a file list beside a live side-by-side diff, where
-  you set each file's direction (push to main / pull from main / undecided) and
-  apply the batch behind one confirmation, with a timestamped backup taken
-  before every overwrite. This is how a new secret created in a worktree reaches
-  everywhere else.
+  you set each file's direction (push to main / pull from main / per-hunk merge /
+  undecided) and apply the batch behind one confirmation, with a timestamped
+  backup taken before every overwrite. This is how a new secret created in a
+  worktree reaches everywhere else.
 - **Pack** (`ss-magic pack`) — snapshot the whole configured file set into a
   single `ss-magic-<repo>.tar.bz2` for backup, machine migration, or handing
   to a teammate.
@@ -240,9 +240,15 @@ git. Tracked files are excluded — they reach main via merge. The flow:
   files show a whole-file notice instead of a diff).
 - Nothing destructive is pre-selected — a file that differs starts *undecided*.
   You set each file's direction with explicit keys: `p` push to main, `l` pull
-  from main, `u` undecided (arrows/`j`/`k` navigate, `PgUp`/`PgDn`/`Space`
-  scroll the diff, `?` toggles help). Each row's mtimes are shown only as an
-  unreliable hint.
+  from main, `m` interactive merge, `u` undecided (arrows/`j`/`k` navigate,
+  `PgUp`/`PgDn`/`Space` scroll the diff, `?` toggles help). Each row's mtimes are
+  shown only as an unreliable hint.
+- `m` on a differing text file opens a per-hunk merge overlay: walk the hunks
+  with the arrows and cycle each between keep-local / keep-main / keep-both
+  (`←`/`→` or `h`/`l`) while a live preview assembles the result; `Enter` accepts
+  it and `Esc` cancels. The accepted bytes are written to **both** sides on apply
+  so they stop differing. Merge is unavailable for binary / oversized / new
+  files (which offer only push/pull).
 - `Enter` applies: one batched confirmation lists every existing-target
   overwrite (defaulting to No). Before each destructive write, the losing bytes
   are copied to a timestamped backup under a gitignored `.superset/backups/`,

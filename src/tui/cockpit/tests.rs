@@ -35,6 +35,8 @@ fn app_with(files: Vec<FileEntry>) -> App {
         focused: 0,
         diff_scroll: 0,
         mode: Mode::Normal,
+        merge: None,
+        notice: None,
     }
 }
 
@@ -222,4 +224,115 @@ fn set_pull_is_noop_for_worktree_only() {
     )]);
     app.set_pull();
     assert!(matches!(app.files[0].decision, Decision::Push));
+}
+
+// ── Interactive merge overlay (Phase 4) ───────────────────────────────────
+
+/// Opening the merge overlay for a one-hunk file (local "X" vs main "Y") shows
+/// both hunk sides and the live assembled preview.
+#[test]
+fn merge_overlay_renders_both_sides_and_preview() {
+    let mut app = app_with(vec![entry(
+        "config.local.json",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Text {
+            local: "a\nX\nc\n".to_string(),
+            main: "a\nY\nc\n".to_string(),
+        },
+    )]);
+    app.try_open_merge();
+    assert_eq!(app.mode, Mode::Merge, "m must enter the merge overlay");
+
+    let out = buffer_text(&render(&app, 120, 40));
+    assert!(out.contains("Local file"), "local side label missing:\n{out}");
+    assert!(out.contains("Main branch"), "main side label missing:\n{out}");
+    assert!(out.contains('X'), "local hunk text missing:\n{out}");
+    assert!(out.contains('Y'), "main hunk text missing:\n{out}");
+    assert!(
+        out.contains("Assembled preview"),
+        "preview pane missing:\n{out}"
+    );
+}
+
+/// The overlay's assembled preview tracks the focused hunk's choice: Main yields
+/// the main side (== `merge::assemble` with `[Main]`); Both yields local then
+/// main, in order.
+#[test]
+fn merge_overlay_preview_tracks_choice() {
+    let local = "a\nX\nc\n";
+    let main = "a\nY\nc\n";
+    let mut overlay = MergeOverlay::build(0, local, main);
+    assert_eq!(overlay.hunk_count(), 1, "exactly one differing hunk");
+
+    overlay.choices[0] = MergeChoice::Main;
+    let segs = merge_segments(local, main);
+    assert_eq!(overlay.preview(), assemble(&segs, &[MergeChoice::Main]));
+    assert_eq!(overlay.preview(), main, "keep-main yields the main text");
+
+    overlay.choices[0] = MergeChoice::Both;
+    let both = overlay.preview();
+    assert_eq!(both, "a\nX\nY\nc\n", "keep-both interleaves local then main");
+    let x = both.find('X').expect("local present in keep-both");
+    let y = both.find('Y').expect("main present in keep-both");
+    assert!(x < y, "keep-both must place local before main: {both:?}");
+}
+
+/// `m` is a no-op on a binary file and on a worktree-only (new) file — neither
+/// can be merged, so the overlay never opens and a notice is set instead.
+#[test]
+fn merge_key_is_noop_for_binary_and_new_files() {
+    let mut binary = app_with(vec![entry(
+        "secret.bin",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Binary {
+            note: "binary — differs".to_string(),
+        },
+    )]);
+    binary.try_open_merge();
+    assert_eq!(binary.mode, Mode::Normal, "binary must not enter merge");
+    assert!(binary.merge.is_none(), "no overlay for a binary file");
+    assert!(binary.notice.is_some(), "a merge-unavailable notice is set");
+
+    let mut new = app_with(vec![entry(
+        "new.env",
+        DiffStatus::WorktreeOnly,
+        Decision::Push,
+        FileDiff::New {
+            content: Some("SECRET=1\n".to_string()),
+        },
+    )]);
+    new.try_open_merge();
+    assert_eq!(new.mode, Mode::Normal, "worktree-only must not enter merge");
+    assert!(new.merge.is_none(), "no overlay for a worktree-only file");
+}
+
+/// Accepting the overlay records a [`Decision::Merge`] carrying the assembled
+/// bytes and returns to the normal view with the merge badge.
+#[test]
+fn accept_merge_sets_merge_decision_and_badge() {
+    let mut app = app_with(vec![entry(
+        "config.local.json",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Text {
+            local: "a\nX\nc\n".to_string(),
+            main: "a\nY\nc\n".to_string(),
+        },
+    )]);
+    app.try_open_merge();
+    // Default choice is keep-local ⇒ assembled == the local text.
+    app.accept_merge();
+
+    assert_eq!(app.mode, Mode::Normal, "accept returns to the cockpit");
+    assert!(app.merge.is_none(), "overlay state is cleared on accept");
+    match &app.files[0].decision {
+        Decision::Merge(text) => assert_eq!(text, "a\nX\nc\n"),
+        other => panic!("expected Decision::Merge, got {other:?}"),
+    }
+    assert!(
+        badge_text(&app.files[0].decision).0.contains("merge"),
+        "badge reflects the merge decision"
+    );
 }

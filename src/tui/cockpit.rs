@@ -3,14 +3,18 @@
 //! This is the interactive layer that replaces the old re-printing
 //! `inquire::Select` picker. It presents a left file-list pane beside a live
 //! side-by-side diff, lets the developer set each file's direction with
-//! explicit keys (`p` push / `l` pull / `u` undecided), and returns the chosen
-//! [`Decision`]s to the caller — it does NOT write any files itself. The
-//! destructive apply is performed by `reverse_sync::apply_decision` after
+//! explicit keys (`p` push / `l` pull / `m` merge / `u` undecided), and returns
+//! the chosen [`Decision`]s to the caller — it does NOT write any files itself.
+//! The destructive apply is performed by `reverse_sync::apply_decision` after
 //! [`run_cockpit`] returns, so the cockpit stays free of filesystem side
 //! effects beyond reading the two versions of each file for the diff.
 //!
-//! Interactive-merge (the per-hunk `m` overlay) is a LATER phase; this cockpit
-//! deliberately offers only push / pull / undecided.
+//! Pressing `m` on a differing text file opens the per-hunk merge overlay
+//! ([`Mode::Merge`]): the user walks the file's hunks, cycling each between
+//! keep-local / keep-main / keep-both, previews the assembled result live (via
+//! [`merge_segments`] + [`assemble`]), and accepts it as a [`Decision::Merge`]
+//! that the apply seam writes to BOTH sides. `m` is a no-op for binary /
+//! oversized / worktree-only files, where interactive merge is unavailable (R9).
 //!
 //! ## Testability
 //!
@@ -38,7 +42,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::sync::merge::{default_decision, Decision, FileState};
+use crate::sync::merge::{
+    assemble, default_decision, diff_count, merge_segments, Decision, FileState, MergeChoice,
+    MergeSegment,
+};
 use crate::sync::reverse_sync::DiffStatus;
 use crate::tui::diffmodel::{self, ContentKind, DiffRow, RowTag, UnifiedRow, UnifiedTag};
 
@@ -105,6 +112,94 @@ enum Mode {
     Help,
     /// The batched apply-confirmation overlay.
     Confirm,
+    /// The per-hunk interactive-merge overlay (state in [`App::merge`]).
+    Merge,
+}
+
+/// Live state of the interactive per-hunk merge overlay (R10). Held apart from
+/// [`Mode`] (which stays `Copy`) so the segment/choice buffers can be owned. The
+/// `choices` vector is aligned to the `Diff` segments in order — one entry per
+/// [`diff_count`] — and `hunk` indexes into it.
+struct MergeOverlay {
+    /// Index into [`App::files`] of the file being merged.
+    file_idx: usize,
+    /// The ordered `Equal`/`Diff` segments from [`merge_segments`].
+    segments: Vec<MergeSegment>,
+    /// One [`MergeChoice`] per `Diff` segment, in order (default `Local`).
+    choices: Vec<MergeChoice>,
+    /// The focused hunk — an index into `choices` / the `Diff` segments.
+    hunk: usize,
+    /// Vertical scroll offset for the assembled-preview pane.
+    preview_scroll: u16,
+}
+
+impl MergeOverlay {
+    /// Build the overlay for `file_idx`, computing hunks from `local` vs `main`
+    /// and defaulting every choice to keep-local (nothing changes until the
+    /// user cycles a hunk).
+    fn build(file_idx: usize, local: &str, main: &str) -> MergeOverlay {
+        let segments = merge_segments(local, main);
+        let n = diff_count(&segments);
+        MergeOverlay {
+            file_idx,
+            segments,
+            choices: vec![MergeChoice::Local; n],
+            hunk: 0,
+            preview_scroll: 0,
+        }
+    }
+
+    /// Number of decision points (differing hunks) in this merge.
+    fn hunk_count(&self) -> usize {
+        self.choices.len()
+    }
+
+    fn next_hunk(&mut self) {
+        if self.hunk + 1 < self.hunk_count() {
+            self.hunk += 1;
+        }
+    }
+
+    fn prev_hunk(&mut self) {
+        if self.hunk > 0 {
+            self.hunk -= 1;
+        }
+    }
+
+    /// Cycle the focused hunk's choice — forward keep-local → keep-main →
+    /// keep-both → keep-local, or backward when `forward` is false.
+    fn cycle_choice(&mut self, forward: bool) {
+        if let Some(c) = self.choices.get_mut(self.hunk) {
+            *c = if forward { next_choice(*c) } else { prev_choice(*c) };
+        }
+    }
+
+    /// The (local, main) candidate texts of the `n`-th `Diff` segment, if any.
+    fn diff_sides(&self, n: usize) -> Option<(&str, &str)> {
+        self.segments
+            .iter()
+            .filter_map(|s| match s {
+                MergeSegment::Diff { local, main } => Some((local.as_str(), main.as_str())),
+                MergeSegment::Equal(_) => None,
+            })
+            .nth(n)
+    }
+
+    /// The focused hunk's local-side text (empty when there is no hunk).
+    fn focused_local(&self) -> &str {
+        self.diff_sides(self.hunk).map(|(l, _)| l).unwrap_or("")
+    }
+
+    /// The focused hunk's main-side text (empty when there is no hunk).
+    fn focused_main(&self) -> &str {
+        self.diff_sides(self.hunk).map(|(_, m)| m).unwrap_or("")
+    }
+
+    /// The live assembled preview for the current choices (pure — testable
+    /// without the event loop).
+    fn preview(&self) -> String {
+        merge_preview(&self.segments, &self.choices)
+    }
 }
 
 /// The whole cockpit state. Holds no terminal handles or roots — everything the
@@ -114,6 +209,11 @@ struct App {
     focused: usize,
     diff_scroll: u16,
     mode: Mode,
+    /// The active merge overlay's state (`Some` iff `mode == Mode::Merge`).
+    merge: Option<MergeOverlay>,
+    /// A transient footer notice (e.g. "merge unavailable"), cleared on the
+    /// next keypress in [`Mode::Normal`].
+    notice: Option<String>,
 }
 
 impl App {
@@ -129,6 +229,8 @@ impl App {
             focused: 0,
             diff_scroll: 0,
             mode: Mode::Normal,
+            merge: None,
+            notice: None,
         })
     }
 
@@ -179,6 +281,45 @@ impl App {
                 f.decision = Decision::Pull;
             }
         }
+    }
+
+    /// Attempt to open the interactive merge overlay for the focused file.
+    /// Only a file that DIFFERS and is text on both sides can be merged (R9,
+    /// R10); for binary / oversized / worktree-only files this is a no-op that
+    /// sets a transient "merge unavailable" notice instead of entering the mode.
+    fn try_open_merge(&mut self) {
+        let overlay = match self.files.get(self.focused) {
+            Some(f) => match (&f.diff, f.status) {
+                (FileDiff::Text { local, main }, DiffStatus::Differs) => {
+                    Some(MergeOverlay::build(self.focused, local, main))
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        match overlay {
+            Some(overlay) => {
+                self.merge = Some(overlay);
+                self.mode = Mode::Merge;
+            }
+            None => {
+                self.notice =
+                    Some("merge unavailable here — only differing text files can be merged".into());
+            }
+        }
+    }
+
+    /// Accept the active merge: set the focused file's decision to
+    /// [`Decision::Merge`] carrying the assembled bytes, then return to the
+    /// normal view. A cancel (`Esc`) instead drops the overlay untouched.
+    fn accept_merge(&mut self) {
+        if let Some(overlay) = self.merge.take() {
+            let assembled = merge_preview(&overlay.segments, &overlay.choices);
+            if let Some(f) = self.files.get_mut(overlay.file_idx) {
+                f.decision = Decision::Merge(assembled);
+            }
+        }
+        self.mode = Mode::Normal;
     }
 
     /// The decisions to hand back on apply: every file that is not undecided.
@@ -353,7 +494,41 @@ fn badge_text(decision: &Decision) -> (String, Color) {
         Decision::Push => ("→ push to main".to_string(), Color::Green),
         Decision::Pull => ("← pull from main".to_string(), Color::Cyan),
         Decision::Undecided => ("? undecided".to_string(), Color::Yellow),
-        Decision::Merge(_) => ("⇄ merge → both".to_string(), Color::Magenta),
+        Decision::Merge(_) => ("⇄ merge (assembled)".to_string(), Color::Magenta),
+    }
+}
+
+/// The assembled merge preview for `segments` under `choices` — a thin, pure
+/// delegate to [`assemble`] so the overlay's live preview is testable without
+/// the event loop.
+fn merge_preview(segments: &[MergeSegment], choices: &[MergeChoice]) -> String {
+    assemble(segments, choices)
+}
+
+/// Cycle a merge choice forward: keep-local → keep-main → keep-both → keep-local.
+fn next_choice(c: MergeChoice) -> MergeChoice {
+    match c {
+        MergeChoice::Local => MergeChoice::Main,
+        MergeChoice::Main => MergeChoice::Both,
+        MergeChoice::Both => MergeChoice::Local,
+    }
+}
+
+/// Cycle a merge choice backward (the inverse of [`next_choice`]).
+fn prev_choice(c: MergeChoice) -> MergeChoice {
+    match c {
+        MergeChoice::Local => MergeChoice::Both,
+        MergeChoice::Main => MergeChoice::Local,
+        MergeChoice::Both => MergeChoice::Main,
+    }
+}
+
+/// Human label for a merge choice, shown in the overlay header + hunk list.
+fn choice_label(c: MergeChoice) -> &'static str {
+    match c {
+        MergeChoice::Local => "keep-local",
+        MergeChoice::Main => "keep-main",
+        MergeChoice::Both => "keep-both (local, then main)",
     }
 }
 
@@ -372,11 +547,12 @@ fn draw(frame: &mut Frame, app: &App) {
     let panes = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).split(body);
     render_file_list(frame, panes[0], app);
     render_diff(frame, panes[1], app, split);
-    render_footer(frame, footer);
+    render_footer(frame, footer, app.notice.as_deref());
 
     match app.mode {
         Mode::Help => render_help(frame, area),
         Mode::Confirm => render_confirm(frame, area, app),
+        Mode::Merge => render_merge(frame, area, app),
         Mode::Normal => {}
     }
 }
@@ -604,12 +780,18 @@ fn num(n: Option<usize>) -> String {
     }
 }
 
-fn render_footer(frame: &mut Frame, area: Rect) {
-    let legend = "↑↓/jk move · PgUp/PgDn/Space/b scroll · p push · l pull · u undecided · Enter apply · ? help · Esc cancel";
-    frame.render_widget(
-        Paragraph::new(Line::from(legend)).style(Style::new().fg(Color::DarkGray)),
-        area,
-    );
+/// The persistent key legend (R5).
+const FOOTER_LEGEND: &str = "↑↓/jk move · PgUp/PgDn/Space/b scroll · p push · l pull · m merge · u undecided · Enter apply · ? help · Esc cancel";
+
+/// Render the footer: the transient `notice` (bold yellow) when present, else
+/// the persistent key legend.
+fn render_footer(frame: &mut Frame, area: Rect, notice: Option<&str>) {
+    let para = match notice {
+        Some(n) => Paragraph::new(Line::from(n.to_string()))
+            .style(Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        None => Paragraph::new(Line::from(FOOTER_LEGEND)).style(Style::new().fg(Color::DarkGray)),
+    };
+    frame.render_widget(para, area);
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
@@ -630,7 +812,20 @@ fn render_help(frame: &mut Frame, area: Rect) {
             Span::raw("  l              "),
             Span::styled("pull main → worktree", Style::new().fg(Color::Cyan)),
         ]),
+        Line::from(vec![
+            Span::raw("  m              "),
+            Span::styled(
+                "interactive merge (differing text files)",
+                Style::new().fg(Color::Magenta),
+            ),
+        ]),
         Line::from("  u              mark undecided"),
+        Line::from(""),
+        Line::from("Merge overlay".bold()),
+        Line::from("  ↑/↓ or j/k     move between hunks"),
+        Line::from("  ←/→ or h/l     cycle keep-local / keep-main / keep-both"),
+        Line::from("  Enter          accept the assembled result"),
+        Line::from("  Esc            cancel the merge (file unchanged)"),
         Line::from(""),
         Line::from("Apply".bold()),
         Line::from("  Enter          review & apply (confirm)"),
@@ -680,6 +875,137 @@ fn render_confirm(frame: &mut Frame, area: Rect, app: &App) {
             .wrap(Wrap { trim: false })
             .block(Block::bordered().title(Line::from(" Confirm apply ".bold()))),
         popup,
+    );
+}
+
+/// Render the per-hunk interactive-merge overlay (R10): the focused hunk's two
+/// sides (clearly labeled), the list of every hunk's current choice, and a live
+/// assembled preview built from [`merge_preview`].
+fn render_merge(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(m) = app.merge.as_ref() else {
+        return;
+    };
+    let rel = app
+        .files
+        .get(m.file_idx)
+        .map(|f| f.rel.display().to_string())
+        .unwrap_or_default();
+
+    let popup = centered_rect(88, 90, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().title(Line::from(format!(" Merge {rel} ").bold()));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1),      // header (hunk N/M + choice)
+        Constraint::Percentage(24), // local side
+        Constraint::Percentage(24), // main side
+        Constraint::Percentage(18), // hunk list
+        Constraint::Min(2),         // assembled preview
+        Constraint::Length(1),      // footer legend
+    ])
+    .split(inner);
+
+    render_merge_header(frame, chunks[0], m);
+    render_merge_side(
+        frame,
+        chunks[1],
+        "Local file (keep-local)",
+        m.focused_local(),
+        Color::Cyan,
+    );
+    render_merge_side(
+        frame,
+        chunks[2],
+        "Main branch (keep-main)",
+        m.focused_main(),
+        Color::Green,
+    );
+    render_merge_hunk_list(frame, chunks[3], m);
+    render_merge_preview(frame, chunks[4], m);
+    frame.render_widget(
+        Paragraph::new(Line::from(
+            "↑↓/jk hunk · ←→/hl choice · Enter accept · Esc cancel",
+        ))
+        .style(Style::new().fg(Color::DarkGray)),
+        chunks[5],
+    );
+}
+
+fn render_merge_header(frame: &mut Frame, area: Rect, m: &MergeOverlay) {
+    let text = if m.hunk_count() == 0 {
+        "No differing hunks — Enter accepts the shared text".to_string()
+    } else {
+        format!(
+            "Hunk {}/{}    choice: {}",
+            m.hunk + 1,
+            m.hunk_count(),
+            choice_label(m.choices[m.hunk]),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(text.bold())),
+        area,
+    );
+}
+
+/// Render one labeled side of the focused hunk; an empty side (a pure
+/// insert/delete) is shown as an explicit placeholder rather than blank.
+fn render_merge_side(frame: &mut Frame, area: Rect, label: &str, text: &str, color: Color) {
+    let block = Block::bordered().title(Line::from(label.bold().fg(color)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines: Vec<Line> = Vec::new();
+    if text.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(nothing on this side)",
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        for l in text.lines() {
+            lines.push(Line::from(Span::styled(l.to_string(), Style::new().fg(color))));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_merge_hunk_list(frame: &mut Frame, area: Rect, m: &MergeOverlay) {
+    let block = Block::bordered().title(Line::from(" Hunks ".bold()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines: Vec<Line> = (0..m.hunk_count())
+        .map(|i| {
+            let focused = i == m.hunk;
+            let marker = if focused { "› " } else { "  " };
+            let style = if focused {
+                Style::new().add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(Color::DarkGray)
+            };
+            Line::from(Span::styled(
+                format!("{marker}hunk {}: {}", i + 1, choice_label(m.choices[i])),
+                style,
+            ))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_merge_preview(frame: &mut Frame, area: Rect, m: &MergeOverlay) {
+    let block = Block::bordered().title(Line::from(" Assembled preview ".bold()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let preview = m.preview();
+    let lines: Vec<Line> = preview
+        .lines()
+        .map(|l| Line::from(l.to_string()))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((m.preview_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        inner,
     );
 }
 
@@ -759,19 +1085,54 @@ where
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.mode = Mode::Normal,
                 _ => {}
             },
-            Mode::Normal => match key.code {
-                KeyCode::Esc => return Ok(CockpitOutcome::Cancel),
-                KeyCode::Up | KeyCode::Char('k') => app.focus_prev(),
-                KeyCode::Down | KeyCode::Char('j') => app.focus_next(),
-                KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_down(page),
-                KeyCode::PageUp | KeyCode::Char('b') => app.scroll_up(page),
-                KeyCode::Char('p') => app.set_decision(Decision::Push),
-                KeyCode::Char('l') => app.set_pull(),
-                KeyCode::Char('u') => app.set_decision(Decision::Undecided),
-                KeyCode::Char('?') => app.mode = Mode::Help,
-                KeyCode::Enter => app.mode = Mode::Confirm,
+            Mode::Merge => match key.code {
+                // Esc leaves the file's decision unchanged (F2).
+                KeyCode::Esc => {
+                    app.merge = None;
+                    app.mode = Mode::Normal;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(m) = app.merge.as_mut() {
+                        m.prev_hunk();
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(m) = app.merge.as_mut() {
+                        m.next_hunk();
+                    }
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    if let Some(m) = app.merge.as_mut() {
+                        m.cycle_choice(true);
+                    }
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    if let Some(m) = app.merge.as_mut() {
+                        m.cycle_choice(false);
+                    }
+                }
+                KeyCode::Enter => app.accept_merge(),
                 _ => {}
             },
+            Mode::Normal => {
+                // Any keypress clears a transient notice from the previous action;
+                // a no-op `m` below may then set a fresh one.
+                app.notice = None;
+                match key.code {
+                    KeyCode::Esc => return Ok(CockpitOutcome::Cancel),
+                    KeyCode::Up | KeyCode::Char('k') => app.focus_prev(),
+                    KeyCode::Down | KeyCode::Char('j') => app.focus_next(),
+                    KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_down(page),
+                    KeyCode::PageUp | KeyCode::Char('b') => app.scroll_up(page),
+                    KeyCode::Char('p') => app.set_decision(Decision::Push),
+                    KeyCode::Char('l') => app.set_pull(),
+                    KeyCode::Char('m') => app.try_open_merge(),
+                    KeyCode::Char('u') => app.set_decision(Decision::Undecided),
+                    KeyCode::Char('?') => app.mode = Mode::Help,
+                    KeyCode::Enter => app.mode = Mode::Confirm,
+                    _ => {}
+                }
+            }
         }
     }
 }

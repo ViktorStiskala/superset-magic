@@ -99,12 +99,22 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   reads both versions of every offered candidate, presents a left file-list
   pane beside a live side-by-side / unified diff (via `tui/diffmodel.rs`),
   and lets the user set each file's `merge::Decision` with explicit keys
-  (`p` push / `l` pull / `u` undecided — interactive `m` merge is a later
-  phase), gated by a batched confirm. It returns `CockpitOutcome::{Apply,
-  Cancel}` and writes NOTHING itself; `reverse_sync::run` applies the
-  decisions via `apply_decision`. `is_interactive` (stdin+stdout TTY, R16)
-  guards launch. A `Drop` guard + panic hook always restore the terminal.
-  The pure `draw(frame, app)` is exercised with `ratatui`'s `TestBackend`
+  (`p` push / `l` pull / `m` merge / `u` undecided), gated by a batched
+  confirm. `m` on a DIFFERING TEXT file opens the per-hunk merge overlay
+  (`Mode::Merge`, state in `App::merge`): it computes hunks with
+  `merge::merge_segments`, holds one `MergeChoice` per `Diff` segment
+  (default `Local`), walks them with the arrows, cycles keep-local /
+  keep-main / keep-both with `←`/`→` (`h`/`l`), previews the live
+  `merge::assemble` result, and on `Enter` sets `Decision::Merge(assembled)`
+  (badge `⇄ merge (assembled)`); `Esc` cancels unchanged. For binary /
+  oversized / worktree-only files `m` is a no-op that shows a transient
+  footer notice (R9). The batched confirm lists a merge as an overwrite of
+  BOTH sides; `apply_decision` writes the assembled bytes to worktree and
+  main. It returns `CockpitOutcome::{Apply, Cancel}` and writes NOTHING
+  itself; `reverse_sync::run` applies the decisions via `apply_decision`.
+  `is_interactive` (stdin+stdout TTY, R16) guards launch. A `Drop` guard +
+  panic hook always restore the terminal. The pure `draw(frame, app)` and
+  the pure `merge_preview` are exercised with `ratatui`'s `TestBackend`
   without the event loop.
 - `cli.rs` — hand-rolled arg parser (no `clap`). `parse(&[String]) ->
   Parsed` selects `Command::{Bare, Sync, Pack, Update}` from the first non-flag
@@ -135,8 +145,10 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   losing bytes under a gitignored `.superset/backups/<ts>/`, and
   `ensure_gitignored_in_main` before any secret bytes land in main). Backup
   paths are printed so a mistaken overwrite is recoverable. `sync/merge.rs`
-  owns the pure `Decision`/`FileState`/`default_decision` + backup-naming;
-  `tui/diffmodel.rs` owns the pure diff-to-rows model.
+  owns the pure `Decision`/`FileState`/`default_decision` + backup-naming and
+  the per-hunk merge model (`merge_segments`, `assemble`, `diff_count`,
+  `MergeSegment`, `MergeChoice`, `Decision::Merge`) driving the cockpit's
+  merge overlay; `tui/diffmodel.rs` owns the pure diff-to-rows model.
 - `pack.rs` — `ss-magic pack`: expand the overlaid `magic.json` patterns
   against the current git repo root (via `sync/apply.rs`'s `match_paths`) and
   write the matches — repo-relative — into `ss-magic-<repo>.tar.bz2` at that
