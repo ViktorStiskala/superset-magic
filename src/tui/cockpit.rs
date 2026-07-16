@@ -591,14 +591,19 @@ fn use_split(diff_pane_inner_width: u16) -> bool {
 }
 
 /// Badge label + color for a decision (R3): direction is shown with an
-/// unambiguous arrow + words, never position alone.
-fn badge_text(decision: &Decision) -> (String, Color) {
+/// unambiguous arrow + words, never position alone. `status` disambiguates a
+/// delete's sides — a worktree-only file has no main copy to remove, and the
+/// badge must say exactly what the batched confirm will say.
+fn badge_text(decision: &Decision, status: DiffStatus) -> (String, Color) {
     match decision {
         Decision::Push => ("→ push to main".to_string(), Color::Green),
         Decision::Pull => ("← pull from main".to_string(), Color::Cyan),
         Decision::Undecided => ("? undecided".to_string(), Color::Yellow),
         Decision::Merge(_) => ("⇄ merge (assembled)".to_string(), Color::Magenta),
-        Decision::Delete => ("✗ delete (both sides)".to_string(), Color::Red),
+        Decision::Delete if status == DiffStatus::WorktreeOnly => {
+            ("✗ delete (worktree copy)".to_string(), Color::Red)
+        }
+        Decision::Delete => ("✗ delete (worktree + main)".to_string(), Color::Red),
     }
 }
 
@@ -679,7 +684,7 @@ fn render_file_list(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn file_list_item(f: &FileEntry) -> ListItem<'static> {
-    let (badge, color) = badge_text(&f.decision);
+    let (badge, color) = badge_text(&f.decision, f.status);
     let line1 = Line::from(vec![
         Span::styled(badge, Style::new().fg(color).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
@@ -910,69 +915,75 @@ fn render_footer(frame: &mut Frame, area: Rect, notice: Option<&str>) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(68, 90, area);
-    frame.render_widget(Clear, popup);
     let lines = vec![
         Line::from("Navigation".bold()),
-        Line::from("  ↑/↓ or j/k     move between files"),
-        Line::from("  PgUp / PgDn    scroll the diff"),
-        Line::from("  Space / b      scroll diff down / up"),
+        Line::from("  ↑/↓ or j/k         move between files"),
+        Line::from("  PgUp/PgDn/Space/b  scroll the diff"),
         Line::from(""),
         Line::from("Decisions".bold()),
         Line::from(vec![
-            Span::raw("  p              "),
+            Span::raw("  p                  "),
             Span::styled("push worktree → main", Style::new().fg(Color::Green)),
         ]),
         Line::from(vec![
-            Span::raw("  l              "),
+            Span::raw("  l                  "),
             Span::styled("pull main → worktree", Style::new().fg(Color::Cyan)),
         ]),
         Line::from(vec![
-            Span::raw("  m              "),
+            Span::raw("  m                  "),
             Span::styled(
                 "interactive merge (differing text files)",
                 Style::new().fg(Color::Magenta),
             ),
         ]),
         Line::from(vec![
-            Span::raw("  d              "),
+            Span::raw("  d                  "),
             Span::styled(
                 "delete from both sides (backed up first)",
                 Style::new().fg(Color::Red),
             ),
         ]),
-        Line::from("  u              mark undecided"),
+        Line::from("  u                  mark undecided"),
         Line::from(""),
         Line::from("Merge overlay".bold()),
-        Line::from("  ↑/↓ or j/k     move between hunks"),
-        Line::from("  ←/→ or h/l     cycle keep-local / keep-main / keep-both"),
-        Line::from("  PgUp/PgDn      scroll the assembled preview (also Space / b)"),
-        Line::from("  Enter          accept the assembled result (written to BOTH sides)"),
-        Line::from("  Esc            cancel the merge (file unchanged)"),
+        Line::from("  ↑/↓ or j/k         move between hunks"),
+        Line::from("  ←/→ or h/l         cycle keep-local / keep-main / keep-both"),
+        Line::from("  PgUp/PgDn/Space/b  scroll the assembled preview"),
+        Line::from("  Enter / Esc        accept (written to BOTH sides) / cancel"),
         Line::from(""),
-        Line::from("Apply".bold()),
-        Line::from("  Enter          review & apply (one batched confirm, default No)"),
-        Line::from("  Esc            cancel — nothing written"),
-        Line::from("  ?              toggle this help"),
-        Line::from(""),
-        Line::from("Safety".bold()),
+        Line::from("Apply & safety".bold()),
+        Line::from("  Enter              review & apply (one batched confirm, default No)"),
+        Line::from("  Esc                cancel — nothing written · ? toggles this help"),
         Line::from(Span::styled(
-            "  Overwritten or deleted bytes are backed up first under",
+            "  Backups first: .superset/backups/<timestamp>/ (10 newest kept)",
             Style::new().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "  .superset/backups/<timestamp>/ (the 10 newest batches are kept).",
-            Style::new().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "  Diffs and merges are EOL-normalized (CRLF→LF); push/pull copy raw bytes.",
+            "  Diffs/merges are EOL-normalized (CRLF→LF); push/pull copy raw bytes",
             Style::new().fg(Color::DarkGray),
         )),
     ];
+    // Size the popup to its content, clamped to the frame — a fixed
+    // percentage of the frame silently clipped the tail of the help (the
+    // safety facts!) on common terminal sizes like 80×24. 22 content lines
+    // + 2 border rows fit a 24-row terminal exactly.
+    let w = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 2;
+    let h = lines.len() as u16 + 2;
+    let popup = centered_rect_abs(w, h, area);
+    frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(Line::from(" Help ".bold()))),
         popup,
     );
+}
+
+/// A centered rect of absolute `width` × `height`, each clamped to `area`.
+fn centered_rect_abs(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height - h) / 2;
+    Rect::new(x, y, w, h)
 }
 
 fn render_confirm(frame: &mut Frame, area: Rect, app: &App) {

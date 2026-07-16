@@ -23,8 +23,11 @@ use similar::{ChangeTag, DiffTag, TextDiff};
 /// and fall back to whole-file push/pull. Tunable.
 pub const MAX_DIFF_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 
-/// Normalize `s` for diffing: every CRLF becomes LF, and a non-empty text
-/// gains a final trailing newline when it lacks one.
+/// Normalize `s` for diffing: every CRLF becomes LF, a trailing lone CR is
+/// treated as a line ending too (so `"x\r"` and `"x\n"` normalize equal
+/// rather than diffing as a phantom replace), and a non-empty text gains a
+/// final trailing newline when it lacks one. A lone CR in the MIDDLE of the
+/// text is content, not an EOL, and is preserved.
 ///
 /// Without this, two files whose CONTENT is identical but whose line endings
 /// (or final newline) differ render as one giant replace hunk of
@@ -40,7 +43,12 @@ pub const MAX_DIFF_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 /// converges both sides to LF + trailing newline (documented behavior).
 pub fn normalize_eol(s: &str) -> String {
     let mut t = s.replace("\r\n", "\n");
-    if !t.is_empty() && !t.ends_with('\n') {
+    if t.ends_with('\r') {
+        // A final lone CR would otherwise gain a '\n' right after it,
+        // synthesizing a CRLF that renders as an invisible "change".
+        t.pop();
+        t.push('\n');
+    } else if !t.is_empty() && !t.ends_with('\n') {
         t.push('\n');
     }
     t

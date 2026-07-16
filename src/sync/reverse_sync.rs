@@ -418,9 +418,12 @@ fn apply_batch(
 }
 
 /// Timestamp string for a batch of backups: the current UTC time as a
-/// human-readable `YYYYmmdd-HHMMSS` directory name (unique enough per batch;
-/// two batches inside one second share a directory, which the per-side
-/// namespaces keep collision-free per file).
+/// human-readable `YYYYmmdd-HHMMSS` directory name. The per-side namespaces
+/// keep the worktree and main copies of the SAME file collision-free within
+/// one batch; two batches inside one second would share the directory, and a
+/// same-side collision would overwrite the earlier backup — practically
+/// unreachable, since every batch requires completing a full interactive
+/// cockpit review.
 fn apply_timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -470,13 +473,21 @@ fn is_backup_batch_name(name: &str) -> bool {
     all_digits(b) || (b.len() == 15 && b[8] == b'-' && all_digits(&b[..8]) && all_digits(&b[9..]))
 }
 
-/// Prune old backup batch directories under `backups_root`, keeping the
-/// newest `keep`. A plain DESCENDING name sort is newest-first across both
-/// name shapes: within each shape lexicographic order is chronological
-/// (fixed-width digits), and every legacy epoch name (`17…`) sorts before
-/// every `YYYYmmdd-HHMMSS` name (`20…`), matching their real ages. Only
-/// directories matching [`is_backup_batch_name`] are touched; a missing
-/// backups root prunes nothing. Returns the pruned directory paths.
+/// Prune old backup batches under `backups_root`, keeping the newest `keep`.
+///
+/// A batch is keyed by its timestamp name, and lexicographic name order is
+/// chronological across both name shapes: within each shape the digits are
+/// fixed-width, and every legacy epoch name (`17…`) sorts before every
+/// `YYYYmmdd-HHMMSS` name (`20…`), matching their real ages. One batch can
+/// own several directories: the modern `<ts>/` layout, plus the legacy
+/// (unreleased-0.4.0) merge layout that wrote `local/<epoch>/` and
+/// `main/<epoch>/` at the TOP level — those children are folded into their
+/// epoch's batch so pre-upgrade backups honor the same keep budget instead
+/// of surviving forever. Only names matching [`is_backup_batch_name`] are
+/// ever touched (a foreign entry — or a non-batch child of `local`/`main` —
+/// is never deleted); the legacy side dirs themselves are removed once
+/// emptied. A missing backups root prunes nothing. Returns the pruned
+/// directory paths.
 fn prune_old_backups(backups_root: &Path, keep: usize) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(backups_root) {
         Ok(e) => e,
@@ -487,25 +498,60 @@ fn prune_old_backups(backups_root: &Path, keep: usize) -> Result<Vec<PathBuf>> {
         }
     };
 
-    let mut batches: Vec<String> = Vec::new();
+    // Batch name → every directory belonging to that batch. BTreeMap keeps
+    // the names sorted ascending, i.e. oldest first.
+    let mut batches: std::collections::BTreeMap<String, Vec<PathBuf>> =
+        std::collections::BTreeMap::new();
     for entry in entries {
         let entry = entry
             .with_context(|| format!("listing backup batches in {}", backups_root.display()))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if is_dir && is_backup_batch_name(name) {
-            batches.push(name.to_string());
+        if !is_dir {
+            continue;
+        }
+        if is_backup_batch_name(name) {
+            batches.entry(name.to_string()).or_default().push(entry.path());
+        } else if name == "local" || name == "main" {
+            // Legacy merge layout: fold `<side>/<epoch>/` into its batch.
+            for child in fs::read_dir(entry.path())
+                .with_context(|| format!("listing legacy backups in {}", entry.path().display()))?
+            {
+                let child = child.with_context(|| {
+                    format!("listing legacy backups in {}", entry.path().display())
+                })?;
+                let cname = child.file_name();
+                let Some(cname) = cname.to_str() else { continue };
+                let child_is_dir = child.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if child_is_dir && is_backup_batch_name(cname) {
+                    batches.entry(cname.to_string()).or_default().push(child.path());
+                }
+            }
         }
     }
 
-    batches.sort_unstable_by(|a, b| b.cmp(a)); // newest first
+    let prune_count = batches.len().saturating_sub(keep);
     let mut pruned = Vec::new();
-    for name in batches.into_iter().skip(keep) {
-        let dir = backups_root.join(&name);
-        fs::remove_dir_all(&dir)
-            .with_context(|| format!("pruning old backup batch {}", dir.display()))?;
-        pruned.push(dir);
+    for (_name, dirs) in batches.into_iter().take(prune_count) {
+        for dir in dirs {
+            fs::remove_dir_all(&dir)
+                .with_context(|| format!("pruning old backup batch {}", dir.display()))?;
+            pruned.push(dir);
+        }
+    }
+
+    // Drop a legacy side dir once it holds nothing — but only when this run
+    // actually pruned from it (never remove a foreign dir that merely shares
+    // the name). Best-effort; a non-empty dir is left alone.
+    for side in ["local", "main"] {
+        let dir = backups_root.join(side);
+        let pruned_from_side = pruned.iter().any(|p| p.parent() == Some(dir.as_path()));
+        if pruned_from_side
+            && fs::read_dir(&dir).map(|mut d| d.next().is_none()).unwrap_or(false)
+        {
+            let _ = fs::remove_dir(&dir);
+        }
     }
     Ok(pruned)
 }

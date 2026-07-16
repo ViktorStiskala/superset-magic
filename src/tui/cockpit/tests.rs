@@ -78,9 +78,10 @@ fn wide_render_shows_list_titles_badge_and_footer() {
     assert!(out.contains("Local file"), "split column title missing:\n{out}");
     assert!(out.contains("Main branch"), "split column title missing:\n{out}");
     assert!(out.contains("push to main"), "decision badge missing:\n{out}");
-    // Footer legend keys.
-    for key in ['p', 'l', 'u', '?'] {
-        assert!(out.contains(key), "footer legend missing `{key}`:\n{out}");
+    // Footer legend entries — full key+word substrings, since single chars
+    // like 'd' would vacuously match badges and file names.
+    for entry in ["p push", "l pull", "m merge", "d delete", "u undecided", "? help"] {
+        assert!(out.contains(entry), "footer legend missing `{entry}`:\n{out}");
     }
 }
 
@@ -185,13 +186,24 @@ fn use_split_thresholds() {
     assert!(!use_split(80));
 }
 
-/// Each decision maps to an unambiguous, direction-bearing badge label.
+/// Each decision maps to an unambiguous, direction-bearing badge label; the
+/// delete badge names exactly the sides that will be removed (mirroring the
+/// batched confirm's wording), so a worktree-only delete never claims a main
+/// copy that does not exist.
 #[test]
 fn badge_text_reflects_direction() {
-    assert!(badge_text(&Decision::Push).0.contains("push to main"));
-    assert!(badge_text(&Decision::Pull).0.contains("pull from main"));
-    assert!(badge_text(&Decision::Undecided).0.contains("undecided"));
-    assert!(badge_text(&Decision::Delete).0.contains("delete"));
+    let differs = DiffStatus::Differs;
+    assert!(badge_text(&Decision::Push, differs).0.contains("push to main"));
+    assert!(badge_text(&Decision::Pull, differs).0.contains("pull from main"));
+    assert!(badge_text(&Decision::Undecided, differs).0.contains("undecided"));
+    assert_eq!(
+        badge_text(&Decision::Delete, differs).0,
+        "✗ delete (worktree + main)"
+    );
+    assert_eq!(
+        badge_text(&Decision::Delete, DiffStatus::WorktreeOnly).0,
+        "✗ delete (worktree copy)"
+    );
 }
 
 /// Apply collects only non-undecided decisions.
@@ -441,7 +453,9 @@ fn accept_merge_sets_merge_decision_and_badge() {
         other => panic!("expected Decision::Merge, got {other:?}"),
     }
     assert!(
-        badge_text(&app.files[0].decision).0.contains("merge"),
+        badge_text(&app.files[0].decision, app.files[0].status)
+            .0
+            .contains("merge"),
         "badge reflects the merge decision"
     );
 }
@@ -651,6 +665,77 @@ fn help_overlay_documents_keys_and_backups() {
     assert!(out.contains("assembled preview"), "preview scroll missing:\n{out}");
     assert!(out.contains(".superset/backups/"), "backup path missing:\n{out}");
     assert!(out.contains("10 newest"), "retention missing:\n{out}");
+}
+
+/// The help popup is sized to its content, so even an 80×24 terminal shows the
+/// FULL help — including the trailing safety facts, which a fixed-percentage
+/// popup used to clip silently.
+#[test]
+fn help_overlay_fits_an_80x24_terminal() {
+    let mut app = two_file_app();
+    app.mode = Mode::Help;
+    let out = buffer_text(&render(&app, 80, 24));
+    assert!(out.contains("Navigation"), "help top missing:\n{out}");
+    assert!(
+        out.contains(".superset/backups/"),
+        "backup path (tail of the help) clipped:\n{out}"
+    );
+    assert!(out.contains("10 newest"), "retention (tail) clipped:\n{out}");
+    assert!(
+        out.contains("EOL-normalized"),
+        "last help line clipped:\n{out}"
+    );
+}
+
+/// The batched-confirm overlay renders the overwrite-or-delete warning and the
+/// per-file side labels for deletes; with nothing destructive it says so.
+#[test]
+fn confirm_overlay_renders_delete_labels_and_clean_case() {
+    let mut app = app_with(vec![
+        entry(
+            "gone.env",
+            DiffStatus::Differs,
+            Decision::Delete,
+            FileDiff::Text {
+                local: "x\n".to_string(),
+                main: "y\n".to_string(),
+            },
+        ),
+        entry(
+            "gone-new.env",
+            DiffStatus::WorktreeOnly,
+            Decision::Delete,
+            FileDiff::New { content: None },
+        ),
+    ]);
+    app.mode = Mode::Confirm;
+    let out = buffer_text(&render(&app, 120, 30));
+    assert!(
+        out.contains("OVERWRITTEN or DELETED"),
+        "destructive warning missing:\n{out}"
+    );
+    assert!(
+        out.contains("delete (worktree + main)"),
+        "differs delete label missing:\n{out}"
+    );
+    assert!(
+        out.contains("delete (worktree copy)"),
+        "worktree-only delete label missing:\n{out}"
+    );
+
+    // Nothing destructive: a worktree-only push is a plain create.
+    let mut clean = app_with(vec![entry(
+        "new.env",
+        DiffStatus::WorktreeOnly,
+        Decision::Push,
+        FileDiff::New { content: None },
+    )]);
+    clean.mode = Mode::Confirm;
+    let out = buffer_text(&render(&clean, 120, 30));
+    assert!(
+        out.contains("No existing files will be overwritten or deleted."),
+        "clean confirm wording missing:\n{out}"
+    );
 }
 
 /// Merge mode: `Esc` cancels the overlay, leaving the file's decision unchanged.

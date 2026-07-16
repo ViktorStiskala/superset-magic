@@ -173,6 +173,12 @@ committable and must never leak.
   pruning is best-effort (a failure warns, never fails the sync) and must only
   ever remove directories whose names match the batch shapes the tool itself
   wrote (`YYYYmmdd-HHMMSS` or legacy all-digit epoch), never foreign entries.
+  An older pre-release merge layout wrote `local/<epoch>/` and `main/<epoch>/`
+  at the TOP level of the backups root; those children are folded into their
+  epoch's batch for the same keep budget, and a `local`/`main` side dir is
+  removed only when this run pruned from it and it ended up empty — a foreign
+  dir merely named `local`/`main` (or its non-batch children) is never
+  touched.
   Flag a retention change that deletes non-batch-named entries, prunes before
   the current batch's backups are written, or turns a pruning error into a
   sync failure.

@@ -102,7 +102,7 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   (`p` push / `l` pull / `m` merge / `d` delete / `u` undecided), gated by a
   batched confirm. Each candidate is loaded once into a `FileDiff` (`Text` —
   EOL-normalized on both sides via `diffmodel::normalize_eol` at load, so
-  hunks are content-only and a pair equal after normalization renders an
+  hunks are content-only and a pair equal after normalization renders a
   "line endings only" notice instead of an empty diff —, `New` for
   worktree-only, `Binary`, `TooLarge`, or `Unreadable` when main's copy fails
   to read — surfaced verbatim, NEVER a fabricated empty buffer, so interactive
@@ -168,7 +168,10 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   the `BACKUP_BATCHES_KEPT` (10) newest batch dirs and removes older ones —
   best-effort (a failure warns, never fails the sync) and only for names
   matching `is_backup_batch_name` (current or legacy epoch shape), never
-  foreign entries.
+  foreign entries; the unreleased-0.4.0 merge layout's top-level
+  `local/<epoch>`+`main/<epoch>` dirs are folded into their epoch's batch
+  under the same budget, and an emptied side dir is removed only when this
+  run pruned from it.
   `ApplyContext` carries the two tree roots plus the batch's shared backups
   root/timestamp. Backup
   paths are printed so a mistaken overwrite is recoverable. `sync/merge.rs`

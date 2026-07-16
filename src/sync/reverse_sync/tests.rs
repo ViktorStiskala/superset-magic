@@ -1007,6 +1007,87 @@ fn apply_delete_skips_when_side_changed_since_review() {
     );
 }
 
+/// Twin of the worktree-side guard test: a delete whose MAIN side changed
+/// since review is skipped independently — both files survive, nothing is
+/// backed up.
+#[test]
+fn apply_delete_skips_when_main_side_changed_since_review() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN_EDITED=1\n");
+    write(&wt, "config.env", "WT_ORIG=1\n");
+
+    let stale_main = Some(FileMeta {
+        len: 999_999,
+        mtime: None,
+    });
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
+    let outcome = apply_decision(
+        &ctx,
+        Path::new("config.env"),
+        &Decision::Delete,
+        Baseline {
+            wt: meta(&wt.join("config.env")),
+            main: stale_main,
+        },
+    )
+    .unwrap();
+
+    match outcome {
+        ApplyOutcome::Skipped(reason) => {
+            assert!(reason.contains("changed since review"), "got: {reason}")
+        }
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    assert!(wt.join("config.env").exists(), "worktree copy must survive");
+    assert!(
+        main.path().join("config.env").exists(),
+        "main copy must survive"
+    );
+    assert!(
+        !backups.path().join(TS).exists(),
+        "a skip must not create the batch's backup dir at all"
+    );
+}
+
+/// The defensive both-sides-missing branch: a delete where neither side
+/// existed at review nor exists now is a "nothing to delete" skip, not an
+/// Applied that pretends to have removed something.
+#[test]
+fn apply_delete_with_nothing_on_disk_is_skipped() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
+    let outcome = apply_decision(
+        &ctx,
+        Path::new("ghost.env"),
+        &Decision::Delete,
+        Baseline { wt: None, main: None },
+    )
+    .unwrap();
+
+    match outcome {
+        ApplyOutcome::Skipped(reason) => assert_eq!(reason, "nothing to delete"),
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    assert!(!backups.path().join(TS).exists());
+}
+
 // ── Backup timestamps + retention ────────────────────────────────────────
 
 /// format_timestamp renders epoch seconds as UTC `YYYYmmdd-HHMMSS`, including
@@ -1081,6 +1162,46 @@ fn prune_old_backups_keeps_newest_and_ignores_foreign_entries() {
     assert!(!root.path().join("1752624100").exists());
     assert!(root.path().join("notes").is_dir(), "non-batch dir must survive");
     assert!(root.path().join("README.txt").is_file(), "plain file must survive");
+}
+
+/// The legacy (unreleased-0.4.0) merge layout — top-level `local/<epoch>/` and
+/// `main/<epoch>/` — is folded into its epoch's batch: pruned under the same
+/// keep budget (together with the top-level `<epoch>/` dir of the same batch),
+/// with the emptied side dirs removed, while a foreign dir named `local`
+/// holding non-batch children survives untouched.
+#[test]
+fn prune_old_backups_folds_legacy_merge_layout_into_batches() {
+    let root = tempfile::tempdir().unwrap();
+    let seed = |rel: &str| {
+        let p = root.path().join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, "X=1\n").unwrap();
+    };
+    // One legacy 0.4.0 batch (epoch 1752624000): push/pull backups at the top
+    // level PLUS merge backups under local/ + main/.
+    seed("1752624000/config.env");
+    seed("local/1752624000/config.env");
+    seed("main/1752624000/config.env");
+    // Two newer modern batches.
+    seed("20260716-100000/main/config.env");
+    seed("20260716-110000/main/config.env");
+    // A foreign non-batch child under local/ must survive.
+    seed("local/notes/keep.txt");
+
+    let pruned = prune_old_backups(root.path(), 2).unwrap();
+
+    // The whole legacy batch — all three of its directories — is pruned.
+    assert_eq!(pruned.len(), 3, "got {pruned:?}");
+    assert!(!root.path().join("1752624000").exists());
+    assert!(!root.path().join("local/1752624000").exists());
+    assert!(!root.path().join("main/1752624000").exists());
+    // The modern batches survive.
+    assert!(root.path().join("20260716-100000").is_dir());
+    assert!(root.path().join("20260716-110000").is_dir());
+    // local/ still holds the foreign child, so it survives; main/ was emptied
+    // by the prune and is removed.
+    assert!(root.path().join("local/notes/keep.txt").is_file());
+    assert!(!root.path().join("main").exists(), "emptied legacy side dir is removed");
 }
 
 /// Fewer batches than `keep` → nothing pruned; a missing backups root is a

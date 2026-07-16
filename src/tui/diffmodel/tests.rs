@@ -210,8 +210,13 @@ fn normalize_eol_normalizes_crlf_and_trailing_newline() {
     assert_eq!(normalize_eol("a\r\nb"), "a\nb\n");
     assert_eq!(normalize_eol("a\nb\n"), "a\nb\n");
     assert_eq!(normalize_eol(""), "", "empty input gains no newline");
-    // A lone CR (classic-Mac ending) is NOT an EOL here — left untouched.
+    // A lone CR in the MIDDLE of the text is content, not an EOL — untouched.
     assert_eq!(normalize_eol("a\rb\n"), "a\rb\n");
+    // A TRAILING lone CR is an EOL: it must not gain a '\n' after it (which
+    // would synthesize a CRLF that diffs as an invisible replace) — it
+    // normalizes to the same text as a trailing LF.
+    assert_eq!(normalize_eol("hello\r"), "hello\n");
+    assert_eq!(normalize_eol("hello\r"), normalize_eol("hello\n"));
 }
 
 /// The normalization goal end-to-end: a CRLF side against an LF side with ONE
