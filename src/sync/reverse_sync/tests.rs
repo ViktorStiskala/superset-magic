@@ -1,4 +1,5 @@
 use super::*;
+use crate::sync::merge::Decision;
 use crate::tests::support::git_run;
 use tempfile::TempDir;
 
@@ -532,4 +533,247 @@ fn is_safe_rel_accepts_normal_rejects_escapes() {
     assert!(!is_safe_rel(Path::new("../oops")));
     assert!(!is_safe_rel(Path::new("a/../b")));
     assert!(!is_safe_rel(Path::new("/abs")));
+}
+
+// ── apply_decision (merge cockpit apply seam) ────────────────────────────
+
+const TS: &str = "20260716-000000";
+
+fn applied(outcome: ApplyOutcome) -> ApplyResult {
+    match outcome {
+        ApplyOutcome::Applied(r) => r,
+        other => panic!("expected Applied, got {other:?}"),
+    }
+}
+
+/// Push over an EXISTING main file: main gets the worktree bytes, the OLD main
+/// bytes are backed up under `backups_root/TS/rel`, a gitignore rule is
+/// appended, and the backup path is reported.
+#[test]
+fn apply_push_overwrites_main_and_backs_up_old_bytes() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN_OLD=1\n");
+    write(&wt, "config.env", "WT_NEW=1\n");
+
+    let res = applied(
+        apply_decision(
+            &wt,
+            main.path(),
+            backups.path(),
+            TS,
+            Path::new("config.env"),
+            &Decision::Push,
+        )
+        .unwrap(),
+    );
+
+    assert!(matches!(res.direction, WriteDirection::PushToMain));
+    assert!(res.gitignore_appended, "push into main must ignore the secret");
+    // main now carries the worktree bytes.
+    assert_eq!(
+        fs::read_to_string(main.path().join("config.env")).unwrap(),
+        "WT_NEW=1\n"
+    );
+    // exactly one backup, at the timestamped path, holding the OLD main bytes.
+    assert_eq!(res.backups.len(), 1);
+    assert_eq!(res.backups[0], backups.path().join(TS).join("config.env"));
+    assert_eq!(fs::read_to_string(&res.backups[0]).unwrap(), "MAIN_OLD=1\n");
+    assert!(git::is_ignored(main.path(), Path::new("config.env")).unwrap());
+}
+
+/// Push to a NEW main path: it is created (parent dirs + file) and gitignored,
+/// with no backup since there were no prior bytes.
+#[test]
+fn apply_push_to_new_main_path_creates_and_gitignores_without_backup() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(&wt, "apps/api/.dev.vars", "SECRET=1\n");
+
+    let res = applied(
+        apply_decision(
+            &wt,
+            main.path(),
+            backups.path(),
+            TS,
+            Path::new("apps/api/.dev.vars"),
+            &Decision::Push,
+        )
+        .unwrap(),
+    );
+
+    assert!(res.backups.is_empty(), "a new path has no prior bytes to back up");
+    assert!(res.gitignore_appended);
+    assert_eq!(
+        fs::read_to_string(main.path().join("apps/api/.dev.vars")).unwrap(),
+        "SECRET=1\n"
+    );
+    assert!(git::is_ignored(main.path(), Path::new("apps/api/.dev.vars")).unwrap());
+}
+
+/// Pull overwrites the WORKTREE with main's bytes and backs up the worktree's
+/// old bytes; no gitignore step on the worktree side.
+#[test]
+fn apply_pull_overwrites_worktree_and_backs_up_its_old_bytes() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN_SIDE=1\n");
+    write(&wt, "config.env", "WT_OLD=1\n");
+
+    let res = applied(
+        apply_decision(
+            &wt,
+            main.path(),
+            backups.path(),
+            TS,
+            Path::new("config.env"),
+            &Decision::Pull,
+        )
+        .unwrap(),
+    );
+
+    assert!(matches!(res.direction, WriteDirection::PullFromMain));
+    assert!(!res.gitignore_appended, "pull writes the worktree side only");
+    assert_eq!(
+        fs::read_to_string(wt.join("config.env")).unwrap(),
+        "MAIN_SIDE=1\n"
+    );
+    assert_eq!(res.backups.len(), 1);
+    assert_eq!(fs::read_to_string(&res.backups[0]).unwrap(), "WT_OLD=1\n");
+}
+
+/// Merge writes the assembled text to BOTH sides and backs up both originals
+/// (to distinct paths, so neither is lost).
+#[test]
+fn apply_merge_writes_assembled_to_both_and_backs_up_both() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN_ORIG=1\n");
+    write(&wt, "config.env", "WT_ORIG=1\n");
+
+    let merged = "ASSEMBLED=1\n".to_string();
+    let res = applied(
+        apply_decision(
+            &wt,
+            main.path(),
+            backups.path(),
+            TS,
+            Path::new("config.env"),
+            &Decision::Merge(merged.clone()),
+        )
+        .unwrap(),
+    );
+
+    assert!(matches!(res.direction, WriteDirection::MergeBoth));
+    assert!(res.gitignore_appended);
+    // Both sides converge on the assembled text.
+    assert_eq!(fs::read_to_string(wt.join("config.env")).unwrap(), merged);
+    assert_eq!(
+        fs::read_to_string(main.path().join("config.env")).unwrap(),
+        merged
+    );
+    // Both originals are backed up at distinct paths.
+    assert_eq!(res.backups.len(), 2);
+    let contents: Vec<String> = res
+        .backups
+        .iter()
+        .map(|p| fs::read_to_string(p).unwrap())
+        .collect();
+    assert!(
+        contents.contains(&"WT_ORIG=1\n".to_string()),
+        "worktree original must be backed up; got {contents:?}"
+    );
+    assert!(
+        contents.contains(&"MAIN_ORIG=1\n".to_string()),
+        "main original must be backed up; got {contents:?}"
+    );
+}
+
+/// A target that changed on disk after its snapshot is skipped, writing
+/// NOTHING (no target overwrite, no backup, no gitignore).
+#[test]
+fn apply_skips_when_target_changed_after_snapshot() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN_ORIG=1\n");
+    write(&wt, "config.env", "WT_NEW=1\n");
+
+    let main_path = main.path().join("config.env");
+    let mut fired = false;
+    let outcome = apply_decision_hooked(
+        &wt,
+        main.path(),
+        backups.path(),
+        TS,
+        Path::new("config.env"),
+        &Decision::Push,
+        &mut || {
+            if !fired {
+                fired = true;
+                // Concurrent edit lands in the snapshot→write window (different
+                // length ⇒ reliably detected regardless of mtime resolution).
+                fs::write(&main_path, "MAIN_CHANGED_CONCURRENTLY=999\n").unwrap();
+            }
+        },
+    )
+    .unwrap();
+
+    match outcome {
+        ApplyOutcome::Skipped(reason) => {
+            assert!(reason.contains("changed since review"), "got: {reason}")
+        }
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    // main retains the concurrent edit, NOT the worktree bytes.
+    assert_eq!(
+        fs::read_to_string(&main_path).unwrap(),
+        "MAIN_CHANGED_CONCURRENTLY=999\n"
+    );
+    // Nothing else was touched: no backup and no .gitignore created.
+    assert!(!backups.path().join(TS).join("config.env").exists());
+    assert!(
+        !main.path().join(".gitignore").exists(),
+        "a skip must not append a gitignore rule"
+    );
+}
+
+/// An Undecided decision is a no-op skip; neither side is touched.
+#[test]
+fn apply_undecided_is_skipped() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN=1\n");
+    write(&wt, "config.env", "WT=1\n");
+
+    let outcome = apply_decision(
+        &wt,
+        main.path(),
+        backups.path(),
+        TS,
+        Path::new("config.env"),
+        &Decision::Undecided,
+    )
+    .unwrap();
+
+    match outcome {
+        ApplyOutcome::Skipped(reason) => assert_eq!(reason, "undecided"),
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(main.path().join("config.env")).unwrap(),
+        "MAIN=1\n"
+    );
+    assert_eq!(fs::read_to_string(wt.join("config.env")).unwrap(), "WT=1\n");
 }

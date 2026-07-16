@@ -38,6 +38,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 
 use crate::sync::apply;
+use crate::sync::merge::{backup_rel_path, Decision};
 use crate::git;
 use crate::git::gitignore;
 use crate::tui::style;
@@ -387,6 +388,261 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
         println!("{}", style::warn(line));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// ── Apply seam (reverse-sync merge cockpit) ──────────────────────────────
+//
+// The cockpit's safe, backup-first apply path. It writes a decision (push /
+// pull / merge) to disk, mirroring the safety order of
+// [`copy_candidate_into_main`]: path-safety guard, a TOCTOU re-check that skips
+// on a concurrent edit, a timestamped pre-write backup of the losing bytes, and
+// `ensure_gitignored_in_main` BEFORE any secret bytes land in main. Not yet
+// wired into `run()`/`pick_reverse_sync` (the cockpit replaces those in a later
+// phase), so the new items carry a scoped `dead_code` allow.
+
+/// Which direction (and how many sides) an applied decision wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by cockpit (later phase)
+pub enum WriteDirection {
+    /// Worktree bytes were written to main.
+    PushToMain,
+    /// Main bytes were written to the worktree.
+    PullFromMain,
+    /// Assembled merge bytes were written to BOTH sides.
+    MergeBoth,
+}
+
+/// The successful outcome of [`apply_decision`]: what was written, the
+/// timestamped backups taken of the overwritten (losing) bytes, and whether a
+/// gitignore rule was appended in main.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by cockpit (later phase)
+pub struct ApplyResult {
+    /// The direction the bytes moved.
+    pub direction: WriteDirection,
+    /// Backup paths written before each destructive overwrite (empty when the
+    /// target was newly created and had no prior bytes).
+    pub backups: Vec<PathBuf>,
+    /// True when a rule was appended to main's `.gitignore` for this path.
+    pub gitignore_appended: bool,
+}
+
+/// The result of [`apply_decision`]: either an applied write or a skip with a
+/// human-readable reason (undecided, or a concurrent edit since review).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by cockpit (later phase)
+pub enum ApplyOutcome {
+    /// The decision was applied; carries the write details.
+    Applied(ApplyResult),
+    /// Nothing was written; the string is a human-readable reason.
+    Skipped(String),
+}
+
+/// Per-target TOCTOU verdict from [`check_target`].
+#[allow(dead_code)] // consumed by cockpit (later phase)
+enum Guard {
+    /// The target does not exist — a fresh write, no backup needed.
+    Missing,
+    /// The target exists and is unchanged since the snapshot — safe to back up
+    /// and overwrite.
+    Unchanged,
+    /// The target changed (size/mtime) since the snapshot — caller must skip.
+    Changed,
+}
+
+/// Snapshot `target`'s metadata, run `hook` (a test seam simulating a
+/// concurrent edit landing in the review→write window), then re-check: a
+/// changed or vanished target yields [`Guard::Changed`] so the caller writes
+/// nothing. A non-existent target is [`Guard::Missing`] (fresh write).
+#[allow(dead_code)] // consumed by cockpit (later phase)
+fn check_target(target: &Path, hook: &mut dyn FnMut()) -> Guard {
+    let pre = match fs::metadata(target) {
+        Ok(m) => m,
+        Err(_) => return Guard::Missing,
+    };
+    hook();
+    match fs::metadata(target) {
+        Ok(now) if pre.len() == now.len() && pre.modified().ok() == now.modified().ok() => {
+            Guard::Unchanged
+        }
+        _ => Guard::Changed,
+    }
+}
+
+/// Copy `target`'s CURRENT bytes to `dest` (creating parent dirs) before it is
+/// overwritten, returning the backup path.
+#[allow(dead_code)] // consumed by cockpit (later phase)
+fn backup(target: &Path, dest: &Path) -> Result<PathBuf> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating backup dir {}", parent.display()))?;
+    }
+    fs::copy(target, dest)
+        .with_context(|| format!("backing up {} → {}", target.display(), dest.display()))?;
+    Ok(dest.to_path_buf())
+}
+
+/// Write `bytes` to `target`, creating any missing parent directories first.
+#[allow(dead_code)] // consumed by cockpit (later phase)
+fn write_bytes(target: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent dirs for {}", target.display()))?;
+    }
+    fs::write(target, bytes).with_context(|| format!("writing {}", target.display()))?;
+    Ok(())
+}
+
+/// Apply one cockpit [`Decision`] for `rel`, safely (KD4, R13–R15).
+///
+/// Safety order mirrors [`copy_candidate_into_main`]: an unsafe `rel` bails; an
+/// [`Decision::Undecided`] is a no-op skip; every destructive overwrite of an
+/// existing target is TOCTOU-guarded and its losing bytes are backed up under
+/// `backups_root` (via [`backup_rel_path`]) BEFORE the write; every write into
+/// main is preceded by [`ensure_gitignored_in_main`] so a git failure never
+/// leaves un-ignored secret bytes on disk. `Merge` writes the assembled text to
+/// BOTH sides (distinct `local/`+`main/` backup dirs so neither original is
+/// lost). A target that changed since its snapshot yields
+/// [`ApplyOutcome::Skipped`] with nothing written.
+#[allow(dead_code)] // consumed by cockpit (later phase)
+pub fn apply_decision(
+    worktree_root: &Path,
+    main_root: &Path,
+    backups_root: &Path,
+    ts: &str,
+    rel: &Path,
+    decision: &Decision,
+) -> Result<ApplyOutcome> {
+    apply_decision_hooked(
+        worktree_root,
+        main_root,
+        backups_root,
+        ts,
+        rel,
+        decision,
+        &mut || {},
+    )
+}
+
+/// [`apply_decision`] with a test seam: `hook` fires once per existing target,
+/// right after its metadata snapshot and before the TOCTOU re-check, so tests
+/// can simulate a concurrent edit (mirrors the `overwrite` closure seam on
+/// [`copy_candidate_into_main`]). Production passes a no-op.
+#[allow(dead_code)] // consumed by cockpit (later phase)
+fn apply_decision_hooked(
+    worktree_root: &Path,
+    main_root: &Path,
+    backups_root: &Path,
+    ts: &str,
+    rel: &Path,
+    decision: &Decision,
+    hook: &mut dyn FnMut(),
+) -> Result<ApplyOutcome> {
+    // Universal path-safety guard (defense-in-depth, as in
+    // `copy_candidate_into_main`) — reject anything that could escape a tree.
+    if !is_safe_rel(rel) {
+        anyhow::bail!(
+            "refusing to reverse-sync unsafe path (escapes the tree): {}",
+            rel.display()
+        );
+    }
+
+    let changed_reason = || format!("{} changed since review", rel.display());
+
+    match decision {
+        Decision::Undecided => Ok(ApplyOutcome::Skipped("undecided".to_string())),
+
+        Decision::Push => {
+            let source = worktree_root.join(rel);
+            let target = main_root.join(rel); // main is the destination
+            let guard = check_target(&target, hook);
+            if matches!(guard, Guard::Changed) {
+                return Ok(ApplyOutcome::Skipped(changed_reason()));
+            }
+            let mut backups = Vec::new();
+            if matches!(guard, Guard::Unchanged) {
+                backups.push(backup(
+                    &target,
+                    &backups_root.join(backup_rel_path(ts, rel)),
+                )?);
+            }
+            // Secret-safety BEFORE the bytes land in main.
+            let gitignore_appended = ensure_gitignored_in_main(worktree_root, main_root, rel)?;
+            let bytes = fs::read(&source)
+                .with_context(|| format!("reading worktree file {}", source.display()))?;
+            write_bytes(&target, &bytes)?;
+            Ok(ApplyOutcome::Applied(ApplyResult {
+                direction: WriteDirection::PushToMain,
+                backups,
+                gitignore_appended,
+            }))
+        }
+
+        Decision::Pull => {
+            let source = main_root.join(rel);
+            let target = worktree_root.join(rel); // worktree is the destination
+            let guard = check_target(&target, hook);
+            if matches!(guard, Guard::Changed) {
+                return Ok(ApplyOutcome::Skipped(changed_reason()));
+            }
+            let mut backups = Vec::new();
+            if matches!(guard, Guard::Unchanged) {
+                backups.push(backup(
+                    &target,
+                    &backups_root.join(backup_rel_path(ts, rel)),
+                )?);
+            }
+            // No gitignore step — the worktree side is not the secret boundary.
+            let bytes = fs::read(&source)
+                .with_context(|| format!("reading main file {}", source.display()))?;
+            write_bytes(&target, &bytes)?;
+            Ok(ApplyOutcome::Applied(ApplyResult {
+                direction: WriteDirection::PullFromMain,
+                backups,
+                gitignore_appended: false,
+            }))
+        }
+
+        Decision::Merge(text) => {
+            let wt_target = worktree_root.join(rel);
+            let main_target = main_root.join(rel);
+            // TOCTOU-check BOTH sides first so a skip writes nothing at all
+            // (no partial backup either).
+            let wt_guard = check_target(&wt_target, hook);
+            if matches!(wt_guard, Guard::Changed) {
+                return Ok(ApplyOutcome::Skipped(changed_reason()));
+            }
+            let main_guard = check_target(&main_target, hook);
+            if matches!(main_guard, Guard::Changed) {
+                return Ok(ApplyOutcome::Skipped(changed_reason()));
+            }
+            // Back up whichever side exists, under distinct dirs so the same
+            // `rel` on both sides does not collide to one backup file.
+            let mut backups = Vec::new();
+            if matches!(wt_guard, Guard::Unchanged) {
+                backups.push(backup(
+                    &wt_target,
+                    &backups_root.join("local").join(backup_rel_path(ts, rel)),
+                )?);
+            }
+            if matches!(main_guard, Guard::Unchanged) {
+                backups.push(backup(
+                    &main_target,
+                    &backups_root.join("main").join(backup_rel_path(ts, rel)),
+                )?);
+            }
+            // Write the assembled text to the worktree, then — secret-safe —
+            // to main.
+            write_bytes(&wt_target, text.as_bytes())?;
+            let gitignore_appended = ensure_gitignored_in_main(worktree_root, main_root, rel)?;
+            write_bytes(&main_target, text.as_bytes())?;
+            Ok(ApplyOutcome::Applied(ApplyResult {
+                direction: WriteDirection::MergeBoth,
+                backups,
+                gitignore_appended,
+            }))
+        }
+    }
 }
 
 #[cfg(test)]
