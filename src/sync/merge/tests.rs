@@ -89,11 +89,17 @@ fn default_decision_is_conservative() {
     ));
 }
 
-/// backup_rel_path joins the timestamp dir onto the repo-relative path.
+/// backup_rel_path joins the timestamp dir + side namespace onto the
+/// repo-relative path, so the same rel backed up from both sides never
+/// collides into one file.
 #[test]
-fn backup_rel_path_joins_ts_and_rel() {
+fn backup_rel_path_joins_ts_side_and_rel() {
     assert_eq!(
-        backup_rel_path("20260716-153000", Path::new("apps/api/.env")),
-        Path::new("20260716-153000/apps/api/.env")
+        backup_rel_path("20260716-153000", BackupSide::Main, Path::new("apps/api/.env")),
+        Path::new("20260716-153000/main/apps/api/.env")
+    );
+    assert_eq!(
+        backup_rel_path("20260716-153000", BackupSide::Worktree, Path::new("apps/api/.env")),
+        Path::new("20260716-153000/worktree/apps/api/.env")
     );
 }

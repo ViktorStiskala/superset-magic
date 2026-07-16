@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 
 use crate::sync::apply;
-use crate::sync::merge::{backup_rel_path, Decision};
+use crate::sync::merge::{backup_rel_path, BackupSide, Decision};
 use crate::git;
 use crate::git::gitignore;
 use crate::tui::cockpit::{self, CockpitOutcome};
@@ -313,6 +313,24 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
         }
     }
 
+    // Retention: keep only the newest batches so `.superset/backups/` cannot
+    // grow without bound. Best-effort — a pruning failure never fails the sync
+    // (the writes above already landed and their backups are intact).
+    match prune_old_backups(&backups_root, BACKUP_BATCHES_KEPT) {
+        Ok(pruned) if !pruned.is_empty() => println!(
+            "{}",
+            style::info(format!(
+                "Pruned {} old backup batch(es), keeping the newest {BACKUP_BATCHES_KEPT}.",
+                pruned.len()
+            ))
+        ),
+        Ok(_) => {}
+        Err(err) => println!(
+            "{}",
+            style::warn(format!("Backup pruning failed (backups left as-is): {err:#}"))
+        ),
+    }
+
     println!();
     let line = format!(
         "Reverse sync done: applied {}, skipped {}, failed {}",
@@ -398,15 +416,97 @@ fn apply_batch(
     summary
 }
 
-/// Timestamp string for a batch of backups. Seconds since the Unix epoch — a
-/// unique, monotonic-enough directory name with no extra dependency (the plan
-/// permits a plain epoch instead of `%Y%m%d-%H%M%S`).
+/// Timestamp string for a batch of backups: the current UTC time as a
+/// human-readable `YYYYmmdd-HHMMSS` directory name (unique enough per batch;
+/// two batches inside one second share a directory, which the per-side
+/// namespaces keep collision-free per file).
 fn apply_timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format!("{secs}")
+    format_timestamp(secs)
+}
+
+/// Format `secs` since the Unix epoch as a UTC `YYYYmmdd-HHMMSS` string —
+/// pure and dependency-free (Howard Hinnant's civil-from-days algorithm), so
+/// backup batch directories get human-readable names without pulling in a
+/// date crate.
+fn format_timestamp(secs: u64) -> String {
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (hh, mm, ss) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+
+    // Civil-from-days: days since 1970-01-01 → (year, month, day).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64; // day-of-era [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // year-of-era [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day-of-year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month index in the Mar-first calendar [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
+    let y = yoe as i64 + era * 400 + i64::from(m <= 2);
+
+    format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
+}
+
+/// How many of the newest backup batch directories are KEPT under
+/// `.superset/backups/` — older batches are pruned after each apply so the
+/// backups dir cannot grow without bound. Each batch is a handful of small
+/// secret files, so ten is cheap insurance.
+const BACKUP_BATCHES_KEPT: usize = 10;
+
+/// True when `name` looks like a backup batch directory THIS TOOL created:
+/// the current `YYYYmmdd-HHMMSS` shape or the legacy all-digits epoch shape.
+/// Anything else under the backups root is never pruned — retention must not
+/// delete a directory it did not name.
+fn is_backup_batch_name(name: &str) -> bool {
+    fn all_digits(s: &[u8]) -> bool {
+        !s.is_empty() && s.iter().all(u8::is_ascii_digit)
+    }
+    let b = name.as_bytes();
+    all_digits(b) || (b.len() == 15 && b[8] == b'-' && all_digits(&b[..8]) && all_digits(&b[9..]))
+}
+
+/// Prune old backup batch directories under `backups_root`, keeping the
+/// newest `keep`. A plain DESCENDING name sort is newest-first across both
+/// name shapes: within each shape lexicographic order is chronological
+/// (fixed-width digits), and every legacy epoch name (`17…`) sorts before
+/// every `YYYYmmdd-HHMMSS` name (`20…`), matching their real ages. Only
+/// directories matching [`is_backup_batch_name`] are touched; a missing
+/// backups root prunes nothing. Returns the pruned directory paths.
+fn prune_old_backups(backups_root: &Path, keep: usize) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(backups_root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("listing backup batches in {}", backups_root.display()))
+        }
+    };
+
+    let mut batches: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .with_context(|| format!("listing backup batches in {}", backups_root.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir && is_backup_batch_name(name) {
+            batches.push(name.to_string());
+        }
+    }
+
+    batches.sort_unstable_by(|a, b| b.cmp(a)); // newest first
+    let mut pruned = Vec::new();
+    for name in batches.into_iter().skip(keep) {
+        let dir = backups_root.join(&name);
+        fs::remove_dir_all(&dir)
+            .with_context(|| format!("pruning old backup batch {}", dir.display()))?;
+        pruned.push(dir);
+    }
+    Ok(pruned)
 }
 
 // ── Apply seam (reverse-sync merge cockpit) ──────────────────────────────
@@ -629,7 +729,7 @@ pub struct Baseline {
 /// `ctx.backups_root` (via [`backup_rel_path`]) BEFORE the write; every write
 /// into main is preceded by [`ensure_gitignored_in_main`] so a git failure
 /// never leaves un-ignored secret bytes on disk. `Merge` writes the assembled
-/// text to BOTH sides (distinct `local/`+`main/` backup dirs so neither
+/// text to BOTH sides (distinct per-side backup namespaces so neither
 /// original is lost). Any side that no longer matches its baseline (edited,
 /// created, or deleted since review) yields [`ApplyOutcome::Skipped`] with
 /// nothing written — no overwrite and no partial backup.
@@ -671,7 +771,8 @@ pub fn apply_decision(
             backups.extend(backup_if_unchanged(
                 &target,
                 guard,
-                &ctx.backups_root.join(backup_rel_path(ctx.ts, rel)),
+                &ctx.backups_root
+                    .join(backup_rel_path(ctx.ts, BackupSide::Main, rel)),
             )?);
             // Secret-safety BEFORE the bytes land in main.
             let gitignore_appended =
@@ -703,7 +804,8 @@ pub fn apply_decision(
             backups.extend(backup_if_unchanged(
                 &target,
                 guard,
-                &ctx.backups_root.join(backup_rel_path(ctx.ts, rel)),
+                &ctx.backups_root
+                    .join(backup_rel_path(ctx.ts, BackupSide::Worktree, rel)),
             )?);
             // No gitignore step — the worktree side is not the secret boundary.
             let bytes = fs::read(&source)
@@ -729,22 +831,20 @@ pub fn apply_decision(
             if matches!(main_guard, Guard::Changed) {
                 return Ok(ApplyOutcome::Skipped(changed_reason()));
             }
-            // Back up whichever side exists, under distinct dirs so the same
-            // `rel` on both sides does not collide to one backup file.
+            // Back up whichever side exists — the per-side namespaces keep the
+            // same `rel` from colliding into one backup file.
             let mut backups = Vec::new();
             backups.extend(backup_if_unchanged(
                 &wt_target,
                 wt_guard,
                 &ctx.backups_root
-                    .join("local")
-                    .join(backup_rel_path(ctx.ts, rel)),
+                    .join(backup_rel_path(ctx.ts, BackupSide::Worktree, rel)),
             )?);
             backups.extend(backup_if_unchanged(
                 &main_target,
                 main_guard,
                 &ctx.backups_root
-                    .join("main")
-                    .join(backup_rel_path(ctx.ts, rel)),
+                    .join(backup_rel_path(ctx.ts, BackupSide::Main, rel)),
             )?);
             // Secret-safety FIRST, then write MAIN, then the worktree. Ordering
             // the main write before the worktree means a failure at or before

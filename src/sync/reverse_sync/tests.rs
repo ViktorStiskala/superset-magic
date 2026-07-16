@@ -325,7 +325,7 @@ fn meta(path: &Path) -> Option<FileMeta> {
 }
 
 /// Push over an EXISTING main file: main gets the worktree bytes, the OLD main
-/// bytes are backed up under `backups_root/TS/rel`, a gitignore rule is
+/// bytes are backed up under `backups_root/TS/main/rel`, a gitignore rule is
 /// appended, and the backup path is reported.
 #[test]
 fn apply_push_overwrites_main_and_backs_up_old_bytes() {
@@ -362,9 +362,13 @@ fn apply_push_overwrites_main_and_backs_up_old_bytes() {
         fs::read_to_string(main.path().join("config.env")).unwrap(),
         "WT_NEW=1\n"
     );
-    // exactly one backup, at the timestamped path, holding the OLD main bytes.
+    // exactly one backup, in the batch's main-side namespace, holding the OLD
+    // main bytes.
     assert_eq!(res.backups.len(), 1);
-    assert_eq!(res.backups[0], backups.path().join(TS).join("config.env"));
+    assert_eq!(
+        res.backups[0],
+        backups.path().join(TS).join("main").join("config.env")
+    );
     assert_eq!(fs::read_to_string(&res.backups[0]).unwrap(), "MAIN_OLD=1\n");
     assert!(git::is_ignored(main.path(), Path::new("config.env")).unwrap());
 }
@@ -444,6 +448,11 @@ fn apply_pull_overwrites_worktree_and_backs_up_its_old_bytes() {
         "MAIN_SIDE=1\n"
     );
     assert_eq!(res.backups.len(), 1);
+    assert_eq!(
+        res.backups[0],
+        backups.path().join(TS).join("worktree").join("config.env"),
+        "pull backs up the worktree side under its namespace"
+    );
     assert_eq!(fs::read_to_string(&res.backups[0]).unwrap(), "WT_OLD=1\n");
 }
 
@@ -486,8 +495,20 @@ fn apply_merge_writes_assembled_to_both_and_backs_up_both() {
         fs::read_to_string(main.path().join("config.env")).unwrap(),
         merged
     );
-    // Both originals are backed up at distinct paths.
+    // Both originals are backed up at distinct per-side paths.
     assert_eq!(res.backups.len(), 2);
+    assert!(
+        res.backups
+            .contains(&backups.path().join(TS).join("worktree").join("config.env")),
+        "worktree-side backup path missing: {:?}",
+        res.backups
+    );
+    assert!(
+        res.backups
+            .contains(&backups.path().join(TS).join("main").join("config.env")),
+        "main-side backup path missing: {:?}",
+        res.backups
+    );
     let contents: Vec<String> = res
         .backups
         .iter()
@@ -553,7 +574,10 @@ fn apply_skips_when_target_changed_since_review() {
         "MAIN_ORIG=1\n"
     );
     // Nothing else was touched: no backup and no .gitignore created.
-    assert!(!backups.path().join(TS).join("config.env").exists());
+    assert!(
+        !backups.path().join(TS).exists(),
+        "a skip must not create the batch's backup dir at all"
+    );
     assert!(
         !main.path().join(".gitignore").exists(),
         "a skip must not append a gitignore rule"
@@ -642,7 +666,10 @@ fn apply_skips_when_target_appeared_after_review() {
         fs::read_to_string(main.path().join("config.env")).unwrap(),
         "APPEARED=1\n"
     );
-    assert!(!backups.path().join(TS).join("config.env").exists());
+    assert!(
+        !backups.path().join(TS).exists(),
+        "a skip must not create the batch's backup dir at all"
+    );
 }
 
 /// An Undecided decision is a no-op skip; neither side is touched.
@@ -730,7 +757,10 @@ fn apply_push_skips_when_source_changed_since_review() {
         fs::read_to_string(main.path().join("config.env")).unwrap(),
         "MAIN_ORIG=1\n"
     );
-    assert!(!backups.path().join(TS).join("config.env").exists());
+    assert!(
+        !backups.path().join(TS).exists(),
+        "a skip must not create the batch's backup dir at all"
+    );
     assert!(
         !main.path().join(".gitignore").exists(),
         "a source-changed skip must not append a gitignore rule"
@@ -781,7 +811,10 @@ fn apply_pull_skips_when_source_changed_since_review() {
         fs::read_to_string(wt.join("config.env")).unwrap(),
         "WT_ORIG=1\n"
     );
-    assert!(!backups.path().join(TS).join("config.env").exists());
+    assert!(
+        !backups.path().join(TS).exists(),
+        "a skip must not create the batch's backup dir at all"
+    );
 }
 
 /// Finding 6: one file's apply error does NOT abort the batch — later files are
@@ -833,4 +866,93 @@ fn apply_batch_continues_past_a_failing_file() {
         1,
         "the good push backed up main's old bytes"
     );
+}
+
+// ── Backup timestamps + retention ────────────────────────────────────────
+
+/// format_timestamp renders epoch seconds as UTC `YYYYmmdd-HHMMSS`, including
+/// the leap-day and end-of-day edges.
+#[test]
+fn format_timestamp_renders_utc_dates() {
+    assert_eq!(format_timestamp(0), "19700101-000000");
+    assert_eq!(format_timestamp(86_399), "19700101-235959");
+    assert_eq!(format_timestamp(86_400), "19700102-000000");
+    // Well-known epoch: 2001-09-09 01:46:40 UTC.
+    assert_eq!(format_timestamp(1_000_000_000), "20010909-014640");
+    // Leap day: 2000-02-29 00:00:00 UTC.
+    assert_eq!(format_timestamp(951_782_400), "20000229-000000");
+}
+
+/// Retention recognizes only the two batch-name shapes this tool has ever
+/// written — current `YYYYmmdd-HHMMSS` and legacy all-digits epoch — and
+/// nothing else.
+#[test]
+fn is_backup_batch_name_matches_only_our_shapes() {
+    assert!(is_backup_batch_name("20260716-153000"));
+    assert!(is_backup_batch_name("1752624000")); // legacy epoch
+    assert!(!is_backup_batch_name("worktree"));
+    assert!(!is_backup_batch_name("main"));
+    assert!(!is_backup_batch_name("2026-07-16"));
+    assert!(!is_backup_batch_name("20260716_153000"));
+    assert!(!is_backup_batch_name("20260716-15300")); // 14 chars
+    assert!(!is_backup_batch_name(""));
+}
+
+/// prune_old_backups keeps the newest `keep` batch dirs (legacy epoch names
+/// count as OLDER than every `YYYYmmdd` name), deletes the rest, and never
+/// touches non-batch entries.
+#[test]
+fn prune_old_backups_keeps_newest_and_ignores_foreign_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let mk = |name: &str| {
+        let d = root.path().join(name).join("main");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("x.env"), "X=1\n").unwrap();
+    };
+    // Two legacy epoch batches (oldest), three current-format batches.
+    mk("1752624000");
+    mk("1752624100");
+    mk("20260716-100000");
+    mk("20260716-110000");
+    mk("20260716-120000");
+    // Foreign entries that must survive: a non-batch dir and a plain file.
+    fs::create_dir_all(root.path().join("notes")).unwrap();
+    fs::write(root.path().join("README.txt"), "hands off\n").unwrap();
+
+    let pruned = prune_old_backups(root.path(), 3).unwrap();
+
+    let pruned_names: Vec<String> = pruned
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        {
+            let mut v = pruned_names.clone();
+            v.sort();
+            v
+        },
+        vec!["1752624000".to_string(), "1752624100".to_string()],
+        "the two legacy (oldest) batches are pruned; got {pruned_names:?}"
+    );
+    // The three newest batches remain, foreign entries untouched.
+    assert!(root.path().join("20260716-100000").is_dir());
+    assert!(root.path().join("20260716-110000").is_dir());
+    assert!(root.path().join("20260716-120000").is_dir());
+    assert!(!root.path().join("1752624000").exists());
+    assert!(!root.path().join("1752624100").exists());
+    assert!(root.path().join("notes").is_dir(), "non-batch dir must survive");
+    assert!(root.path().join("README.txt").is_file(), "plain file must survive");
+}
+
+/// Fewer batches than `keep` → nothing pruned; a missing backups root is a
+/// clean no-op (first-ever sync has no backups dir).
+#[test]
+fn prune_old_backups_noop_under_threshold_and_missing_root() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("20260716-100000")).unwrap();
+    assert!(prune_old_backups(root.path(), 10).unwrap().is_empty());
+    assert!(root.path().join("20260716-100000").is_dir());
+
+    let missing = root.path().join("no-such-dir");
+    assert!(prune_old_backups(&missing, 10).unwrap().is_empty());
 }

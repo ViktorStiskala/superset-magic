@@ -235,12 +235,35 @@ pub fn assemble(segments: &[MergeSegment], choices: &[MergeChoice]) -> String {
     out
 }
 
-/// The repo-relative backup path for `rel` under a timestamp directory, e.g.
-/// `backup_rel_path("20260716-153000", "apps/api/.env")` →
-/// `20260716-153000/apps/api/.env`. Pure — no filesystem access; the apply
-/// seam joins this onto its chosen backups root.
-pub fn backup_rel_path(ts: &str, rel: &Path) -> PathBuf {
-    Path::new(ts).join(rel)
+/// Which side of the reconcile a backup's losing bytes came from. Every backup
+/// lives under a per-side namespace inside the batch's timestamp directory so
+/// the SAME `rel` backed up from both sides (a merge or a delete) never
+/// collides into one file, and so a whole batch is exactly one prunable
+/// `<ts>/` directory (retention).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupSide {
+    /// The worktree copy's bytes.
+    Worktree,
+    /// The main-checkout copy's bytes.
+    Main,
+}
+
+impl BackupSide {
+    /// The namespace directory under the timestamp dir.
+    fn dir_name(self) -> &'static str {
+        match self {
+            BackupSide::Worktree => "worktree",
+            BackupSide::Main => "main",
+        }
+    }
+}
+
+/// The repo-relative backup path for `rel` under a timestamp + side directory,
+/// e.g. `backup_rel_path("20260716-153000", BackupSide::Main, "apps/api/.env")`
+/// → `20260716-153000/main/apps/api/.env`. Pure — no filesystem access; the
+/// apply seam joins this onto its chosen backups root.
+pub fn backup_rel_path(ts: &str, side: BackupSide, rel: &Path) -> PathBuf {
+    Path::new(ts).join(side.dir_name()).join(rel)
 }
 
 #[cfg(test)]
