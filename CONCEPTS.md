@@ -41,16 +41,20 @@ of a diff.
 ### Reconcile decision
 The direction chosen for one reverse-sync candidate in the merge cockpit:
 push (worktree → main), pull (main → worktree), merge (a per-hunk reconciled
-result written to both sides), or undecided (nothing written for that file).
-Undecided is the conservative default for any candidate that exists on both
-sides; only a worktree-only candidate defaults to push, since that direction
-is never destructive.
+result written to both sides), delete (removed from both sides, whichever
+exist), or undecided (nothing written for that file). Undecided is the
+conservative default for any candidate that exists on both sides; only a
+worktree-only candidate defaults to push, since that direction is never
+destructive.
 
 ### Pre-write backup
 A timestamped copy of a file's losing bytes, taken immediately before the
-merge cockpit overwrites it on apply, so a mistaken decision is recoverable.
-Backups live under a gitignored `.superset/backups/` in the worktree (one
-timestamp directory per apply batch) and are never committed.
+merge cockpit overwrites or deletes it on apply, so a mistaken decision is
+recoverable. Backups live under a gitignored `.superset/backups/` in the
+worktree — one `YYYYmmdd-HHMMSS` (UTC) directory per apply batch, with
+`worktree/` and `main/` namespaces inside it for the side the bytes came from
+— and are never committed. Retention keeps the 10 newest batches; older ones
+are pruned after each apply.
 
 ### Pack
 Bundling the files matching the sync patterns from the current git repo root

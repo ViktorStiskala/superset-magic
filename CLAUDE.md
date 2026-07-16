@@ -99,8 +99,11 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   reads both versions of every offered candidate, presents a left file-list
   pane beside a live side-by-side / unified diff (via `tui/diffmodel.rs`),
   and lets the user set each file's `merge::Decision` with explicit keys
-  (`p` push / `l` pull / `m` merge / `u` undecided), gated by a batched
-  confirm. Each candidate is loaded once into a `FileDiff` (`Text`, `New` for
+  (`p` push / `l` pull / `m` merge / `d` delete / `u` undecided), gated by a
+  batched confirm. Each candidate is loaded once into a `FileDiff` (`Text` —
+  EOL-normalized on both sides via `diffmodel::normalize_eol` at load, so
+  hunks are content-only and a pair equal after normalization renders an
+  "line endings only" notice instead of an empty diff —, `New` for
   worktree-only, `Binary`, `TooLarge`, or `Unreadable` when main's copy fails
   to read — surfaced verbatim, NEVER a fabricated empty buffer, so interactive
   merge is unavailable for it). `m` on a DIFFERING TEXT file opens the per-hunk merge overlay
@@ -108,11 +111,14 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   `merge::merge_segments`, holds one `MergeChoice` per `Diff` segment
   (default `Local`), walks them with the arrows, cycles keep-local /
   keep-main / keep-both with `←`/`→` (`h`/`l`), previews the live
-  `merge::assemble` result, and on `Enter` sets `Decision::Merge(assembled)`
+  `merge::assemble` result (scrollable with `PgUp`/`PgDn`/`Space`/`b`,
+  clamped to the preview and re-clamped when a choice cycle shrinks it), and
+  on `Enter` sets `Decision::Merge(assembled)`
   (badge `⇄ merge (assembled)`); `Esc` cancels unchanged. For binary /
   oversized / worktree-only files `m` is a no-op that shows a transient
   footer notice (R9). The batched confirm lists a merge as an overwrite of
-  BOTH sides; `apply_decision` writes the assembled bytes to worktree and
+  BOTH sides and a delete with the sides it removes; `apply_decision` writes
+  the assembled bytes to worktree and
   main. It returns `CockpitOutcome::{Apply, Cancel}` and writes NOTHING
   itself; `reverse_sync::run` applies the decisions via `apply_decision`.
   `is_interactive` (stdin+stdout TTY, R16) guards launch. A `Drop` guard +
@@ -151,15 +157,28 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   re-compared at apply, so a file edited/created/deleted during review is
   skipped, not clobbered; `backup_if_unchanged` takes a timestamped pre-write
   backup of the
-  losing bytes under a gitignored `.superset/backups/<ts>/`, and
+  losing bytes under a gitignored
+  `.superset/backups/<YYYYmmdd-HHMMSS>/{worktree,main}/…` (`apply_timestamp`
+  → the pure `format_timestamp`, UTC civil-from-days, no date crate), and
   `ensure_gitignored_in_main` runs before any secret bytes land in main).
+  `Decision::Delete` unlinks BOTH sides (whichever exist), each backed up
+  first and baseline-guarded like an overwrite, main removed before the
+  worktree so a failure leaves the worktree candidate intact — no gitignore
+  step, nothing lands in main. After each apply, `prune_old_backups` keeps
+  the `BACKUP_BATCHES_KEPT` (10) newest batch dirs and removes older ones —
+  best-effort (a failure warns, never fails the sync) and only for names
+  matching `is_backup_batch_name` (current or legacy epoch shape), never
+  foreign entries.
   `ApplyContext` carries the two tree roots plus the batch's shared backups
   root/timestamp. Backup
   paths are printed so a mistaken overwrite is recoverable. `sync/merge.rs`
-  owns the pure `Decision`/`FileState`/`default_decision` + backup-naming and
+  owns the pure `Decision`/`FileState`/`default_decision` + backup-naming
+  (`backup_rel_path(ts, BackupSide, rel)` → `<ts>/<side>/<rel>`) and
   the per-hunk merge model (`merge_segments`, `assemble`, `diff_count`,
   `MergeSegment`, `MergeChoice`, `Decision::Merge`) driving the cockpit's
-  merge overlay; `tui/diffmodel.rs` owns the pure diff-to-rows model.
+  merge overlay; `tui/diffmodel.rs` owns the pure diff-to-rows model plus
+  `normalize_eol` (CRLF → LF + trailing newline, applied to diff/merge
+  inputs at cockpit load — push/pull still copy raw bytes).
 - `pack.rs` — `ss-magic pack`: expand the overlaid `magic.json` patterns
   against the current git repo root (via `sync/apply.rs`'s `match_paths`) and
   write the matches — repo-relative — into `ss-magic-<repo>.tar.bz2` at that

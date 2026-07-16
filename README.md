@@ -33,9 +33,9 @@ file set:
   changed or appeared in a worktree against the main checkout, through a
   full-screen merge cockpit: a file list beside a live side-by-side diff, where
   you set each file's direction (push to main / pull from main / per-hunk merge /
-  undecided) and apply the batch behind one confirmation, with a timestamped
-  backup taken before every overwrite. This is how a new secret created in a
-  worktree reaches everywhere else.
+  delete from both / undecided) and apply the batch behind one confirmation,
+  with a timestamped backup taken before every overwrite or delete. This is how
+  a new secret created in a worktree reaches everywhere else.
 - **Pack** (`ss-magic pack`) — snapshot the whole configured file set into a
   single `ss-magic-<repo>.tar.bz2` for backup, machine migration, or handing
   to a teammate.
@@ -237,23 +237,28 @@ git. Tracked files are excluded — they reach main via merge. The flow:
 - Collects differing / worktree-only candidates (identical files are hidden)
   and opens a full-screen merge cockpit: a file list beside a live diff
   (side-by-side on a wide terminal, unified when narrow; binary / oversized
-  files show a whole-file notice instead of a diff).
+  files show a whole-file notice instead of a diff). Diffs are EOL-normalized
+  (CRLF → LF, trailing newline) so hunks reflect content changes only; a pair
+  that differs *only* by line endings says so instead of showing an empty diff.
 - Nothing destructive is pre-selected — a file that differs starts *undecided*.
   You set each file's direction with explicit keys: `p` push to main, `l` pull
-  from main, `m` interactive merge, `u` undecided (arrows/`j`/`k` navigate,
-  `PgUp`/`PgDn`/`Space` scroll the diff, `?` toggles help). Each row's mtimes are
-  shown only as an unreliable hint.
+  from main, `m` interactive merge, `d` delete from both sides, `u` undecided
+  (arrows/`j`/`k` navigate, `PgUp`/`PgDn`/`Space` scroll the diff, `?` toggles
+  help). Each row's mtimes are shown only as an unreliable hint.
 - `m` on a differing text file opens a per-hunk merge overlay: walk the hunks
   with the arrows and cycle each between keep-local / keep-main / keep-both
-  (`←`/`→` or `h`/`l`) while a live preview assembles the result; `Enter` accepts
+  (`←`/`→` or `h`/`l`) while a live preview assembles the result
+  (`PgUp`/`PgDn`/`Space`/`b` scroll a long preview); `Enter` accepts
   it and `Esc` cancels. The accepted bytes are written to **both** sides on apply
-  so they stop differing. Merge is unavailable for binary / oversized / new
-  files (which offer only push/pull).
+  so they stop differing (normalized to LF + trailing newline). Merge is
+  unavailable for binary / oversized / new files (which offer only push/pull).
 - `Enter` applies: one batched confirmation lists every existing-target
-  overwrite (defaulting to No). Before each destructive write, the losing bytes
-  are copied to a timestamped backup under a gitignored `.superset/backups/`,
-  whose path is printed so a mistaken overwrite is recoverable. A file changed
-  on either side since you reviewed it is skipped rather than clobbered.
+  overwrite and delete (defaulting to No). Before each destructive write or
+  unlink, the losing bytes are copied to a timestamped backup under a gitignored
+  `.superset/backups/<YYYYmmdd-HHMMSS>/{worktree,main}/…`, whose path is printed
+  so a mistaken decision is recoverable; the 10 newest backup batches are kept
+  and older ones pruned after each apply. A file changed on either side since
+  you reviewed it is skipped rather than clobbered.
 - Gitignore-safety: if a path pushed into main isn't already gitignored there,
   ss-magic copies the worktree's covering `.gitignore` rule (resolved via
   `git check-ignore -v --no-index`) into main's root `.gitignore` (creating it

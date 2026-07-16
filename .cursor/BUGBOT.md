@@ -150,8 +150,10 @@ committable and must never leak.
 - Overwrite safety: reverse sync reconciles files through the full-screen
   merge cockpit (`tui/cockpit.rs`), never writing on any keypress. Nothing
   destructive is pre-selected (a file that differs starts `Undecided`), applying
-  is gated by ONE batched confirm that lists every existing-target overwrite and
-  defaults to No, and every destructive write is preceded by a timestamped
+  is gated by ONE batched confirm that lists every existing-target overwrite
+  and delete and
+  defaults to No, and every destructive write or unlink is preceded by a
+  timestamped
   pre-write backup of the losing bytes under a gitignored `.superset/backups/`
   (`reverse_sync::apply_decision`), with a review-time baseline re-check —
   per-file `(worktree, main)` metadata captured (`meta_of`) BEFORE the cockpit
@@ -160,9 +162,36 @@ committable and must never leak.
   "missing"). The cockpit refuses to launch without an interactive
   TTY and writes nothing then, and `Esc` at the top-level file list cancels the
   whole cockpit (`CockpitOutcome::Cancel`), leaving both the worktree and main
-  untouched. Flag a reverse-sync path that overwrites an
+  untouched. Flag a reverse-sync path that overwrites or deletes an
   existing file without a backup, applies an `Undecided` file, skips the batched
   confirm, or falls through to writing files when there is no TTY.
+- **Backup layout + retention.** Backup batches are one UTC
+  `YYYYmmdd-HHMMSS`-named directory per apply, with per-side `worktree/` and
+  `main/` namespaces inside (`merge::backup_rel_path(ts, side, rel)`), so the
+  same rel backed up from both sides never collides. After each apply the 10
+  newest batch dirs are kept and older ones pruned (`prune_old_backups`) —
+  pruning is best-effort (a failure warns, never fails the sync) and must only
+  ever remove directories whose names match the batch shapes the tool itself
+  wrote (`YYYYmmdd-HHMMSS` or legacy all-digit epoch), never foreign entries.
+  Flag a retention change that deletes non-batch-named entries, prunes before
+  the current batch's backups are written, or turns a pruning error into a
+  sync failure.
+- **Delete decisions remove BOTH sides, backup-first.** `d` records
+  `Decision::Delete`; apply unlinks the file from main and the worktree
+  (whichever exist), each side backed up first and TOCTOU-guarded like an
+  overwrite, main unlinked before the worktree so a failure leaves the
+  worktree copy (and the next run's candidate) intact. Deletes are always in
+  the batched-confirm list. No gitignore step runs (nothing is written into
+  main). Flag a delete path that unlinks without a backup, skips the baseline
+  re-check, or removes the worktree copy before main.
+- **Diff/merge inputs are EOL-normalized; raw copies are not.** Text
+  candidates are normalized at load (`diffmodel::normalize_eol`: CRLF → LF,
+  trailing newline ensured) so diff hunks and merge assembly reflect content
+  only; sides equal after normalization render an explanatory "line endings
+  only" notice instead of an empty diff. Push/pull must keep copying the RAW
+  on-disk bytes, and byte-level classification (`classify`) stays byte-exact.
+  Flag a change that diffs un-normalized text, normalizes the push/pull copy
+  path, or hides an EOL-only-differing candidate entirely.
 - **The cockpit's terminal is always restored, including on panic.**
   `run_cockpit` installs a panic hook and constructs a `TerminalGuard`
   (`Drop` disables raw mode / leaves the alternate screen) immediately after
@@ -185,8 +214,9 @@ committable and must never leak.
   overlay) for binary / oversized / worktree-only files — interactive merge is
   unavailable there. A `Merge` decision overwrites BOTH the worktree and main,
   so the batched confirm must list it as a destructive write and `apply_decision`
-  must back up whichever side exists before writing (distinct `local/` + `main/`
-  backup dirs) and run `ensure_gitignored_in_main` before the main-side write.
+  must back up whichever side exists before writing (distinct per-side
+  `worktree/` + `main/` backup namespaces inside the batch dir) and run
+  `ensure_gitignored_in_main` before the main-side write.
   Flag an `m` handler that opens the overlay for a non-text/new file, a merge
   apply that overwrites either side without a backup, or a main-side merge write
   that skips the gitignore-safety step.
