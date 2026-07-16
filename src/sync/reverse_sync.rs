@@ -385,6 +385,7 @@ fn apply_batch(
                     WriteDirection::PushToMain => "worktree → main",
                     WriteDirection::PullFromMain => "main → worktree",
                     WriteDirection::MergeBoth => "merged → both",
+                    WriteDirection::DeleteBoth => "deleted from both sides",
                 };
                 let ign = if result.gitignore_appended {
                     " (gitignore rule added)"
@@ -560,6 +561,8 @@ pub enum WriteDirection {
     PullFromMain,
     /// Assembled merge bytes were written to BOTH sides.
     MergeBoth,
+    /// The file was deleted from BOTH sides (whichever existed).
+    DeleteBoth,
 }
 
 /// The successful outcome of [`apply_decision`]: what was written, the
@@ -588,6 +591,7 @@ pub enum ApplyOutcome {
 
 /// Per-target verdict from [`check_target`], comparing a review-time baseline
 /// against the target's current metadata.
+#[derive(Clone, Copy)]
 enum Guard {
     /// The target did not exist at review time and still does not — a fresh
     /// write, no backup needed.
@@ -730,9 +734,12 @@ pub struct Baseline {
 /// into main is preceded by [`ensure_gitignored_in_main`] so a git failure
 /// never leaves un-ignored secret bytes on disk. `Merge` writes the assembled
 /// text to BOTH sides (distinct per-side backup namespaces so neither
-/// original is lost). Any side that no longer matches its baseline (edited,
-/// created, or deleted since review) yields [`ApplyOutcome::Skipped`] with
-/// nothing written — no overwrite and no partial backup.
+/// original is lost). `Delete` removes the file from BOTH sides (whichever
+/// exist), backing each existing side up first — no gitignore step, since no
+/// secret bytes land in main. Any side that no longer matches its baseline
+/// (edited, created, or deleted since review) yields
+/// [`ApplyOutcome::Skipped`] with nothing written — no overwrite and no
+/// partial backup.
 pub fn apply_decision(
     ctx: &ApplyContext,
     rel: &Path,
@@ -860,6 +867,59 @@ pub fn apply_decision(
                 direction: WriteDirection::MergeBoth,
                 backups,
                 gitignore_appended,
+            }))
+        }
+
+        Decision::Delete => {
+            let wt_target = ctx.worktree_root.join(rel);
+            let main_target = ctx.main_root.join(rel);
+            // Baseline-check BOTH sides first so a skip removes nothing at all
+            // (no partial backup either).
+            let wt_guard = check_target(&wt_target, baseline.wt.as_ref());
+            if matches!(wt_guard, Guard::Changed) {
+                return Ok(ApplyOutcome::Skipped(changed_reason()));
+            }
+            let main_guard = check_target(&main_target, baseline.main.as_ref());
+            if matches!(main_guard, Guard::Changed) {
+                return Ok(ApplyOutcome::Skipped(changed_reason()));
+            }
+            // Neither side exists (and neither did at review) — defensive; an
+            // offered candidate always exists in the worktree at review time.
+            if matches!(wt_guard, Guard::Missing) && matches!(main_guard, Guard::Missing) {
+                return Ok(ApplyOutcome::Skipped("nothing to delete".to_string()));
+            }
+            // Back up every existing side BEFORE its unlink — a deleted
+            // untracked secret has no git undo, so the backup is the only
+            // recovery path.
+            let mut backups = Vec::new();
+            backups.extend(backup_if_unchanged(
+                &wt_target,
+                wt_guard,
+                &ctx.backups_root
+                    .join(backup_rel_path(ctx.ts, BackupSide::Worktree, rel)),
+            )?);
+            backups.extend(backup_if_unchanged(
+                &main_target,
+                main_guard,
+                &ctx.backups_root
+                    .join(backup_rel_path(ctx.ts, BackupSide::Main, rel)),
+            )?);
+            // Remove main first, then the worktree (mirrors Merge's ordering):
+            // a failure at or before the main unlink leaves the worktree copy
+            // intact, so the file is still offered on the next run rather than
+            // half-vanishing from the side the user works in.
+            if matches!(main_guard, Guard::Unchanged) {
+                fs::remove_file(&main_target)
+                    .with_context(|| format!("deleting main file {}", main_target.display()))?;
+            }
+            if matches!(wt_guard, Guard::Unchanged) {
+                fs::remove_file(&wt_target)
+                    .with_context(|| format!("deleting worktree file {}", wt_target.display()))?;
+            }
+            Ok(ApplyOutcome::Applied(ApplyResult {
+                direction: WriteDirection::DeleteBoth,
+                backups,
+                gitignore_appended: false,
             }))
         }
     }

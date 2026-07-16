@@ -191,6 +191,7 @@ fn badge_text_reflects_direction() {
     assert!(badge_text(&Decision::Push).0.contains("push to main"));
     assert!(badge_text(&Decision::Pull).0.contains("pull from main"));
     assert!(badge_text(&Decision::Undecided).0.contains("undecided"));
+    assert!(badge_text(&Decision::Delete).0.contains("delete"));
 }
 
 /// Apply collects only non-undecided decisions.
@@ -262,6 +263,39 @@ fn destructive_overwrites_lists_only_existing_targets() {
     assert!(paths.contains(&"over.env".to_string()), "{paths:?}");
     assert!(paths.contains(&"pull.env".to_string()), "{paths:?}");
     assert!(!paths.contains(&"new.env".to_string()), "create is not destructive: {paths:?}");
+}
+
+/// A delete is ALWAYS destructive: both a differing and a worktree-only file
+/// marked delete appear in the confirm list, labeled with the sides removed.
+#[test]
+fn destructive_overwrites_lists_deletes_with_side_labels() {
+    let files = vec![
+        entry(
+            "gone.env",
+            DiffStatus::Differs,
+            Decision::Delete,
+            FileDiff::Text {
+                local: "x\n".to_string(),
+                main: "y\n".to_string(),
+            },
+        ),
+        entry(
+            "gone-new.env",
+            DiffStatus::WorktreeOnly,
+            Decision::Delete,
+            FileDiff::New { content: None },
+        ),
+    ];
+    let over = app_with(files).destructive_overwrites();
+    assert_eq!(over.len(), 2, "both deletes are destructive: {over:?}");
+    let label_of = |rel: &str| {
+        over.iter()
+            .find(|(p, _)| p == Path::new(rel))
+            .map(|(_, l)| *l)
+            .unwrap_or_else(|| panic!("{rel} missing from {over:?}"))
+    };
+    assert_eq!(label_of("gone.env"), "delete (worktree + main)");
+    assert_eq!(label_of("gone-new.env"), "delete (worktree copy)");
 }
 
 /// Pull is a no-op on a worktree-only file (main has nothing to pull).
@@ -467,6 +501,9 @@ fn handle_key_plu_set_focused_decision() {
 
     assert_eq!(handle_key(&mut app, KeyCode::Char('l'), 10), None);
     assert!(matches!(app.files[0].decision, Decision::Pull));
+
+    assert_eq!(handle_key(&mut app, KeyCode::Char('d'), 10), None);
+    assert!(matches!(app.files[0].decision, Decision::Delete));
 
     assert_eq!(handle_key(&mut app, KeyCode::Char('u'), 10), None);
     assert!(matches!(app.files[0].decision, Decision::Undecided));

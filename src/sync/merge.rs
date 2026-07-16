@@ -40,6 +40,9 @@ pub enum Decision {
     Pull,
     /// Write this assembled reconciled text to BOTH sides.
     Merge(String),
+    /// Delete the file from BOTH sides (whichever exist) — reconcile by
+    /// removing. Every existing side is backed up before its unlink.
+    Delete,
 }
 
 /// Whether a candidate exists on both sides (a real reconcile) or only in the

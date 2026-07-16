@@ -868,6 +868,145 @@ fn apply_batch_continues_past_a_failing_file() {
     );
 }
 
+/// Delete removes the file from BOTH sides and backs up both originals under
+/// their per-side namespaces first; no gitignore rule is appended (nothing is
+/// written into main).
+#[test]
+fn apply_delete_removes_both_sides_and_backs_up_both() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN_ORIG=1\n");
+    write(&wt, "config.env", "WT_ORIG=1\n");
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
+    let res = applied(
+        apply_decision(
+            &ctx,
+            Path::new("config.env"),
+            &Decision::Delete,
+            Baseline {
+                wt: meta(&wt.join("config.env")),
+                main: meta(&main.path().join("config.env")),
+            },
+        )
+        .unwrap(),
+    );
+
+    assert!(matches!(res.direction, WriteDirection::DeleteBoth));
+    assert!(!res.gitignore_appended, "delete writes nothing into main");
+    assert!(!wt.join("config.env").exists(), "worktree copy removed");
+    assert!(!main.path().join("config.env").exists(), "main copy removed");
+    assert!(
+        !main.path().join(".gitignore").exists(),
+        "delete must not append a gitignore rule"
+    );
+    // Both originals were backed up before the unlinks.
+    assert_eq!(res.backups.len(), 2);
+    let wt_backup = backups.path().join(TS).join("worktree").join("config.env");
+    let main_backup = backups.path().join(TS).join("main").join("config.env");
+    assert_eq!(fs::read_to_string(&wt_backup).unwrap(), "WT_ORIG=1\n");
+    assert_eq!(fs::read_to_string(&main_backup).unwrap(), "MAIN_ORIG=1\n");
+}
+
+/// Delete of a worktree-only file removes just the worktree copy (main has
+/// nothing), with a single worktree-side backup.
+#[test]
+fn apply_delete_worktree_only_removes_and_backs_up_worktree() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(&wt, "apps/api/.dev.vars", "SECRET=1\n");
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
+    let res = applied(
+        apply_decision(
+            &ctx,
+            Path::new("apps/api/.dev.vars"),
+            &Decision::Delete,
+            Baseline {
+                wt: meta(&wt.join("apps/api/.dev.vars")),
+                main: None,
+            },
+        )
+        .unwrap(),
+    );
+
+    assert!(!wt.join("apps/api/.dev.vars").exists(), "worktree copy removed");
+    assert_eq!(res.backups.len(), 1, "only the worktree side existed");
+    assert_eq!(
+        res.backups[0],
+        backups
+            .path()
+            .join(TS)
+            .join("worktree")
+            .join("apps/api/.dev.vars")
+    );
+    assert_eq!(fs::read_to_string(&res.backups[0]).unwrap(), "SECRET=1\n");
+}
+
+/// A delete whose worktree side changed since review is skipped: BOTH files
+/// stay on disk and nothing is backed up — a concurrent edit is never deleted.
+#[test]
+fn apply_delete_skips_when_side_changed_since_review() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN_ORIG=1\n");
+    write(&wt, "config.env", "WT_EDITED=1\n");
+
+    let stale_wt = Some(FileMeta {
+        len: 999_999,
+        mtime: None,
+    });
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
+    let outcome = apply_decision(
+        &ctx,
+        Path::new("config.env"),
+        &Decision::Delete,
+        Baseline {
+            wt: stale_wt,
+            main: meta(&main.path().join("config.env")),
+        },
+    )
+    .unwrap();
+
+    match outcome {
+        ApplyOutcome::Skipped(reason) => {
+            assert!(reason.contains("changed since review"), "got: {reason}")
+        }
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    assert!(wt.join("config.env").exists(), "worktree copy must survive");
+    assert!(
+        main.path().join("config.env").exists(),
+        "main copy must survive"
+    );
+    assert!(
+        !backups.path().join(TS).exists(),
+        "a skip must not create the batch's backup dir at all"
+    );
+}
+
 // ── Backup timestamps + retention ────────────────────────────────────────
 
 /// format_timestamp renders epoch seconds as UTC `YYYYmmdd-HHMMSS`, including

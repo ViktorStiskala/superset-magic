@@ -3,7 +3,8 @@
 //! This is the interactive layer that replaces the old re-printing
 //! `inquire::Select` picker. It presents a left file-list pane beside a live
 //! side-by-side diff, lets the developer set each file's direction with
-//! explicit keys (`p` push / `l` pull / `m` merge / `u` undecided), and returns
+//! explicit keys (`p` push / `l` pull / `m` merge / `d` delete / `u`
+//! undecided), and returns
 //! the chosen [`Decision`]s to the caller — it does NOT write any files itself.
 //! The destructive apply is performed by `reverse_sync::apply_decision` after
 //! [`run_cockpit`] returns, so the cockpit stays free of filesystem side
@@ -351,7 +352,7 @@ impl App {
             .collect()
     }
 
-    /// Existing targets that a decision would overwrite, paired with a
+    /// Existing files a decision would overwrite OR delete, paired with a
     /// human-readable direction — the batched-confirm list (R12).
     fn destructive_overwrites(&self) -> Vec<(PathBuf, &'static str)> {
         self.files
@@ -364,6 +365,11 @@ impl App {
                 // Pull always overwrites the (existing) worktree copy.
                 Decision::Pull => Some((f.rel.clone(), "main → worktree")),
                 Decision::Merge(_) => Some((f.rel.clone(), "merged → both")),
+                // Delete removes every existing side.
+                Decision::Delete if f.status == DiffStatus::WorktreeOnly => {
+                    Some((f.rel.clone(), "delete (worktree copy)"))
+                }
+                Decision::Delete => Some((f.rel.clone(), "delete (worktree + main)")),
                 _ => None,
             })
             .collect()
@@ -568,6 +574,7 @@ fn badge_text(decision: &Decision) -> (String, Color) {
         Decision::Pull => ("← pull from main".to_string(), Color::Cyan),
         Decision::Undecided => ("? undecided".to_string(), Color::Yellow),
         Decision::Merge(_) => ("⇄ merge (assembled)".to_string(), Color::Magenta),
+        Decision::Delete => ("✗ delete (both sides)".to_string(), Color::Red),
     }
 }
 
@@ -865,7 +872,7 @@ fn num(n: Option<usize>) -> String {
 }
 
 /// The persistent key legend (R5).
-const FOOTER_LEGEND: &str = "↑↓/jk move · PgUp/PgDn/Space/b scroll · p push · l pull · m merge · u undecided · Enter apply · ? help · Esc cancel";
+const FOOTER_LEGEND: &str = "↑↓/jk move · PgUp/PgDn/Space/b scroll · p push · l pull · m merge · d delete · u undecided · Enter apply · ? help · Esc cancel";
 
 /// Render the footer: the transient `notice` (bold yellow) when present, else
 /// the persistent key legend.
@@ -903,6 +910,13 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 Style::new().fg(Color::Magenta),
             ),
         ]),
+        Line::from(vec![
+            Span::raw("  d              "),
+            Span::styled(
+                "delete from both sides (backed up first)",
+                Style::new().fg(Color::Red),
+            ),
+        ]),
         Line::from("  u              mark undecided"),
         Line::from(""),
         Line::from("Merge overlay".bold()),
@@ -932,12 +946,12 @@ fn render_confirm(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![Line::from("Apply changes?".bold()), Line::from("")];
     if overwrites.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No existing files will be overwritten.",
+            "No existing files will be overwritten or deleted.",
             Style::new().fg(Color::Green),
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            "These existing files will be OVERWRITTEN (a backup is taken first):",
+            "These existing files will be OVERWRITTEN or DELETED (a backup is taken first):",
             Style::new().fg(Color::Yellow),
         )));
         for (rel, dir) in &overwrites {
@@ -1233,6 +1247,7 @@ fn handle_key(app: &mut App, code: KeyCode, page: u16) -> Option<CockpitOutcome>
                 KeyCode::Char('p') => app.set_decision(Decision::Push),
                 KeyCode::Char('l') => app.set_pull(),
                 KeyCode::Char('m') => app.try_open_merge(),
+                KeyCode::Char('d') => app.set_decision(Decision::Delete),
                 KeyCode::Char('u') => app.set_decision(Decision::Undecided),
                 KeyCode::Char('?') => app.mode = Mode::Help,
                 KeyCode::Enter => app.mode = Mode::Confirm,
