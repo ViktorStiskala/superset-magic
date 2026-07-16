@@ -682,3 +682,155 @@ fn apply_undecided_is_skipped() {
     );
     assert_eq!(fs::read_to_string(wt.join("config.env")).unwrap(), "WT=1\n");
 }
+
+/// Finding 3: a Push whose SOURCE (the worktree file) changed since review is
+/// skipped and main is left untouched — reverse sync never pushes source bytes
+/// the user never reviewed. Simulated with a STALE worktree (source) baseline
+/// whose length no longer matches the on-disk worktree file, while the main
+/// (target) baseline matches current — so only the source-side guard can trip.
+#[test]
+fn apply_push_skips_when_source_changed_since_review() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN_ORIG=1\n");
+    write(&wt, "config.env", "WT_NEW=1\n");
+
+    let stale_wt = Some(FileMeta {
+        len: 999_999,
+        mtime: None,
+    });
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
+    let outcome = apply_decision(
+        &ctx,
+        Path::new("config.env"),
+        &Decision::Push,
+        Baseline {
+            wt: stale_wt,
+            main: meta(&main.path().join("config.env")),
+        },
+    )
+    .unwrap();
+
+    match outcome {
+        ApplyOutcome::Skipped(reason) => {
+            assert!(reason.contains("changed since review"), "got: {reason}")
+        }
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    // main keeps its original bytes; nothing was written, backed up, or ignored.
+    assert_eq!(
+        fs::read_to_string(main.path().join("config.env")).unwrap(),
+        "MAIN_ORIG=1\n"
+    );
+    assert!(!backups.path().join(TS).join("config.env").exists());
+    assert!(
+        !main.path().join(".gitignore").exists(),
+        "a source-changed skip must not append a gitignore rule"
+    );
+}
+
+/// Symmetric to the Push case: a Pull whose SOURCE (main) changed since review
+/// is skipped and the worktree is left untouched.
+#[test]
+fn apply_pull_skips_when_source_changed_since_review() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN_SIDE=1\n");
+    write(&wt, "config.env", "WT_ORIG=1\n");
+
+    let stale_main = Some(FileMeta {
+        len: 999_999,
+        mtime: None,
+    });
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
+    let outcome = apply_decision(
+        &ctx,
+        Path::new("config.env"),
+        &Decision::Pull,
+        Baseline {
+            wt: meta(&wt.join("config.env")),
+            main: stale_main,
+        },
+    )
+    .unwrap();
+
+    match outcome {
+        ApplyOutcome::Skipped(reason) => {
+            assert!(reason.contains("changed since review"), "got: {reason}")
+        }
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    // The worktree keeps its original bytes.
+    assert_eq!(
+        fs::read_to_string(wt.join("config.env")).unwrap(),
+        "WT_ORIG=1\n"
+    );
+    assert!(!backups.path().join(TS).join("config.env").exists());
+}
+
+/// Finding 6: one file's apply error does NOT abort the batch — later files are
+/// still applied and the failure is tallied. An unsafe (`..`-escaping) rel makes
+/// `apply_decision` bail; the good push ordered AFTER it must still land in main.
+#[test]
+fn apply_batch_continues_past_a_failing_file() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "good.env", "OLD=1\n");
+    write(&wt, "good.env", "NEW=1\n");
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
+
+    // The failing (unsafe) decision is FIRST, proving the batch keeps going and
+    // still applies the good one after it.
+    let bad = PathBuf::from("../escape.env");
+    let good = PathBuf::from("good.env");
+    let decisions = vec![(bad.clone(), Decision::Push), (good.clone(), Decision::Push)];
+    let mut baseline: HashMap<PathBuf, (Option<FileMeta>, Option<FileMeta>)> = HashMap::new();
+    baseline.insert(bad, (None, None));
+    baseline.insert(
+        good,
+        (
+            meta(&wt.join("good.env")),
+            meta(&main.path().join("good.env")),
+        ),
+    );
+
+    let summary = apply_batch(&ctx, &decisions, &baseline);
+
+    assert_eq!(summary.failed, 1, "the unsafe path must be counted failed");
+    assert_eq!(summary.applied, 1, "the good push must still apply");
+    assert_eq!(summary.skipped, 0);
+    // The good file really landed in main despite the earlier failure.
+    assert_eq!(
+        fs::read_to_string(main.path().join("good.env")).unwrap(),
+        "NEW=1\n"
+    );
+    assert_eq!(
+        summary.backups.len(),
+        1,
+        "the good push backed up main's old bytes"
+    );
+}

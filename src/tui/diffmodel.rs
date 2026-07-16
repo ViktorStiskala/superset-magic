@@ -9,7 +9,7 @@
 //! - [`side_by_side`] and [`unified`] compute the two diff layouts from a
 //!   `similar` line diff, carrying per-side line numbers, folded context
 //!   gaps, and intra-line (word-level) emphasis.
-//! - [`should_split`] picks the layout that fits the terminal width.
+//! - [`should_split`] picks the layout that fits the diff pane's width.
 //!
 //! It is deliberately free of any TUI / `ratatui` dependency so the logic
 //! stays unit-testable in isolation; the interactive [`crate::tui::cockpit`]
@@ -127,13 +127,25 @@ pub struct UnifiedRow {
     pub segs: Vec<Seg>,
 }
 
-/// Minimum terminal width at which a legible two-column split fits.
-const SPLIT_MIN_WIDTH: u16 = 100;
+/// Minimum legible *content* columns each side of a two-column split needs.
+const MIN_SPLIT_COL: u16 = 40;
 
-/// True when the terminal is wide enough for a two-column side-by-side
-/// diff; below the threshold the caller should fall back to [`unified`].
-pub fn should_split(term_width: u16) -> bool {
-    term_width >= SPLIT_MIN_WIDTH
+/// Per-side line-number gutter width ("%4d " → 5 columns), present on BOTH
+/// columns of the split.
+const SPLIT_GUTTER: u16 = 5;
+
+/// Minimum diff-*pane inner* width (inside its border) at which a legible
+/// two-column split fits: each of the two 50% columns must hold the line-number
+/// gutter plus [`MIN_SPLIT_COL`] content columns. This is the DIFF PANE's inner
+/// width, NOT the terminal's — the pane is only a fraction of the frame, so
+/// testing the frame width would render two illegibly narrow columns.
+const SPLIT_MIN_PANE_WIDTH: u16 = 2 * (MIN_SPLIT_COL + SPLIT_GUTTER);
+
+/// True when the diff pane is wide enough for a two-column side-by-side diff;
+/// below [`SPLIT_MIN_PANE_WIDTH`] the caller should fall back to [`unified`].
+/// The argument is the diff PANE's inner width, not the terminal width.
+pub fn should_split(diff_pane_inner_width: u16) -> bool {
+    diff_pane_inner_width >= SPLIT_MIN_PANE_WIDTH
 }
 
 /// Convert 0-based `similar` indices to a 1-based display line number.

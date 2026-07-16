@@ -277,11 +277,16 @@ impl App {
         }
     }
 
-    /// Pull is meaningless for a worktree-only file (main has nothing to pull),
-    /// so `l` is a no-op there.
+    /// Pull requires a readable, existing main copy to read from. A worktree-only
+    /// file (main absent) or one whose main copy is [`FileDiff::Unreadable`]
+    /// (present but permission/I/O error) has none, so `l` is a no-op for both —
+    /// mirroring the diff pane, which already shows pull disabled. Setting Pull
+    /// there would only fail at apply time.
     fn set_pull(&mut self) {
         if let Some(f) = self.files.get_mut(self.focused) {
-            if f.status != DiffStatus::WorktreeOnly {
+            let main_readable = f.status != DiffStatus::WorktreeOnly
+                && !matches!(f.diff, FileDiff::Unreadable { .. });
+            if main_readable {
                 f.decision = Decision::Pull;
             }
         }
@@ -529,11 +534,13 @@ fn diff_line_count(f: &FileEntry) -> usize {
 
 // ── Pure helpers (unit-tested) ────────────────────────────────────────────
 
-/// Whether the terminal is wide enough for the two-column split (R7). Thin
-/// wrapper over [`diffmodel::should_split`] so the width→layout choice has a
-/// single named seam.
-fn use_split(frame_width: u16) -> bool {
-    diffmodel::should_split(frame_width)
+/// Whether the diff PANE (not the whole frame) is wide enough for the two-column
+/// split (R7). The argument is the diff pane's inner width — the width that
+/// actually has to hold two columns — so the choice matches what the user sees.
+/// Thin wrapper over [`diffmodel::should_split`] so the width→layout choice has
+/// a single named seam.
+fn use_split(diff_pane_inner_width: u16) -> bool {
+    diffmodel::should_split(diff_pane_inner_width)
 }
 
 /// Badge label + color for a decision (R3): direction is shown with an
@@ -587,13 +594,19 @@ fn choice_label(c: MergeChoice) -> &'static str {
 /// a `TestBackend` (no event loop, no filesystem).
 fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let split = use_split(area.width);
 
     let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
     let body = rows[0];
     let footer = rows[1];
 
     let panes = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).split(body);
+    // The split decision is based on the DIFF PANE's inner width, not the frame:
+    // only ~62% of the frame is the diff pane, and it is halved again per column,
+    // so a frame-width test wildly overestimates each column's real width.
+    // `render_diff` wraps the pane in a one-cell border, so the inner width is
+    // the pane width minus 2.
+    let diff_pane_inner_width = panes[1].width.saturating_sub(2);
+    let split = use_split(diff_pane_inner_width);
     render_file_list(frame, panes[0], app);
     render_diff(frame, panes[1], app, split);
     render_footer(frame, footer, app.notice.as_deref());

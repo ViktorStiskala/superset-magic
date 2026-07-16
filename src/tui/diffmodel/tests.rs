@@ -161,11 +161,13 @@ fn unified_folds_hidden_context() {
 
 #[test]
 fn should_split_thresholds() {
-    assert!(!should_split(80));
-    assert!(should_split(120));
-    // Boundary: exactly the minimum splits.
-    assert!(should_split(100));
-    assert!(!should_split(99));
+    // The argument is the diff-PANE inner width (not the frame width): a narrow
+    // pane unifies, a wide pane splits.
+    assert!(!should_split(80), "a narrow diff pane must unify");
+    assert!(should_split(120), "a wide diff pane must split");
+    // Boundary: exactly the minimum pane width splits, one below does not.
+    assert!(should_split(SPLIT_MIN_PANE_WIDTH));
+    assert!(!should_split(SPLIT_MIN_PANE_WIDTH - 1));
 }
 
 /// Two CRLF-identical buffers produce only equal/context rows and leave NO

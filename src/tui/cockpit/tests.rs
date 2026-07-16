@@ -47,7 +47,9 @@ fn render(app: &App, width: u16, height: u16) -> Terminal<TestBackend> {
 }
 
 /// A wide terminal renders the file names, the two side-by-side column titles,
-/// a decision badge, and the footer legend keys.
+/// a decision badge, and the footer legend keys. The terminal is wide enough
+/// (200 cols) that the diff PANE — only ~62% of the frame — still clears the
+/// split threshold; a mere 120-col frame now renders unified.
 #[test]
 fn wide_render_shows_list_titles_badge_and_footer() {
     let files = vec![
@@ -69,7 +71,7 @@ fn wide_render_shows_list_titles_badge_and_footer() {
             },
         ),
     ];
-    let out = buffer_text(&render(&app_with(files), 120, 30));
+    let out = buffer_text(&render(&app_with(files), 200, 30));
 
     assert!(out.contains("config.local.json"), "file name missing:\n{out}");
     assert!(out.contains("apps/api/.env"), "file name missing:\n{out}");
@@ -127,7 +129,8 @@ fn is_interactive_is_callable() {
     let _ = is_interactive();
 }
 
-/// The width→layout choice splits wide terminals and unifies narrow ones.
+/// The width→layout choice splits a wide diff pane and unifies a narrow one.
+/// The argument is the diff-pane inner width, not the frame width.
 #[test]
 fn use_split_thresholds() {
     assert!(use_split(120));
@@ -224,6 +227,30 @@ fn set_pull_is_noop_for_worktree_only() {
     )]);
     app.set_pull();
     assert!(matches!(app.files[0].decision, Decision::Push));
+}
+
+/// Pull is a no-op when main's copy is UNREADABLE (present but permission/I/O
+/// error): the diff pane shows pull disabled, and setting Pull would only fail
+/// at apply time, so `l` leaves the decision unchanged (Finding 1). Distinct
+/// from the worktree-only case: here `status == Differs`, so only the diff-side
+/// guard can catch it.
+#[test]
+fn set_pull_is_noop_for_unreadable_main() {
+    let mut app = app_with(vec![entry(
+        "secret.env",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Unreadable {
+            note: "main unreadable: permission denied — push only (pull/merge disabled)"
+                .to_string(),
+        },
+    )]);
+    app.set_pull();
+    assert!(
+        matches!(app.files[0].decision, Decision::Undecided),
+        "pull must be a no-op for an unreadable-main file: {:?}",
+        app.files[0].decision
+    );
 }
 
 // ── Interactive merge overlay (Phase 4) ───────────────────────────────────

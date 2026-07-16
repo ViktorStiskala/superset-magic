@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -245,7 +246,9 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
                  non-interactive mode. Re-run it in a terminal."
             )
         );
-        return Ok(ExitCode::SUCCESS);
+        // Non-zero so a piped / CI caller can tell "couldn't run, wrote nothing"
+        // apart from a real success (Esc/cancel and empty-candidate stay 0).
+        return Ok(ExitCode::from(2));
     }
 
     // Capture a review-time baseline of every offered file's metadata on BOTH
@@ -289,14 +292,66 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
         ts: &ts,
     };
 
-    let mut applied = 0usize;
-    let mut skipped = 0usize;
-    let mut all_backups: Vec<PathBuf> = Vec::new();
-    for (rel, decision) in &decisions {
+    let summary = apply_batch(&ctx, &decisions, &baseline);
+
+    if !summary.backups.is_empty() {
+        println!();
+        println!(
+            "{}",
+            style::info("Backups of overwritten files (recover a mistake here):")
+        );
+        for backup in &summary.backups {
+            println!("{}", style::info(format!("  {}", backup.display())));
+        }
+    }
+
+    println!();
+    let line = format!(
+        "Reverse sync done: applied {}, skipped {}, failed {}",
+        summary.applied, summary.skipped, summary.failed
+    );
+    if summary.failed > 0 {
+        println!("{}", style::err(line));
+    } else if summary.skipped > 0 {
+        println!("{}", style::warn(line));
+    } else {
+        println!("{}", style::ok(line));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Tallies + collected backups from applying a whole batch of cockpit
+/// decisions. `failed` counts files whose apply raised an I/O error.
+struct BatchSummary {
+    applied: usize,
+    skipped: usize,
+    failed: usize,
+    backups: Vec<PathBuf>,
+}
+
+/// Apply every `(rel, decision)` in order, threading each file's review-time
+/// baseline from `baseline`, and print one line per file as it goes.
+///
+/// Each file's [`apply_decision`] result is handled independently: an `Err` is
+/// reported and counted in `failed` but does NOT abort the batch (a single I/O
+/// error must neither roll back nor hide the files already written + backed up
+/// before it). Skips and applies are tallied and reported as before.
+fn apply_batch(
+    ctx: &ApplyContext,
+    decisions: &[(PathBuf, Decision)],
+    baseline: &HashMap<PathBuf, (Option<FileMeta>, Option<FileMeta>)>,
+) -> BatchSummary {
+    let mut summary = BatchSummary {
+        applied: 0,
+        skipped: 0,
+        failed: 0,
+        backups: Vec::new(),
+    };
+    for (rel, decision) in decisions {
         let (wt, main) = baseline.get(rel).cloned().unwrap_or((None, None));
-        match apply_decision(&ctx, rel, decision, Baseline { wt, main })? {
-            ApplyOutcome::Applied(result) => {
-                applied += 1;
+        match apply_decision(ctx, rel, decision, Baseline { wt, main }) {
+            Ok(ApplyOutcome::Applied(result)) => {
+                summary.applied += 1;
                 let dir = match result.direction {
                     WriteDirection::PushToMain => "worktree → main",
                     WriteDirection::PullFromMain => "main → worktree",
@@ -311,37 +366,25 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
                     "{}",
                     style::ok(format!("Applied {} [{dir}]{ign}", rel.display()))
                 );
-                all_backups.extend(result.backups);
+                summary.backups.extend(result.backups);
             }
-            ApplyOutcome::Skipped(reason) => {
-                skipped += 1;
+            Ok(ApplyOutcome::Skipped(reason)) => {
+                summary.skipped += 1;
                 println!(
                     "{}",
                     style::warn(format!("Skipped {}: {reason}", rel.display()))
                 );
             }
+            Err(err) => {
+                summary.failed += 1;
+                eprintln!(
+                    "{}",
+                    style::err(format!("Failed {}: {err:#}", rel.display()))
+                );
+            }
         }
     }
-
-    if !all_backups.is_empty() {
-        println!();
-        println!(
-            "{}",
-            style::info("Backups of overwritten files (recover a mistake here):")
-        );
-        for backup in &all_backups {
-            println!("{}", style::info(format!("  {}", backup.display())));
-        }
-    }
-
-    println!();
-    let line = format!("Reverse sync done: applied {applied}, skipped {skipped}");
-    if skipped == 0 {
-        println!("{}", style::ok(line));
-    } else {
-        println!("{}", style::warn(line));
-    }
-    Ok(ExitCode::SUCCESS)
+    summary
 }
 
 /// Timestamp string for a batch of backups. Seconds since the Unix epoch — a
@@ -359,9 +402,10 @@ fn apply_timestamp() -> String {
 //
 // The cockpit's safe, backup-first apply path. It writes a decision (push /
 // pull / merge) to disk: a path-safety guard, a review-time-baseline re-check
-// that skips any target changed since the user reviewed it, a timestamped
-// pre-write backup of the losing bytes, and `ensure_gitignored_in_main` BEFORE
-// any secret bytes land in main. Driven by [`run`] with the decisions returned
+// that skips a file when EITHER the side it reads or the side it overwrites
+// changed since the user reviewed it, a timestamped pre-write backup of the
+// losing bytes, and `ensure_gitignored_in_main` BEFORE any secret bytes land in
+// main. Driven by [`run`] (via [`apply_batch`]) with the decisions returned
 // from the cockpit — plus the per-file `(worktree, main)` metadata baseline
 // captured before the cockpit opened — including the `Decision::Merge` produced
 // by the cockpit's interactive-merge overlay, whose assembled bytes this seam
@@ -486,13 +530,42 @@ fn backup(target: &Path, dest: &Path) -> Result<PathBuf> {
     Ok(dest.to_path_buf())
 }
 
-/// Write `bytes` to `target`, creating any missing parent directories first.
+/// Write `bytes` to `target` ATOMICALLY, creating any missing parent
+/// directories first.
+///
+/// The bytes are staged in a temp file in the SAME directory as `target`, then
+/// `persist`ed (renamed) over it, so an interrupted or failing write can never
+/// leave a truncated secret at `target` — the rename either fully replaces the
+/// file or leaves the old bytes intact. An existing target's permissions are
+/// preserved across the replace (the temp file is created 0600 by default) so a
+/// reverse sync never silently changes a file's mode.
 fn write_bytes(target: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating parent dirs for {}", target.display()))?;
+    let parent = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating parent dirs for {}", target.display()))?;
+
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating temp file in {}", parent.display()))?;
+    tmp.write_all(bytes)
+        .with_context(|| format!("writing {}", target.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(target) {
+            let _ = tmp
+                .as_file()
+                .set_permissions(fs::Permissions::from_mode(meta.permissions().mode()));
+        }
     }
-    fs::write(target, bytes).with_context(|| format!("writing {}", target.display()))?;
+
+    // Flush to disk before the rename, then persist atomically over the target.
+    tmp.as_file().sync_all().ok();
+    tmp.persist(target)
+        .with_context(|| format!("persisting {}", target.display()))?;
     Ok(())
 }
 
@@ -535,17 +608,20 @@ pub struct Baseline {
 /// Apply one cockpit [`Decision`] for `rel`, safely (KD4, R13–R15).
 ///
 /// Safety order: an unsafe `rel` bails; an [`Decision::Undecided`] is a no-op
-/// skip; every destructive overwrite of an existing target is guarded against
-/// its review-time baseline (`baseline.wt` for the worktree side,
+/// skip; BOTH the side we OVERWRITE and the side we READ are guarded against
+/// their review-time baselines (`baseline.wt` for the worktree side,
 /// `baseline.main` for the main side — each captured by [`meta_of`] before the
-/// cockpit opened) and its losing bytes are backed up under `ctx.backups_root`
-/// (via [`backup_rel_path`]) BEFORE the write; every write into main is
-/// preceded by [`ensure_gitignored_in_main`] so a git failure never leaves
-/// un-ignored secret bytes on disk. `Merge` writes the assembled text to BOTH
-/// sides (distinct `local/`+`main/` backup dirs so neither original is lost).
-/// A target that no longer matches its baseline (edited, created, or deleted
-/// since review) yields [`ApplyOutcome::Skipped`] with nothing written — no
-/// overwrite and no partial backup.
+/// cockpit opened): `Push` guards worktree(source)+main(target), `Pull` guards
+/// main(source)+worktree(target), `Merge` guards both. A source that changed
+/// since review is stale content the user never saw, so it is skipped just like
+/// a changed target. The overwritten target's losing bytes are backed up under
+/// `ctx.backups_root` (via [`backup_rel_path`]) BEFORE the write; every write
+/// into main is preceded by [`ensure_gitignored_in_main`] so a git failure
+/// never leaves un-ignored secret bytes on disk. `Merge` writes the assembled
+/// text to BOTH sides (distinct `local/`+`main/` backup dirs so neither
+/// original is lost). Any side that no longer matches its baseline (edited,
+/// created, or deleted since review) yields [`ApplyOutcome::Skipped`] with
+/// nothing written — no overwrite and no partial backup.
 pub fn apply_decision(
     ctx: &ApplyContext,
     rel: &Path,
@@ -569,6 +645,13 @@ pub fn apply_decision(
         Decision::Push => {
             let source = ctx.worktree_root.join(rel);
             let target = ctx.main_root.join(rel); // main is the destination
+            // Guard BOTH sides against their review-time baselines: the target
+            // we OVERWRITE (main) and the source we READ (worktree). A source
+            // that changed since review means we'd push bytes the user never
+            // saw, so skip rather than push stale content.
+            if matches!(check_target(&source, baseline.wt.as_ref()), Guard::Changed) {
+                return Ok(ApplyOutcome::Skipped(changed_reason()));
+            }
             let guard = check_target(&target, baseline.main.as_ref());
             if matches!(guard, Guard::Changed) {
                 return Ok(ApplyOutcome::Skipped(changed_reason()));
@@ -595,6 +678,12 @@ pub fn apply_decision(
         Decision::Pull => {
             let source = ctx.main_root.join(rel);
             let target = ctx.worktree_root.join(rel); // worktree is the destination
+            // Guard BOTH sides: the target we OVERWRITE (worktree) and the
+            // source we READ (main). A source changed since review is stale, so
+            // skip rather than pull bytes the user never reviewed.
+            if matches!(check_target(&source, baseline.main.as_ref()), Guard::Changed) {
+                return Ok(ApplyOutcome::Skipped(changed_reason()));
+            }
             let guard = check_target(&target, baseline.wt.as_ref());
             if matches!(guard, Guard::Changed) {
                 return Ok(ApplyOutcome::Skipped(changed_reason()));
@@ -646,12 +735,16 @@ pub fn apply_decision(
                     .join("main")
                     .join(backup_rel_path(ctx.ts, rel)),
             )?);
-            // Write the assembled text to the worktree, then — secret-safe —
-            // to main.
-            write_bytes(&wt_target, text.as_bytes())?;
+            // Secret-safety FIRST, then write MAIN, then the worktree. Ordering
+            // the main write before the worktree means a failure at or before
+            // it leaves BOTH sides untouched (no divergence); only the final
+            // worktree write can fail after main is updated, and `write_bytes`
+            // is atomic so even that leaves no truncated file. The
+            // gitignore-before-any-main-write ordering is preserved.
             let gitignore_appended =
                 ensure_gitignored_in_main(ctx.worktree_root, ctx.main_root, rel)?;
             write_bytes(&main_target, text.as_bytes())?;
+            write_bytes(&wt_target, text.as_bytes())?;
             Ok(ApplyOutcome::Applied(ApplyResult {
                 direction: WriteDirection::MergeBoth,
                 backups,
