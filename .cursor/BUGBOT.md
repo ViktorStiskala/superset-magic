@@ -192,7 +192,9 @@ committable and must never leak.
   re-check, or removes the worktree copy before main.
 - **Diff/merge inputs are EOL-normalized; raw copies are not.** Text
   candidates are normalized at load (`diffmodel::normalize_eol`: CRLF → LF,
-  trailing newline ensured) so diff hunks and merge assembly reflect content
+  a trailing lone CR treated as an EOL — never given a synthesized `\n`
+  after it — and a trailing newline ensured) so diff hunks and merge
+  assembly reflect content
   only; sides equal after normalization render an explanatory "line endings
   only" notice instead of an empty diff. Push/pull must keep copying the RAW
   on-disk bytes, and byte-level classification (`classify`) stays byte-exact.

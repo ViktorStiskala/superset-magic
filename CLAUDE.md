@@ -117,12 +117,17 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   (badge `⇄ merge (assembled)`); `Esc` cancels unchanged. For binary /
   oversized / worktree-only files `m` is a no-op that shows a transient
   footer notice (R9). The batched confirm lists a merge as an overwrite of
-  BOTH sides and a delete with the sides it removes; `apply_decision` writes
+  BOTH sides and a delete with the sides it removes; the delete badge names
+  the same sides (`✗ delete (worktree copy)` for a worktree-only file, else
+  `✗ delete (worktree + main)` — `badge_text` takes the file's
+  `DiffStatus`); `apply_decision` writes
   the assembled bytes to worktree and
   main. It returns `CockpitOutcome::{Apply, Cancel}` and writes NOTHING
   itself; `reverse_sync::run` applies the decisions via `apply_decision`.
   `is_interactive` (stdin+stdout TTY, R16) guards launch. A `Drop` guard +
-  panic hook always restore the terminal. The pure `draw(frame, app)` and
+  panic hook always restore the terminal. The help overlay is sized to its
+  content (`centered_rect_abs`, 22 lines) so the full help — safety facts
+  included — fits an 80×24 terminal. The pure `draw(frame, app)` and
   the pure `merge_preview` are exercised with `ratatui`'s `TestBackend`
   without the event loop.
 - `cli.rs` — hand-rolled arg parser (no `clap`). `parse(&[String]) ->
@@ -180,8 +185,9 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   the per-hunk merge model (`merge_segments`, `assemble`, `diff_count`,
   `MergeSegment`, `MergeChoice`, `Decision::Merge`) driving the cockpit's
   merge overlay; `tui/diffmodel.rs` owns the pure diff-to-rows model plus
-  `normalize_eol` (CRLF → LF + trailing newline, applied to diff/merge
-  inputs at cockpit load — push/pull still copy raw bytes).
+  `normalize_eol` (CRLF → LF, a trailing lone CR treated as an EOL, +
+  trailing newline ensured; applied to diff/merge inputs at cockpit load —
+  push/pull still copy raw bytes).
 - `pack.rs` — `ss-magic pack`: expand the overlaid `magic.json` patterns
   against the current git repo root (via `sync/apply.rs`'s `match_paths`) and
   write the matches — repo-relative — into `ss-magic-<repo>.tar.bz2` at that
