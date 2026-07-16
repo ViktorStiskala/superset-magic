@@ -45,6 +45,37 @@ fn assemble_missing_choice_defaults_to_local() {
     assert_eq!(assemble(&segs, &[]), "a\nb\nc\n");
 }
 
+/// keep-both on a Diff whose local side lacks a trailing newline (the final
+/// line of a newline-less file) must NOT fuse the last local line onto the
+/// first main line — a `\n` separator is inserted so the two stay distinct.
+#[test]
+fn assemble_both_inserts_separator_when_local_lacks_trailing_newline() {
+    let segs = vec![MergeSegment::Diff {
+        local: "LOCAL_LAST".to_string(), // no trailing newline
+        main: "MAIN_FIRST\n".to_string(),
+    }];
+    let out = assemble(&segs, &[MergeChoice::Both]);
+    assert_eq!(
+        out, "LOCAL_LAST\nMAIN_FIRST\n",
+        "the two sides must stay on distinct lines, not fuse into `LOCAL_LASTMAIN_FIRST`"
+    );
+    assert!(
+        !out.contains("LOCAL_LASTMAIN_FIRST"),
+        "no fusion of the local and main lines: {out:?}"
+    );
+}
+
+/// keep-both on a pure-insert Diff (empty local side) inserts NO spurious
+/// separator — the main side is emitted as-is.
+#[test]
+fn assemble_both_pure_insert_adds_no_separator() {
+    let segs = vec![MergeSegment::Diff {
+        local: String::new(),
+        main: "MAIN_ONLY\n".to_string(),
+    }];
+    assert_eq!(assemble(&segs, &[MergeChoice::Both]), "MAIN_ONLY\n");
+}
+
 /// default_decision: worktree-only ⇒ Push; exists-both ⇒ Undecided.
 #[test]
 fn default_decision_is_conservative() {

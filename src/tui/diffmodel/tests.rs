@@ -167,3 +167,34 @@ fn should_split_thresholds() {
     assert!(should_split(100));
     assert!(!should_split(99));
 }
+
+/// Two CRLF-identical buffers produce only equal/context rows and leave NO
+/// stray `\r` in any rendered segment (the full terminator is trimmed, so CRLF
+/// text neither shows a control char nor registers as changed).
+#[test]
+fn crlf_identical_buffers_have_no_stray_cr_and_no_changes() {
+    let local = "a\r\nb\r\nc\r\n";
+    let main = "a\r\nb\r\nc\r\n";
+
+    let rows = side_by_side(local, main, 3);
+    assert!(
+        rows.iter().all(|r| r.tag == RowTag::Equal),
+        "identical CRLF must yield only equal rows: {rows:?}"
+    );
+    for r in &rows {
+        for s in r.left.iter().chain(r.right.iter()) {
+            assert!(!s.text.contains('\r'), "stray CR in side-by-side segment: {:?}", s.text);
+        }
+    }
+
+    let urows = unified(local, main, 3);
+    assert!(
+        urows.iter().all(|r| r.tag == UnifiedTag::Context),
+        "identical CRLF must be all context: {urows:?}"
+    );
+    for r in &urows {
+        for s in &r.segs {
+            assert!(!s.text.contains('\r'), "stray CR in unified segment: {:?}", s.text);
+        }
+    }
+}

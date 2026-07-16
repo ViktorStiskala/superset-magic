@@ -141,9 +141,13 @@ fn line_no(idx: Option<usize>) -> Option<usize> {
     idx.map(|i| i + 1)
 }
 
-/// Build the segment list for one inline change, stripping a single trailing
-/// `\n` from the last segment (and dropping any segment left empty by that
-/// strip, e.g. a blank line).
+/// Build the segment list for one inline change, stripping the FULL trailing
+/// line terminator (`\r\n` or `\n`) from the last segment (and dropping any
+/// segment left empty by that strip, e.g. a blank line).
+///
+/// Popping only the `\n` would leave a bare `\r` on CRLF lines — it would render
+/// as a stray control character AND make an otherwise-identical CRLF/LF pair
+/// register as changed. So the trailing `\r` is dropped too.
 fn segs_from_strings<'s>(strings: impl Iterator<Item = (bool, Cow<'s, str>)>) -> Vec<Seg> {
     let mut segs: Vec<Seg> = strings
         .map(|(emphasized, value)| Seg {
@@ -154,6 +158,10 @@ fn segs_from_strings<'s>(strings: impl Iterator<Item = (bool, Cow<'s, str>)>) ->
     if let Some(last) = segs.last_mut() {
         if last.text.ends_with('\n') {
             last.text.pop();
+            // CRLF: drop the carriage return the `\n` pop left behind.
+            if last.text.ends_with('\r') {
+                last.text.pop();
+            }
         }
     }
     while segs.last().is_some_and(|s| s.text.is_empty()) {

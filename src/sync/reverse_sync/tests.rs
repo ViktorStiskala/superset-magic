@@ -318,6 +318,12 @@ fn applied(outcome: ApplyOutcome) -> ApplyResult {
     }
 }
 
+/// The real on-disk metadata for `path`, as the review-time baseline would have
+/// captured it (panics on a non-`NotFound` stat error — a test bug).
+fn meta(path: &Path) -> Option<FileMeta> {
+    meta_of(path).unwrap()
+}
+
 /// Push over an EXISTING main file: main gets the worktree bytes, the OLD main
 /// bytes are backed up under `backups_root/TS/rel`, a gitignore rule is
 /// appended, and the backup path is reported.
@@ -338,6 +344,8 @@ fn apply_push_overwrites_main_and_backs_up_old_bytes() {
             TS,
             Path::new("config.env"),
             &Decision::Push,
+            meta(&wt.join("config.env")),
+            meta(&main.path().join("config.env")),
         )
         .unwrap(),
     );
@@ -374,6 +382,8 @@ fn apply_push_to_new_main_path_creates_and_gitignores_without_backup() {
             TS,
             Path::new("apps/api/.dev.vars"),
             &Decision::Push,
+            meta(&wt.join("apps/api/.dev.vars")),
+            meta(&main.path().join("apps/api/.dev.vars")),
         )
         .unwrap(),
     );
@@ -406,6 +416,8 @@ fn apply_pull_overwrites_worktree_and_backs_up_its_old_bytes() {
             TS,
             Path::new("config.env"),
             &Decision::Pull,
+            meta(&wt.join("config.env")),
+            meta(&main.path().join("config.env")),
         )
         .unwrap(),
     );
@@ -440,6 +452,8 @@ fn apply_merge_writes_assembled_to_both_and_backs_up_both() {
             TS,
             Path::new("config.env"),
             &Decision::Merge(merged.clone()),
+            meta(&wt.join("config.env")),
+            meta(&main.path().join("config.env")),
         )
         .unwrap(),
     );
@@ -469,10 +483,12 @@ fn apply_merge_writes_assembled_to_both_and_backs_up_both() {
     );
 }
 
-/// A target that changed on disk after its snapshot is skipped, writing
-/// NOTHING (no target overwrite, no backup, no gitignore).
+/// A target whose CURRENT metadata no longer matches its review-time baseline
+/// (an edit landed in the review→apply window) is skipped, writing NOTHING (no
+/// overwrite, no backup, no gitignore). Simulated by handing `apply_decision` a
+/// baseline whose length deliberately mismatches the on-disk file.
 #[test]
-fn apply_skips_when_target_changed_after_snapshot() {
+fn apply_skips_when_target_changed_since_review() {
     let main = init_main_repo();
     let (_wt, wt) = make_worktree(main.path());
     let backups = tempfile::tempdir().unwrap();
@@ -480,23 +496,23 @@ fn apply_skips_when_target_changed_after_snapshot() {
     write(main.path(), "config.env", "MAIN_ORIG=1\n");
     write(&wt, "config.env", "WT_NEW=1\n");
 
-    let main_path = main.path().join("config.env");
-    let mut fired = false;
-    let outcome = apply_decision_hooked(
+    // A stale baseline: length differs from the real main file, as if main had
+    // been edited since the user reviewed it. (A length mismatch is detected
+    // regardless of mtime resolution.)
+    let stale_main = Some(FileMeta {
+        len: 999_999,
+        mtime: None,
+    });
+
+    let outcome = apply_decision(
         &wt,
         main.path(),
         backups.path(),
         TS,
         Path::new("config.env"),
         &Decision::Push,
-        &mut || {
-            if !fired {
-                fired = true;
-                // Concurrent edit lands in the snapshot→write window (different
-                // length ⇒ reliably detected regardless of mtime resolution).
-                fs::write(&main_path, "MAIN_CHANGED_CONCURRENTLY=999\n").unwrap();
-            }
-        },
+        meta(&wt.join("config.env")),
+        stale_main,
     )
     .unwrap();
 
@@ -506,10 +522,10 @@ fn apply_skips_when_target_changed_after_snapshot() {
         }
         other => panic!("expected Skipped, got {other:?}"),
     }
-    // main retains the concurrent edit, NOT the worktree bytes.
+    // main retains its bytes, NOT the worktree bytes.
     assert_eq!(
-        fs::read_to_string(&main_path).unwrap(),
-        "MAIN_CHANGED_CONCURRENTLY=999\n"
+        fs::read_to_string(main.path().join("config.env")).unwrap(),
+        "MAIN_ORIG=1\n"
     );
     // Nothing else was touched: no backup and no .gitignore created.
     assert!(!backups.path().join(TS).join("config.env").exists());
@@ -517,6 +533,81 @@ fn apply_skips_when_target_changed_after_snapshot() {
         !main.path().join(".gitignore").exists(),
         "a skip must not append a gitignore rule"
     );
+}
+
+/// The normal Applied path with a MATCHING baseline still overwrites: passing
+/// the real current metadata as the baseline (an untouched review window) lets
+/// the push through and backs up the old bytes.
+#[test]
+fn apply_applies_when_baseline_matches_current() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN_ORIG=1\n");
+    write(&wt, "config.env", "WT_NEW=1\n");
+
+    let res = applied(
+        apply_decision(
+            &wt,
+            main.path(),
+            backups.path(),
+            TS,
+            Path::new("config.env"),
+            &Decision::Push,
+            meta(&wt.join("config.env")),
+            meta(&main.path().join("config.env")),
+        )
+        .unwrap(),
+    );
+
+    // main took the worktree bytes and the old bytes were backed up.
+    assert_eq!(
+        fs::read_to_string(main.path().join("config.env")).unwrap(),
+        "WT_NEW=1\n"
+    );
+    assert_eq!(res.backups.len(), 1);
+    assert_eq!(fs::read_to_string(&res.backups[0]).unwrap(), "MAIN_ORIG=1\n");
+}
+
+/// A file absent at review time (baseline `None`) that APPEARS before apply
+/// (current `Some`) is treated as Changed and skipped — reverse sync never
+/// clobbers a file that materialized during the review window (Finding 5:
+/// baseline `None` + current `Some` ⇒ Changed, not a fresh no-backup write).
+#[test]
+fn apply_skips_when_target_appeared_after_review() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(&wt, "config.env", "WT_NEW=1\n");
+    // main did NOT hold the file at review time, but it appears before apply.
+    write(main.path(), "config.env", "APPEARED=1\n");
+
+    let outcome = apply_decision(
+        &wt,
+        main.path(),
+        backups.path(),
+        TS,
+        Path::new("config.env"),
+        &Decision::Push,
+        meta(&wt.join("config.env")),
+        None, // review-time baseline: main absent
+    )
+    .unwrap();
+
+    match outcome {
+        ApplyOutcome::Skipped(reason) => {
+            assert!(reason.contains("changed since review"), "got: {reason}")
+        }
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    // main keeps the appeared content, untouched.
+    assert_eq!(
+        fs::read_to_string(main.path().join("config.env")).unwrap(),
+        "APPEARED=1\n"
+    );
+    assert!(!backups.path().join(TS).join("config.env").exists());
 }
 
 /// An Undecided decision is a no-op skip; neither side is touched.
@@ -536,6 +627,8 @@ fn apply_undecided_is_skipped() {
         TS,
         Path::new("config.env"),
         &Decision::Undecided,
+        meta(&wt.join("config.env")),
+        meta(&main.path().join("config.env")),
     )
     .unwrap();
 

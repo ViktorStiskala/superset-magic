@@ -336,3 +336,191 @@ fn accept_merge_sets_merge_decision_and_badge() {
         "badge reflects the merge decision"
     );
 }
+
+// ── handle_key dispatch (Finding 6) ────────────────────────────────────────
+
+fn two_file_app() -> App {
+    app_with(vec![
+        entry(
+            "a.env",
+            DiffStatus::WorktreeOnly,
+            Decision::Push,
+            FileDiff::New { content: None },
+        ),
+        entry(
+            "b.env",
+            DiffStatus::Differs,
+            Decision::Undecided,
+            FileDiff::Text {
+                local: "x\n".to_string(),
+                main: "y\n".to_string(),
+            },
+        ),
+    ])
+}
+
+/// Normal-mode `Esc` yields `Cancel` (invariant 4) AND leaves every file's
+/// decision untouched.
+#[test]
+fn handle_key_normal_esc_cancels_without_touching_decisions() {
+    let mut app = two_file_app();
+    let before: Vec<Decision> = app.files.iter().map(|f| f.decision.clone()).collect();
+
+    let out = handle_key(&mut app, KeyCode::Esc, 10);
+
+    assert_eq!(out, Some(CockpitOutcome::Cancel), "Esc must cancel");
+    let after: Vec<Decision> = app.files.iter().map(|f| f.decision.clone()).collect();
+    assert_eq!(before, after, "cancel must not change any decision");
+}
+
+/// `p` / `l` / `u` set the focused file's decision (and return `None`, staying
+/// in the loop).
+#[test]
+fn handle_key_plu_set_focused_decision() {
+    let mut app = app_with(vec![entry(
+        "diff.env",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Text {
+            local: "x\n".to_string(),
+            main: "y\n".to_string(),
+        },
+    )]);
+
+    assert_eq!(handle_key(&mut app, KeyCode::Char('p'), 10), None);
+    assert!(matches!(app.files[0].decision, Decision::Push));
+
+    assert_eq!(handle_key(&mut app, KeyCode::Char('l'), 10), None);
+    assert!(matches!(app.files[0].decision, Decision::Pull));
+
+    assert_eq!(handle_key(&mut app, KeyCode::Char('u'), 10), None);
+    assert!(matches!(app.files[0].decision, Decision::Undecided));
+}
+
+/// Confirm mode: `n` and `Esc` return to Normal without applying; `y` yields
+/// `Apply` carrying the decided files.
+#[test]
+fn handle_key_confirm_mode_flow() {
+    let mut app = app_with(vec![entry(
+        "diff.env",
+        DiffStatus::Differs,
+        Decision::Pull,
+        FileDiff::Text {
+            local: "x\n".to_string(),
+            main: "y\n".to_string(),
+        },
+    )]);
+
+    app.mode = Mode::Confirm;
+    assert_eq!(handle_key(&mut app, KeyCode::Char('n'), 10), None);
+    assert_eq!(app.mode, Mode::Normal, "n returns to Normal");
+
+    app.mode = Mode::Confirm;
+    assert_eq!(handle_key(&mut app, KeyCode::Esc, 10), None);
+    assert_eq!(app.mode, Mode::Normal, "Esc returns to Normal");
+
+    app.mode = Mode::Confirm;
+    match handle_key(&mut app, KeyCode::Char('y'), 10) {
+        Some(CockpitOutcome::Apply(d)) => {
+            assert_eq!(d.len(), 1, "one decided file");
+            assert_eq!(d[0].0, PathBuf::from("diff.env"));
+        }
+        other => panic!("expected Apply, got {other:?}"),
+    }
+}
+
+/// Merge mode: `→` cycles the focused hunk's choice, `Enter` accepts (recording
+/// a merge decision and returning to Normal).
+#[test]
+fn handle_key_merge_mode_choice_and_accept() {
+    let mut app = app_with(vec![entry(
+        "config.local.json",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Text {
+            local: "a\nX\nc\n".to_string(),
+            main: "a\nY\nc\n".to_string(),
+        },
+    )]);
+    app.try_open_merge();
+    assert_eq!(app.mode, Mode::Merge);
+
+    // Right cycles keep-local → keep-main.
+    assert_eq!(handle_key(&mut app, KeyCode::Right, 10), None);
+    assert_eq!(app.merge.as_ref().unwrap().choices[0], MergeChoice::Main);
+
+    // Enter accepts → back to Normal with a Merge decision.
+    assert_eq!(handle_key(&mut app, KeyCode::Enter, 10), None);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.merge.is_none(), "overlay cleared on accept");
+    assert!(matches!(app.files[0].decision, Decision::Merge(_)));
+}
+
+/// Merge mode: `↑`/`↓` navigate between hunks (clamped at the ends).
+#[test]
+fn handle_key_merge_mode_hunk_navigation() {
+    let mut app = app_with(vec![entry(
+        "c.env",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Text {
+            local: "X\nb\nZ\n".to_string(),
+            main: "A\nb\nC\n".to_string(),
+        },
+    )]);
+    app.try_open_merge();
+    assert_eq!(app.merge.as_ref().unwrap().hunk_count(), 2, "two hunks");
+    assert_eq!(app.merge.as_ref().unwrap().hunk, 0);
+
+    handle_key(&mut app, KeyCode::Down, 10);
+    assert_eq!(app.merge.as_ref().unwrap().hunk, 1);
+    handle_key(&mut app, KeyCode::Up, 10);
+    assert_eq!(app.merge.as_ref().unwrap().hunk, 0);
+}
+
+/// Merge mode: `Esc` cancels the overlay, leaving the file's decision unchanged.
+#[test]
+fn handle_key_merge_mode_esc_leaves_decision_unchanged() {
+    let mut app = app_with(vec![entry(
+        "c.env",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Text {
+            local: "a\nX\nc\n".to_string(),
+            main: "a\nY\nc\n".to_string(),
+        },
+    )]);
+    app.try_open_merge();
+
+    assert_eq!(handle_key(&mut app, KeyCode::Esc, 10), None);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.merge.is_none());
+    assert!(
+        matches!(app.files[0].decision, Decision::Undecided),
+        "Esc keeps the pre-merge decision"
+    );
+}
+
+/// A file whose main side is unreadable is a merge no-op: `try_open_merge` sets
+/// a notice instead of entering the overlay (never merges from fabricated
+/// content).
+#[test]
+fn unreadable_main_disables_merge() {
+    let mut app = app_with(vec![entry(
+        "secret.env",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Unreadable {
+            note: "main unreadable: permission denied — push only (pull/merge disabled)"
+                .to_string(),
+        },
+    )]);
+    app.try_open_merge();
+    assert_eq!(app.mode, Mode::Normal, "unreadable main must not enter merge");
+    assert!(app.merge.is_none(), "no overlay for an unreadable file");
+    assert!(app.notice.is_some(), "a merge-unavailable notice is set");
+
+    // The notice renders in the diff pane.
+    let out = buffer_text(&render(&app, 120, 30));
+    assert!(out.contains("main unreadable"), "unreadable notice missing:\n{out}");
+}

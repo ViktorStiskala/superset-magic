@@ -85,6 +85,10 @@ enum FileDiff {
     Binary { note: String },
     /// Either side is over the diff cap (R8) — whole-file push/pull only.
     TooLarge { note: String },
+    /// Main's copy could not be read (permissions / I/O — NOT missing). The
+    /// error is surfaced verbatim; a diff/merge is NEVER built from a fabricated
+    /// empty buffer, so interactive merge is unavailable for this file.
+    Unreadable { note: String },
 }
 
 /// One reconcile candidate as shown in the cockpit.
@@ -358,23 +362,14 @@ fn load_entry(
     status: DiffStatus,
 ) -> Result<FileEntry> {
     let wt_path = worktree_root.join(rel);
-    let wt_bytes =
-        fs::read(&wt_path).with_context(|| format!("reading worktree file {}", wt_path.display()))?;
     let mtime_local = format_mtime(&wt_path);
 
     let (diff, mtime_main) = match status {
-        DiffStatus::WorktreeOnly => {
-            let content = match classify_content_owned(&wt_bytes) {
-                ContentKind::Text(s) => Some(s),
-                _ => None,
-            };
-            (FileDiff::New { content }, "—".to_string())
-        }
+        DiffStatus::WorktreeOnly => (build_new(&wt_path)?, "—".to_string()),
         DiffStatus::Differs | DiffStatus::Identical => {
             let main_path = main_root.join(rel);
-            let main_bytes = fs::read(&main_path).unwrap_or_default();
             let mtime_main = format_mtime(&main_path);
-            (build_text_diff(&wt_bytes, &main_bytes), mtime_main)
+            (build_two_sided(&wt_path, &main_path)?, mtime_main)
         }
     };
 
@@ -387,6 +382,65 @@ fn load_entry(
         mtime_local,
         mtime_main,
     })
+}
+
+/// Build the [`FileDiff::New`] view for a worktree-only file, consulting the
+/// file's size via metadata BEFORE any full read (R8): an oversized new file is
+/// shown as "content not shown" without paying for the read.
+fn build_new(wt_path: &Path) -> Result<FileDiff> {
+    let wt_len = fs::metadata(wt_path)
+        .with_context(|| format!("reading worktree file {}", wt_path.display()))?
+        .len();
+    let content = if wt_len > diffmodel::MAX_DIFF_BYTES {
+        None
+    } else {
+        let wt_bytes = fs::read(wt_path)
+            .with_context(|| format!("reading worktree file {}", wt_path.display()))?;
+        match classify_content_owned(&wt_bytes) {
+            ContentKind::Text(s) => Some(s),
+            _ => None,
+        }
+    };
+    Ok(FileDiff::New { content })
+}
+
+/// Build the two-sided diff view for a file present on both sides.
+///
+/// Consults both sides' sizes via `fs::metadata` FIRST (R8): if either exceeds
+/// [`diffmodel::MAX_DIFF_BYTES`], a [`FileDiff::TooLarge`] is built from the
+/// metadata length WITHOUT reading either file in full. A main-side read error
+/// that is NOT "missing" (permissions / I/O) surfaces as [`FileDiff::Unreadable`]
+/// — main's bytes are never fabricated as empty, so no diff/merge is driven from
+/// fabricated content. The worktree side propagates its error (it is the secret
+/// being pushed).
+fn build_two_sided(wt_path: &Path, main_path: &Path) -> Result<FileDiff> {
+    let wt_len = fs::metadata(wt_path)
+        .with_context(|| format!("reading worktree file {}", wt_path.display()))?
+        .len();
+    let main_len = match fs::metadata(main_path) {
+        Ok(m) => m.len(),
+        Err(e) => return Ok(main_unreadable(&e)),
+    };
+    if wt_len > diffmodel::MAX_DIFF_BYTES || main_len > diffmodel::MAX_DIFF_BYTES {
+        return Ok(FileDiff::TooLarge {
+            note: too_large_note(wt_len.max(main_len)),
+        });
+    }
+
+    let wt_bytes = fs::read(wt_path)
+        .with_context(|| format!("reading worktree file {}", wt_path.display()))?;
+    let main_bytes = match fs::read(main_path) {
+        Ok(b) => b,
+        Err(e) => return Ok(main_unreadable(&e)),
+    };
+    Ok(build_text_diff(&wt_bytes, &main_bytes))
+}
+
+/// The [`FileDiff::Unreadable`] notice for a main-side read failure.
+fn main_unreadable(err: &io::Error) -> FileDiff {
+    FileDiff::Unreadable {
+        note: format!("main unreadable: {err} — push only (pull/merge disabled)"),
+    }
 }
 
 fn file_state(status: DiffStatus) -> FileState {
@@ -474,7 +528,7 @@ fn diff_line_count(f: &FileEntry) -> usize {
     match &f.diff {
         FileDiff::Text { local, main } => diffmodel::unified(local, main, CONTEXT).len() + 1,
         FileDiff::New { content } => content.as_ref().map(|c| c.lines().count()).unwrap_or(0) + 2,
-        FileDiff::Binary { .. } | FileDiff::TooLarge { .. } => 1,
+        FileDiff::Binary { .. } | FileDiff::TooLarge { .. } | FileDiff::Unreadable { .. } => 1,
     }
 }
 
@@ -605,9 +659,9 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, split: bool) {
 
     match &f.diff {
         FileDiff::New { content } => render_new(frame, inner, content.as_deref(), app.diff_scroll),
-        FileDiff::Binary { note } | FileDiff::TooLarge { note } => {
-            render_notice(frame, inner, note)
-        }
+        FileDiff::Binary { note }
+        | FileDiff::TooLarge { note }
+        | FileDiff::Unreadable { note } => render_notice(frame, inner, note),
         FileDiff::Text { local, main } => {
             if split {
                 render_split(frame, inner, local, main, app.diff_scroll);
@@ -1038,11 +1092,15 @@ pub fn run_cockpit(
 
     install_panic_hook();
     enable_raw_mode().context("enabling terminal raw mode")?;
+    // Construct the RAII guard the instant raw mode is on, BEFORE entering the
+    // alternate screen: its Drop restores the terminal on EVERY later exit path
+    // (normal return, a `?` error from EnterAlternateScreen or terminal setup,
+    // or an unwinding panic) — a guard built after EnterAlternateScreen would
+    // leak raw mode if that step (or `Terminal::new`) failed.
+    let _guard = TerminalGuard;
     io::stdout()
         .execute(EnterAlternateScreen)
         .context("entering the alternate screen")?;
-    // Restores the terminal on scope exit, INCLUDING during unwinding.
-    let _guard = TerminalGuard;
 
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating the terminal")?;
@@ -1072,20 +1130,36 @@ where
             continue;
         }
 
-        match app.mode {
-            Mode::Help => {
-                if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
-                    app.mode = Mode::Normal;
-                }
+        if let Some(outcome) = handle_key(app, key.code, page) {
+            return Ok(outcome);
+        }
+    }
+}
+
+/// Pure key dispatch: mutate `app` for the pressed `code` in the current mode
+/// and return `Some(outcome)` when the loop should exit (apply or cancel), or
+/// `None` to keep going. Factored out of [`event_loop`] so the whole key surface
+/// — including the invariant-4 `Esc → Cancel` arm — is unit-testable with
+/// synthetic [`KeyCode`]s, no terminal or `event::read` required. `page` is the
+/// diff scroll step (terminal height − chrome).
+fn handle_key(app: &mut App, code: KeyCode, page: u16) -> Option<CockpitOutcome> {
+    match app.mode {
+        Mode::Help => {
+            if matches!(code, KeyCode::Char('?') | KeyCode::Esc) {
+                app.mode = Mode::Normal;
             }
-            Mode::Confirm => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    return Ok(CockpitOutcome::Apply(app.decisions()));
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.mode = Mode::Normal,
-                _ => {}
-            },
-            Mode::Merge => match key.code {
+            None
+        }
+        Mode::Confirm => match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(CockpitOutcome::Apply(app.decisions())),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.mode = Mode::Normal;
+                None
+            }
+            _ => None,
+        },
+        Mode::Merge => {
+            match code {
                 // Esc leaves the file's decision unchanged (F2).
                 KeyCode::Esc => {
                     app.merge = None;
@@ -1113,26 +1187,28 @@ where
                 }
                 KeyCode::Enter => app.accept_merge(),
                 _ => {}
-            },
-            Mode::Normal => {
-                // Any keypress clears a transient notice from the previous action;
-                // a no-op `m` below may then set a fresh one.
-                app.notice = None;
-                match key.code {
-                    KeyCode::Esc => return Ok(CockpitOutcome::Cancel),
-                    KeyCode::Up | KeyCode::Char('k') => app.focus_prev(),
-                    KeyCode::Down | KeyCode::Char('j') => app.focus_next(),
-                    KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_down(page),
-                    KeyCode::PageUp | KeyCode::Char('b') => app.scroll_up(page),
-                    KeyCode::Char('p') => app.set_decision(Decision::Push),
-                    KeyCode::Char('l') => app.set_pull(),
-                    KeyCode::Char('m') => app.try_open_merge(),
-                    KeyCode::Char('u') => app.set_decision(Decision::Undecided),
-                    KeyCode::Char('?') => app.mode = Mode::Help,
-                    KeyCode::Enter => app.mode = Mode::Confirm,
-                    _ => {}
-                }
             }
+            None
+        }
+        Mode::Normal => {
+            // Any keypress clears a transient notice from the previous action;
+            // a no-op `m` below may then set a fresh one.
+            app.notice = None;
+            match code {
+                KeyCode::Esc => return Some(CockpitOutcome::Cancel),
+                KeyCode::Up | KeyCode::Char('k') => app.focus_prev(),
+                KeyCode::Down | KeyCode::Char('j') => app.focus_next(),
+                KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_down(page),
+                KeyCode::PageUp | KeyCode::Char('b') => app.scroll_up(page),
+                KeyCode::Char('p') => app.set_decision(Decision::Push),
+                KeyCode::Char('l') => app.set_pull(),
+                KeyCode::Char('m') => app.try_open_merge(),
+                KeyCode::Char('u') => app.set_decision(Decision::Undecided),
+                KeyCode::Char('?') => app.mode = Mode::Help,
+                KeyCode::Enter => app.mode = Mode::Confirm,
+                _ => {}
+            }
+            None
         }
     }
 }

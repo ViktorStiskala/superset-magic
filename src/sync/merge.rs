@@ -199,6 +199,12 @@ pub fn diff_count(segments: &[MergeSegment]) -> usize {
 /// emits the local side, [`MergeChoice::Main`] the main side, [`MergeChoice::Both`]
 /// the local side then the main side. If `choices` is shorter than
 /// [`diff_count`], any missing choice is treated as [`MergeChoice::Local`].
+///
+/// For [`MergeChoice::Both`], a missing line terminator between the two sides is
+/// repaired: when a non-empty `local` side does not end in `\n` (the final line
+/// of a file with no trailing newline), a `\n` is inserted before `main` so the
+/// last local line and the first main line stay distinct rather than fusing into
+/// one corrupted line.
 pub fn assemble(segments: &[MergeSegment], choices: &[MergeChoice]) -> String {
     let mut out = String::new();
     let mut diff_idx = 0usize;
@@ -212,6 +218,13 @@ pub fn assemble(segments: &[MergeSegment], choices: &[MergeChoice]) -> String {
                     MergeChoice::Main => out.push_str(main),
                     MergeChoice::Both => {
                         out.push_str(local);
+                        // Keep the two sides on distinct lines: a local side
+                        // without a trailing newline would otherwise fuse its
+                        // last line onto main's first line. (An empty local
+                        // side — a pure insert — needs no separator.)
+                        if !local.is_empty() && !local.ends_with('\n') {
+                            out.push('\n');
+                        }
                         out.push_str(main);
                     }
                 }

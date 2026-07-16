@@ -144,8 +144,11 @@ committable and must never leak.
   is gated by ONE batched confirm that lists every existing-target overwrite and
   defaults to No, and every destructive write is preceded by a timestamped
   pre-write backup of the losing bytes under a gitignored `.superset/backups/`
-  (`reverse_sync::apply_decision`), with a TOCTOU re-check that skips a file
-  changed since review. The cockpit refuses to launch without an interactive
+  (`reverse_sync::apply_decision`), with a review-time baseline re-check —
+  per-file `(worktree, main)` metadata captured (`meta_of`) BEFORE the cockpit
+  opens and re-compared at apply — that skips a file created, edited, or deleted
+  since review (a non-`NotFound` stat error counts as changed, never as
+  "missing"). The cockpit refuses to launch without an interactive
   TTY and writes nothing then. Flag a reverse-sync path that overwrites an
   existing file without a backup, applies an `Undecided` file, skips the batched
   confirm, or falls through to writing files when there is no TTY.

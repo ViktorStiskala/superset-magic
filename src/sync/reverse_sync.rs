@@ -29,6 +29,7 @@
 //! (consistent with the repo's final-action convention); it returns the user's
 //! per-file decisions and [`run`] feeds each through [`apply_decision`].
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -247,6 +248,19 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Capture a review-time baseline of every offered file's metadata on BOTH
+    // sides, BEFORE the (possibly long) interactive review opens. The apply-time
+    // guard compares this baseline against on-disk metadata at write time, so
+    // any change that lands during the review→apply window — an edit, a create,
+    // or a delete — is detected and that file is skipped rather than clobbered
+    // (KD4 / R13–R15).
+    let mut baseline: HashMap<PathBuf, (Option<FileMeta>, Option<FileMeta>)> = HashMap::new();
+    for (rel, _status) in &offered {
+        let wt_meta = meta_of(&worktree_root.join(rel))?;
+        let main_meta = meta_of(&main_root.join(rel))?;
+        baseline.insert(rel.clone(), (wt_meta, main_meta));
+    }
+
     // Full-screen cockpit: the user sets each file's direction and either
     // cancels (main untouched) or confirms a batch of decisions.
     let decisions = match cockpit::run_cockpit(worktree_root, main_root, &offered)? {
@@ -272,7 +286,17 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
     let mut skipped = 0usize;
     let mut all_backups: Vec<PathBuf> = Vec::new();
     for (rel, decision) in &decisions {
-        match apply_decision(worktree_root, main_root, &backups_root, &ts, rel, decision)? {
+        let (wt_baseline, main_baseline) = baseline.get(rel).cloned().unwrap_or((None, None));
+        match apply_decision(
+            worktree_root,
+            main_root,
+            &backups_root,
+            &ts,
+            rel,
+            decision,
+            wt_baseline,
+            main_baseline,
+        )? {
             ApplyOutcome::Applied(result) => {
                 applied += 1;
                 let dir = match result.direction {
@@ -336,12 +360,43 @@ fn apply_timestamp() -> String {
 // ── Apply seam (reverse-sync merge cockpit) ──────────────────────────────
 //
 // The cockpit's safe, backup-first apply path. It writes a decision (push /
-// pull / merge) to disk: a path-safety guard, a TOCTOU re-check that skips on a
-// concurrent edit, a timestamped pre-write backup of the losing bytes, and
-// `ensure_gitignored_in_main` BEFORE any secret bytes land in main. Driven by
-// [`run`] with the decisions returned from the cockpit, including the
-// `Decision::Merge` produced by the cockpit's interactive-merge overlay, whose
-// assembled bytes this seam writes to BOTH sides.
+// pull / merge) to disk: a path-safety guard, a review-time-baseline re-check
+// that skips any target changed since the user reviewed it, a timestamped
+// pre-write backup of the losing bytes, and `ensure_gitignored_in_main` BEFORE
+// any secret bytes land in main. Driven by [`run`] with the decisions returned
+// from the cockpit — plus the per-file `(worktree, main)` metadata baseline
+// captured before the cockpit opened — including the `Decision::Merge` produced
+// by the cockpit's interactive-merge overlay, whose assembled bytes this seam
+// writes to BOTH sides.
+
+/// Lightweight metadata snapshot backing the review-time TOCTOU baseline: a
+/// byte length plus a best-effort mtime (some filesystems omit mtime, hence the
+/// `Option`).
+#[derive(Debug, Clone)]
+pub struct FileMeta {
+    /// The file's length in bytes.
+    pub len: u64,
+    /// The file's modification time, when the platform / filesystem reports one.
+    pub mtime: Option<SystemTime>,
+}
+
+/// Snapshot `path`'s metadata for the TOCTOU baseline.
+///
+/// Returns `Ok(None)` ONLY when the path does not exist (`ErrorKind::NotFound`);
+/// `Ok(Some(..))` when it exists; and propagates any OTHER io error (permissions,
+/// I/O) via `?`. A non-`NotFound` stat error must NEVER be silently read as
+/// "missing" — doing so would skip the mandatory pre-overwrite backup for a
+/// target that actually exists.
+pub fn meta_of(path: &Path) -> Result<Option<FileMeta>> {
+    match fs::metadata(path) {
+        Ok(m) => Ok(Some(FileMeta {
+            len: m.len(),
+            mtime: m.modified().ok(),
+        })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading metadata of {}", path.display())),
+    }
+}
 
 /// Which direction (and how many sides) an applied decision wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,32 +433,46 @@ pub enum ApplyOutcome {
     Skipped(String),
 }
 
-/// Per-target TOCTOU verdict from [`check_target`].
+/// Per-target verdict from [`check_target`], comparing a review-time baseline
+/// against the target's current metadata.
 enum Guard {
-    /// The target does not exist — a fresh write, no backup needed.
+    /// The target did not exist at review time and still does not — a fresh
+    /// write, no backup needed.
     Missing,
-    /// The target exists and is unchanged since the snapshot — safe to back up
-    /// and overwrite.
+    /// The target exists and is byte-for-byte unchanged (len + mtime) since the
+    /// review baseline — safe to back up and overwrite.
     Unchanged,
-    /// The target changed (size/mtime) since the snapshot — caller must skip.
+    /// The target changed since the review baseline — edited, created, or
+    /// deleted during the review→apply window — so the caller must skip it.
     Changed,
 }
 
-/// Snapshot `target`'s metadata, run `hook` (a test seam simulating a
-/// concurrent edit landing in the review→write window), then re-check: a
-/// changed or vanished target yields [`Guard::Changed`] so the caller writes
-/// nothing. A non-existent target is [`Guard::Missing`] (fresh write).
-fn check_target(target: &Path, hook: &mut dyn FnMut()) -> Guard {
-    let pre = match fs::metadata(target) {
-        Ok(m) => m,
-        Err(_) => return Guard::Missing,
+/// Compare `target`'s review-time `baseline` against its CURRENT metadata to
+/// decide whether the review→apply window stayed quiet:
+///
+/// - baseline `None` + now `None`   → [`Guard::Missing`] (fresh write)
+/// - baseline `None` + now `Some`   → [`Guard::Changed`] (appeared during review)
+/// - baseline `Some` + now `None`   → [`Guard::Changed`] (vanished during review)
+/// - baseline `Some(b)` + now `Some(c)` → [`Guard::Unchanged`] iff
+///   `b.len == c.len && b.mtime == c.mtime`, else [`Guard::Changed`]
+///
+/// A non-`NotFound` stat error at apply time is treated as [`Guard::Changed`]
+/// (fail safe: never overwrite a target we cannot reliably re-stat).
+fn check_target(target: &Path, baseline: Option<&FileMeta>) -> Guard {
+    let current = match meta_of(target) {
+        Ok(c) => c,
+        Err(_) => return Guard::Changed,
     };
-    hook();
-    match fs::metadata(target) {
-        Ok(now) if pre.len() == now.len() && pre.modified().ok() == now.modified().ok() => {
-            Guard::Unchanged
+    match (baseline, current) {
+        (None, None) => Guard::Missing,
+        (None, Some(_)) | (Some(_), None) => Guard::Changed,
+        (Some(b), Some(c)) => {
+            if b.len == c.len && b.mtime == c.mtime {
+                Guard::Unchanged
+            } else {
+                Guard::Changed
+            }
         }
-        _ => Guard::Changed,
     }
 }
 
@@ -431,15 +500,19 @@ fn write_bytes(target: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Apply one cockpit [`Decision`] for `rel`, safely (KD4, R13–R15).
 ///
-/// Safety order: an unsafe `rel` bails; an
-/// [`Decision::Undecided`] is a no-op skip; every destructive overwrite of an
-/// existing target is TOCTOU-guarded and its losing bytes are backed up under
-/// `backups_root` (via [`backup_rel_path`]) BEFORE the write; every write into
-/// main is preceded by [`ensure_gitignored_in_main`] so a git failure never
-/// leaves un-ignored secret bytes on disk. `Merge` writes the assembled text to
-/// BOTH sides (distinct `local/`+`main/` backup dirs so neither original is
-/// lost). A target that changed since its snapshot yields
-/// [`ApplyOutcome::Skipped`] with nothing written.
+/// Safety order: an unsafe `rel` bails; an [`Decision::Undecided`] is a no-op
+/// skip; every destructive overwrite of an existing target is guarded against
+/// its review-time baseline (`wt_baseline` for the worktree side, `main_baseline`
+/// for the main side — each captured by [`meta_of`] before the cockpit opened)
+/// and its losing bytes are backed up under `backups_root` (via
+/// [`backup_rel_path`]) BEFORE the write; every write into main is preceded by
+/// [`ensure_gitignored_in_main`] so a git failure never leaves un-ignored secret
+/// bytes on disk. `Merge` writes the assembled text to BOTH sides (distinct
+/// `local/`+`main/` backup dirs so neither original is lost). A target that no
+/// longer matches its baseline (edited, created, or deleted since review) yields
+/// [`ApplyOutcome::Skipped`] with nothing written — no overwrite and no partial
+/// backup.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_decision(
     worktree_root: &Path,
     main_root: &Path,
@@ -447,30 +520,8 @@ pub fn apply_decision(
     ts: &str,
     rel: &Path,
     decision: &Decision,
-) -> Result<ApplyOutcome> {
-    apply_decision_hooked(
-        worktree_root,
-        main_root,
-        backups_root,
-        ts,
-        rel,
-        decision,
-        &mut || {},
-    )
-}
-
-/// [`apply_decision`] with a test seam: `hook` fires once per existing target,
-/// right after its metadata snapshot and before the TOCTOU re-check, so tests
-/// can simulate a concurrent edit landing in the review→write window.
-/// Production passes a no-op.
-fn apply_decision_hooked(
-    worktree_root: &Path,
-    main_root: &Path,
-    backups_root: &Path,
-    ts: &str,
-    rel: &Path,
-    decision: &Decision,
-    hook: &mut dyn FnMut(),
+    wt_baseline: Option<FileMeta>,
+    main_baseline: Option<FileMeta>,
 ) -> Result<ApplyOutcome> {
     // Universal path-safety guard (defense-in-depth) — reject anything that
     // could escape a tree.
@@ -489,7 +540,7 @@ fn apply_decision_hooked(
         Decision::Push => {
             let source = worktree_root.join(rel);
             let target = main_root.join(rel); // main is the destination
-            let guard = check_target(&target, hook);
+            let guard = check_target(&target, main_baseline.as_ref());
             if matches!(guard, Guard::Changed) {
                 return Ok(ApplyOutcome::Skipped(changed_reason()));
             }
@@ -515,7 +566,7 @@ fn apply_decision_hooked(
         Decision::Pull => {
             let source = main_root.join(rel);
             let target = worktree_root.join(rel); // worktree is the destination
-            let guard = check_target(&target, hook);
+            let guard = check_target(&target, wt_baseline.as_ref());
             if matches!(guard, Guard::Changed) {
                 return Ok(ApplyOutcome::Skipped(changed_reason()));
             }
@@ -540,13 +591,13 @@ fn apply_decision_hooked(
         Decision::Merge(text) => {
             let wt_target = worktree_root.join(rel);
             let main_target = main_root.join(rel);
-            // TOCTOU-check BOTH sides first so a skip writes nothing at all
+            // Baseline-check BOTH sides first so a skip writes nothing at all
             // (no partial backup either).
-            let wt_guard = check_target(&wt_target, hook);
+            let wt_guard = check_target(&wt_target, wt_baseline.as_ref());
             if matches!(wt_guard, Guard::Changed) {
                 return Ok(ApplyOutcome::Skipped(changed_reason()));
             }
-            let main_guard = check_target(&main_target, hook);
+            let main_guard = check_target(&main_target, main_baseline.as_ref());
             if matches!(main_guard, Guard::Changed) {
                 return Ok(ApplyOutcome::Skipped(changed_reason()));
             }

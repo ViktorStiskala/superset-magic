@@ -141,7 +141,10 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   each (`WorktreeOnly`/`Differs`/`Identical`), refuses non-interactively
   (R16), hands the differing/new set to the `tui/cockpit.rs` cockpit, then
   applies the returned decisions via `apply_decision` — a backup-first seam
-  (path-safety guard, TOCTOU re-check, timestamped pre-write backup of the
+  (path-safety guard; a review-time baseline re-check — per-file `(worktree,
+  main)` metadata is captured via `meta_of` BEFORE the cockpit opens and
+  re-compared at apply, so a file edited/created/deleted during review is
+  skipped, not clobbered; timestamped pre-write backup of the
   losing bytes under a gitignored `.superset/backups/<ts>/`, and
   `ensure_gitignored_in_main` before any secret bytes land in main). Backup
   paths are printed so a mistaken overwrite is recoverable. `sync/merge.rs`
