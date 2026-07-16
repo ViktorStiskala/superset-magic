@@ -138,10 +138,17 @@ committable and must never leak.
   never rename an empty tarball over a
   prior good backup, and never report "Packed 0 entries" as success. Flag a
   pack path that persists the temp archive when the added count is zero.
-- Overwrite safety: reverse sync requires a per-file diff + explicit user
-  confirmation before overwriting a file that already exists in the main
-  checkout (`tui/ui.rs::confirm_overwrite_with_diff`). Flag a reverse-sync path
-  that overwrites an existing main-checkout file without that confirm.
+- Overwrite safety: reverse sync reconciles files through the full-screen
+  merge cockpit (`tui/cockpit.rs`), never writing on any keypress. Nothing
+  destructive is pre-selected (a file that differs starts `Undecided`), applying
+  is gated by ONE batched confirm that lists every existing-target overwrite and
+  defaults to No, and every destructive write is preceded by a timestamped
+  pre-write backup of the losing bytes under a gitignored `.superset/backups/`
+  (`reverse_sync::apply_decision`), with a TOCTOU re-check that skips a file
+  changed since review. The cockpit refuses to launch without an interactive
+  TTY and writes nothing then. Flag a reverse-sync path that overwrites an
+  existing file without a backup, applies an `Undecided` file, skips the batched
+  confirm, or falls through to writing files when there is no TTY.
 
 ## Filesystem Writes: Atomic Staging
 

@@ -4,9 +4,9 @@
 //! This is the ONE path that writes untracked (often secret) files into the
 //! shared main checkout, so it is deliberately conservative. The plan's
 //! "Secret-safety boundary": the gitignore-safety step (see
-//! [`copy_candidate_into_main`]) is what prevents a reverse-synced `.dev.vars`
-//! from becoming committable in main — a regression there is a secret leak,
-//! not a cosmetic bug.
+//! [`ensure_gitignored_in_main`], invoked from [`apply_decision`]) is what
+//! prevents a reverse-synced `.dev.vars` from becoming committable in main — a
+//! regression there is a secret leak, not a cosmetic bug.
 //!
 //! ## What moves, and what doesn't (R23, KTD10)
 //!
@@ -23,17 +23,16 @@
 //! ## Structure: testable logic vs interactive TUI
 //!
 //! The candidate computation ([`compute_candidates`]), the diff classification
-//! ([`classify`]), and the copy-into-main logic ([`copy_candidate_into_main`])
-//! are pure / UI-free and unit-tested with `tempfile` + shell `git`. The
-//! interactive picker, the "show diff" pager, and the overwrite confirm are
-//! TUI/manual-smoke (consistent with the repo's final-action convention).
-//! [`copy_candidate_into_main`] takes an `overwrite` decision via a closure
-//! seam so the overwrite-needs-confirm / decline-leaves-intact logic is
-//! testable without driving `inquire`.
+//! ([`classify`]), and the backup-first apply seam ([`apply_decision`]) are
+//! pure / UI-free and unit-tested with `tempfile` + shell `git`. The
+//! interactive merge cockpit ([`crate::tui::cockpit`]) is TUI/manual-smoke
+//! (consistent with the repo's final-action convention); it returns the user's
+//! per-file decisions and [`run`] feeds each through [`apply_decision`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -41,6 +40,7 @@ use crate::sync::apply;
 use crate::sync::merge::{backup_rel_path, Decision};
 use crate::git;
 use crate::git::gitignore;
+use crate::tui::cockpit::{self, CockpitOutcome};
 use crate::tui::style;
 use crate::workspace::superset_files;
 
@@ -54,18 +54,6 @@ pub enum DiffStatus {
     WorktreeOnly,
     /// The file exists in main with IDENTICAL bytes — hidden from the picker.
     Identical,
-}
-
-/// Outcome of attempting to copy one candidate into main, for caller-side
-/// reporting. R25, R26.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CopyOutcome {
-    /// Copied; `gitignored` is true when a rule was appended (or already
-    /// present) so the path is ignored in main.
-    Copied { appended_gitignore: bool },
-    /// The path already existed in main and the overwrite decision declined —
-    /// main's copy is left intact.
-    SkippedOverwriteDeclined,
 }
 
 /// Reject any relative path that could escape the main tree. The matcher and
@@ -155,89 +143,6 @@ pub fn classify(main_root: &Path, worktree_root: &Path, rel: &Path) -> Result<Di
     }
 }
 
-/// Copy ONE selected candidate from the worktree into main, with all the
-/// safety steps (R25, R26, KTD10):
-///
-/// 1. **Path safety:** reject any `rel` that escapes the main tree (`..`,
-///    absolute) — returns an error rather than touching the filesystem.
-/// 2. **Overwrite gate:** if `rel` already EXISTS in main, call `overwrite`
-///    (the per-file diff + confirm decision seam). `Ok(false)` → leave main's
-///    copy intact, return [`CopyOutcome::SkippedOverwriteDeclined`]. Only
-///    `Ok(true)` proceeds to overwrite. A brand-new path skips the gate.
-/// 3. **Parent dirs:** create any missing parent directories under main.
-/// 4. **Copy** the worktree bytes over main's path.
-/// 5. **Gitignore safety:** if the copied path is NOT already gitignored in
-///    main, append a rule to main's root `.gitignore` — the worktree's
-///    COVERING rule (via [`gitignore::find_covering_rule`]) when one exists,
-///    else the literal relative path.
-///
-/// The `overwrite` closure is the test seam: production passes a closure that
-/// shows the diff and prompts; tests pass a fixed decision.
-// consumed by U11 run()
-pub fn copy_candidate_into_main<O>(
-    worktree_root: &Path,
-    main_root: &Path,
-    rel: &Path,
-    overwrite: O,
-) -> Result<CopyOutcome>
-where
-    O: FnOnce(&Path) -> Result<bool>,
-{
-    // 1. Path safety — never let a candidate escape main.
-    if !is_safe_rel(rel) {
-        anyhow::bail!(
-            "refusing to reverse-sync unsafe path (escapes the main tree): {}",
-            rel.display()
-        );
-    }
-
-    let main_path = main_root.join(rel);
-    let wt_path = worktree_root.join(rel);
-
-    // 2. Overwrite gate — only when the path already exists in main. Snapshot
-    //    main's metadata first so we can detect a concurrent edit between the
-    //    diff/confirm and the copy (TOCTOU guard).
-    let pre_meta = fs::metadata(&main_path).ok();
-    if pre_meta.is_some() && !overwrite(rel)? {
-        return Ok(CopyOutcome::SkippedOverwriteDeclined);
-    }
-    // 2b. If main's file changed (size or mtime) while the user reviewed the
-    //     diff, their confirmation was against stale content — skip rather than
-    //     clobber the concurrent edit. Checked before any mutation, so a skip
-    //     leaves main (and its .gitignore) fully untouched.
-    if let (Some(before), Ok(now)) = (&pre_meta, fs::metadata(&main_path)) {
-        if before.len() != now.len() || before.modified().ok() != now.modified().ok() {
-            eprintln!(
-                "{}",
-                crate::tui::style::warn(format!(
-                    "{} changed in main since the diff was shown — skipped to avoid \
-                     clobbering a concurrent edit.",
-                    rel.display()
-                ))
-            );
-            return Ok(CopyOutcome::SkippedOverwriteDeclined);
-        }
-    }
-
-    // 3. Parent dirs in main.
-    if let Some(parent) = main_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating parent dirs for {}", main_path.display()))?;
-    }
-
-    // 4. Gitignore safety BEFORE the copy — guarantee `rel` is ignored in main
-    //    first, so a git failure here never leaves the (often secret) bytes on
-    //    disk un-ignored. `git check-ignore` matches patterns regardless of
-    //    whether the file exists yet, so checking before the copy is sound.
-    let appended_gitignore = ensure_gitignored_in_main(worktree_root, main_root, rel)?;
-
-    // 5. Copy worktree → main.
-    fs::copy(&wt_path, &main_path)
-        .with_context(|| format!("copy {} → {}", wt_path.display(), main_path.display()))?;
-
-    Ok(CopyOutcome::Copied { appended_gitignore })
-}
-
 /// Ensure `rel` is gitignored in main. Returns `true` when a new rule was
 /// appended, `false` when it was already ignored (no-op).
 ///
@@ -291,24 +196,12 @@ fn ensure_gitignored_in_main(
 /// Empty candidate set → print a gray info line and return WITHOUT opening the
 /// picker (R22). Decline at the picker → main fully untouched.
 ///
-/// NOT unit-tested — the picker, the show-diff pager, and the overwrite confirm
-/// are interactive. The logic it orchestrates is covered through
-/// [`compute_candidates`], [`classify`], and [`copy_candidate_into_main`].
-/// Wired into the menu by U10.
+/// NOT unit-tested — the merge cockpit is interactive. The logic it orchestrates
+/// is covered through [`compute_candidates`], [`classify`], and
+/// [`apply_decision`]. Wired into the menu by U10.
 pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
-    style::print_section("Reverse sync (untracked → main)");
-    println!(
-        "{}",
-        style::info(format!("Worktree: {}", worktree_root.display()))
-    );
-    println!(
-        "{}",
-        style::info(format!("Main:     {}", main_root.display()))
-    );
-
     let candidates = compute_candidates(worktree_root)?;
     if candidates.is_empty() {
-        println!();
         println!(
             "{}",
             style::info("No untracked files match the configured patterns.")
@@ -326,62 +219,101 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
     }
 
     if offered.is_empty() {
-        println!();
         println!(
             "{}",
+            style::info("All untracked candidates are identical to main — nothing to push.")
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // R16: the merge cockpit is a full-screen TUI and MUST have a terminal.
+    // A piped / CI / hook invocation refuses to launch and writes NOTHING,
+    // pointing at the (forward-only) non-interactive path instead.
+    if !cockpit::is_interactive() {
+        eprintln!(
+            "{}",
+            style::err(
+                "error: reverse sync needs an interactive terminal — the merge cockpit \
+                 cannot run piped or in CI."
+            )
+        );
+        eprintln!(
+            "{}",
             style::info(
-                "All untracked candidates are identical to main — nothing to push."
+                "`ss-magic sync` is forward-only (main → worktree); reverse sync has no \
+                 non-interactive mode. Re-run it in a terminal."
             )
         );
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Hand off to the interactive picker. Selection + per-file overwrite
-    // confirm live in `ui`; copying flows through `copy_candidate_into_main`.
-    let selected = crate::tui::ui::pick_reverse_sync(worktree_root, main_root, &offered)?;
-    if selected.is_empty() {
-        println!();
+    // Full-screen cockpit: the user sets each file's direction and either
+    // cancels (main untouched) or confirms a batch of decisions.
+    let decisions = match cockpit::run_cockpit(worktree_root, main_root, &offered)? {
+        CockpitOutcome::Cancel => {
+            println!("{}", style::info("Nothing selected — main untouched."));
+            return Ok(ExitCode::SUCCESS);
+        }
+        CockpitOutcome::Apply(d) => d,
+    };
+    if decisions.is_empty() {
         println!("{}", style::info("Nothing selected — main untouched."));
         return Ok(ExitCode::SUCCESS);
     }
 
-    let mut copied = 0usize;
+    // One timestamp for the whole apply; backups live under a gitignored
+    // `.superset/backups/` in the worktree so recovered secret bytes are never
+    // committed (reuse `ensure_entry` — idempotent, appends only when absent).
+    let ts = apply_timestamp();
+    let backups_root = worktree_root.join(".superset/backups");
+    gitignore::ensure_entry(worktree_root, ".superset/backups/")?;
+
+    let mut applied = 0usize;
     let mut skipped = 0usize;
-    for rel in &selected {
-        let main_root_for_overwrite = main_root.to_path_buf();
-        let wt_root_for_overwrite = worktree_root.to_path_buf();
-        let outcome = copy_candidate_into_main(worktree_root, main_root, rel, |rel| {
-            crate::tui::ui::confirm_overwrite_with_diff(
-                &wt_root_for_overwrite,
-                &main_root_for_overwrite,
-                rel,
-            )
-        })?;
-        match outcome {
-            CopyOutcome::Copied { appended_gitignore } => {
-                copied += 1;
-                let ign = if appended_gitignore {
+    let mut all_backups: Vec<PathBuf> = Vec::new();
+    for (rel, decision) in &decisions {
+        match apply_decision(worktree_root, main_root, &backups_root, &ts, rel, decision)? {
+            ApplyOutcome::Applied(result) => {
+                applied += 1;
+                let dir = match result.direction {
+                    WriteDirection::PushToMain => "worktree → main",
+                    WriteDirection::PullFromMain => "main → worktree",
+                    WriteDirection::MergeBoth => "merged → both",
+                };
+                let ign = if result.gitignore_appended {
                     " (gitignore rule added)"
                 } else {
                     ""
                 };
                 println!(
                     "{}",
-                    style::ok(format!("Pushed to main: {}{ign}", rel.display()))
+                    style::ok(format!("Applied {} [{dir}]{ign}", rel.display()))
                 );
+                all_backups.extend(result.backups);
             }
-            CopyOutcome::SkippedOverwriteDeclined => {
+            ApplyOutcome::Skipped(reason) => {
                 skipped += 1;
                 println!(
                     "{}",
-                    style::info(format!("Skipped (kept main's copy): {}", rel.display()))
+                    style::warn(format!("Skipped {}: {reason}", rel.display()))
                 );
             }
         }
     }
 
+    if !all_backups.is_empty() {
+        println!();
+        println!(
+            "{}",
+            style::info("Backups of overwritten files (recover a mistake here):")
+        );
+        for backup in &all_backups {
+            println!("{}", style::info(format!("  {}", backup.display())));
+        }
+    }
+
     println!();
-    let line = format!("Reverse sync done: copied {copied}, skipped {skipped}");
+    let line = format!("Reverse sync done: applied {applied}, skipped {skipped}");
     if skipped == 0 {
         println!("{}", style::ok(line));
     } else {
@@ -390,19 +322,28 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Timestamp string for a batch of backups. Seconds since the Unix epoch — a
+/// unique, monotonic-enough directory name with no extra dependency (the plan
+/// permits a plain epoch instead of `%Y%m%d-%H%M%S`).
+fn apply_timestamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
+
 // ── Apply seam (reverse-sync merge cockpit) ──────────────────────────────
 //
 // The cockpit's safe, backup-first apply path. It writes a decision (push /
-// pull / merge) to disk, mirroring the safety order of
-// [`copy_candidate_into_main`]: path-safety guard, a TOCTOU re-check that skips
-// on a concurrent edit, a timestamped pre-write backup of the losing bytes, and
-// `ensure_gitignored_in_main` BEFORE any secret bytes land in main. Not yet
-// wired into `run()`/`pick_reverse_sync` (the cockpit replaces those in a later
-// phase), so the new items carry a scoped `dead_code` allow.
+// pull / merge) to disk: a path-safety guard, a TOCTOU re-check that skips on a
+// concurrent edit, a timestamped pre-write backup of the losing bytes, and
+// `ensure_gitignored_in_main` BEFORE any secret bytes land in main. Driven by
+// [`run`] with the decisions returned from the cockpit. (The `Decision::Merge`
+// arm stays unexercised until the interactive-merge phase.)
 
 /// Which direction (and how many sides) an applied decision wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by cockpit (later phase)
 pub enum WriteDirection {
     /// Worktree bytes were written to main.
     PushToMain,
@@ -416,7 +357,6 @@ pub enum WriteDirection {
 /// timestamped backups taken of the overwritten (losing) bytes, and whether a
 /// gitignore rule was appended in main.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by cockpit (later phase)
 pub struct ApplyResult {
     /// The direction the bytes moved.
     pub direction: WriteDirection,
@@ -430,7 +370,6 @@ pub struct ApplyResult {
 /// The result of [`apply_decision`]: either an applied write or a skip with a
 /// human-readable reason (undecided, or a concurrent edit since review).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by cockpit (later phase)
 pub enum ApplyOutcome {
     /// The decision was applied; carries the write details.
     Applied(ApplyResult),
@@ -439,7 +378,6 @@ pub enum ApplyOutcome {
 }
 
 /// Per-target TOCTOU verdict from [`check_target`].
-#[allow(dead_code)] // consumed by cockpit (later phase)
 enum Guard {
     /// The target does not exist — a fresh write, no backup needed.
     Missing,
@@ -454,7 +392,6 @@ enum Guard {
 /// concurrent edit landing in the review→write window), then re-check: a
 /// changed or vanished target yields [`Guard::Changed`] so the caller writes
 /// nothing. A non-existent target is [`Guard::Missing`] (fresh write).
-#[allow(dead_code)] // consumed by cockpit (later phase)
 fn check_target(target: &Path, hook: &mut dyn FnMut()) -> Guard {
     let pre = match fs::metadata(target) {
         Ok(m) => m,
@@ -471,7 +408,6 @@ fn check_target(target: &Path, hook: &mut dyn FnMut()) -> Guard {
 
 /// Copy `target`'s CURRENT bytes to `dest` (creating parent dirs) before it is
 /// overwritten, returning the backup path.
-#[allow(dead_code)] // consumed by cockpit (later phase)
 fn backup(target: &Path, dest: &Path) -> Result<PathBuf> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
@@ -483,7 +419,6 @@ fn backup(target: &Path, dest: &Path) -> Result<PathBuf> {
 }
 
 /// Write `bytes` to `target`, creating any missing parent directories first.
-#[allow(dead_code)] // consumed by cockpit (later phase)
 fn write_bytes(target: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
@@ -495,7 +430,7 @@ fn write_bytes(target: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Apply one cockpit [`Decision`] for `rel`, safely (KD4, R13–R15).
 ///
-/// Safety order mirrors [`copy_candidate_into_main`]: an unsafe `rel` bails; an
+/// Safety order: an unsafe `rel` bails; an
 /// [`Decision::Undecided`] is a no-op skip; every destructive overwrite of an
 /// existing target is TOCTOU-guarded and its losing bytes are backed up under
 /// `backups_root` (via [`backup_rel_path`]) BEFORE the write; every write into
@@ -504,7 +439,6 @@ fn write_bytes(target: &Path, bytes: &[u8]) -> Result<()> {
 /// BOTH sides (distinct `local/`+`main/` backup dirs so neither original is
 /// lost). A target that changed since its snapshot yields
 /// [`ApplyOutcome::Skipped`] with nothing written.
-#[allow(dead_code)] // consumed by cockpit (later phase)
 pub fn apply_decision(
     worktree_root: &Path,
     main_root: &Path,
@@ -526,9 +460,8 @@ pub fn apply_decision(
 
 /// [`apply_decision`] with a test seam: `hook` fires once per existing target,
 /// right after its metadata snapshot and before the TOCTOU re-check, so tests
-/// can simulate a concurrent edit (mirrors the `overwrite` closure seam on
-/// [`copy_candidate_into_main`]). Production passes a no-op.
-#[allow(dead_code)] // consumed by cockpit (later phase)
+/// can simulate a concurrent edit landing in the review→write window.
+/// Production passes a no-op.
 fn apply_decision_hooked(
     worktree_root: &Path,
     main_root: &Path,
@@ -538,8 +471,8 @@ fn apply_decision_hooked(
     decision: &Decision,
     hook: &mut dyn FnMut(),
 ) -> Result<ApplyOutcome> {
-    // Universal path-safety guard (defense-in-depth, as in
-    // `copy_candidate_into_main`) — reject anything that could escape a tree.
+    // Universal path-safety guard (defense-in-depth) — reject anything that
+    // could escape a tree.
     if !is_safe_rel(rel) {
         anyhow::bail!(
             "refusing to reverse-sync unsafe path (escapes the tree): {}",

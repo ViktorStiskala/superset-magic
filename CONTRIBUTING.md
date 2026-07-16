@@ -43,7 +43,9 @@ interactive layer, and grouped by purpose under `src/`:
   interaction shells out via `std::process::Command` — **no `git2`**).
 - `sync/` — pattern validation and the glob/exclude/copy engine shared by
   forward sync, reverse sync, and pack.
-- `tui/` — the interactive layer (`inquire` menus and pickers, styling).
+- `tui/` — the interactive layer: `inquire` menus and pickers, styling, the
+  pure diff/decision models (`diffmodel`), and the full-screen `ratatui`
+  reverse-sync merge cockpit (`cockpit`, on the `crossterm` backend).
 - `workspace/` — `.superset/` contract I/O and the init/migration lifecycle.
 - `update/` — the self-update check and apply paths.
 - `pack.rs`, `cli.rs`, `main.rs` — the pack engine, the hand-rolled arg parser

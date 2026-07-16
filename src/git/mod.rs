@@ -342,60 +342,6 @@ fn parse_check_ignore_line(line: &str) -> Option<String> {
     Some(pattern.to_string())
 }
 
-/// Run `git diff --no-index` between two absolute paths and stream the
-/// (colored) output through the user's pager. `--no-index` lets git diff two
-/// arbitrary files outside any repo; `--color=always` forces color even when
-/// piped. The pager is `$PAGER` or `less -R` so a large diff isn't buried by
-/// the picker's re-render. A "files differ" exit (1) is NOT an error — git
-/// diff exits 1 when the inputs differ.
-///
-/// This is a TUI/manual-smoke path: it inherits the terminal and blocks until
-/// the pager is dismissed. It is not unit-tested (consistent with the repo's
-/// final-action convention).
-// consumed by U11 (reverse-sync picker "show diff" action)
-pub fn diff_no_index_paged(left: &Path, right: &Path) -> Result<()> {
-    let pager = std::env::var("PAGER").unwrap_or_else(|_| "less -R".to_string());
-
-    // `git diff --no-index --color=always <left> <right> | $PAGER`. Wire the
-    // pipeline through `git`'s own `core.pager` would require config; spawn
-    // the two processes explicitly so we control the pager and force color.
-    let mut diff = Command::new("git")
-        .args([
-            "diff",
-            "--no-index",
-            "--color=always",
-            "--",
-            left.to_str()
-                .with_context(|| format!("non-UTF-8 path: {}", left.display()))?,
-            right
-                .to_str()
-                .with_context(|| format!("non-UTF-8 path: {}", right.display()))?,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("failed to spawn `git diff --no-index`")?;
-
-    let diff_out = diff
-        .stdout
-        .take()
-        .context("git diff produced no stdout pipe")?;
-
-    // Run the pager via the shell so `$PAGER` may carry arguments (`less -R`).
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut pager_child = Command::new(shell)
-        .arg("-c")
-        .arg(&pager)
-        .stdin(Stdio::from(diff_out))
-        .spawn()
-        .with_context(|| format!("failed to spawn pager `{pager}`"))?;
-
-    // Wait for both: the pager drains stdout, git diff exits 0/1.
-    let _ = pager_child.wait();
-    let _ = diff.wait();
-    Ok(())
-}
-
 /// Shell out to `date +%Y%m%d-%H%M%S` for the feature-branch suffix.
 /// Local timezone — matches what a developer would type by hand.
 pub fn timestamp_branch_suffix() -> Result<String> {

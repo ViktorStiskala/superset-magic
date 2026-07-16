@@ -29,10 +29,13 @@ file set:
   repo's main checkout into the current worktree. Under Superset this runs
   automatically the moment a workspace is created, via the setup-script hook;
   without Superset it's one command to run in a fresh worktree.
-- **Reverse sync** (interactive menu) — push git-untracked files that changed
-  or appeared in a worktree back to the main checkout, through a diff-aware
-  picker with per-file confirmation. This is how a new secret created in a
-  worktree reaches everywhere else.
+- **Reverse sync** (interactive menu) — reconcile git-untracked files that
+  changed or appeared in a worktree against the main checkout, through a
+  full-screen merge cockpit: a file list beside a live side-by-side diff, where
+  you set each file's direction (push to main / pull from main / undecided) and
+  apply the batch behind one confirmation, with a timestamped backup taken
+  before every overwrite. This is how a new secret created in a worktree reaches
+  everywhere else.
 - **Pack** (`ss-magic pack`) — snapshot the whole configured file set into a
   single `ss-magic-<repo>.tar.bz2` for backup, machine migration, or handing
   to a teammate.
@@ -225,25 +228,36 @@ gained files since the worktree was created.
 
 ### Reverse sync (worktree → main, via the menu)
 
-From a worktree's menu, push **git-untracked** files matching the overlaid
-patterns back to the main checkout. "Untracked" includes **gitignored** files
+From a worktree's menu, reconcile **git-untracked** files matching the overlaid
+patterns against the main checkout. "Untracked" includes **gitignored** files
 — that is the point, since the files worth pushing are secrets like `.env` /
 `.dev.vars` (and the gitignored `magic.local.json`), which never merge via
 git. Tracked files are excluded — they reach main via merge. The flow:
 
-- Builds a diff-aware picker of differing / worktree-only candidates
-  (identical files are hidden), each with a "show diff" action (paged via
-  `git diff --no-index`).
-- On copy: creates missing parent dirs in main; a candidate that already
-  exists in main requires a per-file diff + explicit confirm before overwrite.
-- Gitignore-safety: if a copied path isn't already gitignored in main,
+- Collects differing / worktree-only candidates (identical files are hidden)
+  and opens a full-screen merge cockpit: a file list beside a live diff
+  (side-by-side on a wide terminal, unified when narrow; binary / oversized
+  files show a whole-file notice instead of a diff).
+- Nothing destructive is pre-selected — a file that differs starts *undecided*.
+  You set each file's direction with explicit keys: `p` push to main, `l` pull
+  from main, `u` undecided (arrows/`j`/`k` navigate, `PgUp`/`PgDn`/`Space`
+  scroll the diff, `?` toggles help). Each row's mtimes are shown only as an
+  unreliable hint.
+- `Enter` applies: one batched confirmation lists every existing-target
+  overwrite (defaulting to No). Before each destructive write, the losing bytes
+  are copied to a timestamped backup under a gitignored `.superset/backups/`,
+  whose path is printed so a mistaken overwrite is recoverable. A file changed
+  on either side since you reviewed it is skipped rather than clobbered.
+- Gitignore-safety: if a path pushed into main isn't already gitignored there,
   ss-magic copies the worktree's covering `.gitignore` rule (resolved via
   `git check-ignore -v --no-index`) into main's root `.gitignore` (creating it
   if absent), falling back to the literal path when no covering rule exists.
   This is the guard that prevents a reverse-synced secret (e.g. `.dev.vars`)
   from becoming committable in main.
 
-Declining at the picker leaves main fully untouched.
+The cockpit needs an interactive terminal; run piped or in CI it refuses to
+launch and writes nothing (`ss-magic sync` is forward-only). Pressing `Esc` —
+or applying with everything undecided — leaves both sides fully untouched.
 
 ### `ss-magic pack` — archive the configured files
 
@@ -346,8 +360,9 @@ overlaid pattern list with the same rules:
   individual untracked files only, so a directory match yields no
   reverse-sync candidate of its own.
 - Existing files in the destination are overwritten (forward sync; reverse
-  sync instead intersects the matches with git-untracked files and requires a
-  per-file diff + confirm before any overwrite).
+  sync instead intersects the matches with git-untracked files and reconciles
+  them in the merge cockpit — a batched confirm and a pre-write backup gate
+  every overwrite).
 - Matching uses [`globset`](https://docs.rs/globset): unlike a POSIX shell
   glob, `*` can cross path separators. Quote patterns on the command line so
   your shell doesn't expand them first.
@@ -390,7 +405,6 @@ Escape hatches:
 | Variable | Effect |
 | --- | --- |
 | `NO_COLOR` | Disable ANSI color output. Stdout is also checked for TTY support and color is auto-disabled when piping. |
-| `PAGER` | Pager for reverse-sync diffs (default `less -R`). |
 | `SS_MAGIC_NO_UPDATE` | Disable the self-update gate. |
 | `SS_MAGIC_UPDATED` | Internal re-exec guard preventing update loops — not meant to be set by hand. |
 

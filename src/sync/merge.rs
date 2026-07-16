@@ -16,10 +16,11 @@
 //!   the apply seam.
 //!
 //! It is deliberately free of any TUI / `ratatui` dependency so the logic
-//! stays unit-testable in isolation; the interactive cockpit consumes these
-//! in a later phase, so the whole module carries an explicit `dead_code`
-//! allow until it is wired in.
-#![allow(dead_code)]
+//! stays unit-testable in isolation. [`default_decision`] and
+//! [`backup_rel_path`] are wired into the cockpit apply path; the per-hunk
+//! merge machinery ([`merge_segments`], [`assemble`], [`diff_count`],
+//! [`MergeSegment`], [`MergeChoice`], and [`Decision::Merge`]) stays unused
+//! until the interactive-merge phase and carries a scoped `dead_code` allow.
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +39,7 @@ pub enum Decision {
     /// Pull main's copy into the worktree.
     Pull,
     /// Write this assembled reconciled text to BOTH sides.
+    #[allow(dead_code)] // constructed by the interactive-merge phase
     Merge(String),
 }
 
@@ -63,6 +65,7 @@ pub fn default_decision(state: FileState) -> Decision {
 
 /// The per-hunk choice for one differing region during an interactive merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the interactive-merge phase
 pub enum MergeChoice {
     /// Keep the local (worktree) side.
     Local,
@@ -80,6 +83,7 @@ pub enum MergeChoice {
 /// and each differing region (delete / insert / replace) coalesces into a
 /// single `Diff`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the interactive-merge phase
 pub enum MergeSegment {
     /// A run of lines identical on both sides, kept verbatim.
     Equal(String),
@@ -94,12 +98,14 @@ pub enum MergeSegment {
 }
 
 /// Pending accumulator while coalescing the flat change stream into segments.
+#[allow(dead_code)] // consumed by the interactive-merge phase
 enum Pending {
     Equal(String),
     Diff { local: String, main: String },
 }
 
 impl Pending {
+    #[allow(dead_code)] // consumed by the interactive-merge phase
     fn into_segment(self) -> MergeSegment {
         match self {
             Pending::Equal(s) => MergeSegment::Equal(s),
@@ -117,6 +123,7 @@ impl Pending {
 /// and each differing region (delete / insert / replace, and any adjacent runs)
 /// becomes one [`MergeSegment::Diff`]. Line texts retain their trailing newline,
 /// so concatenating segments round-trips the inputs.
+#[allow(dead_code)] // consumed by the interactive-merge phase
 pub fn merge_segments(local: &str, main: &str) -> Vec<MergeSegment> {
     let diff = TextDiff::from_lines(local, main);
     let mut out: Vec<MergeSegment> = Vec::new();
@@ -184,6 +191,7 @@ pub fn merge_segments(local: &str, main: &str) -> Vec<MergeSegment> {
 /// The number of choice points in `segments` — i.e. how many
 /// [`MergeSegment::Diff`]s there are, which is the required length of the
 /// `choices` slice passed to [`assemble`].
+#[allow(dead_code)] // consumed by the interactive-merge phase
 pub fn diff_count(segments: &[MergeSegment]) -> usize {
     segments
         .iter()
@@ -198,6 +206,7 @@ pub fn diff_count(segments: &[MergeSegment]) -> usize {
 /// emits the local side, [`MergeChoice::Main`] the main side, [`MergeChoice::Both`]
 /// the local side then the main side. If `choices` is shorter than
 /// [`diff_count`], any missing choice is treated as [`MergeChoice::Local`].
+#[allow(dead_code)] // consumed by the interactive-merge phase
 pub fn assemble(segments: &[MergeSegment], choices: &[MergeChoice]) -> String {
     let mut out = String::new();
     let mut diff_idx = 0usize;

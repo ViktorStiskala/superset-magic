@@ -42,8 +42,7 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   repo-derived archive naming), plus the reverse-sync probes
   `untracked_files` (`git ls-files --others` — untracked *including*
   gitignored, since reverse sync pushes gitignored secrets),
-  `is_ignored`, `check_ignore_pattern`,
-  `diff_no_index_paged`) and mutating primitives (`stage_paths`,
+  `is_ignored`, `check_ignore_pattern`) and mutating primitives (`stage_paths`,
   `commit`, `push`, `push_upstream`, `create_branch`, `pr_create`,
   `timestamp_branch_suffix`, `gh_available`). All `git`/`gh` invocations
   shell out via a shared `git_raw` helper that surfaces stderr verbatim;
@@ -88,13 +87,25 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
 - `tui/ui.rs` — `inquire` wrappers. `pick_with_actions` is the shared
   `Select`-loop driver behind `pick_patterns`; the shared `Row` shape
   carries `dim_suffix: Option<&'static str>` for the `(no matches)`
-  flag. `pick_final_action`, `print_pattern_list`, `validate_pattern`
-  (delegating to `pattern::check_syntax`), and the reverse-sync picker
-  (`pick_reverse_sync`, `confirm_overwrite_with_diff`) round out the
-  module. (The setup-command picker/validator and the `.envrc`/apply
-  confirms were removed in U13.) See
+  flag. `pick_final_action`, `print_pattern_list`, and `validate_pattern`
+  (delegating to `pattern::check_syntax`) round out the module. (The
+  setup-command picker/validator and the `.envrc`/apply confirms were
+  removed in U13; the reverse-sync picker + overwrite-confirm were
+  replaced by the `tui/cockpit.rs` merge cockpit.) See
   `docs/solutions/design-patterns/inquire-action-loop-2026-05-26.md`
   for why the pickers are `Select` loops rather than a `MultiSelect`.
+- `tui/cockpit.rs` — the full-screen `ratatui` reverse-sync merge cockpit
+  (`crossterm` backend, same `crossterm 0.29` as `inquire`). `run_cockpit`
+  reads both versions of every offered candidate, presents a left file-list
+  pane beside a live side-by-side / unified diff (via `tui/diffmodel.rs`),
+  and lets the user set each file's `merge::Decision` with explicit keys
+  (`p` push / `l` pull / `u` undecided — interactive `m` merge is a later
+  phase), gated by a batched confirm. It returns `CockpitOutcome::{Apply,
+  Cancel}` and writes NOTHING itself; `reverse_sync::run` applies the
+  decisions via `apply_decision`. `is_interactive` (stdin+stdout TTY, R16)
+  guards launch. A `Drop` guard + panic hook always restore the terminal.
+  The pure `draw(frame, app)` is exercised with `ratatui`'s `TestBackend`
+  without the event loop.
 - `cli.rs` — hand-rolled arg parser (no `clap`). `parse(&[String]) ->
   Parsed` selects `Command::{Bare, Sync, Pack, Update}` from the first non-flag
   arg (absent → `Bare`), short-circuits `--help`/`-h` to `Parsed::Help`,
@@ -115,9 +126,17 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   prompt. `run_init_noninteractive` is the TUI-free init behind
   `ss-magic init` (writes the layout from CLI patterns, no prompt, not
   gated by auto-update).
-- `sync/reverse_sync.rs` — push git-untracked worktree files matching the
-  overlaid patterns back to main, with a diff-aware picker,
-  parent-dir creation, and gitignore-safety (`git/gitignore.rs`).
+- `sync/reverse_sync.rs` — reconcile git-untracked worktree files matching
+  the overlaid patterns against main. `run` computes candidates, classifies
+  each (`WorktreeOnly`/`Differs`/`Identical`), refuses non-interactively
+  (R16), hands the differing/new set to the `tui/cockpit.rs` cockpit, then
+  applies the returned decisions via `apply_decision` — a backup-first seam
+  (path-safety guard, TOCTOU re-check, timestamped pre-write backup of the
+  losing bytes under a gitignored `.superset/backups/<ts>/`, and
+  `ensure_gitignored_in_main` before any secret bytes land in main). Backup
+  paths are printed so a mistaken overwrite is recoverable. `sync/merge.rs`
+  owns the pure `Decision`/`FileState`/`default_decision` + backup-naming;
+  `tui/diffmodel.rs` owns the pure diff-to-rows model.
 - `pack.rs` — `ss-magic pack`: expand the overlaid `magic.json` patterns
   against the current git repo root (via `sync/apply.rs`'s `match_paths`) and
   write the matches — repo-relative — into `ss-magic-<repo>.tar.bz2` at that

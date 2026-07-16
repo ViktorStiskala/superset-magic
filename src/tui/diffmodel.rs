@@ -12,12 +12,8 @@
 //! - [`should_split`] picks the layout that fits the terminal width.
 //!
 //! It is deliberately free of any TUI / `ratatui` dependency so the logic
-//! stays unit-testable in isolation; the interactive layer consumes these
-//! models in a later phase.
-//!
-//! The public surface is consumed by not-yet-written cockpit phases, so the
-//! whole module carries an explicit `dead_code` allow until it is wired in.
-#![allow(dead_code)]
+//! stays unit-testable in isolation; the interactive [`crate::tui::cockpit`]
+//! layer consumes these models to render the diff pane.
 
 use std::borrow::Cow;
 
