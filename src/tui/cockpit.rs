@@ -52,6 +52,12 @@ use crate::tui::diffmodel::{self, ContentKind, DiffRow, RowTag, UnifiedRow, Unif
 /// Lines of unchanged context folded around each change (KD2 / R6).
 const CONTEXT: usize = 3;
 
+/// Diff-pane notice for a file whose sides are equal AFTER EOL normalization:
+/// the bytes differ, but only by line endings / trailing newline.
+const EOL_ONLY_NOTE: &str = "no content differences — the sides differ only by line endings \
+(CRLF/LF) or a trailing newline. p/l overwrite the raw bytes; m (then Enter) converges both \
+sides to the normalized text.";
+
 /// The result of running the cockpit: either an ordered set of decisions to
 /// apply (only non-[`Decision::Undecided`] files), or a cancel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,8 +81,13 @@ pub fn is_interactive() -> bool {
 /// The prepared diff payload for one file, computed once at load time so
 /// [`draw`] performs no filesystem I/O.
 enum FileDiff {
-    /// Both sides decoded as UTF-8 text; rendered side-by-side or unified
-    /// depending on the terminal width at draw time.
+    /// Both sides decoded as UTF-8 text, EOL-NORMALIZED at load time
+    /// ([`diffmodel::normalize_eol`]: CRLF → LF, trailing newline ensured) so
+    /// diff hunks and the merge overlay reflect content differences only;
+    /// rendered side-by-side or unified depending on the terminal width at
+    /// draw time. Equal normalized sides (an EOL-only difference — the raw
+    /// bytes still differ, or the file would not be offered) render as an
+    /// explanatory notice instead of an empty diff.
     Text { local: String, main: String },
     /// A worktree-only file (absent in main): it will be created. `content`
     /// carries the local text when it decoded as UTF-8, else `None`.
@@ -469,7 +480,13 @@ fn build_text_diff(wt_bytes: &[u8], main_bytes: &[u8]) -> FileDiff {
         (ContentKind::TooLarge(n), _) | (_, ContentKind::TooLarge(n)) => FileDiff::TooLarge {
             note: too_large_note(n),
         },
-        (ContentKind::Text(local), ContentKind::Text(main)) => FileDiff::Text { local, main },
+        // Normalize EOLs once at load: every downstream consumer (diff pane,
+        // merge overlay, line counts) sees content-only differences. Raw bytes
+        // on disk are untouched — push/pull still copy them verbatim.
+        (ContentKind::Text(local), ContentKind::Text(main)) => FileDiff::Text {
+            local: diffmodel::normalize_eol(&local),
+            main: diffmodel::normalize_eol(&main),
+        },
         // Unreachable: binary handled above, sizes handled above.
         _ => FileDiff::Binary {
             note: binary_note(wt_bytes, main_bytes),
@@ -670,6 +687,11 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, split: bool) {
         FileDiff::Binary { note }
         | FileDiff::TooLarge { note }
         | FileDiff::Unreadable { note } => render_notice(frame, inner, note),
+        // Equal after EOL normalization: the raw bytes differ only by line
+        // endings / trailing newline — say so instead of drawing an empty diff.
+        FileDiff::Text { local, main } if local == main => {
+            render_notice(frame, inner, EOL_ONLY_NOTE)
+        }
         FileDiff::Text { local, main } => {
             if split {
                 render_split(frame, inner, local, main, app.diff_scroll);

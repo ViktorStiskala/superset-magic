@@ -23,6 +23,29 @@ use similar::{ChangeTag, DiffTag, TextDiff};
 /// and fall back to whole-file push/pull. Tunable.
 pub const MAX_DIFF_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 
+/// Normalize `s` for diffing: every CRLF becomes LF, and a non-empty text
+/// gains a final trailing newline when it lacks one.
+///
+/// Without this, two files whose CONTENT is identical but whose line endings
+/// (or final newline) differ render as one giant replace hunk of
+/// identical-looking lines — `similar` sees every `foo\r\n` ≠ `foo\n`, while
+/// the display strips the terminators (see [`side_by_side`]/[`unified`]'s
+/// segment building), so the user is shown a wall of "changes" with nothing
+/// visibly changed. Normalizing BOTH sides before the diff (and before the
+/// per-hunk merge model) makes hunks reflect content differences only.
+///
+/// Display/merge only: push/pull copy the raw on-disk bytes untouched, and a
+/// byte-level EOL difference still classifies the file as differing. A merge
+/// decision assembles from the normalized text, so an accepted merge
+/// converges both sides to LF + trailing newline (documented behavior).
+pub fn normalize_eol(s: &str) -> String {
+    let mut t = s.replace("\r\n", "\n");
+    if !t.is_empty() && !t.ends_with('\n') {
+        t.push('\n');
+    }
+    t
+}
+
 /// Classification of a file's bytes for diffing purposes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentKind {

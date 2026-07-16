@@ -106,6 +106,54 @@ fn narrow_render_uses_unified_layout() {
     );
 }
 
+/// build_text_diff EOL-normalizes both sides at load: CRLF collapses to LF and
+/// a missing trailing newline is added, so hunks reflect content only.
+#[test]
+fn build_text_diff_normalizes_eol_on_both_sides() {
+    match build_text_diff(b"a\r\nX\r\nc", b"a\nY\nc\n") {
+        FileDiff::Text { local, main } => {
+            assert_eq!(local, "a\nX\nc\n");
+            assert_eq!(main, "a\nY\nc\n");
+        }
+        other => panic!("expected FileDiff::Text, got a different variant: {:?}", std::mem::discriminant(&other)),
+    }
+}
+
+/// A file whose sides differ ONLY by line endings / trailing newline renders
+/// the explanatory notice instead of an empty diff pane.
+#[test]
+fn eol_only_difference_renders_notice_not_empty_diff() {
+    // As build_text_diff would produce them: normalized-equal sides.
+    let diff = build_text_diff(b"a\r\nb\r\n", b"a\nb");
+    let files = vec![entry("dos.env", DiffStatus::Differs, Decision::Undecided, diff)];
+    let out = buffer_text(&render(&app_with(files), 120, 30));
+    assert!(
+        out.contains("line endings"),
+        "eol-only notice missing:\n{out}"
+    );
+}
+
+/// Merging an EOL-only file: zero hunks, and accepting converges BOTH sides on
+/// the normalized text — the in-tool path to make the phantom candidate go away.
+#[test]
+fn merge_on_eol_only_file_accepts_normalized_text() {
+    let diff = build_text_diff(b"a\r\nb", b"a\nb\n");
+    let mut app = app_with(vec![entry(
+        "dos.env",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        diff,
+    )]);
+    app.try_open_merge();
+    assert_eq!(app.mode, Mode::Merge, "eol-only text file can be merged");
+    assert_eq!(app.merge.as_ref().unwrap().hunk_count(), 0, "no content hunks");
+    app.accept_merge();
+    match &app.files[0].decision {
+        Decision::Merge(text) => assert_eq!(text, "a\nb\n"),
+        other => panic!("expected Decision::Merge, got {other:?}"),
+    }
+}
+
 /// A binary file renders the "binary — differs" notice, not a diff (R9).
 #[test]
 fn binary_file_renders_notice_not_diff() {

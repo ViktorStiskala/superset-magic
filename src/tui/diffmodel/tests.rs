@@ -200,3 +200,34 @@ fn crlf_identical_buffers_have_no_stray_cr_and_no_changes() {
         }
     }
 }
+
+/// normalize_eol: CRLF collapses to LF, a missing final newline is added, and
+/// already-normalized / empty inputs pass through unchanged.
+#[test]
+fn normalize_eol_normalizes_crlf_and_trailing_newline() {
+    assert_eq!(normalize_eol("a\r\nb\r\n"), "a\nb\n");
+    assert_eq!(normalize_eol("a\nb"), "a\nb\n");
+    assert_eq!(normalize_eol("a\r\nb"), "a\nb\n");
+    assert_eq!(normalize_eol("a\nb\n"), "a\nb\n");
+    assert_eq!(normalize_eol(""), "", "empty input gains no newline");
+    // A lone CR (classic-Mac ending) is NOT an EOL here — left untouched.
+    assert_eq!(normalize_eol("a\rb\n"), "a\rb\n");
+}
+
+/// The normalization goal end-to-end: a CRLF side against an LF side with ONE
+/// real content change diffs to exactly that change — no wall of phantom
+/// replace rows from the terminators.
+#[test]
+fn normalize_eol_removes_phantom_hunks() {
+    let local = normalize_eol("a\r\nX\r\nc");
+    let main = normalize_eol("a\nY\nc\n");
+    let rows = side_by_side(&local, &main, 3);
+    let changed: Vec<&DiffRow> = rows.iter().filter(|r| r.tag != RowTag::Equal).collect();
+    assert_eq!(changed.len(), 1, "exactly one changed row: {rows:?}");
+    assert_eq!(changed[0].tag, RowTag::Replace);
+
+    // Content-identical after normalization → no changed rows at all.
+    let same_l = normalize_eol("a\r\nb\r\nc");
+    let same_m = normalize_eol("a\nb\nc\n");
+    assert_eq!(same_l, same_m, "EOL-only difference must normalize to equal");
+}
