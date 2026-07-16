@@ -100,7 +100,10 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   pane beside a live side-by-side / unified diff (via `tui/diffmodel.rs`),
   and lets the user set each file's `merge::Decision` with explicit keys
   (`p` push / `l` pull / `m` merge / `u` undecided), gated by a batched
-  confirm. `m` on a DIFFERING TEXT file opens the per-hunk merge overlay
+  confirm. Each candidate is loaded once into a `FileDiff` (`Text`, `New` for
+  worktree-only, `Binary`, `TooLarge`, or `Unreadable` when main's copy fails
+  to read — surfaced verbatim, NEVER a fabricated empty buffer, so interactive
+  merge is unavailable for it). `m` on a DIFFERING TEXT file opens the per-hunk merge overlay
   (`Mode::Merge`, state in `App::merge`): it computes hunks with
   `merge::merge_segments`, holds one `MergeChoice` per `Diff` segment
   (default `Local`), walks them with the arrows, cycles keep-local /
@@ -140,13 +143,18 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   the overlaid patterns against main. `run` computes candidates, classifies
   each (`WorktreeOnly`/`Differs`/`Identical`), refuses non-interactively
   (R16), hands the differing/new set to the `tui/cockpit.rs` cockpit, then
-  applies the returned decisions via `apply_decision` — a backup-first seam
-  (path-safety guard; a review-time baseline re-check — per-file `(worktree,
-  main)` metadata is captured via `meta_of` BEFORE the cockpit opens and
+  applies the returned decisions via `apply_decision(&ApplyContext, rel,
+  &Decision, Baseline)` — a backup-first seam
+  (path-safety guard; a review-time baseline re-check via `check_target` —
+  per-file `(worktree, main)` `FileMeta` is captured via `meta_of` BEFORE the
+  cockpit opens (the `Baseline` passed into `apply_decision`) and
   re-compared at apply, so a file edited/created/deleted during review is
-  skipped, not clobbered; timestamped pre-write backup of the
+  skipped, not clobbered; `backup_if_unchanged` takes a timestamped pre-write
+  backup of the
   losing bytes under a gitignored `.superset/backups/<ts>/`, and
-  `ensure_gitignored_in_main` before any secret bytes land in main). Backup
+  `ensure_gitignored_in_main` runs before any secret bytes land in main).
+  `ApplyContext` carries the two tree roots plus the batch's shared backups
+  root/timestamp. Backup
   paths are printed so a mistaken overwrite is recoverable. `sync/merge.rs`
   owns the pure `Decision`/`FileState`/`default_decision` + backup-naming and
   the per-hunk merge model (`merge_segments`, `assemble`, `diff_count`,
@@ -216,7 +224,11 @@ binary is the sole file-copy implementation.)
   any depth. Now owned by `sync/apply.rs` + `sync/pattern.rs`.
 - Tests use `tempfile` + shell-invoked `git init` / `git worktree add`.
   Final-action git ops and the interactive menu/pickers have no unit
-  tests — validated by manual smoke.
+  tests — validated by manual smoke. The reverse-sync merge cockpit
+  (`tui/cockpit.rs`) is a partial exception: its event loop and terminal
+  lifecycle are manual-smoke too, but its render path (`draw`) and pure key
+  dispatch (`handle_key`) ARE unit-tested by driving
+  `ratatui::backend::TestBackend` with synthetic key events.
 - Test layout: each module declares `#[cfg(test)] mod tests;` with the
   body in a sibling child file (`<module>/tests.rs`), keeping private-item
   access. Crate-root tests and shared helpers live in `src/tests/`

@@ -15,7 +15,10 @@ conventions change.
 
 Standalone interactive Rust CLI (binary: `ss-magic`; repo:
 `ViktorStiskala/superset-magic`). Edition 2021. Key dependencies: `anyhow`
-(errors), `inquire` (interactive prompts), `globset` + `walkdir` (pattern
+(errors), `inquire` (interactive prompts), `ratatui` + `crossterm` (the
+full-screen reverse-sync merge cockpit; `crossterm` also backs `inquire`),
+`similar` (line/word diffing for the diff model and merge assembly),
+`globset` + `walkdir` (pattern
 matching), `serde`/`serde_json` (config I/O), `tempfile` (atomic staging),
 `tar` + `bzip2` (pack archives), `self_update` + `ureq` + `fd-lock`
 (self-update), `supports-color` (palette). No `clap` (the arg parser is
@@ -44,10 +47,16 @@ isolation from the interactive TUI. Preserve this boundary.
 - Pure/testable modules: `git/mod.rs` (probes + mutating primitives), `cli.rs`
   (arg parsing), `sync/pattern.rs` (glob syntax checks), `sync/apply.rs` (glob/copy
   engine), `workspace/superset_files.rs` (`.superset/` I/O), `sync/repo_scan.rs` (working-tree
-  scan), `git/gitignore.rs` (`.gitignore` helpers).
+  scan), `git/gitignore.rs` (`.gitignore` helpers), `sync/merge.rs` (the
+  push/pull/merge decision model and per-hunk merge assembly), `tui/diffmodel.rs`
+  (the diff-to-rows model powering the cockpit's diff pane).
 - Interactive/side-effecting: `tui/menu.rs`, `tui/ui.rs` (`inquire` wrappers),
   `tui/style.rs` (palette), the finishing-action prompts in `workspace/migrate.rs` /
-  `sync/reverse_sync.rs`.
+  `sync/reverse_sync.rs`, `tui/cockpit.rs` (the full-screen reverse-sync merge
+  cockpit — its event loop and terminal lifecycle are manual-smoke like the
+  rest of this list, but its render path (`draw`) and key dispatch
+  (`handle_key`) are unit-tested via `ratatui::backend::TestBackend`, so a
+  regression there IS expected to be caught by `cargo test`).
 - `main.rs` composes: `tui::style::init` → `cli::parse` → [auto-update gate for
   `Bare`/`Sync`/`Pack`] → `dispatch`.
 
@@ -149,9 +158,26 @@ committable and must never leak.
   opens and re-compared at apply — that skips a file created, edited, or deleted
   since review (a non-`NotFound` stat error counts as changed, never as
   "missing"). The cockpit refuses to launch without an interactive
-  TTY and writes nothing then. Flag a reverse-sync path that overwrites an
+  TTY and writes nothing then, and `Esc` at the top-level file list cancels the
+  whole cockpit (`CockpitOutcome::Cancel`), leaving both the worktree and main
+  untouched. Flag a reverse-sync path that overwrites an
   existing file without a backup, applies an `Undecided` file, skips the batched
   confirm, or falls through to writing files when there is no TTY.
+- **The cockpit's terminal is always restored, including on panic.**
+  `run_cockpit` installs a panic hook and constructs a `TerminalGuard`
+  (`Drop` disables raw mode / leaves the alternate screen) immediately after
+  `enable_raw_mode()`, BEFORE entering the alternate screen — so a panic or
+  an early `?` failure during setup can never strand the developer's terminal
+  in raw mode. Flag a change that moves terminal setup/teardown outside the
+  guard/panic-hook path, or that enters the alternate screen before the guard
+  exists.
+- **A diff or merge is never built from fabricated content.** If main's copy
+  of a candidate fails to read for a reason OTHER than "does not exist"
+  (permissions, I/O), the cockpit surfaces `FileDiff::Unreadable` with the
+  real error and disables interactive merge for that file — it must NEVER
+  substitute an empty buffer and diff/merge against that. Flag a change that
+  treats a non-missing read error as empty content instead of propagating
+  `Unreadable`.
 - Interactive merge: pressing `m` on a DIFFERING TEXT file opens a per-hunk
   overlay (`Mode::Merge`) that assembles bytes with `merge::merge_segments` +
   `merge::assemble` and, on `Enter`, records `Decision::Merge(assembled)`; `Esc`
@@ -246,9 +272,15 @@ minor (pre-1.0). Flag a behavior-changing PR that does not bump both
 - Tests use `tempfile` for scratch trees and shell-invoked `git init` /
   `git worktree add` for git fixtures. Pure modules (`cli.rs`, `sync/pattern.rs`,
   `sync/apply.rs`, `pack.rs`, `workspace/superset_files.rs`, `git/mod.rs` probes, `tui/menu.rs`
-  routing via `operations_for`) have unit tests; the interactive
+  routing via `operations_for`, `sync/merge.rs`, `tui/diffmodel.rs`, and
+  `sync/reverse_sync.rs`'s `apply_decision`/backup/TOCTOU seam) have unit
+  tests; the interactive
   menu/pickers and final-action git ops are validated by manual smoke, not
-  unit tests.
+  unit tests. The reverse-sync merge cockpit (`tui/cockpit.rs`) is the same
+  mix: its event loop and terminal lifecycle are manual-smoke, but its render
+  path (`draw`) and pure key dispatch (`handle_key`) ARE unit-tested via
+  `ratatui::backend::TestBackend` — do not treat a cockpit regression as
+  automatically untested.
 - New behavior in a pure module (a new command in `cli.rs`, a new
   `operations_for` entry, new glob/exclude/pack behavior) MUST come with tests
   covering the happy path and key edge cases (empty input, error/hard-fail

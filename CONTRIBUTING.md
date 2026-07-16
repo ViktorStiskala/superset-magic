@@ -42,9 +42,13 @@ interactive layer, and grouped by purpose under `src/`:
 - `git/` — git plumbing (read-only probes and mutating primitives; all git/gh
   interaction shells out via `std::process::Command` — **no `git2`**).
 - `sync/` — pattern validation and the glob/exclude/copy engine shared by
-  forward sync, reverse sync, and pack.
+  forward sync, reverse sync, and pack; `merge.rs` owns the reverse-sync
+  push/pull/merge decision model and per-hunk merge assembly (`similar`-based
+  diffing); `reverse_sync.rs` owns the backup-first, TOCTOU-guarded apply seam
+  that writes a cockpit decision to disk.
 - `tui/` — the interactive layer: `inquire` menus and pickers, styling, the
-  pure diff/decision models (`diffmodel`), and the full-screen `ratatui`
+  pure diff/decision models (`diffmodel`, also built on `similar`), and the
+  full-screen `ratatui`
   reverse-sync merge cockpit (`cockpit`, on the `crossterm` backend).
 - `workspace/` — `.superset/` contract I/O and the init/migration lifecycle.
 - `update/` — the self-update check and apply paths.
@@ -88,6 +92,12 @@ Conventions worth knowing:
   (commit/push/PR) have no unit tests; they are validated by manual smoke
   testing. If your change touches one of those surfaces, describe the manual
   path you exercised in the PR.
+- The reverse-sync merge cockpit (`tui/cockpit.rs`) is a partial exception:
+  its event loop and terminal lifecycle are manual-smoke like the rest of the
+  interactive layer, but its render path (`draw`) and pure key dispatch
+  (`handle_key`) ARE unit-tested by driving `ratatui::backend::TestBackend`
+  with synthetic key events — no real terminal required. Prefer extending
+  those tests over adding new manual-smoke-only cockpit behavior.
 
 CI (`.github/workflows/ci.yml`) runs the suite on Ubuntu and macOS for every
 PR commit and every push to `main`. The same workflow gates releases: the

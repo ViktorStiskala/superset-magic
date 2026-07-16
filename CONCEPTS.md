@@ -30,6 +30,28 @@ reach the shared checkout, since they cannot travel through a git merge. Only
 untracked files move; tracked files reach the main checkout through a normal
 merge.
 
+### Merge cockpit
+The full-screen interactive UI reverse sync opens to reconcile candidates: a
+file list beside a live diff (side-by-side or unified, depending on terminal
+width), where the developer sets each candidate's reconcile decision
+explicitly and applies the whole batch behind one confirmation. Binary,
+oversized, or unreadable candidates fall back to a whole-file notice instead
+of a diff.
+
+### Reconcile decision
+The direction chosen for one reverse-sync candidate in the merge cockpit:
+push (worktree → main), pull (main → worktree), merge (a per-hunk reconciled
+result written to both sides), or undecided (nothing written for that file).
+Undecided is the conservative default for any candidate that exists on both
+sides; only a worktree-only candidate defaults to push, since that direction
+is never destructive.
+
+### Pre-write backup
+A timestamped copy of a file's losing bytes, taken immediately before the
+merge cockpit overwrites it on apply, so a mistaken decision is recoverable.
+Backups live under a gitignored `.superset/backups/` in the worktree (one
+timestamp directory per apply batch) and are never committed.
+
 ### Pack
 Bundling the files matching the sync patterns from the current git repo root
 into a single `ss-magic-<repo>.tar.bz2` archive at that root, preserving each
@@ -43,5 +65,6 @@ copy between trees.
 ### Candidate
 A worktree file eligible for reverse sync: it matches the sync patterns and is
 git-untracked (whether or not it is gitignored). Tracked files are never
-candidates. Each candidate is shown to the user for confirmation before anything
-is written into the main checkout.
+candidates. A candidate byte-identical to main's copy is hidden — nothing to
+reconcile; every other candidate is offered in the merge cockpit for a
+reconcile decision before anything is written into the main checkout.
