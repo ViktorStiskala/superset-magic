@@ -55,7 +55,11 @@ fn centered_rect_abs(width: u16, height: u16, area: Rect) -> Rect {
 - Any time popup content GROWS, add/refresh a `TestBackend` render test at the smallest supported size (80×24) asserting the LAST line of content is present in the buffer — asserting the first line only proves the popup opened.
 - If content cannot fit the minimum size, add scrolling plus an indicator; never rely on silent clipping.
 
+## Related incident: horizontal clipping in the diff pane
+
+The same failure class struck horizontally, caught in a real smoke: a candidate whose ONLY difference was a stray character at column 93 (a trailing comment past the pane's right edge) rendered as two visually identical sides — `Paragraph` clips long lines at the pane edge with no indicator, so the changed tail simply did not exist on screen. The general rule: **whenever a widget can clip content, either make the clipping visible (an indicator) or the content reachable (scrolling) — silent clipping of a diff is indistinguishable from "no difference".** Fixed with `←`/`→` horizontal content scroll under fixed line-number gutters plus a pane-title flag ("lines continue →" / "→ col N"); regression test `long_line_change_past_pane_edge_is_flagged_and_reachable` builds the smoke's exact shape.
+
 ## Where
 
-- `src/tui/cockpit.rs` — `render_help`, `centered_rect_abs`
-- `src/tui/cockpit/tests.rs` — `help_overlay_fits_an_80x24_terminal`
+- `src/tui/cockpit.rs` — `render_help`, `centered_rect_abs`; `render_gutter_and_content`, `max_content_width`, `visible_content_width` (horizontal case)
+- `src/tui/cockpit/tests.rs` — `help_overlay_fits_an_80x24_terminal`, `long_line_change_past_pane_edge_is_flagged_and_reachable`

@@ -48,10 +48,18 @@ use crate::sync::merge::{
     MergeSegment,
 };
 use crate::sync::reverse_sync::DiffStatus;
-use crate::tui::diffmodel::{self, ContentKind, DiffRow, RowTag, UnifiedRow, UnifiedTag};
+use crate::tui::diffmodel::{self, ContentKind, DiffRow, RowTag, UnifiedTag};
 
 /// Lines of unchanged context folded around each change (KD2 / R6).
 const CONTEXT: usize = 3;
+
+/// Horizontal scroll step for `←`/`→` over long diff lines, in columns.
+const H_SCROLL_STEP: u16 = 8;
+
+/// Unified-view gutter width: two 4-wide line numbers + separators
+/// (`"%4d %4d "`) plus the 2-column `± ` sign — fixed while the content
+/// scrolls horizontally.
+const UNIFIED_GUTTER: u16 = 12;
 
 /// Diff-pane notice for a file whose sides are equal AFTER EOL normalization:
 /// the bytes differ, but only by line endings / trailing newline.
@@ -248,6 +256,9 @@ struct App {
     files: Vec<FileEntry>,
     focused: usize,
     diff_scroll: u16,
+    /// Horizontal offset of the diff CONTENT (the line-number gutters stay
+    /// fixed) — `←`/`→`, reset when the focus moves to another file.
+    diff_hscroll: u16,
     mode: Mode,
     /// The active merge overlay's state (`Some` iff `mode == Mode::Merge`).
     merge: Option<MergeOverlay>,
@@ -268,6 +279,7 @@ impl App {
             files,
             focused: 0,
             diff_scroll: 0,
+            diff_hscroll: 0,
             mode: Mode::Normal,
             merge: None,
             notice: None,
@@ -278,6 +290,7 @@ impl App {
         if self.focused + 1 < self.files.len() {
             self.focused += 1;
             self.diff_scroll = 0;
+            self.diff_hscroll = 0;
         }
     }
 
@@ -285,6 +298,7 @@ impl App {
         if self.focused > 0 {
             self.focused -= 1;
             self.diff_scroll = 0;
+            self.diff_hscroll = 0;
         }
     }
 
@@ -294,6 +308,28 @@ impl App {
 
     fn scroll_up(&mut self, step: u16) {
         self.diff_scroll = self.diff_scroll.saturating_sub(step);
+    }
+
+    fn scroll_right(&mut self, step: u16) {
+        self.diff_hscroll = self
+            .diff_hscroll
+            .saturating_add(step)
+            .min(self.max_hscroll());
+    }
+
+    fn scroll_left(&mut self, step: u16) {
+        self.diff_hscroll = self.diff_hscroll.saturating_sub(step);
+    }
+
+    /// Upper bound for the horizontal scroll offset, from the focused file's
+    /// longest content line (over-scroll would just show blank columns).
+    fn max_hscroll(&self) -> u16 {
+        self.files
+            .get(self.focused)
+            .map(|f| max_content_width(&f.diff))
+            .unwrap_or(0)
+            .saturating_sub(1)
+            .min(u16::MAX as usize) as u16
     }
 
     /// Upper bound for the diff scroll offset, from the focused file's line
@@ -714,12 +750,36 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, split: bool) {
     let Some(f) = app.files.get(app.focused) else {
         return;
     };
-    let block = Block::bordered().title(Line::from(format!(" {} ", f.rel.display()).bold()));
+
+    // Long-line awareness: when any content line extends past the visible
+    // width (a trailing comment, a long value), the change may live in the
+    // clipped tail — the title must say so, and `←`/`→` scroll to it. A pane
+    // that silently clips the only differing column hides the change entirely.
+    let inner_width = area.width.saturating_sub(2);
+    let visible = visible_content_width(&f.diff, split, inner_width);
+    let scrollable = matches!(&f.diff, FileDiff::Text { local, main } if local != main)
+        || matches!(&f.diff, FileDiff::New { content: Some(_) });
+    let clipped = scrollable
+        && max_content_width(&f.diff) > visible as usize + app.diff_hscroll as usize;
+    let title = if app.diff_hscroll > 0 {
+        format!(" {} · → col {} ", f.rel.display(), app.diff_hscroll)
+    } else if clipped {
+        format!(" {} · lines continue → (←/→ scrolls) ", f.rel.display())
+    } else {
+        format!(" {} ", f.rel.display())
+    };
+    let block = Block::bordered().title(Line::from(title.bold()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     match &f.diff {
-        FileDiff::New { content } => render_new(frame, inner, content.as_deref(), app.diff_scroll),
+        FileDiff::New { content } => render_new(
+            frame,
+            inner,
+            content.as_deref(),
+            app.diff_scroll,
+            app.diff_hscroll,
+        ),
         FileDiff::Binary { note }
         | FileDiff::TooLarge { note }
         | FileDiff::Unreadable { note } => render_notice(frame, inner, note),
@@ -730,15 +790,40 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, split: bool) {
         }
         FileDiff::Text { local, main } => {
             if split {
-                render_split(frame, inner, local, main, app.diff_scroll);
+                render_split(frame, inner, local, main, app.diff_scroll, app.diff_hscroll);
             } else {
-                render_unified(frame, inner, local, main, app.diff_scroll);
+                render_unified(frame, inner, local, main, app.diff_scroll, app.diff_hscroll);
             }
         }
     }
 }
 
-fn render_new(frame: &mut Frame, area: Rect, content: Option<&str>, scroll: u16) {
+/// The widest content line (in chars) of the focused file's diff view — the
+/// clamp for horizontal scrolling and the "lines continue →" hint. Char count
+/// approximates display width; it is only a bound/hint, never a layout.
+fn max_content_width(diff: &FileDiff) -> usize {
+    let longest = |text: &str| text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    match diff {
+        FileDiff::Text { local, main } => longest(local).max(longest(main)),
+        FileDiff::New { content } => content.as_deref().map(longest).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// How many columns of CONTENT (after the fixed gutter) the current view
+/// shows for `diff` at the pane's `inner_width`.
+fn visible_content_width(diff: &FileDiff, split: bool, inner_width: u16) -> u16 {
+    match diff {
+        FileDiff::Text { .. } if split => {
+            (inner_width / 2).saturating_sub(diffmodel::SPLIT_GUTTER)
+        }
+        FileDiff::Text { .. } => inner_width.saturating_sub(UNIFIED_GUTTER),
+        // The `+ ` prefix scrolls with the content in the new-file view.
+        _ => inner_width,
+    }
+}
+
+fn render_new(frame: &mut Frame, area: Rect, content: Option<&str>, scroll: u16, hscroll: u16) {
     let mut lines = vec![
         Line::from(Span::styled(
             "new file — will be created in main",
@@ -760,7 +845,7 @@ fn render_new(frame: &mut Frame, area: Rect, content: Option<&str>, scroll: u16)
             Style::new().fg(Color::DarkGray),
         ))),
     }
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, hscroll)), area);
 }
 
 fn render_notice(frame: &mut Frame, area: Rect, note: &str) {
@@ -772,36 +857,44 @@ fn render_notice(frame: &mut Frame, area: Rect, note: &str) {
     );
 }
 
-fn render_unified(frame: &mut Frame, area: Rect, local: &str, main: &str, scroll: u16) {
-    let lines: Vec<Line> = diffmodel::unified(local, main, CONTEXT)
-        .iter()
-        .map(unified_row_line)
-        .collect();
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
-}
-
-fn unified_row_line(row: &UnifiedRow) -> Line<'static> {
-    if let UnifiedTag::Fold(n) = row.tag {
-        return fold_line(n);
+fn render_unified(frame: &mut Frame, area: Rect, local: &str, main: &str, scroll: u16, hscroll: u16) {
+    let rows = diffmodel::unified(local, main, CONTEXT);
+    let mut nums: Vec<Line> = Vec::with_capacity(rows.len());
+    let mut content: Vec<Line> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let UnifiedTag::Fold(n) = row.tag {
+            nums.push(Line::from(""));
+            content.push(fold_line(n));
+            continue;
+        }
+        let (sign, color) = match row.tag {
+            UnifiedTag::Delete => ("-", Some(Color::Red)),
+            UnifiedTag::Insert => ("+", Some(Color::Green)),
+            UnifiedTag::Context => (" ", None),
+            UnifiedTag::Fold(_) => unreachable!("handled above"),
+        };
+        nums.push(Line::from(vec![
+            Span::styled(
+                format!("{} {} ", num(row.old_no), num(row.new_no)),
+                Style::new().fg(Color::DarkGray),
+            ),
+            Span::styled(format!("{sign} "), style_of(color, false)),
+        ]));
+        let mut spans = Vec::new();
+        push_segments(&mut spans, &row.segs, color);
+        content.push(Line::from(spans));
     }
-    let (sign, color) = match row.tag {
-        UnifiedTag::Delete => ("-", Some(Color::Red)),
-        UnifiedTag::Insert => ("+", Some(Color::Green)),
-        UnifiedTag::Context => (" ", None),
-        UnifiedTag::Fold(_) => unreachable!("handled above"),
-    };
-    let mut spans = vec![
-        Span::styled(
-            format!("{} {} ", num(row.old_no), num(row.new_no)),
-            Style::new().fg(Color::DarkGray),
-        ),
-        Span::styled(format!("{sign} "), style_of(color, false)),
-    ];
-    push_segments(&mut spans, &row.segs, color);
-    Line::from(spans)
+    render_gutter_and_content(frame, area, UNIFIED_GUTTER, nums, content, scroll, hscroll);
 }
 
-fn render_split(frame: &mut Frame, area: Rect, local: &str, main: &str, scroll: u16) {
+fn render_split(
+    frame: &mut Frame,
+    area: Rect,
+    local: &str,
+    main: &str,
+    scroll: u16,
+    hscroll: u16,
+) {
     let vchunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
     let titles = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(vchunks[0]);
@@ -821,19 +914,60 @@ fn render_split(frame: &mut Frame, area: Rect, local: &str, main: &str, scroll: 
     let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(vchunks[1]);
     let rows = diffmodel::side_by_side(local, main, CONTEXT);
-    let (left, right) = side_lines(&rows);
-    frame.render_widget(Paragraph::new(left).scroll((scroll, 0)), cols[0]);
-    frame.render_widget(Paragraph::new(right).scroll((scroll, 0)), cols[1]);
+    let (left, right) = side_columns(&rows);
+    for (area, side) in [(cols[0], left), (cols[1], right)] {
+        render_gutter_and_content(
+            frame,
+            area,
+            diffmodel::SPLIT_GUTTER,
+            side.nums,
+            side.content,
+            scroll,
+            hscroll,
+        );
+    }
 }
 
-/// Build the aligned left/right line vectors for the side-by-side view.
-fn side_lines(rows: &[DiffRow]) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
-    let mut left = Vec::with_capacity(rows.len());
-    let mut right = Vec::with_capacity(rows.len());
+/// Render one diff column as a FIXED line-number gutter beside horizontally
+/// scrollable content — `←`/`→` shift the content while the numbers (and the
+/// unified `±` signs) stay put, so orientation survives the scroll.
+fn render_gutter_and_content(
+    frame: &mut Frame,
+    area: Rect,
+    gutter: u16,
+    nums: Vec<Line<'static>>,
+    content: Vec<Line<'static>>,
+    scroll: u16,
+    hscroll: u16,
+) {
+    let parts = Layout::horizontal([Constraint::Length(gutter), Constraint::Min(0)]).split(area);
+    frame.render_widget(Paragraph::new(nums).scroll((scroll, 0)), parts[0]);
+    frame.render_widget(Paragraph::new(content).scroll((scroll, hscroll)), parts[1]);
+}
+
+/// One side of the side-by-side view, gutter and content held apart so the
+/// content can scroll horizontally under a fixed gutter.
+struct SideColumns {
+    nums: Vec<Line<'static>>,
+    content: Vec<Line<'static>>,
+}
+
+/// Build the aligned left/right column pairs for the side-by-side view.
+fn side_columns(rows: &[DiffRow]) -> (SideColumns, SideColumns) {
+    let mut left = SideColumns {
+        nums: Vec::with_capacity(rows.len()),
+        content: Vec::with_capacity(rows.len()),
+    };
+    let mut right = SideColumns {
+        nums: Vec::with_capacity(rows.len()),
+        content: Vec::with_capacity(rows.len()),
+    };
     for row in rows {
         if let RowTag::Fold(n) = row.tag {
-            left.push(fold_line(n));
-            right.push(fold_line(n));
+            for side in [&mut left, &mut right] {
+                side.nums.push(Line::from(""));
+                side.content.push(fold_line(n));
+            }
             continue;
         }
         let left_color = match row.tag {
@@ -844,23 +978,25 @@ fn side_lines(rows: &[DiffRow]) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
             RowTag::Insert | RowTag::Replace => Some(Color::Green),
             _ => None,
         };
-        left.push(side_cell(row.left_no, &row.left, left_color));
-        right.push(side_cell(row.right_no, &row.right, right_color));
+        push_side_cell(&mut left, row.left_no, &row.left, left_color);
+        push_side_cell(&mut right, row.right_no, &row.right, right_color);
     }
     (left, right)
 }
 
-fn side_cell(
+fn push_side_cell(
+    side: &mut SideColumns,
     line_no: Option<usize>,
     segs: &[crate::tui::diffmodel::Seg],
     color: Option<Color>,
-) -> Line<'static> {
-    let mut spans = vec![Span::styled(
+) {
+    side.nums.push(Line::from(Span::styled(
         format!("{} ", num(line_no)),
         Style::new().fg(Color::DarkGray),
-    )];
+    )));
+    let mut spans = Vec::new();
     push_segments(&mut spans, segs, color);
-    Line::from(spans)
+    side.content.push(Line::from(spans));
 }
 
 /// Append styled spans for a line's segments, emphasizing changed spans (R6).
@@ -918,7 +1054,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from("Navigation".bold()),
         Line::from("  ↑/↓ or j/k         move between files"),
-        Line::from("  PgUp/PgDn/Space/b  scroll the diff"),
+        Line::from("  PgUp/PgDn/Space/b  scroll the diff · ←/→ long lines"),
         Line::from(""),
         Line::from("Decisions".bold()),
         Line::from(vec![
@@ -1306,6 +1442,11 @@ fn handle_key(app: &mut App, code: KeyCode, page: u16) -> Option<CockpitOutcome>
                 KeyCode::Down | KeyCode::Char('j') => app.focus_next(),
                 KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_down(page),
                 KeyCode::PageUp | KeyCode::Char('b') => app.scroll_up(page),
+                // Long lines: shift the diff CONTENT horizontally so a change
+                // past the pane's right edge (e.g. a trailing comment) is
+                // reachable — the pane title hints when lines are clipped.
+                KeyCode::Right => app.scroll_right(H_SCROLL_STEP),
+                KeyCode::Left => app.scroll_left(H_SCROLL_STEP),
                 KeyCode::Char('p') => app.set_decision(Decision::Push),
                 KeyCode::Char('l') => app.set_pull(),
                 KeyCode::Char('m') => app.try_open_merge(),

@@ -243,8 +243,11 @@ git. Tracked files are excluded — they reach main via merge. The flow:
 - Nothing destructive is pre-selected — a file that differs starts *undecided*.
   You set each file's direction with explicit keys: `p` push to main, `l` pull
   from main, `m` interactive merge, `d` delete from both sides, `u` undecided
-  (arrows/`j`/`k` navigate, `PgUp`/`PgDn`/`Space` scroll the diff, `?` toggles
-  help). Each row's mtimes are shown only as an unreliable hint.
+  (arrows/`j`/`k` navigate, `PgUp`/`PgDn`/`Space` scroll the diff, `←`/`→`
+  scroll long lines horizontally, `?` toggles help). Lines wider than the pane
+  are flagged in its title ("lines continue →") so a change past the right
+  edge — a trailing comment, a long value — is never silently invisible. Each
+  row's mtimes are shown only as an unreliable hint.
 - `m` on a differing text file opens a per-hunk merge overlay: walk the hunks
   with the arrows and cycle each between keep-local / keep-main / keep-both
   (`←`/`→` or `h`/`l`) while a live preview assembles the result

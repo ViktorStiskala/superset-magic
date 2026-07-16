@@ -200,6 +200,14 @@ committable and must never leak.
   on-disk bytes, and byte-level classification (`classify`) stays byte-exact.
   Flag a change that diffs un-normalized text, normalizes the push/pull copy
   path, or hides an EOL-only-differing candidate entirely.
+- **A change past the pane's right edge must never be silently invisible.**
+  Diff lines wider than the visible content area are horizontally scrollable
+  (`←`/`→`; the offset is clamped to the longest content line and reset when
+  the focus moves to another file) with the line-number gutter held FIXED,
+  and the pane title flags the state ("lines continue →" when clipped,
+  "→ col N" while scrolled). Flag a diff-pane change that clips content with
+  no indicator, scrolls the gutter away with the content, or leaves a stale
+  horizontal offset when switching files.
 - **The cockpit's terminal is always restored, including on panic.**
   `run_cockpit` installs a panic hook and constructs a `TerminalGuard`
   (`Drop` disables raw mode / leaves the alternate screen) immediately after

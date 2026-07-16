@@ -127,7 +127,12 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   `is_interactive` (stdin+stdout TTY, R16) guards launch. A `Drop` guard +
   panic hook always restore the terminal. The help overlay is sized to its
   content (`centered_rect_abs`, 22 lines) so the full help — safety facts
-  included — fits an 80×24 terminal. The pure `draw(frame, app)` and
+  included — fits an 80×24 terminal. Long diff lines are horizontally
+  scrollable with `←`/`→` (`diff_hscroll`, reset per file, clamped via
+  `max_content_width`): the content shifts under FIXED line-number gutters
+  (`render_gutter_and_content`; `SPLIT_GUTTER`/`UNIFIED_GUTTER`), and the
+  pane title flags clipped lines ("lines continue →" / "→ col N") so a
+  change past the pane edge is never silently invisible. The pure `draw(frame, app)` and
   the pure `merge_preview` are exercised with `ratatui`'s `TestBackend`
   without the event loop.
 - `cli.rs` — hand-rolled arg parser (no `clap`). `parse(&[String]) ->

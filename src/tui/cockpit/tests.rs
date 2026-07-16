@@ -34,6 +34,7 @@ fn app_with(files: Vec<FileEntry>) -> App {
         files,
         focused: 0,
         diff_scroll: 0,
+        diff_hscroll: 0,
         mode: Mode::Normal,
         merge: None,
         notice: None,
@@ -345,6 +346,109 @@ fn set_pull_is_noop_for_unreadable_main() {
         "pull must be a no-op for an unreadable-main file: {:?}",
         app.files[0].decision
     );
+}
+
+// ── Long lines: horizontal scroll + clipped-tail hint ──────────────────────
+
+/// The smoke-caught bug: a line whose ONLY change sits past the pane's right
+/// edge (a trailing comment at col ~80) rendered as two identical-looking
+/// sides with no hint that anything was clipped. The pane title must flag
+/// clipped lines, and `→` must scroll the content (fixed gutter) until the
+/// changed tail is visible.
+#[test]
+fn long_line_change_past_pane_edge_is_flagged_and_reachable() {
+    let prefix = format!(
+        "# pulse_product_name: \"Spiral\"{}# used in report titles",
+        " ".repeat(26)
+    );
+    let mut app = app_with(vec![
+        entry(
+            "config.local.yaml",
+            DiffStatus::Differs,
+            Decision::Undecided,
+            FileDiff::Text {
+                local: format!("{prefix}\n"),
+                main: format!("{prefix}EXTRA\n"),
+            },
+        ),
+        entry(
+            "short.env",
+            DiffStatus::Differs,
+            Decision::Undecided,
+            FileDiff::Text {
+                local: "x\n".to_string(),
+                main: "y\n".to_string(),
+            },
+        ),
+    ]);
+
+    // 100 cols → the diff pane falls back to unified; its content area is far
+    // narrower than the ~84-char lines, so the changed tail starts clipped.
+    let out = buffer_text(&render(&app, 100, 30));
+    assert!(
+        !out.contains("EXTRA"),
+        "precondition: the changed tail must start beyond the pane edge:\n{out}"
+    );
+    assert!(
+        out.contains("lines continue"),
+        "clipped lines must be flagged in the pane title:\n{out}"
+    );
+
+    // Scroll right until the tail is in view; the title shows the offset and
+    // the line-number gutter stays put.
+    for _ in 0..5 {
+        handle_key(&mut app, KeyCode::Right, 10);
+    }
+    assert_eq!(app.diff_hscroll, 40);
+    let out = buffer_text(&render(&app, 100, 30));
+    assert!(
+        out.contains("EXTRA"),
+        "the changed tail must be reachable via → scrolling:\n{out}"
+    );
+    assert!(out.contains("→ col 40"), "title must show the offset:\n{out}");
+    assert!(out.contains("   1"), "line-number gutter must stay fixed:\n{out}");
+
+    // Moving to another file resets the offset; short lines get no hint.
+    handle_key(&mut app, KeyCode::Down, 10);
+    assert_eq!(app.diff_hscroll, 0, "focus move must reset the h-scroll");
+    let out = buffer_text(&render(&app, 100, 30));
+    assert!(!out.contains("lines continue"), "short lines need no hint:\n{out}");
+    assert!(!out.contains("→ col"), "no offset shown at col 0:\n{out}");
+}
+
+/// `←`/`→` clamp: left saturates at 0, right at the longest content line; a
+/// file with no scrollable content (binary) never scrolls.
+#[test]
+fn handle_key_horizontal_scroll_clamps() {
+    let mut app = app_with(vec![entry(
+        "wide.env",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Text {
+            local: format!("{}\n", "L".repeat(30)),
+            main: format!("{}\n", "M".repeat(20)),
+        },
+    )]);
+    assert_eq!(handle_key(&mut app, KeyCode::Left, 10), None);
+    assert_eq!(app.diff_hscroll, 0, "left saturates at 0");
+    for _ in 0..10 {
+        handle_key(&mut app, KeyCode::Right, 10);
+    }
+    assert_eq!(
+        app.diff_hscroll, 29,
+        "right clamps to the longest content line - 1"
+    );
+
+    let mut binary = app_with(vec![entry(
+        "secret.bin",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Binary {
+            note: "binary — differs".to_string(),
+        },
+    )]);
+    handle_key(&mut binary, KeyCode::Right, 10);
+    assert_eq!(binary.diff_hscroll, 0, "a binary notice never h-scrolls");
 }
 
 // ── Interactive merge overlay (Phase 4) ───────────────────────────────────

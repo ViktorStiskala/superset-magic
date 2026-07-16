@@ -162,8 +162,9 @@ pub struct UnifiedRow {
 const MIN_SPLIT_COL: u16 = 40;
 
 /// Per-side line-number gutter width ("%4d " → 5 columns), present on BOTH
-/// columns of the split.
-const SPLIT_GUTTER: u16 = 5;
+/// columns of the split. Public so the renderer lays out its fixed gutter
+/// column with the same width this threshold math assumes.
+pub const SPLIT_GUTTER: u16 = 5;
 
 /// Minimum diff-*pane inner* width (inside its border) at which a legible
 /// two-column split fits: each of the two 50% columns must hold the line-number
