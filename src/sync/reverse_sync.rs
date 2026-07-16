@@ -184,10 +184,18 @@ fn ensure_gitignored_in_main(
     }
 
     gitignore::ensure_entry(main_root, &literal)?;
-    debug_assert!(
-        git::is_ignored(main_root, rel).unwrap_or(false),
-        "literal-path fallback must leave the path ignored in main"
-    );
+    // Verify in ALL builds, not just via debug_assert: this is the secret-leak
+    // boundary and ss-magic ships as a RELEASE binary, where a debug_assert is a
+    // no-op. The literal repo-relative path is anchored at main's root and
+    // appended last, so it must now ignore `rel`; if it somehow still does not,
+    // refuse rather than let the caller write un-ignored secret bytes into main.
+    if !git::is_ignored(main_root, rel)? {
+        anyhow::bail!(
+            "refusing to reverse-sync {}: it is still not gitignored in main after \
+             appending `{literal}` — writing it would leave a secret committable in main",
+            rel.display()
+        );
+    }
     Ok(true)
 }
 
@@ -312,6 +320,9 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
     );
     if summary.failed > 0 {
         println!("{}", style::err(line));
+        // Some files did not apply — signal partial failure to scripts/CI
+        // rather than exiting 0 on a batch that only partly succeeded.
+        return Ok(ExitCode::from(1));
     } else if summary.skipped > 0 {
         println!("{}", style::warn(line));
     } else {
