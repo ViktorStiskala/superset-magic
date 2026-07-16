@@ -188,6 +188,30 @@ impl MergeOverlay {
         if let Some(c) = self.choices.get_mut(self.hunk) {
             *c = if forward { next_choice(*c) } else { prev_choice(*c) };
         }
+        // A different choice can shrink the assembled preview — keep the
+        // scroll offset inside the new preview.
+        self.preview_scroll = self.preview_scroll.min(self.max_preview_scroll());
+    }
+
+    /// Upper bound for the preview scroll offset, from the CURRENT assembled
+    /// preview's line count (over-scroll would just show blank lines).
+    fn max_preview_scroll(&self) -> u16 {
+        self.preview()
+            .lines()
+            .count()
+            .saturating_sub(1)
+            .min(u16::MAX as usize) as u16
+    }
+
+    fn scroll_preview_down(&mut self, step: u16) {
+        self.preview_scroll = self
+            .preview_scroll
+            .saturating_add(step)
+            .min(self.max_preview_scroll());
+    }
+
+    fn scroll_preview_up(&mut self, step: u16) {
+        self.preview_scroll = self.preview_scroll.saturating_sub(step);
     }
 
     /// The (local, main) candidate texts of the `n`-th `Diff` segment, if any.
@@ -886,7 +910,7 @@ fn render_footer(frame: &mut Frame, area: Rect, notice: Option<&str>) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(64, 70, area);
+    let popup = centered_rect(68, 90, area);
     frame.render_widget(Clear, popup);
     let lines = vec![
         Line::from("Navigation".bold()),
@@ -922,13 +946,28 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("Merge overlay".bold()),
         Line::from("  ↑/↓ or j/k     move between hunks"),
         Line::from("  ←/→ or h/l     cycle keep-local / keep-main / keep-both"),
-        Line::from("  Enter          accept the assembled result"),
+        Line::from("  PgUp/PgDn      scroll the assembled preview (also Space / b)"),
+        Line::from("  Enter          accept the assembled result (written to BOTH sides)"),
         Line::from("  Esc            cancel the merge (file unchanged)"),
         Line::from(""),
         Line::from("Apply".bold()),
-        Line::from("  Enter          review & apply (confirm)"),
+        Line::from("  Enter          review & apply (one batched confirm, default No)"),
         Line::from("  Esc            cancel — nothing written"),
         Line::from("  ?              toggle this help"),
+        Line::from(""),
+        Line::from("Safety".bold()),
+        Line::from(Span::styled(
+            "  Overwritten or deleted bytes are backed up first under",
+            Style::new().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  .superset/backups/<timestamp>/ (the 10 newest batches are kept).",
+            Style::new().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  Diffs and merges are EOL-normalized (CRLF→LF); push/pull copy raw bytes.",
+            Style::new().fg(Color::DarkGray),
+        )),
     ];
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(Line::from(" Help ".bold()))),
@@ -1024,7 +1063,7 @@ fn render_merge(frame: &mut Frame, area: Rect, app: &App) {
     render_merge_preview(frame, chunks[4], m);
     frame.render_widget(
         Paragraph::new(Line::from(
-            "↑↓/jk hunk · ←→/hl choice · Enter accept · Esc cancel",
+            "↑↓/jk hunk · ←→/hl choice · PgUp/PgDn/Space/b scroll preview · Enter accept · Esc cancel",
         ))
         .style(Style::new().fg(Color::DarkGray)),
         chunks[5],
@@ -1227,6 +1266,18 @@ fn handle_key(app: &mut App, code: KeyCode, page: u16) -> Option<CockpitOutcome>
                 KeyCode::Left | KeyCode::Char('h') => {
                     if let Some(m) = app.merge.as_mut() {
                         m.cycle_choice(false);
+                    }
+                }
+                // The assembled preview can outgrow its pane — scroll it with
+                // the same keys the normal view uses for the diff.
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    if let Some(m) = app.merge.as_mut() {
+                        m.scroll_preview_down(page);
+                    }
+                }
+                KeyCode::PageUp | KeyCode::Char('b') => {
+                    if let Some(m) = app.merge.as_mut() {
+                        m.scroll_preview_up(page);
                     }
                 }
                 KeyCode::Enter => app.accept_merge(),

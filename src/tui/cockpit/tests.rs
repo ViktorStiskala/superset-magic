@@ -590,6 +590,69 @@ fn handle_key_merge_mode_hunk_navigation() {
     assert_eq!(app.merge.as_ref().unwrap().hunk, 0);
 }
 
+/// Merge mode: PgDn/PgUp (and Space/b) scroll the assembled preview, clamped to
+/// its line count; cycling a choice re-clamps a scroll that outgrew the new,
+/// shorter preview.
+#[test]
+fn handle_key_merge_mode_scrolls_preview_clamped() {
+    // 30 shared lines + one hunk → a preview tall enough to scroll.
+    let shared: String = (0..30).map(|i| format!("line{i}\n")).collect();
+    let mut app = app_with(vec![entry(
+        "long.env",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Text {
+            local: format!("{shared}X\n"),
+            main: format!("{shared}Y\n"),
+        },
+    )]);
+    app.try_open_merge();
+    assert_eq!(app.merge.as_ref().unwrap().preview_scroll, 0);
+
+    // Page down by 10 → offset 10; again → clamped at the last line (30).
+    handle_key(&mut app, KeyCode::PageDown, 10);
+    assert_eq!(app.merge.as_ref().unwrap().preview_scroll, 10);
+    handle_key(&mut app, KeyCode::Char(' '), 10);
+    handle_key(&mut app, KeyCode::PageDown, 100);
+    assert_eq!(
+        app.merge.as_ref().unwrap().preview_scroll,
+        30,
+        "scroll clamps to the preview's last line"
+    );
+
+    // Page up scrolls back (Char('b') too) and saturates at 0.
+    handle_key(&mut app, KeyCode::PageUp, 10);
+    assert_eq!(app.merge.as_ref().unwrap().preview_scroll, 20);
+    handle_key(&mut app, KeyCode::Char('b'), 100);
+    assert_eq!(app.merge.as_ref().unwrap().preview_scroll, 0);
+
+    // A choice change re-clamps: scroll to the bottom of a keep-both preview,
+    // then shrink it back to keep-local — the offset must follow it down.
+    handle_key(&mut app, KeyCode::Right, 10); // keep-main
+    handle_key(&mut app, KeyCode::Right, 10); // keep-both (32 lines)
+    handle_key(&mut app, KeyCode::PageDown, 100);
+    assert_eq!(app.merge.as_ref().unwrap().preview_scroll, 31);
+    handle_key(&mut app, KeyCode::Right, 10); // back to keep-local (31 lines)
+    assert_eq!(
+        app.merge.as_ref().unwrap().preview_scroll,
+        30,
+        "cycling a choice must re-clamp the preview scroll"
+    );
+}
+
+/// The help overlay documents every decision key, the preview scroll, and the
+/// backup location + retention.
+#[test]
+fn help_overlay_documents_keys_and_backups() {
+    let mut app = two_file_app();
+    app.mode = Mode::Help;
+    let out = buffer_text(&render(&app, 120, 40));
+    assert!(out.contains("delete from both sides"), "d key missing:\n{out}");
+    assert!(out.contains("assembled preview"), "preview scroll missing:\n{out}");
+    assert!(out.contains(".superset/backups/"), "backup path missing:\n{out}");
+    assert!(out.contains("10 newest"), "retention missing:\n{out}");
+}
+
 /// Merge mode: `Esc` cancels the overlay, leaving the file's decision unchanged.
 #[test]
 fn handle_key_merge_mode_esc_leaves_decision_unchanged() {
