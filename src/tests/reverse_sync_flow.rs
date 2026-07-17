@@ -8,65 +8,9 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-/// Convert `ExitCode` to u8 for assertions.
-/// `ExitCode` doesn't implement `From<ExitCode> for u8`; this helper
-/// works by matching against known constants.
-fn exit_code_to_u8(code: ExitCode) -> u8 {
-    if code == ExitCode::SUCCESS {
-        0
-    } else {
-        // Any non-SUCCESS code is treated as non-zero. For tests that
-        // assert `!= 0` this is sufficient; we only ever return 0 or 1.
-        1
-    }
-}
-
-/// Initialise a bare-ish main repo with one initial commit.
-fn init_main_repo(branch: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    git_run(&["init", "-q", "-b", branch], dir.path());
-    crate::tests::support::neutralize_global_excludes(dir.path());
-    fs::write(dir.path().join("README.md"), "hi").unwrap();
-    git_run(&["add", "."], dir.path());
-    git_run(&["commit", "-q", "-m", "init"], dir.path());
-    dir
-}
-
-/// Write `magic.json` with the given patterns into `root/.superset/`.
-fn write_magic(root: &Path, patterns: &[&str]) {
-    fs::create_dir_all(root.join(".superset")).unwrap();
-    let files: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
-    let cfg = workspace::superset_files::MagicConfig { files };
-    let body = format!("{}\n", serde_json::to_string_pretty(&cfg).unwrap());
-    fs::write(root.join(".superset/magic.json"), body).unwrap();
-}
-
-/// Write a file at `root/rel_path` with the given body (creates parents).
-fn write_file(root: &Path, rel: &str, body: &str) {
-    let p = root.join(rel);
-    fs::create_dir_all(p.parent().unwrap()).unwrap();
-    fs::write(p, body).unwrap();
-}
-
-/// Create a linked worktree from `main_dir` at a new temp path.
-/// Returns `(worktree_dir, worktree_root_path)`.
-fn make_worktree(main_dir: &Path) -> (TempDir, PathBuf) {
-    let wt = tempfile::tempdir().unwrap();
-    let wt_path = wt.path().join("wt");
-    git_run(
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "feature/reverse-sync-flow-test",
-            wt_path.to_str().unwrap(),
-        ],
-        main_dir,
-    );
-    let wt_root = wt_path.canonicalize().unwrap();
-    (wt, wt_root)
-}
+use crate::tests::support::{
+    exit_code_to_u8, init_main_repo, make_worktree, write_file, write_magic,
+};
 
 /// An untracked worktree file matching `magic.json` that differs from main's
 /// copy must be bulk-pushed into main, gitignored there, with a success exit.

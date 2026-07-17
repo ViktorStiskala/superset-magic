@@ -1,5 +1,5 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -215,13 +215,10 @@ pub fn run_sync_flow(cwd: &Path, no_backup: bool) -> Result<ExitCode> {
     sync_core(cwd, no_backup, print_event)
 }
 
-/// Extracted core of `sync_flow` so tests can inject a no-op event handler
-/// without side-effects on stdout/stderr.
-fn sync_core<F>(cwd: &Path, no_backup: bool, on_event: F) -> Result<ExitCode>
-where
-    F: FnMut(&Event),
-{
-    // 1. Resolve the current repo root (the working tree cwd belongs to).
+/// Resolve the current repo root and the main checkout root for the sync flows,
+/// printing the same styled error and returning the exit code on failure. Shared
+/// by `sync_core` (forward) and `run_reverse_sync_flow` (reverse).
+fn resolve_sync_roots(cwd: &Path) -> std::result::Result<(PathBuf, PathBuf), ExitCode> {
     let cwd_root = match git::cwd_repo_root(cwd) {
         Ok(r) => r,
         Err(err) => {
@@ -232,22 +229,32 @@ where
                     cwd.display()
                 ))
             );
-            return Ok(ExitCode::from(1));
+            return Err(ExitCode::from(1));
         }
     };
-
-    // 2. Resolve the main checkout root (parent of git-common-dir).
     let main_root = match git::main_checkout_root(&cwd_root) {
         Ok(r) => r,
         Err(err) => {
             eprintln!(
                 "{}",
-                tui::style::err(format!(
-                    "error: cannot resolve main checkout root: {err:#}"
-                ))
+                tui::style::err(format!("error: cannot resolve main checkout root: {err:#}"))
             );
-            return Ok(ExitCode::from(1));
+            return Err(ExitCode::from(1));
         }
+    };
+    Ok((cwd_root, main_root))
+}
+
+/// Extracted core of `sync_flow` so tests can inject a no-op event handler
+/// without side-effects on stdout/stderr.
+fn sync_core<F>(cwd: &Path, no_backup: bool, on_event: F) -> Result<ExitCode>
+where
+    F: FnMut(&Event),
+{
+    // 1-2. Resolve the current repo root and the main checkout root.
+    let (cwd_root, main_root) = match resolve_sync_roots(cwd) {
+        Ok(roots) => roots,
+        Err(code) => return Ok(code),
     };
 
     // 3-4. Probe + load the overlaid magic.json (hard error on absent/malformed).
@@ -310,28 +317,9 @@ where
 /// `.superset/backups/` unless `no_backup`, plus the gitignore-in-main secret
 /// gate on every write).
 pub fn run_reverse_sync_flow(cwd: &Path, no_backup: bool) -> Result<ExitCode> {
-    let cwd_root = match git::cwd_repo_root(cwd) {
-        Ok(r) => r,
-        Err(err) => {
-            eprintln!(
-                "{}",
-                tui::style::err(format!(
-                    "error: cannot resolve git repo root from {}: {err:#}",
-                    cwd.display()
-                ))
-            );
-            return Ok(ExitCode::from(1));
-        }
-    };
-    let main_root = match git::main_checkout_root(&cwd_root) {
-        Ok(r) => r,
-        Err(err) => {
-            eprintln!(
-                "{}",
-                tui::style::err(format!("error: cannot resolve main checkout root: {err:#}"))
-            );
-            return Ok(ExitCode::from(1));
-        }
+    let (cwd_root, main_root) = match resolve_sync_roots(cwd) {
+        Ok(roots) => roots,
+        Err(code) => return Ok(code),
     };
     if cwd_root == main_root {
         eprintln!(

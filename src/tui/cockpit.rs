@@ -457,14 +457,9 @@ impl App {
                     Some((f.rel.clone(), "main → worktree"))
                 }
                 Decision::Merge(_) => Some((f.rel.clone(), "merged → both")),
-                // Delete removes every existing side.
-                Decision::Delete if f.status == DiffStatus::WorktreeOnly => {
-                    Some((f.rel.clone(), "delete (worktree copy)"))
-                }
-                Decision::Delete if f.status == DiffStatus::MainOnly => {
-                    Some((f.rel.clone(), "delete (main copy)"))
-                }
-                Decision::Delete => Some((f.rel.clone(), "delete (worktree + main)")),
+                // Delete removes every existing side; `delete_target` names them
+                // the same way the badge does.
+                Decision::Delete => Some((f.rel.clone(), delete_target(f.status))),
                 _ => None,
             })
             .collect()
@@ -508,44 +503,40 @@ fn load_entry(
     })
 }
 
-/// Build the [`FileDiff::New`] view for a worktree-only file, consulting the
-/// file's size via metadata BEFORE any full read (R8): an oversized new file is
-/// shown as "content not shown" without paying for the read.
-fn build_new(wt_path: &Path) -> Result<FileDiff> {
-    let wt_len = fs::metadata(wt_path)
-        .with_context(|| format!("reading worktree file {}", wt_path.display()))?
+/// Read a one-sided file's content for a "will be created" view, consulting the
+/// file's size via metadata BEFORE any full read (R8): an oversized file returns
+/// `None` ("content not shown") without paying for the read, and a binary file
+/// classifies to `None` too. `label` names the side in the error context
+/// (`"worktree file"` / `"main file"`). Shared by [`build_new`] and
+/// [`build_main_only`].
+fn read_created_content(path: &Path, label: &str) -> Result<Option<String>> {
+    let len = fs::metadata(path)
+        .with_context(|| format!("reading {label} {}", path.display()))?
         .len();
-    let content = if wt_len > diffmodel::MAX_DIFF_BYTES {
-        None
-    } else {
-        let wt_bytes = fs::read(wt_path)
-            .with_context(|| format!("reading worktree file {}", wt_path.display()))?;
-        match diffmodel::classify_content(&wt_bytes) {
-            ContentKind::Text(s) => Some(s),
-            _ => None,
-        }
-    };
-    Ok(FileDiff::New { content })
+    if len > diffmodel::MAX_DIFF_BYTES {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).with_context(|| format!("reading {label} {}", path.display()))?;
+    Ok(match diffmodel::classify_content(&bytes) {
+        ContentKind::Text(s) => Some(s),
+        _ => None,
+    })
 }
 
-/// Build the [`FileDiff::MainOnly`] view for a main-only file, mirroring
-/// [`build_new`]: consult the size via metadata BEFORE any full read (R8), then
-/// decode main's bytes (text ⇒ `Some`, binary / oversized ⇒ `None`).
+/// Build the [`FileDiff::New`] view for a worktree-only file (created in main by
+/// a push).
+fn build_new(wt_path: &Path) -> Result<FileDiff> {
+    Ok(FileDiff::New {
+        content: read_created_content(wt_path, "worktree file")?,
+    })
+}
+
+/// Build the [`FileDiff::MainOnly`] view for a main-only file (created locally by
+/// a pull) — the mirror of [`build_new`], sourced from main.
 fn build_main_only(main_path: &Path) -> Result<FileDiff> {
-    let main_len = fs::metadata(main_path)
-        .with_context(|| format!("reading main file {}", main_path.display()))?
-        .len();
-    let content = if main_len > diffmodel::MAX_DIFF_BYTES {
-        None
-    } else {
-        let main_bytes = fs::read(main_path)
-            .with_context(|| format!("reading main file {}", main_path.display()))?;
-        match diffmodel::classify_content(&main_bytes) {
-            ContentKind::Text(s) => Some(s),
-            _ => None,
-        }
-    };
-    Ok(FileDiff::MainOnly { content })
+    Ok(FileDiff::MainOnly {
+        content: read_created_content(main_path, "main file")?,
+    })
 }
 
 /// Build the two-sided diff view for a file present on both sides.
@@ -747,13 +738,22 @@ fn badge_text(decision: &Decision, status: DiffStatus) -> (String, Color) {
         Decision::Pull => ("← pull from main".to_string(), Color::Cyan),
         Decision::Undecided => ("? undecided".to_string(), Color::Yellow),
         Decision::Merge(_) => ("⇄ merge (assembled)".to_string(), Color::Magenta),
-        Decision::Delete if status == DiffStatus::WorktreeOnly => {
-            ("✗ delete (worktree copy)".to_string(), Color::Red)
-        }
-        Decision::Delete if status == DiffStatus::MainOnly => {
-            ("✗ delete (main copy)".to_string(), Color::Red)
-        }
-        Decision::Delete => ("✗ delete (worktree + main)".to_string(), Color::Red),
+        // The label comes from `delete_target` so the badge names EXACTLY the
+        // sides the batched confirm (`destructive_overwrites`) names.
+        Decision::Delete => (format!("✗ {}", delete_target(status)), Color::Red),
+    }
+}
+
+/// The side(s) a delete removes, as the label shared by [`badge_text`] and
+/// [`App::destructive_overwrites`] so the badge and the batched confirm always
+/// name exactly the same sides — a structural guarantee, not a comment-enforced
+/// one. `WorktreeOnly`/`MainOnly` remove only that side; anything else removes
+/// both.
+fn delete_target(status: DiffStatus) -> &'static str {
+    match status {
+        DiffStatus::WorktreeOnly => "delete (worktree copy)",
+        DiffStatus::MainOnly => "delete (main copy)",
+        _ => "delete (worktree + main)",
     }
 }
 
@@ -1100,6 +1100,18 @@ fn render_split_divider(frame: &mut Frame, area: Rect) {
     );
 }
 
+/// The `50% | divider(1) | 50%` horizontal split shared by `render_split`'s
+/// title and content rows — both use the same source width, so the two divider
+/// segments (chunk `[1]`) line up into one continuous column.
+fn split_thirds(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::horizontal([
+        Constraint::Percentage(50),
+        Constraint::Length(1),
+        Constraint::Percentage(50),
+    ])
+    .split(area)
+}
+
 fn render_split(
     frame: &mut Frame,
     area: Rect,
@@ -1109,12 +1121,7 @@ fn render_split(
     hscroll: u16,
 ) {
     let vchunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
-    let titles = Layout::horizontal([
-        Constraint::Percentage(50),
-        Constraint::Length(1),
-        Constraint::Percentage(50),
-    ])
-    .split(vchunks[0]);
+    let titles = split_thirds(vchunks[0]);
     frame.render_widget(
         Paragraph::new(Line::from(
             "Local file".bold().underlined().fg(Color::Cyan),
@@ -1129,12 +1136,7 @@ fn render_split(
         titles[2],
     );
 
-    let cols = Layout::horizontal([
-        Constraint::Percentage(50),
-        Constraint::Length(1),
-        Constraint::Percentage(50),
-    ])
-    .split(vchunks[1]);
+    let cols = split_thirds(vchunks[1]);
     render_split_divider(frame, cols[1]);
     let rows = diffmodel::side_by_side(local, main, CONTEXT);
     let (left, right) = side_columns(&rows);

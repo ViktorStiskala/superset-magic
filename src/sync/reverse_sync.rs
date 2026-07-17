@@ -379,13 +379,7 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
     // Backups live under a gitignored `.superset/backups/` in the worktree so
     // recovered secret bytes are never committed.
     let ts = apply_timestamp();
-    let backups_root = worktree_root.join(".superset/backups");
-    gitignore::ensure_path_ignored(
-        worktree_root,
-        worktree_root,
-        Path::new(".superset/backups"),
-        PathKind::Dir,
-    )?;
+    let backups_root = backups_root_for(worktree_root, true)?;
 
     let ctx = ApplyContext {
         worktree_root,
@@ -564,15 +558,7 @@ pub fn run_bulk(worktree_root: &Path, main_root: &Path, no_backup: bool) -> Resu
     // Backups of main's overwritten bytes live under MAIN's gitignored
     // `.superset/backups/` — the side this direction overwrites.
     let ts = apply_timestamp();
-    let backups_root = main_root.join(".superset/backups");
-    if !no_backup {
-        gitignore::ensure_path_ignored(
-            main_root,
-            main_root,
-            Path::new(".superset/backups"),
-            PathKind::Dir,
-        )?;
-    }
+    let backups_root = backups_root_for(main_root, !no_backup)?;
 
     let ctx = ApplyContext {
         worktree_root,
@@ -610,17 +596,16 @@ fn backup_if_exists(target: &Path, dest: &Path) -> Result<Option<PathBuf>> {
     if !target.exists() {
         return Ok(None);
     }
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating backup dir {}", parent.display()))?;
-    }
     if target.is_dir() {
+        // `copy_dir_recursive`'s first step is `create_dir_all(dest)`, which
+        // creates `dest` and its parents.
         apply::copy_dir_recursive(target, dest)?;
+        Ok(Some(dest.to_path_buf()))
     } else {
-        fs::copy(target, dest)
-            .with_context(|| format!("backing up {} → {}", target.display(), dest.display()))?;
+        // `backup` does the parent mkdir + `fs::copy` (the file-overwrite site's
+        // proven machinery).
+        Ok(Some(backup(target, dest)?))
     }
-    Ok(Some(dest.to_path_buf()))
 }
 
 /// Back up every existing worktree file/dir that a forward `ss-magic sync`
@@ -636,14 +621,8 @@ pub fn backup_forward_targets(main_root: &Path, cwd_root: &Path, patterns: &[Str
     if matches.is_empty() {
         return Ok(());
     }
-    gitignore::ensure_path_ignored(
-        cwd_root,
-        cwd_root,
-        Path::new(".superset/backups"),
-        PathKind::Dir,
-    )?;
     let ts = apply_timestamp();
-    let backups_root = cwd_root.join(".superset/backups");
+    let backups_root = backups_root_for(cwd_root, true)?;
     let mut backed_up = Vec::new();
     for rel in &matches {
         if under_backups_dir(rel) {
@@ -672,6 +651,21 @@ pub fn backup_forward_targets(main_root: &Path, cwd_root: &Path, patterns: &[Str
         );
     }
     Ok(())
+}
+
+/// Repo-relative path of the tool's per-batch backups tree.
+const BACKUPS_REL: &str = ".superset/backups";
+
+/// The backups root under `root`, first ensuring it is gitignored at the closest
+/// `.gitignore` when `ensure_ignore` is set (skipped when `--no-backup` disables
+/// backups — there is nothing to hide). The single place the `.superset/backups`
+/// path + its ignore rule are wired, shared by the cockpit [`run`], the direct
+/// [`run_bulk`], and the forward [`backup_forward_targets`].
+fn backups_root_for(root: &Path, ensure_ignore: bool) -> Result<PathBuf> {
+    if ensure_ignore {
+        gitignore::ensure_path_ignored(root, root, Path::new(BACKUPS_REL), PathKind::Dir)?;
+    }
+    Ok(root.join(BACKUPS_REL))
 }
 
 /// Timestamp string for a batch of backups: the current UTC time as a
