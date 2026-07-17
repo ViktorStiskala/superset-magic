@@ -18,6 +18,38 @@ fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
     s
 }
 
+/// The foreground color carried by the first span of `line` that sets one — for
+/// asserting per-row diff colors without the event loop.
+fn line_fg(line: &Line) -> Option<Color> {
+    line.spans.iter().find_map(|s| s.style.fg)
+}
+
+/// True when some rendered cell shows `sym` with foreground `fg` (`Cell.fg` is a
+/// plain `Color`, defaulting to `Color::Reset` for unstyled cells).
+fn any_cell_is(terminal: &Terminal<TestBackend>, sym: &str, fg: Color) -> bool {
+    !cell_columns(terminal, sym, fg).is_empty()
+}
+
+/// The x column of every `sym`/`fg` cell (one entry per matching cell, sorted,
+/// NOT deduped) — the caller derives both the cell count and the set of unique
+/// columns, e.g. to assert the split divider is one continuous vertical rule.
+fn cell_columns(terminal: &Terminal<TestBackend>, sym: &str, fg: Color) -> Vec<u16> {
+    let buf = terminal.backend().buffer();
+    let area = buf.area();
+    let mut xs = Vec::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            if let Some(cell) = buf.cell((x, y)) {
+                if cell.symbol() == sym && cell.fg == fg {
+                    xs.push(x);
+                }
+            }
+        }
+    }
+    xs.sort_unstable();
+    xs
+}
+
 fn entry(rel: &str, status: DiffStatus, decision: Decision, diff: FileDiff) -> FileEntry {
     FileEntry {
         rel: PathBuf::from(rel),
@@ -627,8 +659,9 @@ fn handle_key_plu_set_focused_decision() {
     assert!(matches!(app.files[0].decision, Decision::Undecided));
 }
 
-/// Confirm mode: `n` and `Esc` return to Normal without applying; `y` yields
-/// `Apply` carrying the decided files.
+/// Confirm mode: `Esc` returns to Normal without applying; `Enter` yields
+/// `Apply` carrying the decided files; the old `y`/`n` keys are no longer bound
+/// (they are inert no-ops that leave the confirm open).
 #[test]
 fn handle_key_confirm_mode_flow() {
     let mut app = app_with(vec![entry(
@@ -641,16 +674,20 @@ fn handle_key_confirm_mode_flow() {
         },
     )]);
 
+    // y/n are no longer bound: they are no-ops and the confirm stays open.
     app.mode = Mode::Confirm;
+    assert_eq!(handle_key(&mut app, KeyCode::Char('y'), 10), None);
+    assert_eq!(app.mode, Mode::Confirm, "y is inert, confirm stays open");
     assert_eq!(handle_key(&mut app, KeyCode::Char('n'), 10), None);
-    assert_eq!(app.mode, Mode::Normal, "n returns to Normal");
+    assert_eq!(app.mode, Mode::Confirm, "n is inert, confirm stays open");
 
-    app.mode = Mode::Confirm;
+    // Esc backs out to Normal without applying.
     assert_eq!(handle_key(&mut app, KeyCode::Esc, 10), None);
     assert_eq!(app.mode, Mode::Normal, "Esc returns to Normal");
 
+    // Enter applies, carrying the decided files.
     app.mode = Mode::Confirm;
-    match handle_key(&mut app, KeyCode::Char('y'), 10) {
+    match handle_key(&mut app, KeyCode::Enter, 10) {
         Some(CockpitOutcome::Apply(d)) => {
             assert_eq!(d.len(), 1, "one decided file");
             assert_eq!(d[0].0, PathBuf::from("diff.env"));
@@ -843,8 +880,8 @@ fn confirm_overlay_renders_delete_labels_and_clean_case() {
 }
 
 /// A destructive list too long for the terminal truncates with an EXPLICIT
-/// "… and N more" marker — never silently — and the count and y/n prompt stay
-/// visible, even at 80×20.
+/// "… and N more" marker — never silently — and the count and Enter/Esc prompt
+/// stay visible, even at 80×20.
 #[test]
 fn confirm_overlay_truncates_long_lists_with_explicit_marker() {
     let files: Vec<FileEntry> = (0..20)
@@ -876,7 +913,10 @@ fn confirm_overlay_truncates_long_lists_with_explicit_marker() {
         out.contains("20 file(s) will be written."),
         "count must stay visible:\n{out}"
     );
-    assert!(out.contains("y = apply"), "prompt must stay visible:\n{out}");
+    assert!(
+        out.contains("Enter = apply"),
+        "prompt must stay visible:\n{out}"
+    );
 }
 
 /// Merge mode: `Esc` cancels the overlay, leaving the file's decision unchanged.
@@ -924,4 +964,245 @@ fn unreadable_main_disables_merge() {
     // The notice renders in the diff pane.
     let out = buffer_text(&render(&app, 120, 30));
     assert!(out.contains("main unreadable"), "unreadable notice missing:\n{out}");
+}
+
+// ── Task 1: file-list wrapping ────────────────────────────────────────────
+
+/// A path that fits the pane width is a single chunk (no spurious extra line).
+#[test]
+fn wrap_hard_returns_one_chunk_when_it_fits() {
+    assert_eq!(wrap_hard("short.env", 26), vec!["short.env".to_string()]);
+}
+
+/// A long, whitespace-free path hard-wraps at the char width (47 chars → 26+21).
+#[test]
+fn wrap_hard_splits_long_token_at_char_width() {
+    assert_eq!(
+        wrap_hard("services/billing/invoice-templates/monthly.tmpl", 26),
+        vec![
+            "services/billing/invoice-t".to_string(),
+            "emplates/monthly.tmpl".to_string(),
+        ]
+    );
+}
+
+/// Empty string → one blank line (stable min height); width 0 → one char per
+/// chunk instead of panicking on `chunks(0)`.
+#[test]
+fn wrap_hard_handles_empty_string_and_zero_width() {
+    assert_eq!(wrap_hard("", 10), vec![String::new()]);
+    assert_eq!(
+        wrap_hard("abc", 0),
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
+}
+
+/// The file-list content width is the pane width minus the border (2) and the
+/// reserved highlight symbol (2).
+#[test]
+fn file_list_content_width_subtracts_border_and_highlight_symbol() {
+    assert_eq!(file_list_content_width(Rect::new(0, 0, 30, 30)), 26);
+    assert_eq!(file_list_content_width(Rect::new(0, 0, 46, 30)), 42);
+    // Underflow saturates to 0, never wraps around.
+    assert_eq!(file_list_content_width(Rect::new(0, 0, 2, 30)), 0);
+}
+
+/// A long path in a narrow Files pane wraps across rows instead of clipping —
+/// both halves of the split path are present in the rendered buffer.
+#[test]
+fn narrow_pane_file_list_wraps_long_path_instead_of_clipping() {
+    let files = vec![entry(
+        "services/billing/invoice-templates/monthly.tmpl",
+        DiffStatus::WorktreeOnly,
+        Decision::Push,
+        FileDiff::New { content: None },
+    )];
+    let out = buffer_text(&render(&app_with(files), 80, 30));
+    assert!(
+        out.contains("services/billing/invoice-t"),
+        "first wrapped chunk missing:\n{out}"
+    );
+    assert!(
+        out.contains("emplates/monthly.tmpl"),
+        "second wrapped chunk missing:\n{out}"
+    );
+}
+
+// ── Task 2: split divider + local-green / main-red recolor ────────────────
+
+fn seg1(text: &str) -> Vec<diffmodel::Seg> {
+    vec![diffmodel::Seg {
+        text: text.to_string(),
+        emphasized: false,
+    }]
+}
+
+/// side_columns colors a local-only line (Delete) green on the left, a main-only
+/// line (Insert) red on the right, and a Replace row green-left / red-right —
+/// the main = base, local = working copy model.
+#[test]
+fn side_columns_colors_local_green_and_main_red() {
+    let rows = vec![
+        DiffRow {
+            left_no: Some(1),
+            left: seg1("local_add"),
+            right_no: None,
+            right: Vec::new(),
+            tag: RowTag::Delete,
+        },
+        DiffRow {
+            left_no: None,
+            left: Vec::new(),
+            right_no: Some(1),
+            right: seg1("main_add"),
+            tag: RowTag::Insert,
+        },
+        DiffRow {
+            left_no: Some(2),
+            left: seg1("L"),
+            right_no: Some(2),
+            right: seg1("M"),
+            tag: RowTag::Replace,
+        },
+    ];
+    let (left, right) = side_columns(&rows);
+    assert_eq!(line_fg(&left.content[0]), Some(Color::Green), "local-only green");
+    assert_eq!(line_fg(&right.content[1]), Some(Color::Red), "main-only red");
+    assert_eq!(line_fg(&left.content[2]), Some(Color::Green), "replace local green");
+    assert_eq!(line_fg(&right.content[2]), Some(Color::Red), "replace main red");
+}
+
+/// The unified view (narrow pane) colors a local addition `+` green and a
+/// main-side line `-` red, matching the split view.
+#[test]
+fn unified_view_signs_and_colors_follow_local_addition_convention() {
+    let files = vec![entry(
+        "config.local.json",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Text {
+            local: "a\nLOCAL_ONLY\nc\n".to_string(),
+            main: "a\nMAIN_ONLY\nc\n".to_string(),
+        },
+    )];
+    let t = render(&app_with(files), 80, 30);
+    assert!(any_cell_is(&t, "+", Color::Green), "local addition '+' must be green");
+    assert!(any_cell_is(&t, "-", Color::Red), "main-side '-' must be red");
+}
+
+/// After the `unified(main, local)` arg-swap, the gutter still prints the LOCAL
+/// line number before the main one (only sign/color meaning flipped).
+#[test]
+fn render_unified_keeps_local_number_column_first_after_arg_swap() {
+    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            render_unified(
+                frame,
+                area,
+                "L1\ncommon1\ncommon2\ncommon3\n",
+                "common1\ncommon2\ncommon3\n",
+                0,
+                0,
+            );
+        })
+        .unwrap();
+    let out = buffer_text(&terminal);
+    // common1 is local line 2, main line 1 → gutter "   2    1" (local first).
+    assert!(
+        out.contains("   2    1"),
+        "local number must print before main number:\n{out}"
+    );
+}
+
+/// The split view draws one continuous faint (DarkGray) vertical divider between
+/// the Local and Main columns.
+#[test]
+fn split_view_renders_divider_between_local_and_main_columns() {
+    let files = vec![entry(
+        "config.local.json",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Text {
+            local: "a\nb\nc\n".to_string(),
+            main: "a\nB\nc\n".to_string(),
+        },
+    )];
+    let t = render(&app_with(files), 200, 30);
+    let cols = cell_columns(&t, "│", Color::DarkGray);
+    assert!(cols.len() >= 2, "expected a multi-row divider, got {cols:?}");
+    let mut unique = cols.clone();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        1,
+        "divider must be one continuous column, got columns {unique:?}"
+    );
+}
+
+// ── Task 4: new-file view header + numbered gutter ────────────────────────
+
+/// A worktree-only file shows the green header notice and 1-based numbered `+`
+/// content rows (line numbers in a fixed gutter).
+#[test]
+fn new_file_view_shows_header_and_numbered_gutter() {
+    let files = vec![entry(
+        "apps/api/.env",
+        DiffStatus::WorktreeOnly,
+        Decision::Push,
+        FileDiff::New {
+            content: Some("FIRST=1\nSECOND=2\n".to_string()),
+        },
+    )];
+    let out = buffer_text(&render(&app_with(files), 120, 24));
+    assert!(
+        out.contains("new file — will be created in main"),
+        "green header notice missing:\n{out}"
+    );
+    assert!(out.contains("1 + FIRST=1"), "numbered first line missing:\n{out}");
+    assert!(out.contains("2 + SECOND=2"), "numbered second line missing:\n{out}");
+}
+
+/// A binary/oversized new file (content `None`) still shows the header, then the
+/// placeholder instead of a numbered gutter.
+#[test]
+fn new_file_view_without_content_shows_placeholder_not_gutter() {
+    let files = vec![entry(
+        "apps/api/blob.bin",
+        DiffStatus::WorktreeOnly,
+        Decision::Push,
+        FileDiff::New { content: None },
+    )];
+    let out = buffer_text(&render(&app_with(files), 120, 24));
+    assert!(
+        out.contains("new file — will be created in main"),
+        "green header notice missing:\n{out}"
+    );
+    assert!(
+        out.contains("(binary or oversized new file — content not shown)"),
+        "placeholder missing:\n{out}"
+    );
+}
+
+/// diff_line_count for a new file counts only the numbered content rows (the
+/// header row is fixed, not scrolled); a content-less new file is 1.
+#[test]
+fn diff_line_count_new_file_excludes_header_rows() {
+    let with_content = entry(
+        "a.env",
+        DiffStatus::WorktreeOnly,
+        Decision::Push,
+        FileDiff::New {
+            content: Some("a\nb\n".to_string()),
+        },
+    );
+    assert_eq!(diff_line_count(&with_content), 2);
+    let no_content = entry(
+        "b.bin",
+        DiffStatus::WorktreeOnly,
+        Decision::Push,
+        FileDiff::New { content: None },
+    );
+    assert_eq!(diff_line_count(&no_content), 1);
 }

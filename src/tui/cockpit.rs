@@ -40,7 +40,7 @@ use ratatui::crossterm::ExecutableCommand;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::sync::merge::{
@@ -60,6 +60,12 @@ const H_SCROLL_STEP: u16 = 8;
 /// (`"%4d %4d "`) plus the 2-column `± ` sign — fixed while the content
 /// scrolls horizontally.
 const UNIFIED_GUTTER: u16 = 12;
+
+/// New-file view gutter width: one 4-wide line number + a separator space
+/// (`"%4d "` → 5) plus the 2-column `+ ` sign — fixed while the content scrolls
+/// horizontally, mirroring [`UNIFIED_GUTTER`] for the single "everything is an
+/// addition" column of a worktree-only file.
+const NEW_GUTTER: u16 = 7;
 
 /// Diff-pane notice for a file whose sides are equal AFTER EOL normalization:
 /// the bytes differ, but only by line endings / trailing newline.
@@ -609,13 +615,59 @@ fn format_mtime(path: &Path) -> String {
 /// A generous line-count bound for the focused file's diff (scroll clamp only).
 fn diff_line_count(f: &FileEntry) -> usize {
     match &f.diff {
+        // Argument order is left `(local, main)` (unlike `render_unified`'s
+        // swapped `(main, local)`): this is only a row/fold count for the scroll
+        // clamp, and that count is symmetric under the swap.
         FileDiff::Text { local, main } => diffmodel::unified(local, main, CONTEXT).len() + 1,
-        FileDiff::New { content } => content.as_ref().map(|c| c.lines().count()).unwrap_or(0) + 2,
+        // The green notice now lives in a fixed header row outside the scrollable
+        // body (see `render_new`), so only the numbered content lines count.
+        FileDiff::New { content } => content.as_ref().map(|c| c.lines().count()).unwrap_or(1),
         FileDiff::Binary { .. } | FileDiff::TooLarge { .. } | FileDiff::Unreadable { .. } => 1,
     }
 }
 
 // ── Pure helpers (unit-tested) ────────────────────────────────────────────
+
+/// The literal handed to [`List::highlight_symbol`] in [`render_file_list`] —
+/// named so its column count is documented in one place.
+const HIGHLIGHT_SYMBOL: &str = "› ";
+
+/// Columns `List` reserves as a left prefix on EVERY row once the list has a
+/// selection. [`render_file_list`] always selects a row, so this budget is
+/// always in effect (the symbol is `"› "` — two columns).
+const HIGHLIGHT_SYMBOL_WIDTH: u16 = 2;
+
+/// The file-list `Block::bordered()` LEFT+RIGHT border columns (1 each) — the
+/// other half of the file-list content-width budget.
+const LIST_BORDER_WIDTH: u16 = 2;
+
+/// The file-list pane's TEXT-content width for a given OUTER pane rect (the same
+/// rect [`render_file_list`] hands to `List`). The border and the reserved
+/// highlight-symbol prefix are the only things between the pane edge and the
+/// text, so the subtraction is exact.
+fn file_list_content_width(area: Rect) -> u16 {
+    area.width
+        .saturating_sub(LIST_BORDER_WIDTH)
+        .saturating_sub(HIGHLIGHT_SYMBOL_WIDTH)
+}
+
+/// Hard-wrap `s` into chunks of at most `width` characters, breaking at char
+/// boundaries. A repo-relative path is one whitespace-free token, so word-wrap
+/// would degenerate to the same clip this fixes; char-count width matches the
+/// approximation [`max_content_width`] already documents ("a bound/hint, never a
+/// layout") and repo paths are overwhelmingly ASCII, so a Unicode-width
+/// dependency is not worth adding for one row. Returns `[""]` for empty `s` (so
+/// a wrapped path always contributes at least one line, never an empty `Vec`);
+/// `width == 0` degenerates to one char per chunk rather than panicking on
+/// `chunks(0)`.
+fn wrap_hard(s: &str, width: u16) -> Vec<String> {
+    if s.is_empty() {
+        return vec![String::new()];
+    }
+    let width = width.max(1) as usize;
+    let chars: Vec<char> = s.chars().collect();
+    chars.chunks(width).map(|c| c.iter().collect()).collect()
+}
 
 /// Whether the diff PANE (not the whole frame) is wide enough for the two-column
 /// split (R7). The argument is the diff pane's inner width — the width that
@@ -709,33 +761,51 @@ fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn render_file_list(frame: &mut Frame, area: Rect, app: &App) {
-    let items: Vec<ListItem> = app.files.iter().map(file_list_item).collect();
+    // Compute the text-content width once (border + reserved highlight symbol)
+    // and thread it into every row so long paths wrap instead of clipping.
+    let content_width = file_list_content_width(area);
+    let items: Vec<ListItem> = app
+        .files
+        .iter()
+        .map(|f| file_list_item(f, content_width))
+        .collect();
     let list = List::new(items)
         .block(Block::bordered().title(Line::from(" Files ".bold())))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("› ");
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let mut state = ListState::default();
     state.select(Some(app.focused.min(app.files.len().saturating_sub(1))));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn file_list_item(f: &FileEntry) -> ListItem<'static> {
+/// One file's row: badge + status tag (line 1), the WRAPPED repo-relative path
+/// (one or more lines — hard-wrapped at `content_width`, since `List` clips
+/// rather than wraps), then the mtime-hint label and its value on their own
+/// lines. Previously the badge, path, and status shared one line with the mtime
+/// on a second, so any path longer than the pane had its tail silently clipped.
+fn file_list_item(f: &FileEntry, content_width: u16) -> ListItem<'static> {
     let (badge, color) = badge_text(&f.decision, f.status);
     let line1 = Line::from(vec![
         Span::styled(badge, Style::new().fg(color).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::raw(f.rel.display().to_string()),
-        Span::raw("  "),
         status_tag(f.status),
     ]);
-    let line2 = Line::from(Span::styled(
-        format!(
-            "   mtime hint (unreliable): local {} · main {}",
-            f.mtime_local, f.mtime_main
-        ),
+
+    let mut lines = vec![line1];
+    lines.extend(
+        wrap_hard(&f.rel.display().to_string(), content_width)
+            .into_iter()
+            .map(Line::from),
+    );
+    lines.push(Line::from(Span::styled(
+        "   mtime hint (unreliable):",
         Style::new().fg(Color::DarkGray),
-    ));
-    ListItem::new(vec![line1, line2])
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("   local {} · main {}", f.mtime_local, f.mtime_main),
+        Style::new().fg(Color::DarkGray),
+    )));
+    ListItem::new(lines)
 }
 
 fn status_tag(status: DiffStatus) -> Span<'static> {
@@ -814,38 +884,63 @@ fn max_content_width(diff: &FileDiff) -> usize {
 /// shows for `diff` at the pane's `inner_width`.
 fn visible_content_width(diff: &FileDiff, split: bool, inner_width: u16) -> u16 {
     match diff {
+        // One shared column goes to the Local/Main divider (render_split_divider);
+        // subtract it before halving so this hint never overestimates a column's
+        // real width (still an approximation, per max_content_width's note).
         FileDiff::Text { .. } if split => {
-            (inner_width / 2).saturating_sub(diffmodel::SPLIT_GUTTER)
+            (inner_width.saturating_sub(1) / 2).saturating_sub(diffmodel::SPLIT_GUTTER)
         }
         FileDiff::Text { .. } => inner_width.saturating_sub(UNIFIED_GUTTER),
-        // The `+ ` prefix scrolls with the content in the new-file view.
+        // The line number + `+ ` sign now live in a fixed gutter (see render_new).
+        FileDiff::New { .. } => inner_width.saturating_sub(NEW_GUTTER),
         _ => inner_width,
     }
 }
 
+/// Render the new-file view: a fixed green header row (mirroring `render_split`'s
+/// `Length(1)` title row — and, unlike before, NEVER part of the scrollable body,
+/// which is why `visible_content_width`/`diff_line_count` no longer count it),
+/// then the content as 1-based numbered `+` rows behind the same fixed-gutter
+/// primitive the text-diff views use (`render_gutter_and_content`), so the line
+/// numbers + `+` sign stay put while the content scrolls horizontally.
 fn render_new(frame: &mut Frame, area: Rect, content: Option<&str>, scroll: u16, hscroll: u16) {
-    let mut lines = vec![
-        Line::from(Span::styled(
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
             "new file — will be created in main",
             Style::new().fg(Color::Green).add_modifier(Modifier::ITALIC),
-        )),
-        Line::from(""),
-    ];
+        ))),
+        chunks[0],
+    );
     match content {
         Some(text) => {
-            for l in text.lines() {
+            let mut nums: Vec<Line> = Vec::with_capacity(text.lines().count());
+            let mut lines: Vec<Line> = Vec::with_capacity(text.lines().count());
+            for (i, l) in text.lines().enumerate() {
+                nums.push(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", num(Some(i + 1))),
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                    Span::styled("+ ", Style::new().fg(Color::Green)),
+                ]));
                 lines.push(Line::from(Span::styled(
-                    format!("+ {l}"),
+                    l.to_string(),
                     Style::new().fg(Color::Green),
                 )));
             }
+            render_gutter_and_content(frame, chunks[1], NEW_GUTTER, nums, lines, scroll, hscroll);
         }
-        None => lines.push(Line::from(Span::styled(
-            "(binary or oversized new file — content not shown)",
-            Style::new().fg(Color::DarkGray),
-        ))),
+        // Inert scroll kept for symmetry with the Some arm (max_scroll is 1 here).
+        None => frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "(binary or oversized new file — content not shown)",
+                Style::new().fg(Color::DarkGray),
+            )))
+            .scroll((scroll, hscroll)),
+            chunks[1],
+        ),
     }
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, hscroll)), area);
 }
 
 fn render_notice(frame: &mut Frame, area: Rect, note: &str) {
@@ -857,8 +952,17 @@ fn render_notice(frame: &mut Frame, area: Rect, note: &str) {
     );
 }
 
+/// Render the unified (single-column) diff. [`diffmodel::unified`] is called
+/// `(main, local)` — main as "old", local as "new" — so the sign/color pairing
+/// stays the conventional `-` red / `+` green: a `-` row is "present in main,
+/// missing locally" and a `+` row is "a local addition" (main = base, local =
+/// working copy, matching the split view's coloring). This is the OPPOSITE
+/// argument order from every other `unified`/`side_by_side` caller, so
+/// `row.old_no`/`row.new_no` now carry main's/local's numbers — bound to
+/// `main_no`/`local_no` and printed local-first so the gutter's VISIBLE column
+/// order is unchanged; only the sign/color meaning flips.
 fn render_unified(frame: &mut Frame, area: Rect, local: &str, main: &str, scroll: u16, hscroll: u16) {
-    let rows = diffmodel::unified(local, main, CONTEXT);
+    let rows = diffmodel::unified(main, local, CONTEXT);
     let mut nums: Vec<Line> = Vec::with_capacity(rows.len());
     let mut content: Vec<Line> = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -868,14 +972,15 @@ fn render_unified(frame: &mut Frame, area: Rect, local: &str, main: &str, scroll
             continue;
         }
         let (sign, color) = match row.tag {
-            UnifiedTag::Delete => ("-", Some(Color::Red)),
-            UnifiedTag::Insert => ("+", Some(Color::Green)),
+            UnifiedTag::Delete => ("-", Some(Color::Red)), // main-only: missing locally
+            UnifiedTag::Insert => ("+", Some(Color::Green)), // local-only: a local addition
             UnifiedTag::Context => (" ", None),
             UnifiedTag::Fold(_) => unreachable!("handled above"),
         };
+        let (local_no, main_no) = (row.new_no, row.old_no);
         nums.push(Line::from(vec![
             Span::styled(
-                format!("{} {} ", num(row.old_no), num(row.new_no)),
+                format!("{} {} ", num(local_no), num(main_no)),
                 Style::new().fg(Color::DarkGray),
             ),
             Span::styled(format!("{sign} "), style_of(color, false)),
@@ -887,6 +992,20 @@ fn render_unified(frame: &mut Frame, area: Rect, local: &str, main: &str, scroll
     render_gutter_and_content(frame, area, UNIFIED_GUTTER, nums, content, scroll, hscroll);
 }
 
+/// A faint (DarkGray) vertical rule between the split view's Local/Main columns.
+/// Rendered once into the title row's 1-col chunk and once into the content
+/// row's 1-col chunk — both of `render_split`'s horizontal splits share the same
+/// source width (only the vertical split changes `y`), so the two segments line
+/// up into one continuous divider.
+fn render_split_divider(frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Block::new()
+            .borders(Borders::LEFT)
+            .border_style(Style::new().fg(Color::DarkGray)),
+        area,
+    );
+}
+
 fn render_split(
     frame: &mut Frame,
     area: Rect,
@@ -896,26 +1015,36 @@ fn render_split(
     hscroll: u16,
 ) {
     let vchunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
-    let titles = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(vchunks[0]);
+    let titles = Layout::horizontal([
+        Constraint::Percentage(50),
+        Constraint::Length(1),
+        Constraint::Percentage(50),
+    ])
+    .split(vchunks[0]);
     frame.render_widget(
         Paragraph::new(Line::from(
             "Local file".bold().underlined().fg(Color::Cyan),
         )),
         titles[0],
     );
+    render_split_divider(frame, titles[1]);
     frame.render_widget(
         Paragraph::new(Line::from(
             "Main branch".bold().underlined().fg(Color::Cyan),
         )),
-        titles[1],
+        titles[2],
     );
 
-    let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(vchunks[1]);
+    let cols = Layout::horizontal([
+        Constraint::Percentage(50),
+        Constraint::Length(1),
+        Constraint::Percentage(50),
+    ])
+    .split(vchunks[1]);
+    render_split_divider(frame, cols[1]);
     let rows = diffmodel::side_by_side(local, main, CONTEXT);
     let (left, right) = side_columns(&rows);
-    for (area, side) in [(cols[0], left), (cols[1], right)] {
+    for (area, side) in [(cols[0], left), (cols[2], right)] {
         render_gutter_and_content(
             frame,
             area,
@@ -970,12 +1099,18 @@ fn side_columns(rows: &[DiffRow]) -> (SideColumns, SideColumns) {
             }
             continue;
         }
+        // Colors follow the mental model main = base, local = working copy: a
+        // line only in local (`RowTag::Delete` — local is `side_by_side`'s
+        // "old"/left side) is a LOCAL ADDITION and renders GREEN; a line only in
+        // main (`RowTag::Insert`) is MISSING locally and renders RED. A
+        // `Replace` row colors each side by the same rule — local's version
+        // green, main's version red.
         let left_color = match row.tag {
-            RowTag::Delete | RowTag::Replace => Some(Color::Red),
+            RowTag::Delete | RowTag::Replace => Some(Color::Green),
             _ => None,
         };
         let right_color = match row.tag {
-            RowTag::Insert | RowTag::Replace => Some(Color::Green),
+            RowTag::Insert | RowTag::Replace => Some(Color::Red),
             _ => None,
         };
         push_side_cell(&mut left, row.left_no, &row.left, left_color);
@@ -1088,7 +1223,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  Enter / Esc        accept (written to BOTH sides) / cancel"),
         Line::from(""),
         Line::from("Apply & safety".bold()),
-        Line::from("  Enter              review & apply (one batched confirm, default No)"),
+        Line::from("  Enter              review & apply (one batched confirm)"),
         Line::from("  Esc                cancel — nothing written · ? toggles this help"),
         Line::from(Span::styled(
             "  Backups first: .superset/backups/<timestamp>/ (10 newest kept)",
@@ -1169,9 +1304,7 @@ fn render_confirm(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(format!("{decided} file(s) will be written.")));
     lines.push(Line::from(""));
-    lines.push(Line::from(
-        "y = apply · n / Esc = back (default: No)".bold(),
-    ));
+    lines.push(Line::from("Enter = apply · Esc = back".bold()));
 
     let w = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 2;
     let h = lines.len() as u16 + 2;
@@ -1402,8 +1535,11 @@ fn handle_key(app: &mut App, code: KeyCode, page: u16) -> Option<CockpitOutcome>
             None
         }
         Mode::Confirm => match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => Some(CockpitOutcome::Apply(app.decisions())),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            // Enter applies (Normal-mode Enter opened this confirm, so the full
+            // accept path is Enter → Enter); Esc backs out; every other key is a
+            // no-op. y/n were dropped so every bound key is an explicit action.
+            KeyCode::Enter => Some(CockpitOutcome::Apply(app.decisions())),
+            KeyCode::Esc => {
                 app.mode = Mode::Normal;
                 None
             }

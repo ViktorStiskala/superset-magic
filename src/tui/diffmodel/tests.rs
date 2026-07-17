@@ -170,6 +170,19 @@ fn should_split_thresholds() {
     assert!(!should_split(SPLIT_MIN_PANE_WIDTH - 1));
 }
 
+/// At the split threshold, the smaller 50% column still keeps its content
+/// minimum (`MIN_SPLIT_COL` + `SPLIT_GUTTER`) AFTER the shared divider column is
+/// subtracted — the `+ 1` in `SPLIT_MIN_PANE_WIDTH` reserves that column.
+#[test]
+fn split_pane_reserves_divider_column_at_threshold() {
+    let per_column = (SPLIT_MIN_PANE_WIDTH - 1) / 2;
+    assert!(
+        per_column >= MIN_SPLIT_COL + SPLIT_GUTTER,
+        "each split column must keep {} content+gutter cols after the divider; got {per_column}",
+        MIN_SPLIT_COL + SPLIT_GUTTER
+    );
+}
+
 /// Two CRLF-identical buffers produce only equal/context rows and leave NO
 /// stray `\r` in any rendered segment (the full terminator is trimmed, so CRLF
 /// text neither shows a control char nor registers as changed).

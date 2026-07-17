@@ -99,6 +99,12 @@ pub struct Seg {
 }
 
 /// The role of a side-by-side row.
+///
+/// Naming is relative to the diff call's `(old, new)` argument order, NOT to how
+/// [`crate::tui::cockpit`] colors the row: the cockpit treats main as the base
+/// and local as the working copy, so a [`RowTag::Delete`] (local-only) row
+/// renders GREEN and a [`RowTag::Insert`] (main-only) row renders RED — see
+/// `tui::cockpit::side_columns`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowTag {
     /// Unchanged line, present identically on both sides.
@@ -133,6 +139,12 @@ pub struct DiffRow {
 }
 
 /// The role of a unified (single-column) row.
+///
+/// As with [`RowTag`], the Delete/Insert naming is relative to the diff call's
+/// `(old, new)` order, not to the cockpit's coloring. `tui::cockpit::render_unified`
+/// calls [`unified`] as `(main, local)`, so a [`UnifiedTag::Delete`] row is
+/// "present in main, missing locally" (rendered `-` RED) and a
+/// [`UnifiedTag::Insert`] row is "a local addition" (rendered `+` GREEN).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnifiedTag {
     /// Unchanged context line.
@@ -168,10 +180,14 @@ pub const SPLIT_GUTTER: u16 = 5;
 
 /// Minimum diff-*pane inner* width (inside its border) at which a legible
 /// two-column split fits: each of the two 50% columns must hold the line-number
-/// gutter plus [`MIN_SPLIT_COL`] content columns. This is the DIFF PANE's inner
-/// width, NOT the terminal's — the pane is only a fraction of the frame, so
-/// testing the frame width would render two illegibly narrow columns.
-const SPLIT_MIN_PANE_WIDTH: u16 = 2 * (MIN_SPLIT_COL + SPLIT_GUTTER);
+/// gutter plus [`MIN_SPLIT_COL`] content columns, PLUS one shared column for the
+/// faint vertical divider `tui::cockpit` draws between the Local/Main columns
+/// (`render_split_divider`). Without the `+ 1` the smaller of the two 50%
+/// columns would fall one content column below the minimum right at the boundary
+/// width. This is the DIFF PANE's inner width, NOT the terminal's — the pane is
+/// only a fraction of the frame, so testing the frame width would render two
+/// illegibly narrow columns.
+const SPLIT_MIN_PANE_WIDTH: u16 = 2 * (MIN_SPLIT_COL + SPLIT_GUTTER) + 1;
 
 /// True when the diff pane is wide enough for a two-column side-by-side diff;
 /// below [`SPLIT_MIN_PANE_WIDTH`] the caller should fall back to [`unified`].
