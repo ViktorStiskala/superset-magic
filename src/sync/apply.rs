@@ -292,7 +292,9 @@ fn is_excluded(rel: &Path) -> bool {
     })
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// Recursively copy `src` into `dst`. Crate-visible so the reverse-sync backup
+/// pass can back up a directory target before a forward sync overwrites it.
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst).with_context(|| format!("mkdir -p {}", dst.display()))?;
     for entry in WalkDir::new(src).follow_links(false) {
         let entry = entry?;

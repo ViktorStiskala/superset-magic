@@ -235,9 +235,15 @@ where
     //    drop any match that resolves to the repo root itself (a `.` pattern):
     //    `append_dir_all(".", root)` would walk the whole tree live — including
     //    the in-progress temp archive and `.git` — corrupting the archive and
-    //    bypassing the self-exclusion guard.
+    //    bypassing the self-exclusion guard. And drop anything under the tool's
+    //    own `.superset/backups/` tree so a recovered secret copy is never
+    //    packed back into an archive.
     let file_name = archive_file_name(&root);
-    rels.retain(|r| !is_pack_archive_rel(r) && !is_repo_root_rel(r));
+    rels.retain(|r| {
+        !is_pack_archive_rel(r)
+            && !is_repo_root_rel(r)
+            && !crate::sync::reverse_sync::under_backups_dir(r)
+    });
 
     // 7. Nothing left to archive after filtering → success, no archive written.
     if rels.is_empty() {

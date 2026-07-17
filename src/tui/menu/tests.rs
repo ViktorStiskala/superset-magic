@@ -2,32 +2,28 @@ use super::*;
 
 // ── operations_for: location gating ──────────────────────────────────────
 
-/// Worktree always gets ForwardSync + ReverseSync + Pack, regardless of the
-/// branch value passed (branch is irrelevant for a worktree).
+/// Worktree always gets the unified Sync + Pack, regardless of the branch value
+/// passed (branch is irrelevant for a worktree).
 #[test]
-fn worktree_ops_are_forward_and_reverse_sync_and_pack() {
+fn worktree_ops_are_sync_and_pack() {
     for branch in [Branch::Init, Branch::Migrate, Branch::Normal] {
         let ops = operations_for(Location::Worktree, branch);
         assert_eq!(
             ops,
-            vec![MenuOp::ForwardSync, MenuOp::ReverseSync, MenuOp::Pack],
-            "worktree branch={branch:?} must offer ForwardSync + ReverseSync + Pack"
+            vec![MenuOp::Sync, MenuOp::Pack],
+            "worktree branch={branch:?} must offer Sync + Pack"
         );
     }
 }
 
-/// Main checkout never offers ForwardSync or ReverseSync.
+/// Main checkout never offers the worktree-only unified Sync.
 #[test]
 fn main_checkout_ops_never_include_worktree_ops() {
     for branch in [Branch::Init, Branch::Migrate, Branch::Normal] {
         let ops = operations_for(Location::Main, branch);
         assert!(
-            !ops.contains(&MenuOp::ForwardSync),
-            "main checkout must not offer ForwardSync; branch={branch:?}"
-        );
-        assert!(
-            !ops.contains(&MenuOp::ReverseSync),
-            "main checkout must not offer ReverseSync; branch={branch:?}"
+            !ops.contains(&MenuOp::Sync),
+            "main checkout must not offer Sync; branch={branch:?}"
         );
     }
 }

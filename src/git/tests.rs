@@ -165,3 +165,54 @@ fn parse_check_ignore_line_handles_negation_and_empty() {
     );
     assert_eq!(parse_check_ignore_line(""), None);
 }
+
+// ── Unified sync (Task 5) ────────────────────────────────────────────────
+
+/// `is_ignored_str` on a directory-shaped query (trailing slash) matches a
+/// `foo/bar/` gitignore rule even though `foo/bar` does not exist on disk yet
+/// — the whole point of the raw-pathname variant over `is_ignored`, which can
+/// only query paths that already exist. The no-slash query for the same
+/// (still-absent) path is treated as a file and MISSES the directory rule.
+#[test]
+fn is_ignored_str_dir_trailing_slash_matches_before_dir_exists() {
+    let dir = init_repo("main");
+    let root = dir.path();
+    write(root, ".gitignore", "foo/bar/\n");
+    // `foo/bar` does not exist on disk at all.
+    assert!(
+        is_ignored_str(root, "foo/bar/").unwrap(),
+        "trailing-slash query must match the dir rule before the dir exists"
+    );
+    assert!(
+        !is_ignored_str(root, "foo/bar").unwrap(),
+        "no-slash query on an absent path must NOT match a directory-only rule"
+    );
+}
+
+/// `tracked_files` returns only the git-TRACKED members of `pathspecs`: a
+/// committed file is listed, a merely-present-on-disk untracked file is not
+/// — scoped to the pathspecs passed, mirroring `untracked_files`'s contract.
+#[test]
+fn tracked_files_returns_committed_excludes_untracked() {
+    let dir = init_repo("main");
+    let root = dir.path();
+    write(root, "tracked.txt", "hi\n");
+    git_run(&["add", "tracked.txt"], root);
+    git_run(&["commit", "-q", "-m", "add tracked.txt"], root);
+    write(root, "untracked.txt", "nope\n");
+
+    let got: Vec<String> = tracked_files(root, &["tracked.txt", "untracked.txt"])
+        .unwrap()
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        got.contains(&"tracked.txt".to_string()),
+        "committed file must be listed; got {got:?}"
+    );
+    assert!(
+        !got.contains(&"untracked.txt".to_string()),
+        "untracked file must NOT be listed; got {got:?}"
+    );
+}

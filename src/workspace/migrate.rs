@@ -254,7 +254,12 @@ and must be recreated."
     // ---- Materialize: copy staged files in, delete the retired setup.sh. ----
     superset_files::copy_into_repo(staging.path(), repo_root, &[SETUP_SH_REL])?;
     rename_setup_config(repo_root)?;
-    gitignore::ensure_entry(repo_root, MAGIC_LOCAL_REL)?;
+    gitignore::ensure_path_ignored(
+        repo_root,
+        repo_root,
+        Path::new(MAGIC_LOCAL_REL),
+        gitignore::PathKind::File,
+    )?;
 
     println!();
     println!("{}", style::ok("Wrote .superset/magic.json"));
@@ -412,7 +417,12 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
 
     // ---- Materialize. ----
     superset_files::copy_into_repo(stage_root, repo_root, &[])?;
-    gitignore::ensure_entry(repo_root, MAGIC_LOCAL_REL)?;
+    gitignore::ensure_path_ignored(
+        repo_root,
+        repo_root,
+        Path::new(MAGIC_LOCAL_REL),
+        gitignore::PathKind::File,
+    )?;
 
     println!();
     println!("{}", style::ok("Wrote .superset/magic.json"));
@@ -455,7 +465,12 @@ pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<
     }
 
     superset_files::copy_into_repo(stage_root, repo_root, &[])?;
-    gitignore::ensure_entry(repo_root, MAGIC_LOCAL_REL)?;
+    gitignore::ensure_path_ignored(
+        repo_root,
+        repo_root,
+        Path::new(MAGIC_LOCAL_REL),
+        gitignore::PathKind::File,
+    )?;
 
     println!("{}", style::ok("Wrote .superset/magic.json"));
     println!("{}", style::ok("Wrote .superset/magic.sh"));

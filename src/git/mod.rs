@@ -268,6 +268,15 @@ pub fn is_ignored(repo_root: &Path, rel: &Path) -> Result<bool> {
     let rel_str = rel
         .to_str()
         .with_context(|| format!("non-UTF-8 path: {}", rel.display()))?;
+    is_ignored_str(repo_root, rel_str)
+}
+
+/// Raw-pathname variant of [`is_ignored`] so a caller can force git's
+/// directory-only match with a trailing slash: a `foo/bar/` rule matches the
+/// query `foo/bar/` even before the directory exists on disk, whereas `foo/bar`
+/// (no slash, dir absent) is treated as a file and MISSES it. Exit 0 → ignored,
+/// exit 1 → not ignored, any other exit is a real error.
+pub fn is_ignored_str(repo_root: &Path, rel_str: &str) -> Result<bool> {
     let out = git_raw(&["check-ignore", "-q", "--", rel_str], Some(repo_root))?;
     match out.status.code() {
         Some(0) => Ok(true),
@@ -277,6 +286,32 @@ pub fn is_ignored(repo_root: &Path, rel: &Path) -> Result<bool> {
             bail!("`git check-ignore -- {rel_str}` failed: {stderr}");
         }
     }
+}
+
+/// Git-TRACKED files among `pathspecs`, via `git ls-files --cached -z --`. The
+/// mirror of [`untracked_files`], used for POSITIVE tracked determination in the
+/// reverse-sync secret gate — a path NOT in this set is treated as untracked (a
+/// secret), so an unenumerable / oddly-normalized name fails closed. Output is
+/// repo-relative porcelain paths; leading-`..`/absolute paths are defensively
+/// dropped. Empty `pathspecs` list the WHOLE index, so callers should skip the
+/// probe when there are no matches.
+pub fn tracked_files(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<PathBuf>> {
+    let mut args: Vec<&str> = vec!["ls-files", "--cached", "-z", "--"];
+    args.extend_from_slice(pathspecs);
+    let out = git(&args, Some(repo_root))?;
+    let mut paths = Vec::new();
+    for raw in out.split('\0') {
+        if raw.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(raw);
+        if p.is_absolute() || raw.split('/').any(|seg| seg == "..") {
+            // Defensive: git never emits these from the repo root.
+            continue;
+        }
+        paths.push(p);
+    }
+    Ok(paths)
 }
 
 /// Resolve the `.gitignore` rule that COVERS `rel` in the working tree rooted

@@ -76,17 +76,21 @@ fn assemble_both_pure_insert_adds_no_separator() {
     assert_eq!(assemble(&segs, &[MergeChoice::Both]), "MAIN_ONLY\n");
 }
 
-/// default_decision: worktree-only ⇒ Push; exists-both ⇒ Undecided.
+/// default_decision: the unified Sync cockpit pre-selects NOTHING — every state
+/// starts Undecided so nothing (destructive or otherwise) is chosen on a bare
+/// keystroke, including a tracked worktree-only file that must not auto-push.
 #[test]
 fn default_decision_is_conservative() {
-    assert!(matches!(
-        default_decision(FileState::WorktreeOnly),
-        Decision::Push
-    ));
-    assert!(matches!(
-        default_decision(FileState::ExistsBoth),
-        Decision::Undecided
-    ));
+    for state in [
+        FileState::WorktreeOnly,
+        FileState::MainOnly,
+        FileState::ExistsBoth,
+    ] {
+        assert!(
+            matches!(default_decision(state), Decision::Undecided),
+            "state {state:?} must start Undecided"
+        );
+    }
 }
 
 /// backup_rel_path joins the timestamp dir + side namespace onto the

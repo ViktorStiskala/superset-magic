@@ -74,7 +74,7 @@ fn sync_literal_file_copies_into_worktree() {
     write_file(main.path(), ".env", "FOO=1\n");
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, |_| {}).unwrap();
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0, "sync_core must succeed");
     assert!(
         wt_root.join(".env").is_file(),
@@ -93,7 +93,7 @@ fn sync_glob_pattern_copies_at_depth() {
     write_file(main.path(), "apps/web/.dev.vars", "OTHER=y\n");
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, |_| {}).unwrap();
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0);
     assert!(wt_root.join("apps/api/.dev.vars").is_file());
     assert!(wt_root.join("apps/web/.dev.vars").is_file());
@@ -107,7 +107,7 @@ fn sync_double_glob_matches_deep_paths() {
     write_file(main.path(), "a/b/c/.env", "DEEP=1\n");
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, |_| {}).unwrap();
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0);
     assert!(wt_root.join("a/b/c/.env").is_file(), "deep path must copy");
 }
@@ -122,7 +122,7 @@ fn sync_excludes_node_modules_and_venv() {
     write_file(main.path(), ".venv/lib/.env", "drop\n");
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, |_| {}).unwrap();
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0);
     assert!(wt_root.join("apps/api/.env").is_file());
     assert!(!wt_root.join("node_modules/pkg/.env").exists());
@@ -145,7 +145,7 @@ fn sync_uses_overlaid_config() {
     write_file(main.path(), "apps/api/.dev.vars", "VARS=2\n");
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, |_| {}).unwrap();
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0);
     assert!(wt_root.join("apps/api/.env").is_file());
     assert!(wt_root.join("apps/api/.dev.vars").is_file());
@@ -159,7 +159,7 @@ fn sync_empty_files_succeeds_with_nothing_copied() {
 
     let (_wt, wt_root) = make_worktree(main.path());
     let mut events: Vec<sync::apply::Event> = Vec::new();
-    let code = sync_core(&wt_root, |e| events.push(e.clone())).unwrap();
+    let code = sync_core(&wt_root, false, |e| events.push(e.clone())).unwrap();
     assert_eq!(exit_code_to_u8(code), 0);
     assert!(events.is_empty(), "no events when files is empty");
 }
@@ -173,7 +173,7 @@ fn sync_no_magic_json_is_hard_error() {
     // Deliberately do NOT write magic.json.
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, |_| {}).unwrap();
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
     assert_ne!(exit_code_to_u8(code), 0, "must exit non-zero when magic.json absent");
 }
 
@@ -185,7 +185,7 @@ fn sync_malformed_magic_json_is_hard_error() {
     fs::write(main.path().join(".superset/magic.json"), "{bad json").unwrap();
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, |_| {}).unwrap();
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
     assert_ne!(
         exit_code_to_u8(code),
         0,
@@ -205,7 +205,7 @@ fn sync_malformed_magic_local_json_is_hard_error() {
     .unwrap();
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, |_| {}).unwrap();
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
     assert_ne!(
         exit_code_to_u8(code),
         0,
@@ -218,10 +218,111 @@ fn sync_malformed_magic_local_json_is_hard_error() {
 fn sync_outside_git_repo_is_hard_error() {
     let dir = tempfile::tempdir().unwrap();
     // No git init — not a repo.
-    let code = sync_core(dir.path(), |_| {}).unwrap();
+    let code = sync_core(dir.path(), false, |_| {}).unwrap();
     assert_ne!(
         exit_code_to_u8(code),
         0,
         "must exit non-zero when not in a git repo"
+    );
+}
+
+// ── Pre-copy backup pass (unified sync, Task 5) ─────────────────────────
+
+/// Forward sync backs up the worktree's pre-overwrite bytes under
+/// `.superset/backups/<ts>/<rel>` before copying main's version in, unless
+/// `--no-backup` is set.
+#[test]
+fn sync_backs_up_overwritten_worktree_file_by_default() {
+    let main = init_main_repo("main");
+    write_magic(main.path(), &[".env"]);
+    write_file(main.path(), ".env", "NEW=1\n");
+
+    let (_wt, wt_root) = make_worktree(main.path());
+    write_file(&wt_root, ".env", "OLD=0\n");
+
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    assert_eq!(exit_code_to_u8(code), 0, "sync_core must succeed");
+    assert_eq!(
+        fs::read_to_string(wt_root.join(".env")).unwrap(),
+        "NEW=1\n",
+        "worktree must end up with main's bytes"
+    );
+
+    let backups_dir = wt_root.join(".superset/backups");
+    let batch = fs::read_dir(&backups_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.is_dir())
+        .expect("one backup batch dir must exist under .superset/backups");
+    let backed_up = fs::read_to_string(batch.join(".env")).unwrap();
+    assert_eq!(
+        backed_up, "OLD=0\n",
+        "the backup must hold the pre-overwrite (OLD) bytes"
+    );
+}
+
+/// `--no-backup` (`no_backup: true`) skips the pre-copy backup pass entirely —
+/// no `.superset/backups` dir is created at all.
+#[test]
+fn sync_no_backup_flag_skips_backup() {
+    let main = init_main_repo("main");
+    write_magic(main.path(), &[".env"]);
+    write_file(main.path(), ".env", "NEW=1\n");
+
+    let (_wt, wt_root) = make_worktree(main.path());
+    write_file(&wt_root, ".env", "OLD=0\n");
+
+    let code = sync_core(&wt_root, true, |_| {}).unwrap();
+    assert_eq!(exit_code_to_u8(code), 0, "sync_core must succeed");
+    assert_eq!(
+        fs::read_to_string(wt_root.join(".env")).unwrap(),
+        "NEW=1\n",
+        "worktree must still end up with main's bytes"
+    );
+    assert!(
+        !wt_root.join(".superset/backups").exists(),
+        "no_backup must skip the backup pass, so no backups dir is created"
+    );
+}
+
+/// A file matched by `magic.json` but absent from the worktree is a fresh
+/// create — nothing to lose, so no backup is written for it.
+#[test]
+fn sync_new_file_creates_no_backup() {
+    let main = init_main_repo("main");
+    write_magic(main.path(), &[".env"]);
+    write_file(main.path(), ".env", "FOO=1\n");
+
+    let (_wt, wt_root) = make_worktree(main.path());
+    // Worktree deliberately has no `.env` yet.
+
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    assert_eq!(exit_code_to_u8(code), 0, "sync_core must succeed");
+    assert!(
+        wt_root.join(".env").is_file(),
+        ".env must be created in the worktree"
+    );
+    assert!(
+        !wt_root.join(".superset/backups").exists(),
+        "a fresh create has nothing to back up, so no backups dir is created"
+    );
+}
+
+/// After a default (backing-up) sync, `.superset/backups` is gitignored in
+/// the worktree so a mistaken overwrite's recovery copy is never committed.
+#[test]
+fn sync_backup_dir_is_gitignored_in_worktree() {
+    let main = init_main_repo("main");
+    write_magic(main.path(), &[".env"]);
+    write_file(main.path(), ".env", "NEW=1\n");
+
+    let (_wt, wt_root) = make_worktree(main.path());
+    write_file(&wt_root, ".env", "OLD=0\n");
+
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    assert_eq!(exit_code_to_u8(code), 0, "sync_core must succeed");
+    assert!(
+        git::is_ignored(&wt_root, Path::new(".superset/backups")).unwrap(),
+        ".superset/backups must be gitignored in the worktree after a backing-up sync"
     );
 }

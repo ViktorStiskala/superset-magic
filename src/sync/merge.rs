@@ -53,16 +53,20 @@ pub enum FileState {
     ExistsBoth,
     /// Present only in the worktree; absent in main.
     WorktreeOnly,
+    /// Present only in main; absent in the worktree. A pull creates it locally;
+    /// a delete removes main's copy. NEW in the unified sync (Task 5).
+    MainOnly,
 }
 
-/// The conservative starting decision for a file (KD4): a worktree-only file
-/// defaults to a non-destructive push; a file that exists on both sides starts
-/// undecided so nothing destructive is ever pre-selected.
-pub fn default_decision(state: FileState) -> Decision {
-    match state {
-        FileState::WorktreeOnly => Decision::Push,
-        FileState::ExistsBoth => Decision::Undecided,
-    }
+/// The starting decision for a file in the unified Sync cockpit: NOTHING is
+/// pre-selected (KD4). The user explicitly picks push / pull / merge / delete
+/// for every file, so nothing destructive — and nothing at all — is auto-chosen.
+/// This replaces the old worktree-only auto-push default: the unified set now
+/// includes TRACKED worktree-only files, which must not be pushed to main on a
+/// bare keystroke. `FileState` is retained for the cockpit's exhaustive
+/// `file_state` mapping and future use.
+pub fn default_decision(_state: FileState) -> Decision {
+    Decision::Undecided
 }
 
 /// The per-hunk choice for one differing region during an interactive merge.

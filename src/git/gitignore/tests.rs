@@ -134,3 +134,139 @@ fn covering_rule_none_when_uncovered() {
         find_covering_rule(dir.path(), Path::new("apps/api/.dev.vars")).unwrap();
     assert_eq!(got, None);
 }
+
+// ── ensure_path_ignored (Task 5) ─────────────────────────────────────────
+
+/// Already-ignored path → `Ignored::Already`, and the `.gitignore` is left
+/// byte-identical — no rewrite is attempted once git confirms coverage.
+#[test]
+fn ensure_path_ignored_noop_when_already_ignored() {
+    let dir = fresh();
+    git_init(dir.path());
+    let gi = dir.path().join(".gitignore");
+    let initial = "secret.txt\n";
+    fs::write(&gi, initial).unwrap();
+
+    let got =
+        ensure_path_ignored(dir.path(), dir.path(), Path::new("secret.txt"), PathKind::File)
+            .unwrap();
+    assert_eq!(got, Ignored::Already);
+
+    let after = fs::read_to_string(&gi).unwrap();
+    assert_eq!(after, initial, ".gitignore must be byte-identical when already covered");
+}
+
+/// Uncovered file → an anchored literal is appended to the root `.gitignore`
+/// and git now ignores the path.
+#[test]
+fn ensure_path_ignored_appends_literal_when_uncovered() {
+    let dir = fresh();
+    git_init(dir.path());
+
+    let got =
+        ensure_path_ignored(dir.path(), dir.path(), Path::new("secret.txt"), PathKind::File)
+            .unwrap();
+    assert_eq!(got, Ignored::Appended);
+
+    let after = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert_eq!(after, "secret.txt\n");
+    assert!(
+        git::is_ignored_str(dir.path(), "secret.txt").unwrap(),
+        "git must now ignore secret.txt"
+    );
+}
+
+/// A `Dir` rule for a directory that doesn't exist on disk yet is still
+/// queried and written with a trailing slash, and git honors it.
+#[test]
+fn ensure_path_ignored_dir_kind_ignores_backups_before_dir_exists() {
+    let dir = fresh();
+    git_init(dir.path());
+    assert!(!dir.path().join(".superset/backups").exists());
+
+    let got = ensure_path_ignored(
+        dir.path(),
+        dir.path(),
+        Path::new(".superset/backups"),
+        PathKind::Dir,
+    )
+    .unwrap();
+    assert_eq!(got, Ignored::Appended);
+
+    let after = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert_eq!(after, ".superset/backups/\n");
+    assert!(
+        git::is_ignored_str(dir.path(), ".superset/backups/").unwrap(),
+        "git must ignore the backups dir even before it exists on disk"
+    );
+}
+
+/// A broader `.superset/` rule already covers the nested backups dir → noop,
+/// no new line is written.
+#[test]
+fn ensure_path_ignored_dir_kind_noop_when_broader_rule_covers() {
+    let dir = fresh();
+    git_init(dir.path());
+    let gi = dir.path().join(".gitignore");
+    let initial = ".superset/\n";
+    fs::write(&gi, initial).unwrap();
+
+    let got = ensure_path_ignored(
+        dir.path(),
+        dir.path(),
+        Path::new(".superset/backups"),
+        PathKind::Dir,
+    )
+    .unwrap();
+    assert_eq!(got, Ignored::Already);
+
+    let after = fs::read_to_string(&gi).unwrap();
+    assert_eq!(after, initial, "the broader rule already covers it; no line should be added");
+}
+
+/// A non-git root (e.g. a unit-test tempdir) never errors: the "already
+/// ignored?" probe degrades to `None` and the literal is appended anyway.
+#[test]
+fn ensure_path_ignored_tolerates_non_git_root() {
+    let dir = fresh();
+
+    let got =
+        ensure_path_ignored(dir.path(), dir.path(), Path::new("secret.txt"), PathKind::File)
+            .unwrap();
+    assert_eq!(got, Ignored::Appended);
+
+    let after = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert_eq!(after, "secret.txt\n");
+}
+
+/// A rule for a nested path lands in the closest EXISTING `.gitignore` among
+/// its ancestors, not the repo root — and a sibling directory is unaffected.
+#[test]
+fn ensure_path_ignored_places_rule_in_nested_gitignore() {
+    let dir = fresh();
+    git_init(dir.path());
+    fs::create_dir_all(dir.path().join("apps/api")).unwrap();
+    fs::create_dir_all(dir.path().join("apps/api2")).unwrap();
+    fs::write(dir.path().join("apps/api/.gitignore"), "node_modules/\n").unwrap();
+
+    let got = ensure_path_ignored(
+        dir.path(),
+        dir.path(),
+        Path::new("apps/api/.env"),
+        PathKind::File,
+    )
+    .unwrap();
+    assert_eq!(got, Ignored::Appended);
+
+    let nested = fs::read_to_string(dir.path().join("apps/api/.gitignore")).unwrap();
+    assert_eq!(nested, "node_modules/\n/.env\n");
+    assert!(
+        !dir.path().join(".gitignore").exists(),
+        "the rule must not leak into the repo-root .gitignore"
+    );
+    assert!(git::is_ignored_str(dir.path(), "apps/api/.env").unwrap());
+    assert!(
+        !git::is_ignored_str(dir.path(), "apps/api2/.env").unwrap(),
+        "the nested rule must not leak to a sibling directory"
+    );
+}

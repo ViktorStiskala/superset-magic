@@ -1206,3 +1206,115 @@ fn diff_line_count_new_file_excludes_header_rows() {
     );
     assert_eq!(diff_line_count(&no_content), 1);
 }
+
+// ── Task 5: MainOnly cockpit view + the set_push gate ─────────────────────
+
+/// The delete badge names the main copy exactly (mirroring the batched
+/// confirm's wording); pull is the natural, always-available direction for a
+/// main-only file.
+#[test]
+fn badge_text_main_only_delete_and_pull() {
+    assert_eq!(
+        badge_text(&Decision::Delete, DiffStatus::MainOnly).0,
+        "✗ delete (main copy)"
+    );
+    assert!(badge_text(&Decision::Pull, DiffStatus::MainOnly)
+        .0
+        .contains("pull from main"));
+}
+
+/// A main-only file renders the Cyan "will be created in this worktree"
+/// header and the same 1-based numbered `+` gutter as a worktree-only file
+/// (mirrored from main's content instead of the worktree's).
+#[test]
+fn main_only_file_renders_numbered_pull_notice() {
+    let files = vec![entry(
+        "config.main.json",
+        DiffStatus::MainOnly,
+        Decision::Pull,
+        FileDiff::MainOnly {
+            content: Some("K=V\n".to_string()),
+        },
+    )];
+    let out = buffer_text(&render(&app_with(files), 120, 24));
+    assert!(
+        out.contains("main only"),
+        "main-only header notice missing:\n{out}"
+    );
+    assert!(out.contains("1 + K=V"), "numbered content line missing:\n{out}");
+}
+
+/// `p` is a no-op on a main-only file (no worktree copy to push) and sets a
+/// transient notice instead of a decision; `l` (pull) is unaffected and still
+/// works, since main IS present and readable.
+#[test]
+fn set_push_is_noop_for_main_only_and_pull_allowed() {
+    let mut app = app_with(vec![entry(
+        "config.main.json",
+        DiffStatus::MainOnly,
+        Decision::Undecided,
+        FileDiff::MainOnly {
+            content: Some("K=V\n".to_string()),
+        },
+    )]);
+    app.set_push();
+    assert!(
+        matches!(app.files[0].decision, Decision::Undecided),
+        "push must be a no-op for a main-only file: {:?}",
+        app.files[0].decision
+    );
+    assert!(app.notice.is_some(), "a push-unavailable notice is set");
+
+    app.set_pull();
+    assert!(
+        matches!(app.files[0].decision, Decision::Pull),
+        "pull must still be allowed for a main-only file"
+    );
+}
+
+/// destructive_overwrites: a main-only PULL only CREATES the worktree file
+/// (not destructive, so excluded); a main-only DELETE removes main's only
+/// copy and is listed as such.
+#[test]
+fn destructive_overwrites_main_only_pull_is_create_delete_is_main_copy() {
+    let pulled = app_with(vec![entry(
+        "config.main.json",
+        DiffStatus::MainOnly,
+        Decision::Pull,
+        FileDiff::MainOnly { content: None },
+    )])
+    .destructive_overwrites();
+    assert!(
+        pulled.is_empty(),
+        "a main-only pull creates the worktree file, not destructive: {pulled:?}"
+    );
+
+    let deleted = app_with(vec![entry(
+        "config.main.json",
+        DiffStatus::MainOnly,
+        Decision::Delete,
+        FileDiff::MainOnly { content: None },
+    )])
+    .destructive_overwrites();
+    assert_eq!(deleted.len(), 1, "a main-only delete is destructive: {deleted:?}");
+    assert_eq!(deleted[0].1, "delete (main copy)");
+}
+
+/// Regression for the switch from `set_decision(Decision::Push)` to the
+/// gated `set_push()`: `p` on an ordinary Differs file must still push it —
+/// the MainOnly guard must not swallow the common case.
+#[test]
+fn handle_key_p_still_pushes_a_differs_file_after_set_push_switch() {
+    let mut app = app_with(vec![entry(
+        "diff.env",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Text {
+            local: "x\n".to_string(),
+            main: "y\n".to_string(),
+        },
+    )]);
+    assert_eq!(handle_key(&mut app, KeyCode::Char('p'), 10), None);
+    assert!(matches!(app.files[0].decision, Decision::Push));
+    assert!(app.notice.is_none(), "no notice for a normal push");
+}

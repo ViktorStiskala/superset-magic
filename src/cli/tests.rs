@@ -6,7 +6,7 @@ fn argv(parts: &[&str]) -> Vec<String> {
 
 #[test]
 fn sync_token_dispatches_to_sync() {
-    assert_eq!(parse(&argv(&["sync"])), Parsed::Command(Command::Sync));
+    assert_eq!(parse(&argv(&["sync"])), Parsed::Command(Command::Sync { no_backup: false }));
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn unknown_flag_before_subcommand_is_skipped() {
     // subcommand token.
     assert_eq!(
         parse(&argv(&["--verbose", "sync"])),
-        Parsed::Command(Command::Sync)
+        Parsed::Command(Command::Sync { no_backup: false })
     );
 }
 
@@ -81,7 +81,7 @@ fn flags_only_with_no_subcommand_routes_to_bare() {
 fn extra_args_after_subcommand_are_ignored() {
     assert_eq!(
         parse(&argv(&["sync", "extra"])),
-        Parsed::Command(Command::Sync)
+        Parsed::Command(Command::Sync { no_backup: false })
     );
 }
 
@@ -98,5 +98,72 @@ fn init_collects_positional_patterns() {
             "**/.env".to_string(),
             "apps/*/.dev.vars".to_string()
         ])
+    );
+}
+
+#[test]
+fn reverse_sync_token_dispatches_to_reverse_sync() {
+    assert_eq!(
+        parse(&argv(&["reverse-sync"])),
+        Parsed::Command(Command::ReverseSync { no_backup: false })
+    );
+}
+
+#[test]
+fn sync_no_backup_long_flag() {
+    assert_eq!(
+        parse(&argv(&["sync", "--no-backup"])),
+        Parsed::Command(Command::Sync { no_backup: true })
+    );
+}
+
+#[test]
+fn sync_no_backup_short_flag() {
+    assert_eq!(
+        parse(&argv(&["sync", "-n"])),
+        Parsed::Command(Command::Sync { no_backup: true })
+    );
+}
+
+#[test]
+fn sync_no_backup_before_subcommand() {
+    // has_no_backup scans the whole argv, so a leading flag counts too, not
+    // just one trailing after the subcommand token.
+    assert_eq!(
+        parse(&argv(&["--no-backup", "sync"])),
+        Parsed::Command(Command::Sync { no_backup: true })
+    );
+}
+
+#[test]
+fn reverse_sync_no_backup_flag() {
+    assert_eq!(
+        parse(&argv(&["reverse-sync", "-n"])),
+        Parsed::Command(Command::ReverseSync { no_backup: true })
+    );
+}
+
+#[test]
+fn no_backup_ignored_for_pack() {
+    // Command::Pack has no no_backup field to set — the flag is simply inert.
+    assert_eq!(
+        parse(&argv(&["pack", "--no-backup"])),
+        Parsed::Command(Command::Pack)
+    );
+}
+
+#[test]
+fn help_mentions_reverse_sync() {
+    assert!(
+        usage().contains("reverse-sync"),
+        "usage should mention reverse-sync"
+    );
+}
+
+#[test]
+fn help_mentions_no_backup() {
+    assert!(
+        usage().contains("--no-backup"),
+        "usage should mention --no-backup"
     );
 }

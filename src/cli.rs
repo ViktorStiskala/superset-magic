@@ -16,8 +16,19 @@
 pub enum Command {
     /// No subcommand — open the interactive operation menu.
     Bare,
-    /// Non-interactive forward file copy, main → current worktree.
-    Sync,
+    /// Non-interactive forward file copy, main → current worktree. Backs up
+    /// every overwritten worktree file first unless `no_backup`.
+    Sync {
+        /// `--no-backup`/`-n`: skip the pre-overwrite backup pass.
+        no_backup: bool,
+    },
+    /// Non-interactive reverse copy, current worktree → main, for git-untracked
+    /// files matching the configured patterns. Backs up every overwritten main
+    /// file first unless `no_backup`.
+    ReverseSync {
+        /// `--no-backup`/`-n`: skip the pre-overwrite backup pass.
+        no_backup: bool,
+    },
     /// Non-interactive pack: archive the configured files into a tar.bz2 at the
     /// git root.
     Pack,
@@ -44,19 +55,24 @@ pub enum Parsed {
 
 /// One-line program usage banner.
 pub const USAGE: &str = "\
-Usage: ss-magic [COMMAND]
+Usage: ss-magic [COMMAND] [OPTIONS]
 
 Commands:
-  (none)    Open the interactive operation menu
-  sync      Non-interactive forward file copy (main → current worktree)
-  pack      Archive the configured files into ss-magic-<repo>.tar.bz2 at the
-            git root (name derived from the origin remote)
-  update    Force a self-update to the latest release
-  init      Initialize .superset (magic.json layout) non-interactively;
-            optional file-pattern args become magic.json `files`
+  (none)         Open the interactive sync / operation menu
+  sync           Non-interactive forward file copy (main → current worktree)
+  reverse-sync   Non-interactive reverse copy (current worktree → main) for
+                 git-untracked files matching the configured patterns
+  pack           Archive the configured files into ss-magic-<repo>.tar.bz2 at
+                 the git root (name derived from the origin remote)
+  update         Force a self-update to the latest release
+  init           Initialize .superset (magic.json layout) non-interactively;
+                 optional file-pattern args become magic.json `files`
 
 Options:
-  -h, --help    Print this help";
+  -n, --no-backup   Skip the pre-overwrite backup on `sync`/`reverse-sync`.
+                    WARNING: overwriting or deleting an untracked secret then
+                    leaves NO recovery path (no git history, no backup).
+  -h, --help        Print this help (recognized before the subcommand)";
 
 /// Render the usage text. Kept as a function (not just the `const`) so the
 /// help path and the error path share one source of truth and a trailing
@@ -82,7 +98,12 @@ pub fn parse(args: &[String]) -> Parsed {
             continue;
         }
         return match arg.as_str() {
-            "sync" => Parsed::Command(Command::Sync),
+            "sync" => Parsed::Command(Command::Sync {
+                no_backup: has_no_backup(args),
+            }),
+            "reverse-sync" => Parsed::Command(Command::ReverseSync {
+                no_backup: has_no_backup(args),
+            }),
             "pack" => Parsed::Command(Command::Pack),
             "update" => Parsed::Command(Command::Update),
             // Positional args after `init` become magic.json file patterns.
@@ -97,6 +118,16 @@ pub fn parse(args: &[String]) -> Parsed {
         };
     }
     Parsed::Command(Command::Bare)
+}
+
+/// True when `--no-backup`/`-n` appears ANYWHERE in argv — before OR after the
+/// subcommand token. Position-independent because [`parse`]'s loop returns as
+/// soon as it matches a subcommand, so a whole-slice scan is the only way to
+/// also catch a trailing flag. Deliberately asymmetric with `-h`/`--help`, a
+/// terminal short-circuit recognized only BEFORE the subcommand (see USAGE): a
+/// maintainer should NOT "fix" one to match the other.
+fn has_no_backup(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--no-backup" || a == "-n")
 }
 
 #[cfg(test)]

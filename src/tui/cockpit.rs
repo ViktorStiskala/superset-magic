@@ -104,9 +104,14 @@ enum FileDiff {
     /// bytes still differ, or the file would not be offered) render as an
     /// explanatory notice instead of an empty diff.
     Text { local: String, main: String },
-    /// A worktree-only file (absent in main): it will be created. `content`
-    /// carries the local text when it decoded as UTF-8, else `None`.
+    /// A worktree-only file (absent in main): it will be created in main by a
+    /// push. `content` carries the local text when it decoded as UTF-8, else
+    /// `None`.
     New { content: Option<String> },
+    /// A main-only file (absent in the worktree): it will be created locally by
+    /// a pull. `content` carries main's text when it decoded as UTF-8, else
+    /// `None` (binary / oversized). Mirror of [`FileDiff::New`], sourced from main.
+    MainOnly { content: Option<String> },
     /// Either side is binary / non-UTF-8 (R9) — whole-file push/pull only.
     Binary { note: String },
     /// Either side is over the diff cap (R8) — whole-file push/pull only.
@@ -355,6 +360,22 @@ impl App {
         }
     }
 
+    /// Push writes the worktree copy into main, so it needs a worktree copy to
+    /// read from. A [`DiffStatus::MainOnly`] file has none, so `p` is a no-op
+    /// that sets a transient notice (mirroring [`set_pull`]'s guard for a
+    /// worktree-only file) — setting Push there would only fail at apply time
+    /// after backing up + gitignoring main.
+    fn set_push(&mut self) {
+        if let Some(f) = self.files.get_mut(self.focused) {
+            if f.status != DiffStatus::MainOnly {
+                f.decision = Decision::Push;
+            } else {
+                self.notice =
+                    Some("push unavailable — this file exists only in main (l pulls it)".into());
+            }
+        }
+    }
+
     /// Pull requires a readable, existing main copy to read from. A worktree-only
     /// file (main absent) or one whose main copy is [`FileDiff::Unreadable`]
     /// (present but permission/I/O error) has none, so `l` is a no-op for both —
@@ -428,12 +449,19 @@ impl App {
                 Decision::Push if f.status == DiffStatus::Differs => {
                     Some((f.rel.clone(), "worktree → main"))
                 }
-                // Pull always overwrites the (existing) worktree copy.
-                Decision::Pull => Some((f.rel.clone(), "main → worktree")),
+                // A MainOnly pull CREATES the worktree file (non-destructive), so
+                // it is NOT in the overwrite list; any other pull overwrites the
+                // existing worktree copy.
+                Decision::Pull if f.status != DiffStatus::MainOnly => {
+                    Some((f.rel.clone(), "main → worktree"))
+                }
                 Decision::Merge(_) => Some((f.rel.clone(), "merged → both")),
                 // Delete removes every existing side.
                 Decision::Delete if f.status == DiffStatus::WorktreeOnly => {
                     Some((f.rel.clone(), "delete (worktree copy)"))
+                }
+                Decision::Delete if f.status == DiffStatus::MainOnly => {
+                    Some((f.rel.clone(), "delete (main copy)"))
                 }
                 Decision::Delete => Some((f.rel.clone(), "delete (worktree + main)")),
                 _ => None,
@@ -450,15 +478,22 @@ fn load_entry(
     status: DiffStatus,
 ) -> Result<FileEntry> {
     let wt_path = worktree_root.join(rel);
-    let mtime_local = format_mtime(&wt_path);
+    let main_path = main_root.join(rel);
 
-    let (diff, mtime_main) = match status {
-        DiffStatus::WorktreeOnly => (build_new(&wt_path)?, "—".to_string()),
-        DiffStatus::Differs | DiffStatus::Identical => {
-            let main_path = main_root.join(rel);
-            let mtime_main = format_mtime(&main_path);
-            (build_two_sided(&wt_path, &main_path)?, mtime_main)
-        }
+    // Per-branch (diff, mtime_local, mtime_main): a worktree-only file has no
+    // main mtime and a main-only file has no worktree mtime (shown as "—").
+    let (diff, mtime_local, mtime_main) = match status {
+        DiffStatus::WorktreeOnly => (build_new(&wt_path)?, format_mtime(&wt_path), "—".to_string()),
+        DiffStatus::MainOnly => (
+            build_main_only(&main_path)?,
+            "—".to_string(),
+            format_mtime(&main_path),
+        ),
+        DiffStatus::Differs | DiffStatus::Identical => (
+            build_two_sided(&wt_path, &main_path)?,
+            format_mtime(&wt_path),
+            format_mtime(&main_path),
+        ),
     };
 
     let decision = default_decision(file_state(status));
@@ -490,6 +525,26 @@ fn build_new(wt_path: &Path) -> Result<FileDiff> {
         }
     };
     Ok(FileDiff::New { content })
+}
+
+/// Build the [`FileDiff::MainOnly`] view for a main-only file, mirroring
+/// [`build_new`]: consult the size via metadata BEFORE any full read (R8), then
+/// decode main's bytes (text ⇒ `Some`, binary / oversized ⇒ `None`).
+fn build_main_only(main_path: &Path) -> Result<FileDiff> {
+    let main_len = fs::metadata(main_path)
+        .with_context(|| format!("reading main file {}", main_path.display()))?
+        .len();
+    let content = if main_len > diffmodel::MAX_DIFF_BYTES {
+        None
+    } else {
+        let main_bytes = fs::read(main_path)
+            .with_context(|| format!("reading main file {}", main_path.display()))?;
+        match diffmodel::classify_content(&main_bytes) {
+            ContentKind::Text(s) => Some(s),
+            _ => None,
+        }
+    };
+    Ok(FileDiff::MainOnly { content })
 }
 
 /// Build the two-sided diff view for a file present on both sides.
@@ -534,6 +589,7 @@ fn main_unreadable(err: &io::Error) -> FileDiff {
 fn file_state(status: DiffStatus) -> FileState {
     match status {
         DiffStatus::WorktreeOnly => FileState::WorktreeOnly,
+        DiffStatus::MainOnly => FileState::MainOnly,
         DiffStatus::Differs | DiffStatus::Identical => FileState::ExistsBoth,
     }
 }
@@ -619,9 +675,11 @@ fn diff_line_count(f: &FileEntry) -> usize {
         // swapped `(main, local)`): this is only a row/fold count for the scroll
         // clamp, and that count is symmetric under the swap.
         FileDiff::Text { local, main } => diffmodel::unified(local, main, CONTEXT).len() + 1,
-        // The green notice now lives in a fixed header row outside the scrollable
-        // body (see `render_new`), so only the numbered content lines count.
-        FileDiff::New { content } => content.as_ref().map(|c| c.lines().count()).unwrap_or(1),
+        // The header notice lives in a fixed row outside the scrollable body
+        // (see `render_created`), so only the numbered content lines count.
+        FileDiff::New { content } | FileDiff::MainOnly { content } => {
+            content.as_ref().map(|c| c.lines().count()).unwrap_or(1)
+        }
         FileDiff::Binary { .. } | FileDiff::TooLarge { .. } | FileDiff::Unreadable { .. } => 1,
     }
 }
@@ -690,6 +748,9 @@ fn badge_text(decision: &Decision, status: DiffStatus) -> (String, Color) {
         Decision::Merge(_) => ("⇄ merge (assembled)".to_string(), Color::Magenta),
         Decision::Delete if status == DiffStatus::WorktreeOnly => {
             ("✗ delete (worktree copy)".to_string(), Color::Red)
+        }
+        Decision::Delete if status == DiffStatus::MainOnly => {
+            ("✗ delete (main copy)".to_string(), Color::Red)
         }
         Decision::Delete => ("✗ delete (worktree + main)".to_string(), Color::Red),
     }
@@ -811,6 +872,7 @@ fn file_list_item(f: &FileEntry, content_width: u16) -> ListItem<'static> {
 fn status_tag(status: DiffStatus) -> Span<'static> {
     match status {
         DiffStatus::WorktreeOnly => Span::styled("(new)", Style::new().fg(Color::Green)),
+        DiffStatus::MainOnly => Span::styled("(main only)", Style::new().fg(Color::Cyan)),
         DiffStatus::Differs => Span::styled("(differs)", Style::new().fg(Color::Yellow)),
         DiffStatus::Identical => Span::styled("(identical)", Style::new().fg(Color::DarkGray)),
     }
@@ -828,7 +890,10 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, split: bool) {
     let inner_width = area.width.saturating_sub(2);
     let visible = visible_content_width(&f.diff, split, inner_width);
     let scrollable = matches!(&f.diff, FileDiff::Text { local, main } if local != main)
-        || matches!(&f.diff, FileDiff::New { content: Some(_) });
+        || matches!(
+            &f.diff,
+            FileDiff::New { content: Some(_) } | FileDiff::MainOnly { content: Some(_) }
+        );
     let clipped = scrollable
         && max_content_width(&f.diff) > visible as usize + app.diff_hscroll as usize;
     let title = if app.diff_hscroll > 0 {
@@ -843,12 +908,25 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, split: bool) {
     frame.render_widget(block, area);
 
     match &f.diff {
-        FileDiff::New { content } => render_new(
+        FileDiff::New { content } => render_created(
             frame,
             inner,
             content.as_deref(),
             app.diff_scroll,
             app.diff_hscroll,
+            "new file — will be created in main",
+            Color::Green,
+            "(binary or oversized new file — content not shown)",
+        ),
+        FileDiff::MainOnly { content } => render_created(
+            frame,
+            inner,
+            content.as_deref(),
+            app.diff_scroll,
+            app.diff_hscroll,
+            "main only — will be created in this worktree",
+            Color::Cyan,
+            "(binary or oversized file — content not shown)",
         ),
         FileDiff::Binary { note }
         | FileDiff::TooLarge { note }
@@ -875,7 +953,9 @@ fn max_content_width(diff: &FileDiff) -> usize {
     let longest = |text: &str| text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
     match diff {
         FileDiff::Text { local, main } => longest(local).max(longest(main)),
-        FileDiff::New { content } => content.as_deref().map(longest).unwrap_or(0),
+        FileDiff::New { content } | FileDiff::MainOnly { content } => {
+            content.as_deref().map(longest).unwrap_or(0)
+        }
         _ => 0,
     }
 }
@@ -891,24 +971,37 @@ fn visible_content_width(diff: &FileDiff, split: bool, inner_width: u16) -> u16 
             (inner_width.saturating_sub(1) / 2).saturating_sub(diffmodel::SPLIT_GUTTER)
         }
         FileDiff::Text { .. } => inner_width.saturating_sub(UNIFIED_GUTTER),
-        // The line number + `+ ` sign now live in a fixed gutter (see render_new).
-        FileDiff::New { .. } => inner_width.saturating_sub(NEW_GUTTER),
+        // The line number + `+ ` sign live in a fixed gutter (see render_created).
+        FileDiff::New { .. } | FileDiff::MainOnly { .. } => inner_width.saturating_sub(NEW_GUTTER),
         _ => inner_width,
     }
 }
 
-/// Render the new-file view: a fixed green header row (mirroring `render_split`'s
-/// `Length(1)` title row — and, unlike before, NEVER part of the scrollable body,
-/// which is why `visible_content_width`/`diff_line_count` no longer count it),
-/// then the content as 1-based numbered `+` rows behind the same fixed-gutter
-/// primitive the text-diff views use (`render_gutter_and_content`), so the line
-/// numbers + `+` sign stay put while the content scrolls horizontally.
-fn render_new(frame: &mut Frame, area: Rect, content: Option<&str>, scroll: u16, hscroll: u16) {
+/// Render a one-sided "will be created" view — a worktree-only file (created in
+/// main by a push) or a main-only file (created locally by a pull). A fixed
+/// 1-line `header` (colored `header_color`) mirrors `render_split`'s title row
+/// and is NEVER part of the scrollable body (which is why
+/// `visible_content_width`/`diff_line_count` no longer count it); then the
+/// content renders as 1-based numbered `+` rows behind the fixed [`NEW_GUTTER`]
+/// gutter (line numbers + `+` sign stay put while content scrolls
+/// horizontally), or `absent_note` (dark gray) when the content is binary /
+/// oversized.
+#[allow(clippy::too_many_arguments)]
+fn render_created(
+    frame: &mut Frame,
+    area: Rect,
+    content: Option<&str>,
+    scroll: u16,
+    hscroll: u16,
+    header: &str,
+    header_color: Color,
+    absent_note: &str,
+) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "new file — will be created in main",
-            Style::new().fg(Color::Green).add_modifier(Modifier::ITALIC),
+            header.to_string(),
+            Style::new().fg(header_color).add_modifier(Modifier::ITALIC),
         ))),
         chunks[0],
     );
@@ -934,7 +1027,7 @@ fn render_new(frame: &mut Frame, area: Rect, content: Option<&str>, scroll: u16,
         // Inert scroll kept for symmetry with the Some arm (max_scroll is 1 here).
         None => frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "(binary or oversized new file — content not shown)",
+                absent_note.to_string(),
                 Style::new().fg(Color::DarkGray),
             )))
             .scroll((scroll, hscroll)),
@@ -1604,7 +1697,7 @@ fn handle_key(app: &mut App, code: KeyCode, page: u16) -> Option<CockpitOutcome>
                 // reachable — the pane title hints when lines are clipped.
                 KeyCode::Right => app.scroll_right(H_SCROLL_STEP),
                 KeyCode::Left => app.scroll_left(H_SCROLL_STEP),
-                KeyCode::Char('p') => app.set_decision(Decision::Push),
+                KeyCode::Char('p') => app.set_push(),
                 KeyCode::Char('l') => app.set_pull(),
                 KeyCode::Char('m') => app.try_open_merge(),
                 KeyCode::Char('d') => app.set_decision(Decision::Delete),

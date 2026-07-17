@@ -341,6 +341,7 @@ fn apply_push_overwrites_main_and_backs_up_old_bytes() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let res = applied(
         apply_decision(
@@ -350,6 +351,7 @@ fn apply_push_overwrites_main_and_backs_up_old_bytes() {
             Baseline {
                 wt: meta(&wt.join("config.env")),
                 main: meta(&main.path().join("config.env")),
+                source_untracked: true,
             },
         )
         .unwrap(),
@@ -388,6 +390,7 @@ fn apply_push_to_new_main_path_creates_and_gitignores_without_backup() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let res = applied(
         apply_decision(
@@ -397,6 +400,7 @@ fn apply_push_to_new_main_path_creates_and_gitignores_without_backup() {
             Baseline {
                 wt: meta(&wt.join("apps/api/.dev.vars")),
                 main: meta(&main.path().join("apps/api/.dev.vars")),
+                source_untracked: true,
             },
         )
         .unwrap(),
@@ -427,6 +431,7 @@ fn apply_pull_overwrites_worktree_and_backs_up_its_old_bytes() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let res = applied(
         apply_decision(
@@ -436,6 +441,7 @@ fn apply_pull_overwrites_worktree_and_backs_up_its_old_bytes() {
             Baseline {
                 wt: meta(&wt.join("config.env")),
                 main: meta(&main.path().join("config.env")),
+                source_untracked: true,
             },
         )
         .unwrap(),
@@ -473,6 +479,7 @@ fn apply_merge_writes_assembled_to_both_and_backs_up_both() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let res = applied(
         apply_decision(
@@ -482,6 +489,7 @@ fn apply_merge_writes_assembled_to_both_and_backs_up_both() {
             Baseline {
                 wt: meta(&wt.join("config.env")),
                 main: meta(&main.path().join("config.env")),
+                source_untracked: true,
             },
         )
         .unwrap(),
@@ -551,6 +559,7 @@ fn apply_skips_when_target_changed_since_review() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let outcome = apply_decision(
         &ctx,
@@ -559,6 +568,7 @@ fn apply_skips_when_target_changed_since_review() {
         Baseline {
             wt: meta(&wt.join("config.env")),
             main: stale_main,
+            source_untracked: true,
         },
     )
     .unwrap();
@@ -602,6 +612,7 @@ fn apply_applies_when_baseline_matches_current() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let res = applied(
         apply_decision(
@@ -611,6 +622,7 @@ fn apply_applies_when_baseline_matches_current() {
             Baseline {
                 wt: meta(&wt.join("config.env")),
                 main: meta(&main.path().join("config.env")),
+                source_untracked: true,
             },
         )
         .unwrap(),
@@ -644,6 +656,7 @@ fn apply_skips_when_target_appeared_after_review() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let outcome = apply_decision(
         &ctx,
@@ -652,6 +665,7 @@ fn apply_skips_when_target_appeared_after_review() {
         Baseline {
             wt: meta(&wt.join("config.env")),
             main: None, // review-time baseline: main absent
+            source_untracked: true,
         },
     )
     .unwrap();
@@ -688,6 +702,7 @@ fn apply_undecided_is_skipped() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let outcome = apply_decision(
         &ctx,
@@ -696,6 +711,7 @@ fn apply_undecided_is_skipped() {
         Baseline {
             wt: meta(&wt.join("config.env")),
             main: meta(&main.path().join("config.env")),
+            source_untracked: true,
         },
     )
     .unwrap();
@@ -736,6 +752,7 @@ fn apply_push_skips_when_source_changed_since_review() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let outcome = apply_decision(
         &ctx,
@@ -744,6 +761,7 @@ fn apply_push_skips_when_source_changed_since_review() {
         Baseline {
             wt: stale_wt,
             main: meta(&main.path().join("config.env")),
+            source_untracked: true,
         },
     )
     .unwrap();
@@ -791,6 +809,7 @@ fn apply_pull_skips_when_source_changed_since_review() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let outcome = apply_decision(
         &ctx,
@@ -799,6 +818,7 @@ fn apply_pull_skips_when_source_changed_since_review() {
         Baseline {
             wt: meta(&wt.join("config.env")),
             main: stale_main,
+            source_untracked: true,
         },
     )
     .unwrap();
@@ -837,6 +857,7 @@ fn apply_batch_continues_past_a_failing_file() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
 
     // The failing (unsafe) decision is FIRST, proving the batch keeps going and
@@ -844,14 +865,22 @@ fn apply_batch_continues_past_a_failing_file() {
     let bad = PathBuf::from("../escape.env");
     let good = PathBuf::from("good.env");
     let decisions = vec![(bad.clone(), Decision::Push), (good.clone(), Decision::Push)];
-    let mut baseline: HashMap<PathBuf, (Option<FileMeta>, Option<FileMeta>)> = HashMap::new();
-    baseline.insert(bad, (None, None));
+    let mut baseline: HashMap<PathBuf, Baseline> = HashMap::new();
+    baseline.insert(
+        bad,
+        Baseline {
+            wt: None,
+            main: None,
+            source_untracked: true,
+        },
+    );
     baseline.insert(
         good,
-        (
-            meta(&wt.join("good.env")),
-            meta(&main.path().join("good.env")),
-        ),
+        Baseline {
+            wt: meta(&wt.join("good.env")),
+            main: meta(&main.path().join("good.env")),
+            source_untracked: true,
+        },
     );
 
     let summary = apply_batch(&ctx, &decisions, &baseline);
@@ -888,6 +917,7 @@ fn apply_delete_removes_both_sides_and_backs_up_both() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let res = applied(
         apply_decision(
@@ -897,6 +927,7 @@ fn apply_delete_removes_both_sides_and_backs_up_both() {
             Baseline {
                 wt: meta(&wt.join("config.env")),
                 main: meta(&main.path().join("config.env")),
+                source_untracked: true,
             },
         )
         .unwrap(),
@@ -933,6 +964,7 @@ fn apply_delete_worktree_only_removes_and_backs_up_worktree() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let res = applied(
         apply_decision(
@@ -942,6 +974,7 @@ fn apply_delete_worktree_only_removes_and_backs_up_worktree() {
             Baseline {
                 wt: meta(&wt.join("apps/api/.dev.vars")),
                 main: None,
+                source_untracked: true,
             },
         )
         .unwrap(),
@@ -982,6 +1015,7 @@ fn apply_delete_skips_when_side_changed_since_review() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let outcome = apply_decision(
         &ctx,
@@ -990,6 +1024,7 @@ fn apply_delete_skips_when_side_changed_since_review() {
         Baseline {
             wt: stale_wt,
             main: meta(&main.path().join("config.env")),
+            source_untracked: true,
         },
     )
     .unwrap();
@@ -1034,6 +1069,7 @@ fn apply_delete_skips_when_main_side_changed_since_review() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let outcome = apply_decision(
         &ctx,
@@ -1042,6 +1078,7 @@ fn apply_delete_skips_when_main_side_changed_since_review() {
         Baseline {
             wt: meta(&wt.join("config.env")),
             main: stale_main,
+            source_untracked: true,
         },
     )
     .unwrap();
@@ -1077,12 +1114,13 @@ fn apply_delete_with_nothing_on_disk_is_skipped() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let outcome = apply_decision(
         &ctx,
         Path::new("ghost.env"),
         &Decision::Delete,
-        Baseline { wt: None, main: None },
+        Baseline { wt: None, main: None, source_untracked: true },
     )
     .unwrap();
 
@@ -1148,6 +1186,7 @@ fn review_baseline_pins_main_absent_for_worktree_only_status() {
         main_root: main.path(),
         backups_root: backups.path(),
         ts: TS,
+        backup: true,
     };
     let outcome = apply_decision(
         &ctx,
@@ -1156,6 +1195,7 @@ fn review_baseline_pins_main_absent_for_worktree_only_status() {
         Baseline {
             wt: wt_meta,
             main: main_meta,
+            source_untracked: true,
         },
     )
     .unwrap();
@@ -1342,4 +1382,524 @@ fn prune_old_backups_noop_under_threshold_and_missing_root() {
 
     let missing = root.path().join("no-such-dir");
     assert!(prune_old_backups(&missing, 10, None).unwrap().is_empty());
+}
+
+// ── Unified sync (Task 5): 4-way classify + reconcile set ─────────────────
+
+/// `classify` is FOUR-way on presence: worktree-only → WorktreeOnly; the NEW
+/// main-only case → MainOnly; byte-equal on both → Identical; present-but-
+/// different → Differs.
+#[test]
+fn classify_is_four_way_including_main_only() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+
+    // worktree-only
+    write(&wt, "wtonly.env", "WT=1\n");
+    // main-only
+    write(main.path(), "mainonly.env", "MAIN=1\n");
+    // identical on both
+    write(&wt, "same.env", "SAME=1\n");
+    write(main.path(), "same.env", "SAME=1\n");
+    // differing
+    write(&wt, "diff.env", "A=1\n");
+    write(main.path(), "diff.env", "B=1\n");
+
+    assert_eq!(
+        classify(main.path(), &wt, Path::new("wtonly.env")).unwrap(),
+        DiffStatus::WorktreeOnly
+    );
+    assert_eq!(
+        classify(main.path(), &wt, Path::new("mainonly.env")).unwrap(),
+        DiffStatus::MainOnly
+    );
+    assert_eq!(
+        classify(main.path(), &wt, Path::new("same.env")).unwrap(),
+        DiffStatus::Identical
+    );
+    assert_eq!(
+        classify(main.path(), &wt, Path::new("diff.env")).unwrap(),
+        DiffStatus::Differs
+    );
+}
+
+/// `compute_reconcile_set` unions the pattern matches on BOTH roots (so a
+/// main-only file, invisible to the worktree walk, still appears) with the
+/// right per-file status, and drops byte-identical files (nothing to
+/// reconcile).
+#[test]
+fn compute_reconcile_set_unions_both_roots_and_hides_identical() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+
+    write_magic(&wt, &["*.env"]);
+    write(&wt, "wtonly.env", "WT=1\n");
+    write(main.path(), "mainonly.env", "MAIN=1\n");
+    write(&wt, "diff.env", "WT=1\n");
+    write(main.path(), "diff.env", "MAIN=1\n");
+    write(&wt, "same.env", "SAME=1\n");
+    write(main.path(), "same.env", "SAME=1\n");
+
+    let set = compute_reconcile_set(&wt, main.path()).unwrap();
+    let by: HashMap<String, DiffStatus> = set
+        .iter()
+        .map(|c| (c.rel.to_string_lossy().to_string(), c.status))
+        .collect();
+    assert_eq!(
+        by.get("wtonly.env"),
+        Some(&DiffStatus::WorktreeOnly),
+        "got {by:?}"
+    );
+    assert_eq!(
+        by.get("mainonly.env"),
+        Some(&DiffStatus::MainOnly),
+        "main-only file (only visible via main's walk) must appear; got {by:?}"
+    );
+    assert_eq!(by.get("diff.env"), Some(&DiffStatus::Differs), "got {by:?}");
+    assert!(
+        !by.contains_key("same.env"),
+        "byte-identical files are hidden; got {by:?}"
+    );
+}
+
+/// A pattern that matches a DIRECTORY present on a side is dropped before
+/// `classify` (reverse sync copies single files; a directory would EISDIR), and
+/// the reconcile set is NOT errored by it — a sibling file candidate survives.
+#[test]
+fn compute_reconcile_set_drops_directory_matches() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+
+    // A literal pattern for a DIRECTORY that exists in the worktree, plus a
+    // normal file so a successful (non-error) call is non-vacuous.
+    fs::create_dir_all(wt.join("confdir")).unwrap();
+    write(&wt, "confdir/inner.txt", "x\n");
+    write(&wt, "real.env", "R=1\n");
+    write_magic(&wt, &["confdir", "real.env"]);
+
+    let set = compute_reconcile_set(&wt, main.path()).unwrap();
+    let rels: Vec<String> = set
+        .iter()
+        .map(|c| c.rel.to_string_lossy().to_string())
+        .collect();
+    assert!(
+        !rels.contains(&"confdir".to_string()),
+        "a directory match must be dropped, not classified; got {rels:?}"
+    );
+    assert!(
+        rels.contains(&"real.env".to_string()),
+        "the file candidate must survive (call did not error-empty); got {rels:?}"
+    );
+}
+
+/// A broad pattern (`**/.env`) never re-offers a backed-up secret copy living
+/// under the tool's own `.superset/backups/<ts>/…` tree.
+#[test]
+fn compute_reconcile_set_excludes_backups_dir() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+
+    write_magic(&wt, &["**/.env"]);
+    write(&wt, "apps/.env", "SECRET=1\n");
+    // A recovered secret copy under the backups tree, matching the same glob.
+    write(
+        &wt,
+        ".superset/backups/20260716-000000/worktree/apps/.env",
+        "OLD=1\n",
+    );
+
+    let set = compute_reconcile_set(&wt, main.path()).unwrap();
+    let rels: Vec<String> = set
+        .iter()
+        .map(|c| c.rel.to_string_lossy().to_string())
+        .collect();
+    assert!(
+        rels.contains(&"apps/.env".to_string()),
+        "the real secret must be a candidate; got {rels:?}"
+    );
+    assert!(
+        !rels.iter().any(|r| r.contains("backups")),
+        "a backed-up copy must never be re-offered; got {rels:?}"
+    );
+}
+
+/// `wt_untracked` (the push secret-gate) is POSITIVE-tracked-derived: `false`
+/// for a tracked-but-differing file, `true` for an untracked secret.
+#[test]
+fn wt_untracked_false_for_tracked_true_for_untracked() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+
+    write_magic(&wt, &["*.env"]);
+
+    // A tracked file whose worktree copy also differs from main's copy.
+    write(&wt, "tracked.env", "WT=1\n");
+    git_run(&["add", "tracked.env"], &wt);
+    git_run(&["commit", "-q", "-m", "add tracked.env"], &wt);
+    write(main.path(), "tracked.env", "MAIN=1\n"); // differs
+
+    // An untracked secret (worktree-only).
+    write(&wt, "secret.env", "SECRET=1\n");
+
+    let set = compute_reconcile_set(&wt, main.path()).unwrap();
+    let by: HashMap<String, bool> = set
+        .iter()
+        .map(|c| (c.rel.to_string_lossy().to_string(), c.wt_untracked))
+        .collect();
+    assert_eq!(
+        by.get("tracked.env"),
+        Some(&false),
+        "a tracked file is not a secret; got {by:?}"
+    );
+    assert_eq!(
+        by.get("secret.env"),
+        Some(&true),
+        "an untracked secret gates the push; got {by:?}"
+    );
+}
+
+/// `review_baseline` pins the reviewed-ABSENT side to `None` for a MainOnly
+/// candidate: the worktree side is `None` even if a worktree copy materialized
+/// between classify and capture (symmetric to WorktreeOnly pinning main `None`).
+#[test]
+fn review_baseline_pins_worktree_none_for_main_only() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+
+    write(main.path(), "config.env", "MAIN=1\n");
+    // A worktree copy appears AFTER classify said MainOnly, BEFORE the capture.
+    write(&wt, "config.env", "APPEARED=1\n");
+
+    let (wt_meta, main_meta) = review_baseline(
+        &wt,
+        main.path(),
+        Path::new("config.env"),
+        DiffStatus::MainOnly,
+    )
+    .unwrap();
+    assert!(
+        wt_meta.is_none(),
+        "main-only status pins the worktree side absent"
+    );
+    assert!(main_meta.is_some(), "main-only captures main's metadata");
+}
+
+// ── Apply seam: MainOnly + backup toggle + secret gate ────────────────────
+
+/// A MainOnly Pull CREATES the worktree copy from main's bytes: no backup (the
+/// worktree had no prior bytes) and no gitignore step (the worktree is not the
+/// secret boundary).
+#[test]
+fn apply_pull_creates_worktree_for_main_only() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN=1\n"); // main-only
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+        backup: true,
+    };
+    let res = applied(
+        apply_decision(
+            &ctx,
+            Path::new("config.env"),
+            &Decision::Pull,
+            Baseline {
+                wt: None, // MainOnly: worktree side pinned absent
+                main: meta(&main.path().join("config.env")),
+                source_untracked: true,
+            },
+        )
+        .unwrap(),
+    );
+
+    assert!(matches!(res.direction, WriteDirection::PullFromMain));
+    assert!(!res.gitignore_appended, "pull never ignores in main");
+    assert!(
+        res.backups.is_empty(),
+        "a fresh worktree create has no prior bytes to back up"
+    );
+    assert_eq!(fs::read_to_string(wt.join("config.env")).unwrap(), "MAIN=1\n");
+}
+
+/// A MainOnly Delete removes main's copy (backed up first) and leaves the
+/// worktree — which never held the file — untouched.
+#[test]
+fn apply_delete_main_only_removes_main_and_backs_up() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN=1\n"); // main-only
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+        backup: true,
+    };
+    let res = applied(
+        apply_decision(
+            &ctx,
+            Path::new("config.env"),
+            &Decision::Delete,
+            Baseline {
+                wt: None, // MainOnly: no worktree copy
+                main: meta(&main.path().join("config.env")),
+                source_untracked: true,
+            },
+        )
+        .unwrap(),
+    );
+
+    assert!(matches!(res.direction, WriteDirection::DeleteBoth));
+    assert!(!main.path().join("config.env").exists(), "main copy removed");
+    assert!(
+        !wt.join("config.env").exists(),
+        "the worktree never had a copy"
+    );
+    assert_eq!(res.backups.len(), 1, "only main's side existed");
+    assert_eq!(
+        res.backups[0],
+        backups.path().join(TS).join("main").join("config.env")
+    );
+    assert_eq!(fs::read_to_string(&res.backups[0]).unwrap(), "MAIN=1\n");
+}
+
+/// A Push whose source is TRACKED (`source_untracked: false`) skips the
+/// gitignore step: no rule reported AND no `.gitignore` created in main — a
+/// committed path must never gain an ignore rule.
+#[test]
+fn apply_push_tracked_source_skips_gitignore() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "tracked.env", "MAIN=1\n");
+    write(&wt, "tracked.env", "WT=1\n");
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+        backup: true,
+    };
+    let res = applied(
+        apply_decision(
+            &ctx,
+            Path::new("tracked.env"),
+            &Decision::Push,
+            Baseline {
+                wt: meta(&wt.join("tracked.env")),
+                main: meta(&main.path().join("tracked.env")),
+                source_untracked: false, // tracked source: no gitignore step
+            },
+        )
+        .unwrap(),
+    );
+
+    assert!(matches!(res.direction, WriteDirection::PushToMain));
+    assert!(
+        !res.gitignore_appended,
+        "a tracked source must not gain a .gitignore rule"
+    );
+    assert!(
+        !main.path().join(".gitignore").exists(),
+        "no .gitignore is appended for a tracked push"
+    );
+    assert_eq!(
+        fs::read_to_string(main.path().join("tracked.env")).unwrap(),
+        "WT=1\n"
+    );
+}
+
+/// `ApplyContext.backup: false` skips ONLY the backup copy: the file is still
+/// written into main AND the secret gitignore gate still runs for an untracked
+/// source.
+#[test]
+fn apply_push_with_backup_disabled_still_writes() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(main.path(), "config.env", "MAIN_OLD=1\n");
+    write(&wt, "config.env", "WT_NEW=1\n");
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+        backup: false,
+    };
+    let res = applied(
+        apply_decision(
+            &ctx,
+            Path::new("config.env"),
+            &Decision::Push,
+            Baseline {
+                wt: meta(&wt.join("config.env")),
+                main: meta(&main.path().join("config.env")),
+                source_untracked: true,
+            },
+        )
+        .unwrap(),
+    );
+
+    assert!(res.backups.is_empty(), "--no-backup skips the backup copy");
+    assert!(
+        !backups.path().join(TS).exists(),
+        "no backup batch dir is created when backups are disabled"
+    );
+    assert!(
+        res.gitignore_appended,
+        "the secret gate still runs with backups disabled"
+    );
+    assert_eq!(
+        fs::read_to_string(main.path().join("config.env")).unwrap(),
+        "WT_NEW=1\n"
+    );
+    assert!(git::is_ignored(main.path(), Path::new("config.env")).unwrap());
+}
+
+/// Fail-closed: an untracked secret pushed with `source_untracked: true` always
+/// ends up gitignored in main (even a brand-new main path), never written
+/// committable.
+#[test]
+fn secret_fail_closed_push_untracked_always_gitignored() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    // A brand-new secret with no prior main copy.
+    write(&wt, "apps/api/.dev.vars", "SECRET=1\n");
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+        backup: true,
+    };
+    let res = applied(
+        apply_decision(
+            &ctx,
+            Path::new("apps/api/.dev.vars"),
+            &Decision::Push,
+            Baseline {
+                wt: meta(&wt.join("apps/api/.dev.vars")),
+                main: None,
+                source_untracked: true,
+            },
+        )
+        .unwrap(),
+    );
+
+    assert!(
+        res.gitignore_appended,
+        "an untracked secret must be ignored in main"
+    );
+    assert!(
+        git::is_ignored(main.path(), Path::new("apps/api/.dev.vars")).unwrap(),
+        "the pushed secret is gitignored in main, never committable"
+    );
+    assert_eq!(
+        fs::read_to_string(main.path().join("apps/api/.dev.vars")).unwrap(),
+        "SECRET=1\n"
+    );
+}
+
+// ── run_bulk (direct `ss-magic reverse-sync`) ─────────────────────────────
+
+/// End-to-end `run_bulk(no_backup=false)`: an untracked candidate differing from
+/// main is pushed INTO main, main's old bytes are backed up under MAIN's own
+/// `.superset/backups/` tree, and the secret is gitignored in main.
+#[test]
+fn run_bulk_pushes_untracked_differing_with_backup_under_main() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+
+    write_magic(&wt, &["**/.dev.vars"]);
+    write(&wt, "apps/api/.dev.vars", "WT_NEW=1\n"); // untracked
+    write(main.path(), "apps/api/.dev.vars", "MAIN_OLD=1\n"); // differs
+
+    let _ = run_bulk(&wt, main.path(), false).unwrap();
+
+    // main took the worktree bytes and is gitignored there.
+    assert_eq!(
+        fs::read_to_string(main.path().join("apps/api/.dev.vars")).unwrap(),
+        "WT_NEW=1\n"
+    );
+    assert!(git::is_ignored(main.path(), Path::new("apps/api/.dev.vars")).unwrap());
+
+    // main's OLD bytes are backed up under MAIN's own backups tree (the
+    // overwritten side), namespaced under `main/`.
+    let backups_root = main.path().join(".superset/backups");
+    assert!(backups_root.is_dir(), "direct reverse-sync backs up under main");
+    let batch = fs::read_dir(&backups_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("a backup batch dir under main");
+    let backup = batch.join("main/apps/api/.dev.vars");
+    assert_eq!(
+        fs::read_to_string(&backup).unwrap(),
+        "MAIN_OLD=1\n",
+        "the backup holds main's overwritten bytes"
+    );
+}
+
+/// `run_bulk(no_backup=true)` still writes into main but creates no
+/// `.superset/backups/` tree there; the secret gate still fires.
+#[test]
+fn run_bulk_no_backup_skips_backups() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+
+    write_magic(&wt, &["**/.dev.vars"]);
+    write(&wt, "apps/api/.dev.vars", "WT_NEW=1\n");
+    write(main.path(), "apps/api/.dev.vars", "MAIN_OLD=1\n");
+
+    let _ = run_bulk(&wt, main.path(), true).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(main.path().join("apps/api/.dev.vars")).unwrap(),
+        "WT_NEW=1\n"
+    );
+    assert!(
+        !main.path().join(".superset/backups").exists(),
+        "--no-backup writes no backups tree in main"
+    );
+    assert!(
+        git::is_ignored(main.path(), Path::new("apps/api/.dev.vars")).unwrap(),
+        "the secret gate still fires with backups disabled"
+    );
+}
+
+/// `run_bulk` with no untracked candidates (no `magic.json` configured) is a
+/// success no-op that writes nothing at all.
+#[test]
+fn run_bulk_noop_when_no_untracked_candidates() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+
+    // No magic.json ⇒ no candidates.
+    let _ = run_bulk(&wt, main.path(), false).unwrap();
+
+    assert!(
+        !main.path().join(".superset/backups").exists(),
+        "a no-op writes no backups"
+    );
+    assert!(
+        !main.path().join(".gitignore").exists(),
+        "a no-op appends no gitignore rule"
+    );
 }

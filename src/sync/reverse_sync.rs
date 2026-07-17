@@ -1,38 +1,50 @@
-//! Reverse sync (U11): push git-UNTRACKED worktree files back into the main
-//! checkout, safely.
+//! Sync engine: reconcile the configured files between a worktree and the main
+//! checkout, safely, in both directions.
 //!
-//! This is the ONE path that writes untracked (often secret) files into the
-//! shared main checkout, so it is deliberately conservative. The plan's
-//! "Secret-safety boundary": the gitignore-safety step (see
-//! [`ensure_gitignored_in_main`], invoked from [`apply_decision`]) is what
-//! prevents a reverse-synced `.dev.vars` from becoming committable in main — a
-//! regression there is a secret leak, not a cosmetic bug.
+//! This is the ONE path that can write untracked (often secret) files into the
+//! shared main checkout, so it is deliberately conservative. The
+//! "Secret-safety boundary": a push into main only appends a `.gitignore` rule
+//! for a git-UNTRACKED source (see [`ensure_gitignored_in_main`], gated on
+//! `Baseline::source_untracked` in [`apply_decision`]), and that determination
+//! is POSITIVE and fail-closed (`!`[`git::tracked_files`]`.contains`) — an
+//! unenumerable / oddly-normalized name defaults to "secret". A regression there
+//! is a secret leak, not a cosmetic bug.
 //!
-//! ## What moves, and what doesn't (R23, KTD10)
+//! ## Entry points
 //!
-//! Candidates are files that BOTH match the worktree's overlaid patterns
-//! (`magic.json` + `magic.local.json`, via [`apply::match_paths`]) AND are
-//! git-untracked in the worktree (`git ls-files --others`, via
-//! [`git::untracked_files`]). "Untracked" INCLUDES gitignored files — that is
-//! the point: the files reverse sync pushes are secrets (`.env`, `.dev.vars`,
-//! the gitignored `magic.local.json`), and those are gitignored by definition.
-//! Tracked files are EXCLUDED — they reach main through a normal merge. So
-//! `magic.local.json` (gitignored ⇒ untracked) flows through with no
-//! special-casing.
+//! - [`run`] — the interactive unified Sync cockpit (worktree menu). It offers
+//!   the [`compute_reconcile_set`] set — every configured file whose worktree
+//!   and main copies differ, in EITHER direction ([`DiffStatus::WorktreeOnly`] /
+//!   [`DiffStatus::MainOnly`] / [`DiffStatus::Differs`]) — and applies the user's
+//!   per-file push / pull / merge / delete decisions via [`apply_decision`].
+//! - [`run_bulk`] — the non-interactive `ss-magic reverse-sync`: bulk-push every
+//!   git-untracked candidate ([`compute_candidates`]) that differs from main.
+//! - [`backup_forward_targets`] — the pre-copy backup pass for the non-interactive
+//!   forward `ss-magic sync` (main → worktree), keeping that direction recoverable.
+//!
+//! ## Push vs pull scope (R23, KTD10)
+//!
+//! A PULL / create-in-worktree may target ANY configured file (tracked or not).
+//! A PUSH into main is the secret-safety concern: only an untracked source gets
+//! the gitignore rule; a tracked file is already committed and must NOT gain one.
+//! The direct [`run_bulk`] restricts itself to untracked candidates entirely.
+//! Backups live under the `.superset/backups/` of the root being overwritten,
+//! gitignored there via the unified [`gitignore::ensure_path_ignored`].
 //!
 //! ## Structure: testable logic vs interactive TUI
 //!
-//! The candidate computation ([`compute_candidates`]), the diff classification
-//! ([`classify`]), and the backup-first apply seam ([`apply_decision`]) are
-//! pure / UI-free and unit-tested with `tempfile` + shell `git`. The
-//! interactive merge cockpit ([`crate::tui::cockpit`]) is TUI/manual-smoke
-//! (consistent with the repo's final-action convention); it returns the user's
-//! per-file decisions and [`run`] feeds each through [`apply_decision`].
+//! The candidate computation ([`compute_reconcile_set`] / [`compute_candidates`]),
+//! the diff classification ([`classify`]), and the backup-first apply seam
+//! ([`apply_decision`]) are pure / UI-free and unit-tested with `tempfile` +
+//! shell `git`. The interactive merge cockpit ([`crate::tui::cockpit`]) is
+//! TUI/manual-smoke (consistent with the repo's final-action convention); it
+//! returns the user's per-file decisions and [`run`] feeds each through
+//! [`apply_decision`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -41,7 +53,7 @@ use anyhow::{Context, Result};
 use crate::sync::apply;
 use crate::sync::merge::{backup_rel_path, BackupSide, Decision};
 use crate::git;
-use crate::git::gitignore;
+use crate::git::gitignore::{self, Ignored, PathKind};
 use crate::tui::cockpit::{self, CockpitOutcome};
 use crate::tui::style;
 use crate::workspace::superset_files;
@@ -50,11 +62,18 @@ use crate::workspace::superset_files;
 /// or is identical (and is hidden — nothing to push). R24.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffStatus {
-    /// The file exists in main with DIFFERENT bytes.
+    /// The file exists on BOTH sides with DIFFERENT bytes.
     Differs,
-    /// The file does NOT exist in main (worktree-only / new).
+    /// The file exists only in the worktree (absent in main) — a push CREATES
+    /// it in main.
     WorktreeOnly,
-    /// The file exists in main with IDENTICAL bytes — hidden from the picker.
+    /// The file exists only in main (absent in the worktree) — a pull CREATES it
+    /// locally; a delete removes main's copy. NEW in the unified sync (Task 5).
+    MainOnly,
+    /// Byte-identical on both sides — hidden from the cockpit. Also the
+    /// walk↔classify race outcome (the path vanished on both sides), so a
+    /// consumer must treat `Identical` as "nothing to reconcile", NOT as "exists
+    /// on both sides and is equal".
     Identical,
 }
 
@@ -116,6 +135,8 @@ pub fn compute_candidates(worktree_root: &Path) -> Result<Vec<PathBuf>> {
         .into_iter()
         .filter(|rel| matched_set.contains(rel.as_path()))
         .filter(|rel| is_safe_rel(rel))
+        // Never re-offer a backed-up secret copy under the tool's own tree.
+        .filter(|rel| !under_backups_dir(rel))
         .collect();
 
     out.sort();
@@ -123,80 +144,150 @@ pub fn compute_candidates(worktree_root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Classify a single candidate against main for the diff-aware picker (R24).
+/// One reconcile candidate for the unified cockpit: a path whose worktree and
+/// main copies are not byte-identical, its presence classification, and whether
+/// its worktree copy is git-UNTRACKED (the secret-safety push gate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// Repo-relative path (identical on both sides).
+    pub rel: PathBuf,
+    /// How this path relates to main.
+    pub status: DiffStatus,
+    /// The worktree copy is git-UNTRACKED (a secret): the gate that decides
+    /// whether a push into main must be gitignored there. Derived FAIL-CLOSED —
+    /// `true` for anything NOT positively known-tracked, so an unenumerable /
+    /// oddly-normalized name defaults to "secret". Always `true` for a
+    /// [`DiffStatus::MainOnly`] rel (no worktree copy is tracked), harmless
+    /// since a main-only file is never pushed.
+    pub wt_untracked: bool,
+}
+
+/// Compute the unified reconcile set for the interactive Sync cockpit: every
+/// overlaid-pattern match on EITHER root whose worktree and main copies are not
+/// byte-identical, classified, with `Identical` dropped.
 ///
-/// Compares bytes: missing-in-main → [`DiffStatus::WorktreeOnly`]; present and
-/// byte-equal → [`DiffStatus::Identical`]; present and different →
-/// [`DiffStatus::Differs`]. A read error on main's copy is treated as
-/// `Differs` (surface it in the picker rather than silently hide it).
-// consumed by U11 run()
+/// Patterns are expanded against BOTH roots (a main-only file is invisible to
+/// the worktree walk, and vice-versa). Directory matches are dropped (reverse
+/// sync copies single files; a directory would `EISDIR` in [`classify`] / the
+/// cockpit), as is the tool's own `.superset/backups/` tree (so a backed-up
+/// secret is never re-offered). `wt_untracked` is derived by POSITIVE tracked
+/// determination ([`git::tracked_files`]) so a path that cannot be enumerated as
+/// tracked biases to "secret".
+pub fn compute_reconcile_set(worktree_root: &Path, main_root: &Path) -> Result<Vec<Candidate>> {
+    let cfg = match superset_files::load_overlaid(worktree_root)? {
+        Some(c) => c,
+        None => return Ok(Vec::new()),
+    };
+    if cfg.files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let wt_matched = apply::match_paths(worktree_root, &cfg.files)?;
+    let main_matched = apply::match_paths(main_root, &cfg.files)?;
+
+    // POSITIVE tracked set, scoped to the worktree matches (an index lookup).
+    // Empty pathspecs make `git ls-files` walk the WHOLE tree, so skip the probe
+    // entirely when there are no worktree matches (an all-main-only repo).
+    let tracked: HashSet<PathBuf> = if wt_matched.is_empty() {
+        HashSet::new()
+    } else {
+        let specs: Vec<&str> = wt_matched.iter().filter_map(|p| p.to_str()).collect();
+        git::tracked_files(worktree_root, &specs)?.into_iter().collect()
+    };
+
+    let mut rels: Vec<PathBuf> = wt_matched
+        .into_iter()
+        .chain(main_matched)
+        .filter(|rel| is_safe_rel(rel) && !under_backups_dir(rel))
+        .collect();
+    rels.sort();
+    rels.dedup();
+
+    let mut out = Vec::new();
+    for rel in rels {
+        // Drop directory matches: reverse sync copies single files. A directory
+        // present on either side would otherwise EISDIR in classify / the cockpit.
+        if worktree_root.join(&rel).is_dir() || main_root.join(&rel).is_dir() {
+            continue;
+        }
+        let status = classify(main_root, worktree_root, &rel)?;
+        if status == DiffStatus::Identical {
+            continue;
+        }
+        let wt_untracked = !tracked.contains(&rel);
+        out.push(Candidate {
+            rel,
+            status,
+            wt_untracked,
+        });
+    }
+    Ok(out)
+}
+
+/// True when `rel` lives under the tool's own `.superset/backups/…` tree, so a
+/// broad user pattern (`**/.env`) can never re-offer or pack a backed-up secret
+/// copy. Shared with `pack` so an archive never captures a recovered secret.
+pub(crate) fn under_backups_dir(rel: &Path) -> bool {
+    use std::ffi::OsStr;
+    let mut c = rel.components();
+    matches!(c.next(), Some(Component::Normal(a)) if a == OsStr::new(".superset"))
+        && matches!(c.next(), Some(Component::Normal(b)) if b == OsStr::new("backups"))
+}
+
+/// Classify one candidate `rel` against both trees for the unified cockpit (R24).
+///
+/// Four-way on presence: worktree-only → [`DiffStatus::WorktreeOnly`]; main-only
+/// → [`DiffStatus::MainOnly`]; present on both and byte-equal →
+/// [`DiffStatus::Identical`]; present on both and different →
+/// [`DiffStatus::Differs`]. `(false, false)` — the path vanished on BOTH sides
+/// between the pattern walk and this classify — is reported as `Identical`
+/// (nothing to reconcile), never a phantom candidate. A read error on main's
+/// copy is surfaced as `Differs` (show it rather than silently hide it); the
+/// worktree read only happens when the worktree copy exists, so a main-only rel
+/// never triggers a spurious read error.
+// consumed by the unified cockpit run() and the direct reverse-sync run_bulk()
 pub fn classify(main_root: &Path, worktree_root: &Path, rel: &Path) -> Result<DiffStatus> {
     let main_path = main_root.join(rel);
-    if !main_path.exists() {
-        return Ok(DiffStatus::WorktreeOnly);
-    }
     let wt_path = worktree_root.join(rel);
-    let main_bytes = fs::read(&main_path);
-    let wt_bytes = fs::read(&wt_path)
-        .with_context(|| format!("reading worktree file {}", wt_path.display()))?;
-    match main_bytes {
-        Ok(mb) if mb == wt_bytes => Ok(DiffStatus::Identical),
-        _ => Ok(DiffStatus::Differs),
+    match (wt_path.exists(), main_path.exists()) {
+        (true, false) => Ok(DiffStatus::WorktreeOnly),
+        (false, true) => Ok(DiffStatus::MainOnly),
+        (false, false) => Ok(DiffStatus::Identical),
+        (true, true) => {
+            let wt_bytes = fs::read(&wt_path)
+                .with_context(|| format!("reading worktree file {}", wt_path.display()))?;
+            match fs::read(&main_path) {
+                Ok(mb) if mb == wt_bytes => Ok(DiffStatus::Identical),
+                _ => Ok(DiffStatus::Differs),
+            }
+        }
     }
 }
 
-/// Ensure `rel` is gitignored in main. Returns `true` when a new rule was
-/// appended, `false` when it was already ignored (no-op).
+/// Ensure `rel` is gitignored in main, the secret-leak boundary. Returns `true`
+/// when a new rule was appended, `false` when it was already ignored (no-op).
 ///
-/// "Already ignored in main" is checked via `git check-ignore` run in main.
-/// When not ignored, the rule appended is the worktree's COVERING rule if one
-/// exists (so `apps/api/.dev.vars` lands as `**/.dev.vars`, not the literal
-/// path), else the literal relative path. `ensure_entry` is idempotent on the
-/// exact line, so a covering rule that already happens to be present in main
-/// produces no duplicate.
-fn ensure_gitignored_in_main(
-    worktree_root: &Path,
-    main_root: &Path,
-    rel: &Path,
-) -> Result<bool> {
-    // Already ignored in main → nothing to do.
-    if git::is_ignored(main_root, rel)? {
-        return Ok(false);
-    }
-
-    let literal = rel
-        .to_str()
-        .with_context(|| format!("non-UTF-8 path: {}", rel.display()))?
-        .to_string();
-
-    // Prefer the worktree's covering rule (it generalizes protection, e.g.
-    // `**/.dev.vars`). But a directory-anchored rule (e.g. `/.dev.vars` from
-    // `apps/api/.gitignore`) does NOT match once appended to main's ROOT
-    // `.gitignore`. So append it, then VERIFY it actually ignores `rel`; if it
-    // doesn't, fall back to the literal repo-relative path, which is always
-    // anchored at the root and therefore always matches. The secret MUST end
-    // up ignored in main — this is the secret-leak boundary.
-    if let Some(pattern) = gitignore::find_covering_rule(worktree_root, rel)? {
-        gitignore::ensure_entry(main_root, &pattern)?;
-        if git::is_ignored(main_root, rel)? {
-            return Ok(true);
+/// A thin wrapper over the unified [`gitignore::ensure_path_ignored`] (closest
+/// `.gitignore`, covering-glob-then-anchored-literal) that adds the STRICT
+/// re-verify the secret boundary requires: `ensure_path_ignored` is
+/// git-TOLERANT (a git failure reads as "not ignored" and writes a literal),
+/// but here a git error must FAIL the push rather than trust a tolerant append.
+/// `git::is_ignored` propagates the error, and a still-unignored path bails, so
+/// no un-ignored secret ever lands committable in main.
+fn ensure_gitignored_in_main(worktree_root: &Path, main_root: &Path, rel: &Path) -> Result<bool> {
+    match gitignore::ensure_path_ignored(main_root, worktree_root, rel, PathKind::File)? {
+        Ignored::Already => Ok(false),
+        Ignored::Appended => {
+            if !git::is_ignored(main_root, rel)? {
+                anyhow::bail!(
+                    "refusing to reverse-sync {}: it is still not gitignored in main after \
+                     appending an ignore rule — writing it would leave a secret committable in main",
+                    rel.display()
+                );
+            }
+            Ok(true)
         }
     }
-
-    gitignore::ensure_entry(main_root, &literal)?;
-    // Verify in ALL builds, not just via debug_assert: this is the secret-leak
-    // boundary and ss-magic ships as a RELEASE binary, where a debug_assert is a
-    // no-op. The literal repo-relative path is anchored at main's root and
-    // appended last, so it must now ignore `rel`; if it somehow still does not,
-    // refuse rather than let the caller write un-ignored secret bytes into main.
-    if !git::is_ignored(main_root, rel)? {
-        anyhow::bail!(
-            "refusing to reverse-sync {}: it is still not gitignored in main after \
-             appending `{literal}` — writing it would leave a secret committable in main",
-            rel.display()
-        );
-    }
-    Ok(true)
 }
 
 /// Interactive reverse-sync entry point (TUI / manual-smoke): compute
@@ -210,31 +301,20 @@ fn ensure_gitignored_in_main(
 /// is covered through [`compute_candidates`], [`classify`], and
 /// [`apply_decision`]. Wired into the menu by U10.
 pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
-    let candidates = compute_candidates(worktree_root)?;
-    if candidates.is_empty() {
+    // The unified reconcile set: every configured file that differs between the
+    // worktree and main, in EITHER direction (worktree-only / main-only /
+    // differing), with the per-file untracked flag that gates a push into main.
+    let reconcile = compute_reconcile_set(worktree_root, main_root)?;
+    if reconcile.is_empty() {
         println!(
             "{}",
-            style::info("No untracked files match the configured patterns.")
+            style::info("Everything configured is already in sync with main.")
         );
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Diff-aware: keep only differing / worktree-only candidates (R24).
-    let mut offered: Vec<(PathBuf, DiffStatus)> = Vec::new();
-    for rel in &candidates {
-        let status = classify(main_root, worktree_root, rel)?;
-        if status != DiffStatus::Identical {
-            offered.push((rel.clone(), status));
-        }
-    }
-
-    if offered.is_empty() {
-        println!(
-            "{}",
-            style::info("All untracked candidates are identical to main — nothing to push.")
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
+    let offered: Vec<(PathBuf, DiffStatus)> =
+        reconcile.iter().map(|c| (c.rel.clone(), c.status)).collect();
 
     // R16: the merge cockpit is a full-screen TUI and MUST have a terminal.
     // A piped / CI / hook invocation refuses to launch and writes NOTHING,
@@ -243,15 +323,15 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
         eprintln!(
             "{}",
             style::err(
-                "error: reverse sync needs an interactive terminal — the merge cockpit \
-                 cannot run piped or in CI."
+                "error: interactive sync needs a terminal — the merge cockpit cannot run \
+                 piped or in CI."
             )
         );
         eprintln!(
             "{}",
             style::info(
-                "`ss-magic sync` is forward-only (main → worktree); reverse sync has no \
-                 non-interactive mode. Re-run it in a terminal."
+                "Use the non-interactive `ss-magic sync` (main → worktree) or \
+                 `ss-magic reverse-sync` (worktree → main) instead."
             )
         );
         // Non-zero so a piped / CI caller can tell "couldn't run, wrote nothing"
@@ -260,17 +340,25 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
     }
 
     // Capture a review-time baseline of every offered file's metadata on BOTH
-    // sides, BEFORE the (possibly long) interactive review opens. The apply-time
-    // guard compares this baseline against on-disk metadata at write time, so
-    // any change that lands during the review→apply window — an edit, a create,
-    // or a delete — is detected and that file is skipped rather than clobbered
+    // sides BEFORE the (possibly long) interactive review opens, plus the
+    // per-file untracked flag carried straight from `compute_reconcile_set` (the
+    // ONE place tracked-ness is determined — no recomputation, no drift). The
+    // apply-time guard compares the metadata baseline against on-disk metadata
+    // at write time, so any change during the review→apply window (edit / create
+    // / delete) is detected and that file skipped rather than clobbered
     // (KD4 / R13–R15). The baseline is derived COHERENTLY with each file's
-    // reviewed status (see `review_baseline`) so what the confirm claims and
-    // what apply does can never disagree.
-    let mut baseline: HashMap<PathBuf, (Option<FileMeta>, Option<FileMeta>)> = HashMap::new();
-    for (rel, status) in &offered {
-        let metas = review_baseline(worktree_root, main_root, rel, *status)?;
-        baseline.insert(rel.clone(), metas);
+    // reviewed status (see `review_baseline`), so the confirm and apply agree.
+    let mut baseline: HashMap<PathBuf, Baseline> = HashMap::new();
+    for c in &reconcile {
+        let (wt, main) = review_baseline(worktree_root, main_root, &c.rel, c.status)?;
+        baseline.insert(
+            c.rel.clone(),
+            Baseline {
+                wt,
+                main,
+                source_untracked: c.wt_untracked,
+            },
+        );
     }
 
     // Full-screen cockpit: the user sets each file's direction and either
@@ -287,52 +375,65 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // One timestamp for the whole apply; backups live under a gitignored
-    // `.superset/backups/` in the worktree so recovered secret bytes are never
-    // committed (reuse `ensure_entry` — idempotent, appends only when absent).
+    // Backups live under a gitignored `.superset/backups/` in the worktree so
+    // recovered secret bytes are never committed.
     let ts = apply_timestamp();
     let backups_root = worktree_root.join(".superset/backups");
-    gitignore::ensure_entry(worktree_root, ".superset/backups/")?;
+    gitignore::ensure_path_ignored(
+        worktree_root,
+        worktree_root,
+        Path::new(".superset/backups"),
+        PathKind::Dir,
+    )?;
 
     let ctx = ApplyContext {
         worktree_root,
         main_root,
         backups_root: &backups_root,
         ts: &ts,
+        backup: true,
     };
-
     let summary = apply_batch(&ctx, &decisions, &baseline);
+    Ok(finish_batch(summary, &backups_root, &ts, true))
+}
 
+/// The shared batch tail: print the recorded backup paths, best-effort-prune old
+/// batches (skipped when `backup` is false — nothing was written to prune),
+/// print the applied/skipped/failed summary, and choose the exit code (non-zero
+/// iff a file failed). Shared by the interactive [`run`] and the direct
+/// [`run_bulk`].
+fn finish_batch(summary: BatchSummary, backups_root: &Path, ts: &str, backup: bool) -> ExitCode {
     if !summary.backups.is_empty() {
         println!();
         println!(
             "{}",
             style::info("Backups of overwritten files (recover a mistake here):")
         );
-        for backup in &summary.backups {
-            println!("{}", style::info(format!("  {}", backup.display())));
+        for b in &summary.backups {
+            println!("{}", style::info(format!("  {}", b.display())));
         }
     }
 
-    // Retention: keep only the newest batches so `.superset/backups/` cannot
-    // grow without bound. Best-effort — a pruning failure never fails the sync
-    // (the writes above already landed and their backups are intact). The
-    // batch just written is passed as protected: even a backward clock jump
-    // that makes its name sort among the oldest must not delete the backups
-    // whose recovery paths were printed moments ago.
-    match prune_old_backups(&backups_root, BACKUP_BATCHES_KEPT, Some(&ts)) {
-        Ok(pruned) if !pruned.is_empty() => println!(
-            "{}",
-            style::info(format!(
-                "Pruned {} old backup batch(es), keeping the newest {BACKUP_BATCHES_KEPT}.",
-                pruned.len()
-            ))
-        ),
-        Ok(_) => {}
-        Err(err) => println!(
-            "{}",
-            style::warn(format!("Backup pruning failed (backups left as-is): {err:#}"))
-        ),
+    // Retention: keep only the newest batches so `.superset/backups/` cannot grow
+    // without bound. Best-effort — a pruning failure never fails the sync (the
+    // writes already landed and their backups are intact); the batch just written
+    // is protected by name even under a backward clock jump. Skipped entirely
+    // when backups were disabled (nothing new to prune against).
+    if backup {
+        match prune_old_backups(backups_root, BACKUP_BATCHES_KEPT, Some(ts)) {
+            Ok(pruned) if !pruned.is_empty() => println!(
+                "{}",
+                style::info(format!(
+                    "Pruned {} old backup batch(es), keeping the newest {BACKUP_BATCHES_KEPT}.",
+                    pruned.len()
+                ))
+            ),
+            Ok(_) => {}
+            Err(err) => println!(
+                "{}",
+                style::warn(format!("Backup pruning failed (backups left as-is): {err:#}"))
+            ),
+        }
     }
 
     println!();
@@ -344,13 +445,13 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
         println!("{}", style::err(line));
         // Some files did not apply — signal partial failure to scripts/CI
         // rather than exiting 0 on a batch that only partly succeeded.
-        return Ok(ExitCode::from(1));
+        return ExitCode::from(1);
     } else if summary.skipped > 0 {
         println!("{}", style::warn(line));
     } else {
         println!("{}", style::ok(line));
     }
-    Ok(ExitCode::SUCCESS)
+    ExitCode::SUCCESS
 }
 
 /// Tallies + collected backups from applying a whole batch of cockpit
@@ -372,7 +473,7 @@ struct BatchSummary {
 fn apply_batch(
     ctx: &ApplyContext,
     decisions: &[(PathBuf, Decision)],
-    baseline: &HashMap<PathBuf, (Option<FileMeta>, Option<FileMeta>)>,
+    baseline: &HashMap<PathBuf, Baseline>,
 ) -> BatchSummary {
     let mut summary = BatchSummary {
         applied: 0,
@@ -381,8 +482,15 @@ fn apply_batch(
         backups: Vec::new(),
     };
     for (rel, decision) in decisions {
-        let (wt, main) = baseline.get(rel).cloned().unwrap_or((None, None));
-        match apply_decision(ctx, rel, decision, Baseline { wt, main }) {
+        // Fail-closed on a miss: an absent baseline defaults to
+        // `source_untracked: true` (treat as a secret) so a bookkeeping gap
+        // never silently skips the gitignore-in-main gate.
+        let bl = baseline.get(rel).cloned().unwrap_or(Baseline {
+            wt: None,
+            main: None,
+            source_untracked: true,
+        });
+        match apply_decision(ctx, rel, decision, bl) {
             Ok(ApplyOutcome::Applied(result)) => {
                 summary.applied += 1;
                 let dir = match result.direction {
@@ -419,6 +527,144 @@ fn apply_batch(
         }
     }
     summary
+}
+
+/// Direct, non-interactive `ss-magic reverse-sync`: bulk-push every git-untracked
+/// candidate that differs from main INTO main (creating or overwriting), backing
+/// up each overwritten main file first (unless `no_backup`) and running the
+/// gitignore-in-main secret gate. No TUI. Every candidate is untracked by
+/// construction ([`compute_candidates`]), so the secret gate always fires and
+/// `source_untracked` is hard-coded `true`.
+pub fn run_bulk(worktree_root: &Path, main_root: &Path, no_backup: bool) -> Result<ExitCode> {
+    let candidates = compute_candidates(worktree_root)?;
+    let mut work: Vec<(PathBuf, DiffStatus)> = Vec::new();
+    for rel in &candidates {
+        let status = classify(main_root, worktree_root, rel)?;
+        // Untracked worktree candidates are never MainOnly (they exist in the
+        // worktree); Identical is nothing to push.
+        if status != DiffStatus::Identical {
+            work.push((rel.clone(), status));
+        }
+    }
+    if work.is_empty() {
+        println!(
+            "{}",
+            style::info("Nothing to reverse-sync — no untracked candidates differ from main.")
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Backups of main's overwritten bytes live under MAIN's gitignored
+    // `.superset/backups/` — the side this direction overwrites.
+    let ts = apply_timestamp();
+    let backups_root = main_root.join(".superset/backups");
+    if !no_backup {
+        gitignore::ensure_path_ignored(
+            main_root,
+            main_root,
+            Path::new(".superset/backups"),
+            PathKind::Dir,
+        )?;
+    }
+
+    let ctx = ApplyContext {
+        worktree_root,
+        main_root,
+        backups_root: &backups_root,
+        ts: &ts,
+        backup: !no_backup,
+    };
+
+    // No interactive review window, so the baseline is the current on-disk
+    // metadata captured immediately before apply.
+    let mut baseline: HashMap<PathBuf, Baseline> = HashMap::new();
+    let mut decisions: Vec<(PathBuf, Decision)> = Vec::new();
+    for (rel, status) in &work {
+        let (wt, main) = review_baseline(worktree_root, main_root, rel, *status)?;
+        baseline.insert(
+            rel.clone(),
+            Baseline {
+                wt,
+                main,
+                source_untracked: true,
+            },
+        );
+        decisions.push((rel.clone(), Decision::Push));
+    }
+
+    let summary = apply_batch(&ctx, &decisions, &baseline);
+    Ok(finish_batch(summary, &backups_root, &ts, !no_backup))
+}
+
+/// Back up a file OR directory `target` to `dest` before it is overwritten,
+/// returning the backup path (`Ok(None)` when `target` is absent — a fresh
+/// create has nothing to lose). A directory is copied recursively.
+fn backup_if_exists(target: &Path, dest: &Path) -> Result<Option<PathBuf>> {
+    if !target.exists() {
+        return Ok(None);
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating backup dir {}", parent.display()))?;
+    }
+    if target.is_dir() {
+        apply::copy_dir_recursive(target, dest)?;
+    } else {
+        fs::copy(target, dest)
+            .with_context(|| format!("backing up {} → {}", target.display(), dest.display()))?;
+    }
+    Ok(Some(dest.to_path_buf()))
+}
+
+/// Back up every existing worktree file/dir that a forward `ss-magic sync`
+/// (main → worktree) is about to overwrite, under `cwd_root/.superset/backups/
+/// <ts>/…` (the worktree side forward sync overwrites), gitignored there. A
+/// no-op when the configured patterns match nothing. The copy engine itself
+/// stays untouched — this is a deliberate pre-pass with a narrow, documented
+/// same-process TOCTOU window (nothing else writes the worktree between this
+/// pass and the copy). Best-effort pruning keeps the backups dir bounded.
+pub fn backup_forward_targets(main_root: &Path, cwd_root: &Path, patterns: &[String]) -> Result<()> {
+    let matches = apply::match_paths(main_root, patterns)
+        .context("expanding sync patterns for the pre-copy backup pass")?;
+    if matches.is_empty() {
+        return Ok(());
+    }
+    gitignore::ensure_path_ignored(
+        cwd_root,
+        cwd_root,
+        Path::new(".superset/backups"),
+        PathKind::Dir,
+    )?;
+    let ts = apply_timestamp();
+    let backups_root = cwd_root.join(".superset/backups");
+    let mut backed_up = Vec::new();
+    for rel in &matches {
+        if under_backups_dir(rel) {
+            continue;
+        }
+        let dest = backups_root.join(&ts).join(rel);
+        if let Some(p) = backup_if_exists(&cwd_root.join(rel), &dest)? {
+            backed_up.push(p);
+        }
+    }
+    if !backed_up.is_empty() {
+        println!();
+        println!(
+            "{}",
+            style::info("Backups of files about to be overwritten (recover a mistake here):")
+        );
+        for p in &backed_up {
+            println!("{}", style::info(format!("  {}", p.display())));
+        }
+    }
+    // Best-effort prune; a failure warns but never fails the forward sync.
+    if let Err(err) = prune_old_backups(&backups_root, BACKUP_BATCHES_KEPT, Some(&ts)) {
+        println!(
+            "{}",
+            style::warn(format!("Backup pruning failed (backups left as-is): {err:#}"))
+        );
+    }
+    Ok(())
 }
 
 /// Timestamp string for a batch of backups: the current UTC time as a
@@ -648,24 +894,27 @@ fn hash_file(path: &Path) -> Result<u64> {
 /// COHERENT with the `status` the user reviews — not with whatever the disk
 /// happens to hold at capture time.
 ///
-/// A candidate offered as [`DiffStatus::WorktreeOnly`] was classified with
-/// main ABSENT: the cockpit shows it as a new file, the batched confirm lists
-/// its push as a non-destructive create (and its delete as "worktree copy"
-/// only). So its main-side baseline is pinned to `None`. If main gained a
-/// copy in the classify→capture window, the apply-time guard then sees a file
-/// the review never covered (`baseline None` vs a present file →
-/// [`Guard::Changed`]) and SKIPS it — instead of silently overwriting or
-/// deleting a main copy the user was told did not exist.
+/// The reviewed-ABSENT side is pinned to `None`, symmetric on both directions:
+/// a [`DiffStatus::WorktreeOnly`] file was reviewed with main absent (main side
+/// `None`), and a [`DiffStatus::MainOnly`] file was reviewed with the worktree
+/// copy absent (worktree side `None`). So if the pinned side gains a copy in the
+/// classify→capture window, the apply-time guard sees a file the review never
+/// covered (`baseline None` vs a present file → [`Guard::Changed`]) and SKIPS
+/// it — instead of silently overwriting or deleting a copy the user was told did
+/// not exist.
 fn review_baseline(
     worktree_root: &Path,
     main_root: &Path,
     rel: &Path,
     status: DiffStatus,
 ) -> Result<(Option<FileMeta>, Option<FileMeta>)> {
-    let wt = meta_of(&worktree_root.join(rel))?;
+    let wt = match status {
+        DiffStatus::MainOnly => None,
+        _ => meta_of(&worktree_root.join(rel))?,
+    };
     let main = match status {
         DiffStatus::WorktreeOnly => None,
-        DiffStatus::Differs | DiffStatus::Identical => meta_of(&main_root.join(rel))?,
+        _ => meta_of(&main_root.join(rel))?,
     };
     Ok((wt, main))
 }
@@ -821,13 +1070,20 @@ fn write_bytes(target: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Back up `target` to `dest` iff `guard` is [`Guard::Unchanged`] — the "back
-/// up the losing bytes before a safe overwrite" rule shared by every
-/// destructive-overwrite site in [`apply_decision`]. A no-op (`Ok(None)`) for
-/// [`Guard::Missing`] (no prior bytes to lose) — the caller has already bailed
-/// out on [`Guard::Changed`] before reaching here.
-fn backup_if_unchanged(target: &Path, guard: Guard, dest: &Path) -> Result<Option<PathBuf>> {
-    if matches!(guard, Guard::Unchanged) {
+/// Back up `target` to `dest` iff backups are enabled AND `guard` is
+/// [`Guard::Unchanged`] — the "back up the losing bytes before a safe overwrite"
+/// rule shared by every destructive-overwrite site in [`apply_decision`]. A
+/// no-op (`Ok(None)`) for [`Guard::Missing`] (no prior bytes to lose), or when
+/// `take_backup` is false (`--no-backup`). The caller has already bailed out on
+/// [`Guard::Changed`] before reaching here, so disabling backups never disables
+/// the concurrent-edit guard.
+fn backup_if_unchanged(
+    target: &Path,
+    guard: Guard,
+    dest: &Path,
+    take_backup: bool,
+) -> Result<Option<PathBuf>> {
+    if take_backup && matches!(guard, Guard::Unchanged) {
         Ok(Some(backup(target, dest)?))
     } else {
         Ok(None)
@@ -842,19 +1098,32 @@ pub struct ApplyContext<'a> {
     /// The main checkout root (reverse-sync destination for `Push`, source for
     /// `Pull`, and the secret-safety boundary).
     pub main_root: &'a Path,
-    /// Root directory backups are written under (gitignored in the worktree).
+    /// Root directory backups are written under (gitignored via
+    /// [`gitignore::ensure_path_ignored`] at the closest `.gitignore`).
     pub backups_root: &'a Path,
     /// The batch's single timestamp, shared by every backup path in the run.
     pub ts: &'a str,
+    /// Whether to take a pre-overwrite backup of the losing bytes. `false`
+    /// (`--no-backup` on a direct path) skips ONLY the backup copy — the TOCTOU
+    /// [`Guard::Changed`] skip and the secret-safety gitignore step are
+    /// unaffected.
+    pub backup: bool,
 }
 
 /// One file's review-time metadata baseline for [`apply_decision`]'s TOCTOU
 /// guard, one side each — see [`check_target`].
+#[derive(Debug, Clone)]
 pub struct Baseline {
     /// The worktree side's metadata at review time (`None` if it didn't exist).
     pub wt: Option<FileMeta>,
     /// The main side's metadata at review time (`None` if it didn't exist).
     pub main: Option<FileMeta>,
+    /// Whether the PUSH SOURCE (the worktree copy) is git-untracked — the
+    /// secret-safety gate. `true` fires [`ensure_gitignored_in_main`] before a
+    /// push/merge writes into main; `false` (a positively-tracked file) skips it
+    /// so a committed path never gets a `.gitignore` rule. Fail-closed: when
+    /// tracked-ness cannot be determined, this is `true` (treat as a secret).
+    pub source_untracked: bool,
 }
 
 /// Apply one cockpit [`Decision`] for `rel`, safely (KD4, R13–R15).
@@ -917,10 +1186,17 @@ pub fn apply_decision(
                 guard,
                 &ctx.backups_root
                     .join(backup_rel_path(ctx.ts, BackupSide::Main, rel)),
+                ctx.backup,
             )?);
-            // Secret-safety BEFORE the bytes land in main.
-            let gitignore_appended =
-                ensure_gitignored_in_main(ctx.worktree_root, ctx.main_root, rel)?;
+            // Secret-safety BEFORE the bytes land in main — but ONLY for an
+            // untracked (secret) source. A TRACKED file is already committed in
+            // main and must NOT gain a `.gitignore` rule; `source_untracked` is
+            // derived fail-closed, so an undeterminable source still gates on.
+            let gitignore_appended = if baseline.source_untracked {
+                ensure_gitignored_in_main(ctx.worktree_root, ctx.main_root, rel)?
+            } else {
+                false
+            };
             let bytes = fs::read(&source)
                 .with_context(|| format!("reading worktree file {}", source.display()))?;
             write_bytes(&target, &bytes)?;
@@ -950,6 +1226,7 @@ pub fn apply_decision(
                 guard,
                 &ctx.backups_root
                     .join(backup_rel_path(ctx.ts, BackupSide::Worktree, rel)),
+                ctx.backup,
             )?);
             // No gitignore step — the worktree side is not the secret boundary.
             let bytes = fs::read(&source)
@@ -983,21 +1260,28 @@ pub fn apply_decision(
                 wt_guard,
                 &ctx.backups_root
                     .join(backup_rel_path(ctx.ts, BackupSide::Worktree, rel)),
+                ctx.backup,
             )?);
             backups.extend(backup_if_unchanged(
                 &main_target,
                 main_guard,
                 &ctx.backups_root
                     .join(backup_rel_path(ctx.ts, BackupSide::Main, rel)),
+                ctx.backup,
             )?);
             // Secret-safety FIRST, then write MAIN, then the worktree. Ordering
             // the main write before the worktree means a failure at or before
             // it leaves BOTH sides untouched (no divergence); only the final
             // worktree write can fail after main is updated, and `write_bytes`
             // is atomic so even that leaves no truncated file. The
-            // gitignore-before-any-main-write ordering is preserved.
-            let gitignore_appended =
-                ensure_gitignored_in_main(ctx.worktree_root, ctx.main_root, rel)?;
+            // gitignore-before-any-main-write ordering is preserved. Gated on an
+            // untracked source (see the Push arm) so a tracked merge target never
+            // gains a `.gitignore` rule.
+            let gitignore_appended = if baseline.source_untracked {
+                ensure_gitignored_in_main(ctx.worktree_root, ctx.main_root, rel)?
+            } else {
+                false
+            };
             write_bytes(&main_target, text.as_bytes())?;
             write_bytes(&wt_target, text.as_bytes())?;
             Ok(ApplyOutcome::Applied(ApplyResult {
@@ -1034,12 +1318,14 @@ pub fn apply_decision(
                 wt_guard,
                 &ctx.backups_root
                     .join(backup_rel_path(ctx.ts, BackupSide::Worktree, rel)),
+                ctx.backup,
             )?);
             backups.extend(backup_if_unchanged(
                 &main_target,
                 main_guard,
                 &ctx.backups_root
                     .join(backup_rel_path(ctx.ts, BackupSide::Main, rel)),
+                ctx.backup,
             )?);
             // Remove main first, then the worktree (mirrors Merge's ordering):
             // a failure at or before the main unlink leaves the worktree copy
