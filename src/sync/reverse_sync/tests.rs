@@ -1230,7 +1230,7 @@ fn prune_old_backups_keeps_newest_and_ignores_foreign_entries() {
     fs::create_dir_all(root.path().join("notes")).unwrap();
     fs::write(root.path().join("README.txt"), "hands off\n").unwrap();
 
-    let pruned = prune_old_backups(root.path(), 3).unwrap();
+    let pruned = prune_old_backups(root.path(), 3, None).unwrap();
 
     let pruned_names: Vec<String> = pruned
         .iter()
@@ -1279,7 +1279,7 @@ fn prune_old_backups_folds_legacy_merge_layout_into_batches() {
     // A foreign non-batch child under local/ must survive.
     seed("local/notes/keep.txt");
 
-    let pruned = prune_old_backups(root.path(), 2).unwrap();
+    let pruned = prune_old_backups(root.path(), 2, None).unwrap();
 
     // The whole legacy batch — all three of its directories — is pruned.
     assert_eq!(pruned.len(), 3, "got {pruned:?}");
@@ -1295,15 +1295,51 @@ fn prune_old_backups_folds_legacy_merge_layout_into_batches() {
     assert!(!root.path().join("main").exists(), "emptied legacy side dir is removed");
 }
 
+/// The batch written by THIS RUN is never pruned, even when a backward clock
+/// jump names it "older" than the existing batches — the recovery paths the
+/// user was just shown must outlive the prune. The budget then falls on the
+/// oldest unprotected batch instead.
+#[test]
+fn prune_old_backups_never_prunes_the_current_batch() {
+    let root = tempfile::tempdir().unwrap();
+    let mk = |name: &str| {
+        let d = root.path().join(name);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("x.env"), "X=1\n").unwrap();
+    };
+    // The clock jumped back: this run's batch sorts BEFORE all existing ones.
+    let current = "20260101-000000";
+    mk(current);
+    for i in 0..11 {
+        mk(&format!("20260716-1000{i:02}"));
+    }
+
+    let pruned = prune_old_backups(root.path(), 10, Some(current)).unwrap();
+
+    assert!(
+        root.path().join(current).is_dir(),
+        "the just-written batch must survive its own run's prune"
+    );
+    let pruned_names: Vec<String> = pruned
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        pruned_names,
+        vec!["20260716-100000".to_string()],
+        "the oldest unprotected batch takes the hit instead"
+    );
+}
+
 /// Fewer batches than `keep` → nothing pruned; a missing backups root is a
 /// clean no-op (first-ever sync has no backups dir).
 #[test]
 fn prune_old_backups_noop_under_threshold_and_missing_root() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir_all(root.path().join("20260716-100000")).unwrap();
-    assert!(prune_old_backups(root.path(), 10).unwrap().is_empty());
+    assert!(prune_old_backups(root.path(), 10, None).unwrap().is_empty());
     assert!(root.path().join("20260716-100000").is_dir());
 
     let missing = root.path().join("no-such-dir");
-    assert!(prune_old_backups(&missing, 10).unwrap().is_empty());
+    assert!(prune_old_backups(&missing, 10, None).unwrap().is_empty());
 }

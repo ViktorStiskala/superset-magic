@@ -188,9 +188,12 @@ committable and must never leak.
   removed only when this run pruned from it and it ended up empty — a foreign
   dir merely named `local`/`main` (or its non-batch children) is never
   touched.
+  The batch written by the CURRENT run is protected by name and never pruned
+  — a backward clock jump could otherwise name it "older" than the keep set
+  and delete the backups whose recovery paths were just printed.
   Flag a retention change that deletes non-batch-named entries, prunes before
-  the current batch's backups are written, or turns a pruning error into a
-  sync failure.
+  the current batch's backups are written, drops the current-batch
+  protection, or turns a pruning error into a sync failure.
 - **Delete decisions remove BOTH sides, backup-first.** `d` records
   `Decision::Delete`; apply unlinks the file from main and the worktree
   (whichever exist), each side backed up first and TOCTOU-guarded like an

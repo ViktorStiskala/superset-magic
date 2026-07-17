@@ -190,8 +190,9 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   matching `is_backup_batch_name` (current or legacy epoch shape), never
   foreign entries; the unreleased-0.4.0 merge layout's top-level
   `local/<epoch>`+`main/<epoch>` dirs are folded into their epoch's batch
-  under the same budget, and an emptied side dir is removed only when this
-  run pruned from it.
+  under the same budget, an emptied side dir is removed only when this
+  run pruned from it, and the batch written by the current run is protected
+  by name (never pruned, even under a backward clock jump).
   `ApplyContext` carries the two tree roots plus the batch's shared backups
   root/timestamp. Backup
   paths are printed so a mistaken overwrite is recoverable. `sync/merge.rs`

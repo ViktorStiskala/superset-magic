@@ -316,8 +316,11 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
 
     // Retention: keep only the newest batches so `.superset/backups/` cannot
     // grow without bound. Best-effort — a pruning failure never fails the sync
-    // (the writes above already landed and their backups are intact).
-    match prune_old_backups(&backups_root, BACKUP_BATCHES_KEPT) {
+    // (the writes above already landed and their backups are intact). The
+    // batch just written is passed as protected: even a backward clock jump
+    // that makes its name sort among the oldest must not delete the backups
+    // whose recovery paths were printed moments ago.
+    match prune_old_backups(&backups_root, BACKUP_BATCHES_KEPT, Some(&ts)) {
         Ok(pruned) if !pruned.is_empty() => println!(
             "{}",
             style::info(format!(
@@ -489,7 +492,18 @@ fn is_backup_batch_name(name: &str) -> bool {
 /// is never deleted); the legacy side dirs themselves are removed once
 /// emptied. A missing backups root prunes nothing. Returns the pruned
 /// directory paths.
-fn prune_old_backups(backups_root: &Path, keep: usize) -> Result<Vec<PathBuf>> {
+///
+/// `protect` names the batch WRITTEN BY THIS RUN: it is never pruned, no
+/// matter where it sorts — a backward clock jump could otherwise name the
+/// fresh batch "older" than ten existing ones and delete the very backups
+/// whose recovery paths were just printed. (Normally the fresh batch is the
+/// newest name and the protection is a no-op; when it does fire, one extra
+/// old batch survives until the next healthy run.)
+fn prune_old_backups(
+    backups_root: &Path,
+    keep: usize,
+    protect: Option<&str>,
+) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(backups_root) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -534,7 +548,11 @@ fn prune_old_backups(backups_root: &Path, keep: usize) -> Result<Vec<PathBuf>> {
 
     let prune_count = batches.len().saturating_sub(keep);
     let mut pruned = Vec::new();
-    for (_name, dirs) in batches.into_iter().take(prune_count) {
+    for (name, dirs) in batches.into_iter().take(prune_count) {
+        // Never the batch this run just wrote (see the doc comment).
+        if protect == Some(name.as_str()) {
+            continue;
+        }
         for dir in dirs {
             fs::remove_dir_all(&dir)
                 .with_context(|| format!("pruning old backup batch {}", dir.display()))?;
