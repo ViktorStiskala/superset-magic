@@ -22,7 +22,7 @@ fn ae3_bare_no_guard_gate_fires() {
 #[test]
 fn sync_no_guard_gate_fires() {
     assert!(
-        should_run_update_gate(Command::Sync { no_backup: false },false),
+        should_run_update_gate(Command::Sync { no_backup: false }, false),
         "Sync + guard inactive → gate must fire"
     );
 }

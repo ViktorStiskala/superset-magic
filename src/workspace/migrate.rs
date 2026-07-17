@@ -56,8 +56,9 @@ pub const MAGIC_WRAPPER_ENTRY: &str = "./.superset/magic.sh sync";
 /// Relative path of the retired `setup.sh`, deleted on migration.
 const SETUP_SH_REL: &str = ".superset/setup.sh";
 
-/// Relative path of `magic.local.json` as it appears inside the repo. Added
-/// to the git-root `.gitignore` during migration and init.
+/// Relative path of `magic.local.json` as it appears inside the repo. Gitignored
+/// via `gitignore::ensure_path_ignored` during migration and init (the closest
+/// existing `.gitignore`, or the git-root file; a no-op if git already ignores it).
 const MAGIC_LOCAL_REL: &str = ".superset/magic.local.json";
 
 /// Which branch the main-checkout bare invocation should take, decided from

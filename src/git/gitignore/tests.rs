@@ -270,3 +270,35 @@ fn ensure_path_ignored_places_rule_in_nested_gitignore() {
         "the nested rule must not leak to a sibling directory"
     );
 }
+
+/// The cross-root covering-glob branch (the shape `ensure_gitignored_in_main`
+/// uses in production: worktree source, main target): a broad rule resolved from
+/// `rule_source_root`'s .gitignore is written into `target_root`'s .gitignore
+/// (verified to actually ignore the path), NOT the anchored literal.
+#[test]
+fn ensure_path_ignored_prefers_covering_glob_from_source_root() {
+    let source = fresh();
+    let target = fresh();
+    git_init(source.path());
+    git_init(target.path());
+    // Source already ignores the secret via a broad glob; target has no rule.
+    fs::write(source.path().join(".gitignore"), "**/.dev.vars\n").unwrap();
+
+    let rel = Path::new("apps/api/.dev.vars");
+    let outcome = ensure_path_ignored(target.path(), source.path(), rel, PathKind::File).unwrap();
+    assert_eq!(outcome, Ignored::Appended);
+
+    let gi = fs::read_to_string(target.path().join(".gitignore")).unwrap();
+    assert!(
+        gi.lines().any(|l| l == "**/.dev.vars"),
+        "the covering glob must be written into the target, got: {gi:?}"
+    );
+    assert!(
+        !gi.contains("apps/api/.dev.vars"),
+        "the anchored literal must NOT be used when a glob covers it: {gi:?}"
+    );
+    assert!(
+        git::is_ignored_str(target.path(), "apps/api/.dev.vars").unwrap(),
+        "the target must now ignore the secret"
+    );
+}

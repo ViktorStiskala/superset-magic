@@ -61,10 +61,11 @@ const H_SCROLL_STEP: u16 = 8;
 /// scrolls horizontally.
 const UNIFIED_GUTTER: u16 = 12;
 
-/// New-file view gutter width: one 4-wide line number + a separator space
-/// (`"%4d "` → 5) plus the 2-column `+ ` sign — fixed while the content scrolls
-/// horizontally, mirroring [`UNIFIED_GUTTER`] for the single "everything is an
-/// addition" column of a worktree-only file.
+/// Gutter width for the one-sided "will be created" views: one 4-wide line
+/// number + a separator space (`"%4d "` → 5) plus the 2-column `+ ` sign — fixed
+/// while the content scrolls horizontally, mirroring [`UNIFIED_GUTTER`]. Shared
+/// by [`FileDiff::New`] (a worktree-only file) and [`FileDiff::MainOnly`] (a
+/// main-only file) via `render_created`.
 const NEW_GUTTER: u16 = 7;
 
 /// Diff-pane notice for a file whose sides are equal AFTER EOL normalization:

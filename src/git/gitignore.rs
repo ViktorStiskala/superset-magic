@@ -175,7 +175,10 @@ fn closest_gitignore_dir(target_root: &Path, rel: &Path) -> PathBuf {
 
 /// The literal gitignore rule for `rel` (of `kind`) to write into the
 /// `.gitignore` at `gi_dir`. When `gi_dir == target_root` the rule is the
-/// repo-relative path verbatim (already anchored at the root); when `gi_dir` is
+/// repo-relative path verbatim — anchored at the root only when `rel` itself
+/// contains a `/`; a bare top-level filename (e.g. `.env`) is intentionally left
+/// UNANCHORED (matches at any depth, like `**/.env`), which is safe-directioned
+/// for secret protection (only widens the ignore scope). When `gi_dir` is
 /// nested, the rule is `/`-anchored and relative to `gi_dir`. A `Dir` gains a
 /// trailing slash.
 fn anchored_literal(

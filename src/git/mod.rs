@@ -237,11 +237,17 @@ pub fn pr_create(repo_root: &Path, base: &str) -> Result<String> {
 pub fn untracked_files(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<PathBuf>> {
     let mut args: Vec<&str> = vec!["ls-files", "--others", "-z", "--"];
     args.extend_from_slice(pathspecs);
-    let out = git(&args, Some(repo_root))?;
-    // `-z` gives NUL-separated, unquoted paths so filenames with spaces or
-    // special characters survive intact (the default output quotes them).
-    // `git`'s trim() above strips a trailing NUL, so split on NUL and drop
-    // any empty trailing segment.
+    Ok(parse_ls_files_z(&git(&args, Some(repo_root))?))
+}
+
+/// Parse the NUL-separated (`-z`) stdout of a `git ls-files` invocation into
+/// repo-relative paths. `-z` gives unquoted paths so filenames with spaces or
+/// special characters survive intact; `git`'s `trim()` strips the trailing NUL,
+/// so an empty trailing segment is dropped. Any absolute or `..`-bearing entry
+/// is defensively dropped (git never emits such paths from the repo root, but
+/// BOTH [`untracked_files`] and [`tracked_files`] gate the secret-safety
+/// determination, so the filter lives in ONE place).
+fn parse_ls_files_z(out: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for raw in out.split('\0') {
         if raw.is_empty() {
@@ -249,12 +255,11 @@ pub fn untracked_files(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<PathB
         }
         let p = PathBuf::from(raw);
         if p.is_absolute() || raw.split('/').any(|seg| seg == "..") {
-            // Defensive: git never emits these from the repo root.
             continue;
         }
         paths.push(p);
     }
-    Ok(paths)
+    paths
 }
 
 /// True when `rel` (a repo-relative path) is gitignored in the working tree
@@ -293,25 +298,13 @@ pub fn is_ignored_str(repo_root: &Path, rel_str: &str) -> Result<bool> {
 /// reverse-sync secret gate — a path NOT in this set is treated as untracked (a
 /// secret), so an unenumerable / oddly-normalized name fails closed. Output is
 /// repo-relative porcelain paths; leading-`..`/absolute paths are defensively
-/// dropped. Empty `pathspecs` list the WHOLE index, so callers should skip the
-/// probe when there are no matches.
+/// dropped. A directory pathspec expands to the tracked files within it (same as
+/// [`untracked_files`]). Empty `pathspecs` list the WHOLE index, so callers
+/// should skip the probe when there are no matches.
 pub fn tracked_files(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<PathBuf>> {
     let mut args: Vec<&str> = vec!["ls-files", "--cached", "-z", "--"];
     args.extend_from_slice(pathspecs);
-    let out = git(&args, Some(repo_root))?;
-    let mut paths = Vec::new();
-    for raw in out.split('\0') {
-        if raw.is_empty() {
-            continue;
-        }
-        let p = PathBuf::from(raw);
-        if p.is_absolute() || raw.split('/').any(|seg| seg == "..") {
-            // Defensive: git never emits these from the repo root.
-            continue;
-        }
-        paths.push(p);
-    }
-    Ok(paths)
+    Ok(parse_ls_files_z(&git(&args, Some(repo_root))?))
 }
 
 /// Resolve the `.gitignore` rule that COVERS `rel` in the working tree rooted

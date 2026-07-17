@@ -290,16 +290,17 @@ fn ensure_gitignored_in_main(worktree_root: &Path, main_root: &Path, rel: &Path)
     }
 }
 
-/// Interactive reverse-sync entry point (TUI / manual-smoke): compute
-/// candidates, hide identical ones, present the diff-aware picker, and copy
-/// the user-selected subset into main with the overwrite + gitignore safety.
+/// Interactive unified Sync entry point (TUI / manual-smoke): compute the
+/// bidirectional [`compute_reconcile_set`], present the merge cockpit, and apply
+/// the user's per-file push / pull / merge / delete decisions with the overwrite
+/// backup + gitignore secret gate.
 ///
-/// Empty candidate set → print a gray info line and return WITHOUT opening the
-/// picker (R22). Decline at the picker → main fully untouched.
+/// Empty reconcile set → print a gray info line and return WITHOUT opening the
+/// cockpit (R22). Decline at the cockpit → both sides fully untouched.
 ///
 /// NOT unit-tested — the merge cockpit is interactive. The logic it orchestrates
-/// is covered through [`compute_candidates`], [`classify`], and
-/// [`apply_decision`]. Wired into the menu by U10.
+/// is covered through [`compute_reconcile_set`], [`classify`], and
+/// [`apply_decision`]. Wired into the worktree menu's single "Sync" entry.
 pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
     // The unified reconcile set: every configured file that differs between the
     // worktree and main, in EITHER direction (worktree-only / main-only /
@@ -394,15 +395,21 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
         backup: true,
     };
     let summary = apply_batch(&ctx, &decisions, &baseline);
-    Ok(finish_batch(summary, &backups_root, &ts, true))
+    Ok(finish_batch(summary, &backups_root, &ts, true, "Sync"))
 }
 
 /// The shared batch tail: print the recorded backup paths, best-effort-prune old
 /// batches (skipped when `backup` is false — nothing was written to prune),
-/// print the applied/skipped/failed summary, and choose the exit code (non-zero
-/// iff a file failed). Shared by the interactive [`run`] and the direct
-/// [`run_bulk`].
-fn finish_batch(summary: BatchSummary, backups_root: &Path, ts: &str, backup: bool) -> ExitCode {
+/// print the applied/skipped/failed summary (prefixed with `label`, since the
+/// interactive [`run`] is bidirectional "Sync" while [`run_bulk`] is a one-way
+/// "Reverse sync"), and choose the exit code (non-zero iff a file failed).
+fn finish_batch(
+    summary: BatchSummary,
+    backups_root: &Path,
+    ts: &str,
+    backup: bool,
+    label: &str,
+) -> ExitCode {
     if !summary.backups.is_empty() {
         println!();
         println!(
@@ -438,7 +445,7 @@ fn finish_batch(summary: BatchSummary, backups_root: &Path, ts: &str, backup: bo
 
     println!();
     let line = format!(
-        "Reverse sync done: applied {}, skipped {}, failed {}",
+        "{label} done: applied {}, skipped {}, failed {}",
         summary.applied, summary.skipped, summary.failed
     );
     if summary.failed > 0 {
@@ -593,7 +600,7 @@ pub fn run_bulk(worktree_root: &Path, main_root: &Path, no_backup: bool) -> Resu
     }
 
     let summary = apply_batch(&ctx, &decisions, &baseline);
-    Ok(finish_batch(summary, &backups_root, &ts, !no_backup))
+    Ok(finish_batch(summary, &backups_root, &ts, !no_backup, "Reverse sync"))
 }
 
 /// Back up a file OR directory `target` to `dest` before it is overwritten,
@@ -1169,6 +1176,17 @@ pub fn apply_decision(
         Decision::Push => {
             let source = ctx.worktree_root.join(rel);
             let target = ctx.main_root.join(rel); // main is the destination
+            // Defense-in-depth: Push reads the worktree copy, so a file with no
+            // worktree side at review (a MainOnly candidate) is out of contract —
+            // skip rather than read an absent source. In-contract callers never
+            // reach here (the cockpit's `set_push` gates it and `run_bulk` only
+            // pushes worktree-existing candidates), but the guard keeps this
+            // "one safety path" self-enforcing rather than trusting the caller.
+            if baseline.wt.is_none() {
+                return Ok(ApplyOutcome::Skipped(
+                    "push has no worktree source".to_string(),
+                ));
+            }
             // Guard BOTH sides against their review-time baselines: the target
             // we OVERWRITE (main) and the source we READ (worktree). A source
             // that changed since review means we'd push bytes the user never
@@ -1242,6 +1260,14 @@ pub fn apply_decision(
         Decision::Merge(text) => {
             let wt_target = ctx.worktree_root.join(rel);
             let main_target = ctx.main_root.join(rel);
+            // Defense-in-depth: a merge reconciles two EXISTING sides, so a file
+            // that was one-sided at review (WorktreeOnly / MainOnly) is out of
+            // contract — skip rather than write the assembled text onto a side
+            // the review pinned absent. The cockpit only offers merge for a
+            // two-sided Differs file, so this never fires in practice.
+            if baseline.wt.is_none() || baseline.main.is_none() {
+                return Ok(ApplyOutcome::Skipped("merge needs both sides".to_string()));
+            }
             // Baseline-check BOTH sides first so a skip writes nothing at all
             // (no partial backup either).
             let wt_guard = check_target(&wt_target, baseline.wt.as_ref());
