@@ -543,6 +543,7 @@ fn apply_skips_when_target_changed_since_review() {
     let stale_main = Some(FileMeta {
         len: 999_999,
         mtime: None,
+        content_hash: None,
     });
 
     let ctx = ApplyContext {
@@ -727,6 +728,7 @@ fn apply_push_skips_when_source_changed_since_review() {
     let stale_wt = Some(FileMeta {
         len: 999_999,
         mtime: None,
+        content_hash: None,
     });
 
     let ctx = ApplyContext {
@@ -781,6 +783,7 @@ fn apply_pull_skips_when_source_changed_since_review() {
     let stale_main = Some(FileMeta {
         len: 999_999,
         mtime: None,
+        content_hash: None,
     });
 
     let ctx = ApplyContext {
@@ -971,6 +974,7 @@ fn apply_delete_skips_when_side_changed_since_review() {
     let stale_wt = Some(FileMeta {
         len: 999_999,
         mtime: None,
+        content_hash: None,
     });
 
     let ctx = ApplyContext {
@@ -1022,6 +1026,7 @@ fn apply_delete_skips_when_main_side_changed_since_review() {
     let stale_main = Some(FileMeta {
         len: 999_999,
         mtime: None,
+        content_hash: None,
     });
 
     let ctx = ApplyContext {
@@ -1086,6 +1091,92 @@ fn apply_delete_with_nothing_on_disk_is_skipped() {
         other => panic!("expected Skipped, got {other:?}"),
     }
     assert!(!backups.path().join(TS).exists());
+}
+
+/// metas_match: mtimes present on both sides decide; without an mtime the
+/// content hashes decide; a bare length (no mtime, no hash) must NEVER pass
+/// as unchanged — a same-length edit would slip through the TOCTOU guard.
+#[test]
+fn metas_match_requires_a_real_change_signal() {
+    let m = |len: u64, mtime: Option<SystemTime>, content_hash: Option<u64>| FileMeta {
+        len,
+        mtime,
+        content_hash,
+    };
+    let t = SystemTime::UNIX_EPOCH;
+    let t2 = t + std::time::Duration::from_secs(1);
+    assert!(metas_match(&m(5, Some(t), None), &m(5, Some(t), None)));
+    assert!(!metas_match(&m(5, Some(t), None), &m(5, Some(t2), None)));
+    assert!(!metas_match(&m(5, Some(t), None), &m(6, Some(t), None)));
+    // No mtime: the content hashes decide.
+    assert!(metas_match(&m(5, None, Some(1)), &m(5, None, Some(1))));
+    assert!(!metas_match(&m(5, None, Some(1)), &m(5, None, Some(2))));
+    // No mtime and no hash: fail safe — never trusted as unchanged.
+    assert!(!metas_match(&m(5, None, None), &m(5, None, None)));
+    // Mixed signals (one side lost its mtime, no hash on the other): fail safe.
+    assert!(!metas_match(&m(5, Some(t), None), &m(5, None, Some(1))));
+}
+
+/// Bugbot (stale status): a candidate classified WorktreeOnly whose main copy
+/// APPEARS before the baseline capture must still get a `None` main-side
+/// baseline — the user reviews it as a plain create (the confirm lists no
+/// overwrite), so apply must SKIP rather than overwrite the copy the review
+/// never covered.
+#[test]
+fn review_baseline_pins_main_absent_for_worktree_only_status() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(&wt, "config.env", "WT=1\n");
+    // Main gains a copy AFTER classify said WorktreeOnly, BEFORE the capture.
+    write(main.path(), "config.env", "APPEARED=1\n");
+
+    let (wt_meta, main_meta) = review_baseline(
+        &wt,
+        main.path(),
+        Path::new("config.env"),
+        DiffStatus::WorktreeOnly,
+    )
+    .unwrap();
+    assert!(wt_meta.is_some());
+    assert!(main_meta.is_none(), "worktree-only status pins main absent");
+
+    // The apply-time guard then refuses the push: main keeps its bytes.
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+    };
+    let outcome = apply_decision(
+        &ctx,
+        Path::new("config.env"),
+        &Decision::Push,
+        Baseline {
+            wt: wt_meta,
+            main: main_meta,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(outcome, ApplyOutcome::Skipped(_)),
+        "expected Skipped, got {outcome:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(main.path().join("config.env")).unwrap(),
+        "APPEARED=1\n"
+    );
+
+    // A Differs-status candidate captures main's REAL metadata as before.
+    let (_w, m) = review_baseline(
+        &wt,
+        main.path(),
+        Path::new("config.env"),
+        DiffStatus::Differs,
+    )
+    .unwrap();
+    assert!(m.is_some(), "differs status captures main's metadata");
 }
 
 // ── Backup timestamps + retention ────────────────────────────────────────

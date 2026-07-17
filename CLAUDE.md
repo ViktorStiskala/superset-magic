@@ -100,7 +100,9 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   pane beside a live side-by-side / unified diff (via `tui/diffmodel.rs`),
   and lets the user set each file's `merge::Decision` with explicit keys
   (`p` push / `l` pull / `m` merge / `d` delete / `u` undecided), gated by a
-  batched confirm. Each candidate is loaded once into a `FileDiff` (`Text` —
+  batched confirm (content-sized popup; an overwrite list too long for the
+  frame truncates with an explicit "… and N more" marker, never silently).
+  Each candidate is loaded once into a `FileDiff` (`Text` —
   EOL-normalized on both sides via `diffmodel::normalize_eol` at load, so
   hunks are content-only and a pair equal after normalization renders a
   "line endings only" notice instead of an empty diff —, `New` for
@@ -162,10 +164,18 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   applies the returned decisions via `apply_decision(&ApplyContext, rel,
   &Decision, Baseline)` — a backup-first seam
   (path-safety guard; a review-time baseline re-check via `check_target` —
-  per-file `(worktree, main)` `FileMeta` is captured via `meta_of` BEFORE the
+  per-file `(worktree, main)` `FileMeta` is captured via `review_baseline`
+  BEFORE the
   cockpit opens (the `Baseline` passed into `apply_decision`) and
-  re-compared at apply, so a file edited/created/deleted during review is
-  skipped, not clobbered; `backup_if_unchanged` takes a timestamped pre-write
+  re-compared at apply (`metas_match`: length + mtime, with a content-hash
+  fallback captured when the filesystem reports no mtime — a bare length
+  never passes as unchanged), so a file edited/created/deleted during review
+  is
+  skipped, not clobbered. The baseline is COHERENT with the reviewed status:
+  a `WorktreeOnly` candidate's main side is pinned `None`, so a main copy
+  that appears between classify and capture is skipped at apply instead of
+  overwritten/deleted without having been listed in the confirm;
+  `backup_if_unchanged` takes a timestamped pre-write
   backup of the
   losing bytes under a gitignored
   `.superset/backups/<YYYYmmdd-HHMMSS>/{worktree,main}/…` (`apply_timestamp`

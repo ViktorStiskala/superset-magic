@@ -1123,11 +1123,24 @@ fn centered_rect_abs(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn render_confirm(frame: &mut Frame, area: Rect, app: &App) {
-    let popup = centered_rect(70, 60, area);
-    frame.render_widget(Clear, popup);
-
     let overwrites = app.destructive_overwrites();
     let decided = app.decisions().len();
+
+    // Non-entry rows around the overwrite list: header + blank, the
+    // warning/clean line, then blank + count + blank + prompt. The popup is
+    // content-sized (a fixed percentage clipped the overwrite list — the ONLY
+    // pre-apply review of what gets destroyed — on small terminals), and a
+    // list too long for the frame truncates with an EXPLICIT "… and N more"
+    // marker rather than silently.
+    const CHROME_LINES: u16 = 7;
+    let max_entries = area.height.saturating_sub(2 + CHROME_LINES) as usize;
+    let (shown, hidden) = if overwrites.len() > max_entries {
+        // Reserve one row for the "… and N more" marker.
+        let shown = max_entries.saturating_sub(1);
+        (shown, overwrites.len() - shown)
+    } else {
+        (overwrites.len(), 0)
+    };
 
     let mut lines = vec![Line::from("Apply changes?".bold()), Line::from("")];
     if overwrites.is_empty() {
@@ -1140,11 +1153,17 @@ fn render_confirm(frame: &mut Frame, area: Rect, app: &App) {
             "These existing files will be OVERWRITTEN or DELETED (a backup is taken first):",
             Style::new().fg(Color::Yellow),
         )));
-        for (rel, dir) in &overwrites {
+        for (rel, dir) in overwrites.iter().take(shown) {
             lines.push(Line::from(vec![
                 Span::raw(format!("  {}  ", rel.display())),
                 Span::styled(*dir, Style::new().fg(Color::Yellow)),
             ]));
+        }
+        if hidden > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  … and {hidden} more — review the file list before confirming"),
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )));
         }
     }
     lines.push(Line::from(""));
@@ -1154,10 +1173,12 @@ fn render_confirm(frame: &mut Frame, area: Rect, app: &App) {
         "y = apply · n / Esc = back (default: No)".bold(),
     ));
 
+    let w = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 2;
+    let h = lines.len() as u16 + 2;
+    let popup = centered_rect_abs(w, h, area);
+    frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(Line::from(" Confirm apply ".bold()))),
+        Paragraph::new(lines).block(Block::bordered().title(Line::from(" Confirm apply ".bold()))),
         popup,
     );
 }

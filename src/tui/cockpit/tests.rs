@@ -842,6 +842,43 @@ fn confirm_overlay_renders_delete_labels_and_clean_case() {
     );
 }
 
+/// A destructive list too long for the terminal truncates with an EXPLICIT
+/// "… and N more" marker — never silently — and the count and y/n prompt stay
+/// visible, even at 80×20.
+#[test]
+fn confirm_overlay_truncates_long_lists_with_explicit_marker() {
+    let files: Vec<FileEntry> = (0..20)
+        .map(|i| {
+            entry(
+                &format!("file{i:02}.env"),
+                DiffStatus::Differs,
+                Decision::Pull,
+                FileDiff::Text {
+                    local: "x\n".to_string(),
+                    main: "y\n".to_string(),
+                },
+            )
+        })
+        .collect();
+    let mut app = app_with(files);
+    app.mode = Mode::Confirm;
+    let out = buffer_text(&render(&app, 80, 20));
+    assert!(out.contains("file00.env"), "leading entries listed:\n{out}");
+    assert!(
+        !out.contains("file19.env"),
+        "overflow entries must not render past the popup:\n{out}"
+    );
+    assert!(
+        out.contains("… and 10 more"),
+        "explicit truncation marker missing:\n{out}"
+    );
+    assert!(
+        out.contains("20 file(s) will be written."),
+        "count must stay visible:\n{out}"
+    );
+    assert!(out.contains("y = apply"), "prompt must stay visible:\n{out}");
+}
+
 /// Merge mode: `Esc` cancels the overlay, leaving the file's decision unchanged.
 #[test]
 fn handle_key_merge_mode_esc_leaves_decision_unchanged() {

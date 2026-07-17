@@ -264,12 +264,13 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
     // guard compares this baseline against on-disk metadata at write time, so
     // any change that lands during the review→apply window — an edit, a create,
     // or a delete — is detected and that file is skipped rather than clobbered
-    // (KD4 / R13–R15).
+    // (KD4 / R13–R15). The baseline is derived COHERENTLY with each file's
+    // reviewed status (see `review_baseline`) so what the confirm claims and
+    // what apply does can never disagree.
     let mut baseline: HashMap<PathBuf, (Option<FileMeta>, Option<FileMeta>)> = HashMap::new();
-    for (rel, _status) in &offered {
-        let wt_meta = meta_of(&worktree_root.join(rel))?;
-        let main_meta = meta_of(&main_root.join(rel))?;
-        baseline.insert(rel.clone(), (wt_meta, main_meta));
+    for (rel, status) in &offered {
+        let metas = review_baseline(worktree_root, main_root, rel, *status)?;
+        baseline.insert(rel.clone(), metas);
     }
 
     // Full-screen cockpit: the user sets each file's direction and either
@@ -571,13 +572,18 @@ fn prune_old_backups(backups_root: &Path, keep: usize) -> Result<Vec<PathBuf>> {
 
 /// Lightweight metadata snapshot backing the review-time TOCTOU baseline: a
 /// byte length plus a best-effort mtime (some filesystems omit mtime, hence the
-/// `Option`).
+/// `Option`), plus a content hash captured ONLY when the mtime is unavailable —
+/// without it, a same-length edit during the review window would pass the
+/// guard on length alone.
 #[derive(Debug, Clone)]
 pub struct FileMeta {
     /// The file's length in bytes.
     pub len: u64,
     /// The file's modification time, when the platform / filesystem reports one.
     pub mtime: Option<SystemTime>,
+    /// A content fingerprint, present only when `mtime` is unavailable (the
+    /// fallback change signal for filesystems that report no mtime).
+    pub content_hash: Option<u64>,
 }
 
 /// Snapshot `path`'s metadata for the TOCTOU baseline.
@@ -586,15 +592,81 @@ pub struct FileMeta {
 /// `Ok(Some(..))` when it exists; and propagates any OTHER io error (permissions,
 /// I/O) via `?`. A non-`NotFound` stat error must NEVER be silently read as
 /// "missing" — doing so would skip the mandatory pre-overwrite backup for a
-/// target that actually exists.
+/// target that actually exists. When the filesystem reports no mtime, the
+/// content is hashed instead (these are small secret files — the read is
+/// cheap) so the guard never has to trust a bare length.
 pub fn meta_of(path: &Path) -> Result<Option<FileMeta>> {
     match fs::metadata(path) {
-        Ok(m) => Ok(Some(FileMeta {
-            len: m.len(),
-            mtime: m.modified().ok(),
-        })),
+        Ok(m) => {
+            let mtime = m.modified().ok();
+            let content_hash = if mtime.is_none() {
+                Some(hash_file(path)?)
+            } else {
+                None
+            };
+            Ok(Some(FileMeta {
+                len: m.len(),
+                mtime,
+                content_hash,
+            }))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading metadata of {}", path.display())),
+    }
+}
+
+/// Content fingerprint for the mtime-less TOCTOU fallback. Non-cryptographic —
+/// the threat model is a concurrent edit, not an adversary.
+fn hash_file(path: &Path) -> Result<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = fs::read(path)
+        .with_context(|| format!("reading {} for the review baseline", path.display()))?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    Ok(h.finish())
+}
+
+/// Capture one offered candidate's review-time `(worktree, main)` baseline,
+/// COHERENT with the `status` the user reviews — not with whatever the disk
+/// happens to hold at capture time.
+///
+/// A candidate offered as [`DiffStatus::WorktreeOnly`] was classified with
+/// main ABSENT: the cockpit shows it as a new file, the batched confirm lists
+/// its push as a non-destructive create (and its delete as "worktree copy"
+/// only). So its main-side baseline is pinned to `None`. If main gained a
+/// copy in the classify→capture window, the apply-time guard then sees a file
+/// the review never covered (`baseline None` vs a present file →
+/// [`Guard::Changed`]) and SKIPS it — instead of silently overwriting or
+/// deleting a main copy the user was told did not exist.
+fn review_baseline(
+    worktree_root: &Path,
+    main_root: &Path,
+    rel: &Path,
+    status: DiffStatus,
+) -> Result<(Option<FileMeta>, Option<FileMeta>)> {
+    let wt = meta_of(&worktree_root.join(rel))?;
+    let main = match status {
+        DiffStatus::WorktreeOnly => None,
+        DiffStatus::Differs | DiffStatus::Identical => meta_of(&main_root.join(rel))?,
+    };
+    Ok((wt, main))
+}
+
+/// Whether two snapshots of the same path can be trusted as "unchanged".
+/// Lengths must match; beyond that, mtimes present on BOTH sides decide;
+/// without an mtime the content hashes decide; and with neither signal the
+/// answer is a fail-safe `false` — a bare length must never pass a
+/// same-length edit as unchanged.
+fn metas_match(b: &FileMeta, c: &FileMeta) -> bool {
+    if b.len != c.len {
+        return false;
+    }
+    match (b.mtime, c.mtime) {
+        (Some(bm), Some(cm)) => bm == cm,
+        _ => match (b.content_hash, c.content_hash) {
+            (Some(bh), Some(ch)) => bh == ch,
+            _ => false,
+        },
     }
 }
 
@@ -657,7 +729,8 @@ enum Guard {
 /// - baseline `None` + now `Some`   → [`Guard::Changed`] (appeared during review)
 /// - baseline `Some` + now `None`   → [`Guard::Changed`] (vanished during review)
 /// - baseline `Some(b)` + now `Some(c)` → [`Guard::Unchanged`] iff
-///   `b.len == c.len && b.mtime == c.mtime`, else [`Guard::Changed`]
+///   [`metas_match`] (length + mtime, with a content-hash fallback when the
+///   filesystem reports no mtime), else [`Guard::Changed`]
 ///
 /// A non-`NotFound` stat error at apply time is treated as [`Guard::Changed`]
 /// (fail safe: never overwrite a target we cannot reliably re-stat).
@@ -670,7 +743,7 @@ fn check_target(target: &Path, baseline: Option<&FileMeta>) -> Guard {
         (None, None) => Guard::Missing,
         (None, Some(_)) | (Some(_), None) => Guard::Changed,
         (Some(b), Some(c)) => {
-            if b.len == c.len && b.mtime == c.mtime {
+            if metas_match(b, &c) {
                 Guard::Unchanged
             } else {
                 Guard::Changed

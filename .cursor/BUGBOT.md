@@ -156,10 +156,19 @@ committable and must never leak.
   timestamped
   pre-write backup of the losing bytes under a gitignored `.superset/backups/`
   (`reverse_sync::apply_decision`), with a review-time baseline re-check —
-  per-file `(worktree, main)` metadata captured (`meta_of`) BEFORE the cockpit
+  per-file `(worktree, main)` metadata captured (`review_baseline`) BEFORE the
+  cockpit
   opens and re-compared at apply — that skips a file created, edited, or deleted
   since review (a non-`NotFound` stat error counts as changed, never as
-  "missing"). The cockpit refuses to launch without an interactive
+  "missing"). The unchanged-check needs a REAL change signal: length + mtime
+  when the filesystem reports mtimes, else a content hash captured at
+  snapshot time — flag a guard that trusts a bare length (a same-length edit
+  must never pass as unchanged). The baseline must be COHERENT with the
+  reviewed status, not with the disk at capture time: a worktree-only
+  candidate's main-side baseline is pinned absent, so a main copy that
+  appears between classification and capture is skipped at apply — flag a
+  baseline capture that stats the disk for a side the review classified as
+  missing. The cockpit refuses to launch without an interactive
   TTY and writes nothing then, and `Esc` at the top-level file list cancels the
   whole cockpit (`CockpitOutcome::Cancel`), leaving both the worktree and main
   untouched. Flag a reverse-sync path that overwrites or deletes an
@@ -205,7 +214,10 @@ committable and must never leak.
   (`←`/`→`; the offset is clamped to the longest content line and reset when
   the focus moves to another file) with the line-number gutter held FIXED,
   and the pane title flags the state ("lines continue →" when clipped,
-  "→ col N" while scrolled). Flag a diff-pane change that clips content with
+  "→ col N" while scrolled). The batched-confirm overlay is content-sized and
+  truncates an over-long overwrite list with an explicit "… and N more"
+  marker while keeping the count and y/n prompt visible. Flag a diff-pane or
+  overlay change that clips content with
   no indicator, scrolls the gutter away with the content, or leaves a stale
   horizontal offset when switching files.
 - **The cockpit's terminal is always restored, including on panic.**
