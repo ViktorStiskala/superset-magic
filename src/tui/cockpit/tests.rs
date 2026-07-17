@@ -153,6 +153,23 @@ fn build_text_diff_normalizes_eol_on_both_sides() {
     }
 }
 
+/// A read failure on a one-sided "will be created" file (worktree-only or
+/// main-only) degrades to `FileDiff::Unreadable` — surfaced, cockpit stays open —
+/// instead of propagating an error that would abort `App::new` for the whole
+/// session, mirroring `build_two_sided`'s main-side handling.
+#[test]
+fn one_sided_read_error_degrades_to_unreadable_not_abort() {
+    let missing = Path::new("/nonexistent-ss-magic-test-xyz/does/not/exist.env");
+    match build_new(missing) {
+        FileDiff::Unreadable { .. } => {}
+        _ => panic!("build_new on an unreadable path must degrade to Unreadable"),
+    }
+    match build_main_only(missing) {
+        FileDiff::Unreadable { .. } => {}
+        _ => panic!("build_main_only on an unreadable path must degrade to Unreadable"),
+    }
+}
+
 /// A file whose sides differ ONLY by line endings / trailing newline renders
 /// the explanatory notice instead of an empty diff pane.
 #[test]

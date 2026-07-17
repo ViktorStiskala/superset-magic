@@ -479,9 +479,9 @@ fn load_entry(
     // Per-branch (diff, mtime_local, mtime_main): a worktree-only file has no
     // main mtime and a main-only file has no worktree mtime (shown as "—").
     let (diff, mtime_local, mtime_main) = match status {
-        DiffStatus::WorktreeOnly => (build_new(&wt_path)?, format_mtime(&wt_path), "—".to_string()),
+        DiffStatus::WorktreeOnly => (build_new(&wt_path), format_mtime(&wt_path), "—".to_string()),
         DiffStatus::MainOnly => (
-            build_main_only(&main_path)?,
+            build_main_only(&main_path),
             "—".to_string(),
             format_mtime(&main_path),
         ),
@@ -524,19 +524,30 @@ fn read_created_content(path: &Path, label: &str) -> Result<Option<String>> {
 }
 
 /// Build the [`FileDiff::New`] view for a worktree-only file (created in main by
-/// a push).
-fn build_new(wt_path: &Path) -> Result<FileDiff> {
-    Ok(FileDiff::New {
-        content: read_created_content(wt_path, "worktree file")?,
-    })
+/// a push). A read failure on the sole side degrades to [`FileDiff::Unreadable`]
+/// — surfaced, session left open — rather than propagating (which would abort the
+/// WHOLE cockpit for one bad file), mirroring how [`build_two_sided`] handles a
+/// main-side read error.
+fn build_new(wt_path: &Path) -> FileDiff {
+    match read_created_content(wt_path, "worktree file") {
+        Ok(content) => FileDiff::New { content },
+        Err(err) => FileDiff::Unreadable {
+            note: format!("worktree unreadable: {err:#} — a push would fail"),
+        },
+    }
 }
 
 /// Build the [`FileDiff::MainOnly`] view for a main-only file (created locally by
-/// a pull) — the mirror of [`build_new`], sourced from main.
-fn build_main_only(main_path: &Path) -> Result<FileDiff> {
-    Ok(FileDiff::MainOnly {
-        content: read_created_content(main_path, "main file")?,
-    })
+/// a pull) — the mirror of [`build_new`], sourced from main. A main-side read
+/// failure degrades to [`FileDiff::Unreadable`] (session open, pull disabled via
+/// `set_pull`'s guard) instead of aborting the cockpit.
+fn build_main_only(main_path: &Path) -> FileDiff {
+    match read_created_content(main_path, "main file") {
+        Ok(content) => FileDiff::MainOnly { content },
+        Err(err) => FileDiff::Unreadable {
+            note: format!("main unreadable: {err:#} — pull disabled"),
+        },
+    }
 }
 
 /// Build the two-sided diff view for a file present on both sides.
