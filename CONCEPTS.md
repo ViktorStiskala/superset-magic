@@ -24,37 +24,42 @@ worktree, so a freshly created worktree gains the local/untracked files (secrets
 local overlays) that never travel through git.
 
 ### Reverse sync
-Pushing a worktree's git-untracked files that match the sync patterns back into
-the main checkout — the path by which gitignored secrets created in a worktree
-reach the shared checkout, since they cannot travel through a git merge. Only
-untracked files move; tracked files reach the main checkout through a normal
-merge.
+Pushing a worktree's files that match the sync patterns back into the main
+checkout. The direct `ss-magic reverse-sync` subcommand bulk-pushes every
+git-untracked match – the path by which gitignored secrets created in a
+worktree reach the shared checkout, since they cannot travel through a git
+merge. The interactive merge cockpit, opened from the worktree menu's unified
+Sync entry, can also push a tracked candidate's worktree bytes into main on
+request; that push skips the gitignore step, since a tracked file is not a
+secret and already reaches main through a normal git merge.
 
 ### Merge cockpit
-The full-screen interactive UI reverse sync opens to reconcile candidates: a
-file list beside a live diff (side-by-side or unified, depending on terminal
-width), where the developer sets each candidate's reconcile decision
-explicitly and applies the whole batch behind one confirmation. Binary,
-oversized, or unreadable candidates fall back to a whole-file notice instead
-of a diff.
+The full-screen interactive UI the worktree menu's unified Sync entry opens
+to reconcile candidates in either direction: a file list beside a live diff
+(side-by-side or unified, depending on terminal width), where the developer
+sets each candidate's reconcile decision explicitly and applies the whole
+batch behind one confirmation. Binary, oversized, or unreadable candidates
+fall back to a whole-file notice instead of a diff.
 
 ### Reconcile decision
-The direction chosen for one reverse-sync candidate in the merge cockpit:
-push (worktree → main), pull (main → worktree), merge (a per-hunk reconciled
-result written to both sides), delete (removed from both sides, whichever
-exist), or undecided (nothing written for that file). Undecided is the
-conservative default for any candidate that exists on both sides; only a
-worktree-only candidate defaults to push, since that direction is never
-destructive.
+The direction chosen for one candidate in the merge cockpit: push (worktree
+→ main), pull (main → worktree), merge (a per-hunk reconciled result written
+to both sides), delete (removed from both sides, whichever exist), or
+undecided (nothing written for that file). The unified Sync cockpit
+pre-selects nothing – every candidate opens undecided, and the developer
+picks a decision per file before applying the batch.
 
 ### Pre-write backup
-A timestamped copy of a file's losing bytes, taken immediately before the
-merge cockpit overwrites or deletes it on apply, so a mistaken decision is
-recoverable. Backups live under a gitignored `.superset/backups/` in the
-worktree — one `YYYYmmdd-HHMMSS` (UTC) directory per apply batch, with
-`worktree/` and `main/` namespaces inside it for the side the bytes came from
-— and are never committed. Retention keeps the 10 newest batches; older ones
-are pruned after each apply.
+A timestamped copy of a file's losing bytes, taken immediately before an
+apply overwrites or deletes it, so a mistaken decision is recoverable.
+Backups live under a gitignored `.superset/backups/` of the root being
+overwritten – the worktree for the merge cockpit and forward sync, main for
+the direct `ss-magic reverse-sync` subcommand – one `YYYYmmdd-HHMMSS` (UTC)
+directory per apply batch, with `worktree/` and `main/` namespaces inside it
+for the side the bytes came from, and are never committed. Taking backups is
+opt-out (`--no-backup`/`-n` on the direct subcommands) and, when skipped,
+leaves an overwritten or deleted file with no recovery path. Retention keeps
+the 10 newest batches; older ones are pruned after each apply.
 
 ### Pack
 Bundling the files matching the sync patterns from the current git repo root
@@ -67,8 +72,25 @@ configured file set (for backup, machine transfer, or handoff) rather than a
 copy between trees.
 
 ### Candidate
-A worktree file eligible for reverse sync: it matches the sync patterns and is
-git-untracked (whether or not it is gitignored). Tracked files are never
-candidates. A candidate byte-identical to main's copy is hidden — nothing to
+A sync-pattern match whose worktree and main copies differ: present only in
+the worktree (worktree-only), present only in main (a main-only candidate –
+see below), or present on both sides with different bytes (differing).
+Patterns are expanded against both the worktree and main checkout, so a
+main-only file is visible even though a worktree-only walk would never see
+it. A candidate byte-identical on both sides is hidden – nothing to
 reconcile; every other candidate is offered in the merge cockpit for a
-reconcile decision before anything is written into the main checkout.
+reconcile decision before anything is written into either tree.
+
+Only a candidate with worktree bytes (worktree-only or differing) can be
+pushed; a main-only candidate has no worktree source, so push is unavailable
+and it can only be pulled or deleted. Pushing a worktree-untracked
+candidate into main also gitignores it there – the secret-safety gate, since
+only an untracked file is treated as a secret needing that protection.
+Pushing a tracked candidate skips that gitignore step: it lands as an
+ordinary working-tree copy in main, recoverable through the pre-write backup
+and git.
+
+### Main-only candidate
+A candidate present in main but absent from the worktree. Pulling it creates
+the file locally; deleting it removes main's copy; push is unavailable,
+since there is no worktree copy to push.

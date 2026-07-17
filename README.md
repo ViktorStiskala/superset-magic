@@ -25,17 +25,21 @@ You declare the files once, as glob patterns in a committed
 `.superset/magic.json`. ss-magic then gives you three operations over that one
 file set:
 
-- **Forward sync** (`ss-magic sync`) — copy every matching file from the
-  repo's main checkout into the current worktree. Under Superset this runs
-  automatically the moment a workspace is created, via the setup-script hook;
-  without Superset it's one command to run in a fresh worktree.
-- **Reverse sync** (interactive menu) — reconcile git-untracked files that
-  changed or appeared in a worktree against the main checkout, through a
-  full-screen merge cockpit: a file list beside a live side-by-side diff, where
-  you set each file's direction (push to main / pull from main / per-hunk merge /
-  delete from both / undecided) and apply the batch behind one confirmation,
-  with a timestamped backup taken before every overwrite or delete. This is how
-  a new secret created in a worktree reaches everywhere else.
+- **Forward sync** (`ss-magic sync`) – copy every matching file from the
+  repo's main checkout into the current worktree, backing up every file it's
+  about to overwrite first (skip with `-n`/`--no-backup`). Under Superset this
+  runs automatically the moment a workspace is created, via the setup-script
+  hook; without Superset it's one command to run in a fresh worktree.
+- **Sync** (interactive, worktree menu) – reconcile every configured file
+  against the main checkout in either direction, through a full-screen merge
+  cockpit: a file list beside a live side-by-side diff, where you set each
+  file's direction (push to main / pull from main / per-hunk merge / delete
+  from both / undecided) and apply the batch behind one confirmation, with a
+  timestamped backup taken before every overwrite or delete. It's how a new
+  secret created in a worktree reaches everywhere else, and how a file added
+  directly to main reaches a worktree. For scripted use, `ss-magic
+  reverse-sync` non-interactively bulk-pushes every git-untracked candidate
+  that differs from main.
 - **Pack** (`ss-magic pack`) — snapshot the whole configured file set into a
   single `ss-magic-<repo>.tar.bz2` for backup, machine migration, or handing
   to a teammate.
@@ -55,8 +59,8 @@ or packed.
 
 If you work with git worktrees and carry per-developer gitignored files, this
 tool is for you. It is built for Superset's workspace lifecycle, but forward
-sync, pack, and init are ordinary CLI commands that work in any worktree
-setup.
+sync, reverse sync, pack, and init are ordinary CLI commands that work in any
+worktree setup.
 
 ## How it works with Superset
 
@@ -152,18 +156,25 @@ other way, run `ss-magic sync` yourself.
 ## Commands
 
 ```plaintext
-ss-magic            # interactive operation menu (location-aware)
-ss-magic sync       # non-interactive forward copy: main → current worktree
-ss-magic pack       # archive the configured files into ss-magic-<repo>.tar.bz2
-ss-magic update     # force a self-update to the latest release
+ss-magic              # interactive operation menu (location-aware)
+ss-magic sync         # non-interactive forward copy: main → current worktree
+ss-magic reverse-sync # non-interactive bulk copy: current worktree → main,
+                       # for git-untracked files matching the configured
+                       # patterns
+ss-magic pack         # archive the configured files into ss-magic-<repo>.tar.bz2
+ss-magic update       # force a self-update to the latest release
 ss-magic init [PATTERN...]   # non-interactively seed .superset (magic.json
                              # layout); extra args become magic.json `files`
-ss-magic --help     # usage
+ss-magic --help       # usage
 ```
 
-Reverse sync is an option in the worktree menu opened by bare `ss-magic` —
-there is no separate reverse-sync subcommand. `SS_MAGIC_NO_UPDATE=1` disables
-the auto-update gate (the explicit `ss-magic update` ignores it and always
+`sync` and `reverse-sync` both take a timestamped backup of every file they're
+about to overwrite unless `-n`/`--no-backup` is given – skipping it leaves no
+recovery path for an overwritten or deleted untracked secret. The worktree
+menu opened by bare `ss-magic` offers a single interactive **Sync** entry that
+reconciles files in both directions through the merge cockpit; there's no
+separate forward/reverse choice there. `SS_MAGIC_NO_UPDATE=1` disables the
+auto-update gate (the explicit `ss-magic update` ignores it and always
 checks).
 
 ### `ss-magic` — the interactive menu
@@ -173,8 +184,8 @@ The bare invocation opens a menu whose options depend on where you run it:
 - **Main checkout** — one lifecycle operation, chosen from the detected state:
   init the contract, migrate an old `setup.sh` layout, or edit the
   synced-files config.
-- **Worktree** — forward sync (main → here), or reverse sync (push untracked
-  files from here back to main).
+- **Worktree** – a single **Sync** entry: the interactive merge cockpit,
+  reconciling every configured file against main in both directions.
 - **Pack** is offered wherever an initialized `magic.json` exists (any
   worktree, or the main checkout once set up).
 
@@ -223,30 +234,75 @@ Non-interactive, files-only — the command the Superset app setup hook runs:
 No git/gh operations, no setup commands — setup commands live in Superset's
 own `config.json` and are run by Superset.
 
-Forward sync is also offered from the worktree menu, because main may have
-gained files since the worktree was created.
+By default every worktree file this is about to overwrite is backed up first,
+under a gitignored `<worktree>/.superset/backups/<YYYYmmdd-HHMMSS>/…`; pass
+`-n`/`--no-backup` to skip it. Forward sync is not offered from the worktree
+menu – the menu's single **Sync** entry (below) covers pulling from main too.
 
-### Reverse sync (worktree → main, via the menu)
+### `ss-magic reverse-sync` – bulk push (worktree → main)
 
-From a worktree's menu, reconcile **git-untracked** files matching the overlaid
-patterns against the main checkout. "Untracked" includes **gitignored** files
-— that is the point, since the files worth pushing are secrets like `.env` /
-`.dev.vars` (and the gitignored `magic.local.json`), which never merge via
-git. Tracked files are excluded — they reach main via merge. The flow:
+Non-interactive, worktree → main, files-only: pushes every configured file
+that is git-**untracked** in the current worktree and differs from main.
+"Untracked" includes **gitignored** files – that is the point, since this
+command exists for secrets like `.env` / `.dev.vars` (and the gitignored
+`magic.local.json`), which never merge via git. Tracked files are never
+touched by this command – they reach main via a normal merge; use the
+interactive **Sync** menu entry below if you want to push a tracked file's
+local edits into main's working copy.
 
-- Collects differing / worktree-only candidates (identical files are hidden)
-  and opens a full-screen merge cockpit: a file list beside a live diff
-  (side-by-side on a wide terminal, unified when narrow; binary / oversized
-  files show a whole-file notice instead of a diff). Diffs are EOL-normalized
+1. Resolve the current repo root and the main checkout root; hard error
+   (non-zero exit) if run from the main checkout itself – there is nothing to
+   push.
+2. Compute the untracked candidates matching the overlaid patterns that differ
+   from main (identical files are skipped, nothing to do).
+3. For each: back up main's existing bytes first (unless `-n`/`--no-backup`)
+   under a gitignored `<main>/.superset/backups/<YYYYmmdd-HHMMSS>/…`, ensure
+   the path is gitignored in main (the same secret-safety gate the interactive
+   cockpit uses – see below), then write the worktree's bytes into main,
+   creating the file there if it was absent.
+
+`-n`/`--no-backup` skips the pre-overwrite backup – the only recovery path for
+an overwritten or deleted untracked secret, so use it deliberately. Exit code
+is non-zero if any file failed to apply.
+
+### Sync (worktree ↔ main, via the menu)
+
+From a worktree's menu, the single **Sync** entry reconciles every configured
+file against the main checkout **in either direction**, tracked or untracked.
+Candidates come from expanding the overlaid patterns against *both* roots and
+classifying each path into one of four situations (directory matches and
+anything under the tool's own `.superset/backups/` tree are dropped before
+classification, so a directory pattern or a recovered backup copy is never
+offered):
+
+- **Differs** – exists on both sides with different bytes.
+- **Worktree-only** – absent in main; a push *creates* it there.
+- **Main-only** – absent in the worktree; a pull *creates* it locally, a
+  delete removes main's copy (push is unavailable – there is no worktree copy
+  to push).
+- **Identical** – hidden; nothing to reconcile.
+
+The flow:
+
+- Opens a full-screen merge cockpit: a file list – long paths wrap onto
+  additional lines instead of clipping – beside a live diff, side-by-side on a
+  wide terminal (with a faint divider between the two columns) or unified when
+  narrow; binary / oversized files show a whole-file notice instead of a diff.
+  In both the split and the unified view, local additions/changes render
+  **green** and main additions/changes render **red**. A worktree-only or
+  main-only file instead shows its content as numbered `+` lines under a
+  colored header ("new file – will be created in main" in green, "main
+  only – will be created in this worktree" in cyan). Diffs are EOL-normalized
   (CRLF → LF, trailing newline) so hunks reflect content changes only; a pair
   that differs *only* by line endings says so instead of showing an empty diff.
-- Nothing destructive is pre-selected — a file that differs starts *undecided*.
-  You set each file's direction with explicit keys: `p` push to main, `l` pull
-  from main, `m` interactive merge, `d` delete from both sides, `u` undecided
+- Nothing is pre-selected – every file starts *undecided*, including a
+  worktree-only file (a bare Enter never auto-pushes anything). You set each
+  file's direction with explicit keys: `p` push to main, `l` pull from main,
+  `m` interactive merge, `d` delete from both sides, `u` undecided
   (arrows/`j`/`k` navigate, `PgUp`/`PgDn`/`Space` scroll the diff, `←`/`→`
   scroll long lines horizontally, `?` toggles help). Lines wider than the pane
   are flagged in its title ("lines continue →") so a change past the right
-  edge — a trailing comment, a long value — is never silently invisible. Each
+  edge – a trailing comment, a long value – is never silently invisible. Each
   row's mtimes are shown only as an unreliable hint.
 - `m` on a differing text file opens a per-hunk merge overlay: walk the hunks
   with the arrows and cycle each between keep-local / keep-main / keep-both
@@ -254,24 +310,35 @@ git. Tracked files are excluded — they reach main via merge. The flow:
   (`PgUp`/`PgDn`/`Space`/`b` scroll a long preview); `Enter` accepts
   it and `Esc` cancels. The accepted bytes are written to **both** sides on apply
   so they stop differing (normalized to LF + trailing newline). Merge is
-  unavailable for binary / oversized / new files (which offer only push/pull).
-- `Enter` applies: one batched confirmation lists every existing-target
-  overwrite and delete (defaulting to No). Before each destructive write or
-  unlink, the losing bytes are copied to a timestamped backup under a gitignored
-  `.superset/backups/<YYYYmmdd-HHMMSS>/{worktree,main}/…`, whose path is printed
-  so a mistaken decision is recoverable; the 10 newest backup batches are kept
-  and older ones pruned after each apply. A file changed on either side since
-  you reviewed it is skipped rather than clobbered.
-- Gitignore-safety: if a path pushed into main isn't already gitignored there,
-  ss-magic copies the worktree's covering `.gitignore` rule (resolved via
-  `git check-ignore -v --no-index`) into main's root `.gitignore` (creating it
-  if absent), falling back to the literal path when no covering rule exists.
-  This is the guard that prevents a reverse-synced secret (e.g. `.dev.vars`)
-  from becoming committable in main.
+  unavailable for binary / oversized / worktree-only / main-only files (which
+  offer only push/pull as applicable).
+- `Enter` opens one batched confirmation listing every existing-target
+  overwrite and delete (a delete names exactly which side(s) it removes, e.g.
+  "delete (main copy)" for a main-only file). `Enter` again applies; `Esc`
+  backs out to the file list, changing nothing. Before each destructive write
+  or unlink, the losing bytes are copied to a timestamped backup under the
+  worktree's gitignored `.superset/backups/<YYYYmmdd-HHMMSS>/{worktree,main}/…`,
+  whose path is printed so a mistaken decision is recoverable; the 10 newest
+  backup batches are kept and older ones pruned after each apply. A file
+  changed on either side since you reviewed it is skipped rather than
+  clobbered.
+- Gitignore-safety: a push into main only touches main's `.gitignore` when the
+  worktree source is git-**untracked** – pushing a **tracked** file instead
+  updates main's working copy in place with no `.gitignore` change (it's
+  recoverable via the pre-write backup and ordinary `git restore`, like any
+  other overwrite in the batch). Tracked-ness is determined positively; a path
+  that can't be confirmed tracked is treated as a secret. When an untracked
+  push isn't already gitignored in main, ss-magic adds a rule to the closest
+  existing `.gitignore` among the file's ancestor directories (else main's
+  root `.gitignore`, creating it if absent), preferring the worktree's own
+  covering rule (e.g. `**/.dev.vars`) over a literal path – the guard that
+  prevents a reverse-synced secret from becoming committable in main.
 
 The cockpit needs an interactive terminal; run piped or in CI it refuses to
-launch and writes nothing (`ss-magic sync` is forward-only). Pressing `Esc` —
-or applying with everything undecided — leaves both sides fully untouched.
+launch and writes nothing – use the non-interactive `ss-magic sync` (main →
+worktree) or `ss-magic reverse-sync` (worktree → main, untracked-only)
+instead. Pressing `Esc` – or applying with everything undecided – leaves both
+sides fully untouched.
 
 ### `ss-magic pack` — archive the configured files
 
@@ -359,8 +426,8 @@ overlay is itself copied into each worktree.
 
 ## Pattern semantics
 
-Forward sync, reverse-sync candidate selection, and pack all expand the same
-overlaid pattern list with the same rules:
+Forward sync, the Sync menu's reconcile set, `ss-magic reverse-sync`, and pack
+all expand the same overlaid pattern list with the same rules:
 
 - Patterns are repo-relative. Absolute patterns (`/etc/foo`) and patterns
   containing a `..` segment are rejected (counted as skipped).
@@ -370,22 +437,27 @@ overlaid pattern list with the same rules:
 - Matches inside `node_modules` or `.venv` are dropped at any depth
   (uncounted, logged gray as "excluded").
 - Matches are de-duplicated by relative path. Matched directories are
-  copied/archived recursively by forward sync and pack; reverse sync offers
-  individual untracked files only, so a directory match yields no
-  reverse-sync candidate of its own.
-- Existing files in the destination are overwritten (forward sync; reverse
-  sync instead intersects the matches with git-untracked files and reconciles
-  them in the merge cockpit — a batched confirm and a pre-write backup gate
-  every overwrite).
+  copied/archived recursively by forward sync and pack; the Sync menu and
+  `ss-magic reverse-sync` reconcile individual files only, so a directory
+  match yields no candidate of its own.
+- The Sync menu, `ss-magic reverse-sync`, and pack additionally exclude the
+  tool's own `.superset/backups/` tree, so a backed-up secret copy is never
+  re-offered for reconciliation or re-archived.
+- Existing files in the destination are overwritten (forward sync; the Sync
+  menu instead classifies every match against both roots – differs /
+  worktree-only / main-only / identical – and reconciles them in the merge
+  cockpit, a batched confirm and a pre-write backup gating every overwrite;
+  `ss-magic reverse-sync` narrows further to untracked-only candidates pushed
+  straight into main).
 - Matching uses [`globset`](https://docs.rs/globset): unlike a POSIX shell
   glob, `*` can cross path separators. Quote patterns on the command line so
   your shell doesn't expand them first.
 
 ## Self-update
 
-Every invocation of `ss-magic` (bare), `sync`, and `pack` runs a cheap,
-daily-cached check for a newer GitHub release (`init` and `--help` skip the
-gate; the `update` subcommand forces its own path instead):
+Every invocation of `ss-magic` (bare), `sync`, `reverse-sync`, and `pack` runs
+a cheap, daily-cached check for a newer GitHub release (`init` and `--help`
+skip the gate; the `update` subcommand forces its own path instead):
 
 - The version cache lives in the OS cache dir; if it's fresh (< 24 h) no
   network call is made.

@@ -30,9 +30,10 @@ make clean     # cargo clean
 Both install paths drop `ss-magic` into `$CARGO_HOME/bin` (usually
 `~/.cargo/bin`). ss-magic is not yet published to crates.io.
 
-**Tip:** the binary self-updates on bare / `sync` / `pack` invocations. While
-testing a local build, export `SS_MAGIC_NO_UPDATE=1` so the auto-updater
-doesn't replace your development binary with the latest GitHub release.
+**Tip:** the binary self-updates on bare / `sync` / `reverse-sync` / `pack`
+invocations. While testing a local build, export `SS_MAGIC_NO_UPDATE=1` so the
+auto-updater doesn't replace your development binary with the latest GitHub
+release.
 
 ## Code layout
 
@@ -53,7 +54,9 @@ interactive layer, and grouped by purpose under `src/`:
 - `workspace/` — `.superset/` contract I/O and the init/migration lifecycle.
 - `update/` — the self-update check and apply paths.
 - `pack.rs`, `cli.rs`, `main.rs` — the pack engine, the hand-rolled arg parser
-  (**no `clap`**), and composition (update gate, dispatch, event rendering).
+  (**no `clap`** — this is also where the `-n`/`--no-backup` flag for
+  `sync`/`reverse-sync` is parsed), and composition (update gate, dispatch,
+  event rendering).
 
 `assets/magic.sh` is the canonical wrapper script, embedded into the binary
 via `include_str!` — edit it there, never in a repo's generated `.superset/`
@@ -84,7 +87,7 @@ Conventions worth knowing:
 - Each module declares `#[cfg(test)] mod tests;` with the body in a sibling
   child file (`<module>/tests.rs`), keeping private-item access. Crate-root
   integration tests and shared helpers live in `src/tests/` (`sync.rs`,
-  `update_gate.rs`, `support.rs`).
+  `reverse_sync_flow.rs`, `update_gate.rs`, `support.rs`).
 - Tests use `tempfile` plus shell-invoked `git init` / `git worktree add` to
   build real repos — no git mocking. They must not depend on or mutate your
   real repositories, global git config, clipboard, or installed `ss-magic`.
