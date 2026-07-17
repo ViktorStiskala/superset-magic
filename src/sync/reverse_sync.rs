@@ -363,16 +363,16 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
     }
 
     // Full-screen cockpit: the user sets each file's direction and either
-    // cancels (main untouched) or confirms a batch of decisions.
+    // cancels (both sides untouched) or confirms a batch of decisions.
     let decisions = match cockpit::run_cockpit(worktree_root, main_root, &offered)? {
         CockpitOutcome::Cancel => {
-            println!("{}", style::info("Nothing selected — main untouched."));
+            println!("{}", style::info("Nothing selected — worktree and main untouched."));
             return Ok(ExitCode::SUCCESS);
         }
         CockpitOutcome::Apply(d) => d,
     };
     if decisions.is_empty() {
-        println!("{}", style::info("Nothing selected — main untouched."));
+        println!("{}", style::info("Nothing selected — worktree and main untouched."));
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -628,7 +628,11 @@ pub fn backup_forward_targets(main_root: &Path, cwd_root: &Path, patterns: &[Str
         if under_backups_dir(rel) {
             continue;
         }
-        let dest = backups_root.join(&ts).join(rel);
+        // Forward sync overwrites the WORKTREE side, so back up under the shared
+        // `<ts>/worktree/<rel>` namespace (`backup_rel_path`) that the cockpit and
+        // reverse-sync bulk path use — one consistent layout, and no collision if
+        // a forward and an interactive/bulk run ever share a timestamp directory.
+        let dest = backups_root.join(backup_rel_path(&ts, BackupSide::Worktree, rel));
         if let Some(p) = backup_if_exists(&cwd_root.join(rel), &dest)? {
             backed_up.push(p);
         }

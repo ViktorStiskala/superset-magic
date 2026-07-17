@@ -173,8 +173,8 @@ fn sync_outside_git_repo_is_hard_error() {
 // ── Pre-copy backup pass (unified sync, Task 5) ─────────────────────────
 
 /// Forward sync backs up the worktree's pre-overwrite bytes under
-/// `.superset/backups/<ts>/<rel>` before copying main's version in, unless
-/// `--no-backup` is set.
+/// `.superset/backups/<ts>/worktree/<rel>` before copying main's version in,
+/// unless `--no-backup` is set.
 #[test]
 fn sync_backs_up_overwritten_worktree_file_by_default() {
     let main = init_main_repo("main");
@@ -198,7 +198,9 @@ fn sync_backs_up_overwritten_worktree_file_by_default() {
         .map(|e| e.unwrap().path())
         .find(|p| p.is_dir())
         .expect("one backup batch dir must exist under .superset/backups");
-    let backed_up = fs::read_to_string(batch.join(".env")).unwrap();
+    // Forward sync overwrites the worktree side, so the backup lands under the
+    // shared `<ts>/worktree/<rel>` namespace (`backup_rel_path`).
+    let backed_up = fs::read_to_string(batch.join("worktree").join(".env")).unwrap();
     assert_eq!(
         backed_up, "OLD=0\n",
         "the backup must hold the pre-overwrite (OLD) bytes"
