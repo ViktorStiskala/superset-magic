@@ -397,6 +397,35 @@ binary is the sole file-copy implementation.)
   update `.cursor/BUGBOT.md` in the same change so its rules never describe
   stale conventions.
 
+## Secret-safety constraints (hard rules)
+
+The unified sync engine is the ONE path that writes untracked (secret) files into
+the shared main checkout, and `pack` archives the configured files, so both are
+secret-leak surfaces. Two constraints are load-bearing here: violating either is a
+secret leak, not a cosmetic bug. Each is backed by a `docs/solutions/` write-up of
+the real incident this run fixed.
+
+- **Determine "is this a secret?" POSITIVELY, and fail closed.** The
+  gitignore-in-main gate must fire for a git-UNTRACKED worktree source, decided by
+  POSITIVE tracked determination (`!git::tracked_files(...).contains(rel)`) so that
+  anything NOT positively known-tracked (a non-UTF-8 / NFD-vs-NFC / otherwise
+  unenumerable name) defaults to secret and runs the gate. NEVER derive
+  untracked-ness by ABSENCE from an untracked set (`untracked.contains(rel)`) — a
+  lookup miss then lands on the permissive side and leaks. Rule for any security
+  gate: phrase the question so the UNKNOWN answer is the SAFE one. See
+  [docs/solutions/logic-errors/secret-gate-positive-tracked-determination-fail-closed.md](./docs/solutions/logic-errors/secret-gate-positive-tracked-determination-fail-closed.md).
+- **Enforce a secret-excluding path filter at the point of final enumeration, not
+  on an upstream list.** The `.superset/backups/` exclusion (and any filter meant
+  to keep secrets out) must be applied where the file set is actually materialized
+  — the directory walk (`pack`'s `append_dir_excluding_backups`) — NOT only on the
+  flat match list, because a later step that re-walks the live filesystem
+  (`append_dir_all`, `copy_dir_recursive`, `WalkDir`) bypasses an upstream filter.
+  The trap is a directory match that is an ANCESTOR of the excluded subtree (a bare
+  `.superset` pattern, a broad `**`). A comment asserting "X is never included" is a
+  red flag unless the guard sits on the enumeration layer; test the directory-match
+  shape, not just the leaf. See
+  [docs/solutions/logic-errors/pack-backups-exclusion-must-guard-the-directory-walk.md](./docs/solutions/logic-errors/pack-backups-exclusion-must-guard-the-directory-walk.md).
+
 ## Documented Solutions
 
 `docs/solutions/` — documented solutions to past problems (bugs, best
