@@ -1199,6 +1199,15 @@ pub fn apply_decision(
             if matches!(guard, Guard::Changed) {
                 return Ok(ApplyOutcome::Skipped(changed_reason()));
             }
+            // Read the worktree source FIRST, before ANY mutation of main (backup,
+            // gitignore, or write): a read failure — e.g. an unreadable source,
+            // reachable because `set_push` allows Push on a worktree-only
+            // `Unreadable` entry — then returns with main entirely untouched, with
+            // no stray backup and no stray `.gitignore` rule for a file that was
+            // never pushed. The gitignore still precedes the WRITE below, so the
+            // "gitignore before any secret bytes land in main" invariant holds.
+            let bytes = fs::read(&source)
+                .with_context(|| format!("reading worktree file {}", source.display()))?;
             let mut backups = Vec::new();
             backups.extend(backup_if_unchanged(
                 &target,
@@ -1216,8 +1225,6 @@ pub fn apply_decision(
             } else {
                 false
             };
-            let bytes = fs::read(&source)
-                .with_context(|| format!("reading worktree file {}", source.display()))?;
             write_bytes(&target, &bytes)?;
             Ok(ApplyOutcome::Applied(ApplyResult {
                 direction: WriteDirection::PushToMain,

@@ -1720,6 +1720,57 @@ fn apply_push_tracked_source_skips_gitignore() {
     );
 }
 
+/// A Push whose worktree source can't be READ leaves main ENTIRELY untouched:
+/// the source is read before any mutation of main, so a read failure appends NO
+/// stray `.gitignore` rule and writes nothing (Bugbot: "Gitignore before
+/// unreadable push read").
+#[cfg(unix)]
+#[test]
+fn apply_push_unreadable_source_leaves_main_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let backups = tempfile::tempdir().unwrap();
+
+    write(&wt, "secret.env", "S=1\n");
+    // Capture the baseline while the source is still readable.
+    let base = Baseline {
+        wt: meta(&wt.join("secret.env")),
+        main: None, // worktree-only push (creates in main)
+        source_untracked: true,
+    };
+    // Make the source unreadable; `fs::metadata` (the guard) still succeeds, but
+    // `fs::read` at apply time fails.
+    fs::set_permissions(&wt.join("secret.env"), fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&wt.join("secret.env")).is_ok() {
+        // Running as root (or a permissive FS): can't exercise the unreadable
+        // path here — restore and skip rather than assert a false failure.
+        let _ = fs::set_permissions(&wt.join("secret.env"), fs::Permissions::from_mode(0o644));
+        return;
+    }
+
+    let ctx = ApplyContext {
+        worktree_root: &wt,
+        main_root: main.path(),
+        backups_root: backups.path(),
+        ts: TS,
+        backup: true,
+    };
+    let res = apply_decision(&ctx, Path::new("secret.env"), &Decision::Push, base);
+    let _ = fs::set_permissions(&wt.join("secret.env"), fs::Permissions::from_mode(0o644));
+
+    assert!(res.is_err(), "an unreadable push source must error, not partially apply");
+    let gi = fs::read_to_string(main.path().join(".gitignore")).unwrap_or_default();
+    assert!(
+        !gi.contains("secret.env"),
+        "a failed unreadable push must leave NO stray .gitignore rule in main: {gi:?}"
+    );
+    assert!(
+        !main.path().join("secret.env").exists(),
+        "a failed unreadable push must not partially write into main"
+    );
+}
+
 /// `ApplyContext.backup: false` skips ONLY the backup copy: the file is still
 /// written into main AND the secret gitignore gate still runs for an untracked
 /// source.
