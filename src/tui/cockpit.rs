@@ -554,15 +554,17 @@ fn build_main_only(main_path: &Path) -> FileDiff {
 ///
 /// Consults both sides' sizes via `fs::metadata` FIRST (R8): if either exceeds
 /// [`diffmodel::MAX_DIFF_BYTES`], a [`FileDiff::TooLarge`] is built from the
-/// metadata length WITHOUT reading either file in full. A main-side read error
-/// that is NOT "missing" (permissions / I/O) surfaces as [`FileDiff::Unreadable`]
-/// — main's bytes are never fabricated as empty, so no diff/merge is driven from
-/// fabricated content. The worktree side propagates its error (it is the secret
-/// being pushed).
+/// metadata length WITHOUT reading either file in full. A read error that is NOT
+/// "missing" (permissions / I/O) on EITHER side surfaces as
+/// [`FileDiff::Unreadable`] — neither side's bytes are ever fabricated as empty,
+/// so no diff/merge is driven from fabricated content, and one unreadable file
+/// keeps the cockpit open (the whole session no longer aborts on a single
+/// permission problem, matching the one-sided New/MainOnly handling).
 fn build_two_sided(wt_path: &Path, main_path: &Path) -> Result<FileDiff> {
-    let wt_len = fs::metadata(wt_path)
-        .with_context(|| format!("reading worktree file {}", wt_path.display()))?
-        .len();
+    let wt_len = match fs::metadata(wt_path) {
+        Ok(m) => m.len(),
+        Err(e) => return Ok(wt_unreadable(&e)),
+    };
     let main_len = match fs::metadata(main_path) {
         Ok(m) => m.len(),
         Err(e) => return Ok(main_unreadable(&e)),
@@ -573,8 +575,10 @@ fn build_two_sided(wt_path: &Path, main_path: &Path) -> Result<FileDiff> {
         });
     }
 
-    let wt_bytes = fs::read(wt_path)
-        .with_context(|| format!("reading worktree file {}", wt_path.display()))?;
+    let wt_bytes = match fs::read(wt_path) {
+        Ok(b) => b,
+        Err(e) => return Ok(wt_unreadable(&e)),
+    };
     let main_bytes = match fs::read(main_path) {
         Ok(b) => b,
         Err(e) => return Ok(main_unreadable(&e)),
@@ -582,10 +586,21 @@ fn build_two_sided(wt_path: &Path, main_path: &Path) -> Result<FileDiff> {
     Ok(build_text_diff(&wt_bytes, &main_bytes))
 }
 
-/// The [`FileDiff::Unreadable`] notice for a main-side read failure.
+/// The [`FileDiff::Unreadable`] notice for a main-side read failure. Main is the
+/// pull/merge source, so an unreadable main copy leaves push as the only option.
 fn main_unreadable(err: &io::Error) -> FileDiff {
     FileDiff::Unreadable {
         note: format!("main unreadable: {err} — push only (pull/merge disabled)"),
+    }
+}
+
+/// The [`FileDiff::Unreadable`] notice for a WORKTREE-side read failure. The
+/// worktree copy is the push/merge source, so an unreadable one can't be pushed
+/// or merged; the file is surfaced (never hidden, never aborting the cockpit) so
+/// the user fixes the permission and re-runs.
+fn wt_unreadable(err: &io::Error) -> FileDiff {
+    FileDiff::Unreadable {
+        note: format!("worktree unreadable: {err} — fix permissions and re-run"),
     }
 }
 

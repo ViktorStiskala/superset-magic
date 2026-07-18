@@ -241,10 +241,11 @@ pub(crate) fn under_backups_dir(rel: &Path) -> bool {
 /// [`DiffStatus::Identical`]; present on both and different →
 /// [`DiffStatus::Differs`]. `(false, false)` — the path vanished on BOTH sides
 /// between the pattern walk and this classify — is reported as `Identical`
-/// (nothing to reconcile), never a phantom candidate. A read error on main's
-/// copy is surfaced as `Differs` (show it rather than silently hide it); the
-/// worktree read only happens when the worktree copy exists, so a main-only rel
-/// never triggers a spurious read error.
+/// (nothing to reconcile), never a phantom candidate. A read error on EITHER
+/// side (permissions / I/O) is surfaced as `Differs` — shown rather than silently
+/// hidden, and never propagated, so one unreadable file can't abort the whole
+/// reconcile; the cockpit's `build_two_sided` then degrades the unreadable side
+/// to a notice.
 // consumed by the unified cockpit run() and the direct reverse-sync run_bulk()
 pub fn classify(main_root: &Path, worktree_root: &Path, rel: &Path) -> Result<DiffStatus> {
     let main_path = main_root.join(rel);
@@ -254,10 +255,12 @@ pub fn classify(main_root: &Path, worktree_root: &Path, rel: &Path) -> Result<Di
         (false, true) => Ok(DiffStatus::MainOnly),
         (false, false) => Ok(DiffStatus::Identical),
         (true, true) => {
-            let wt_bytes = fs::read(&wt_path)
-                .with_context(|| format!("reading worktree file {}", wt_path.display()))?;
-            match fs::read(&main_path) {
-                Ok(mb) if mb == wt_bytes => Ok(DiffStatus::Identical),
+            // A read error on EITHER side means byte-equality can't be confirmed,
+            // so surface the file as Differs — never hide it, and never abort the
+            // WHOLE reconcile for one unreadable file. The cockpit's
+            // `build_two_sided` then degrades the unreadable side to a notice.
+            match (fs::read(&wt_path), fs::read(&main_path)) {
+                (Ok(wt), Ok(mb)) if wt == mb => Ok(DiffStatus::Identical),
                 _ => Ok(DiffStatus::Differs),
             }
         }

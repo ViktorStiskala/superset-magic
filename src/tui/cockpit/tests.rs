@@ -170,6 +170,21 @@ fn one_sided_read_error_degrades_to_unreadable_not_abort() {
     }
 }
 
+/// A two-sided (Differs) file whose WORKTREE side fails to read degrades to
+/// `FileDiff::Unreadable` (cockpit stays open) instead of propagating an error
+/// that would abort `App::new` — symmetric with the main-side handling.
+#[test]
+fn two_sided_worktree_read_error_degrades_to_unreadable_not_abort() {
+    let missing_wt = Path::new("/nonexistent-ss-magic-test-xyz/wt.env");
+    let missing_main = Path::new("/nonexistent-ss-magic-test-xyz/main.env");
+    match build_two_sided(missing_wt, missing_main) {
+        Ok(FileDiff::Unreadable { note }) => {
+            assert!(note.contains("worktree unreadable"), "note: {note}")
+        }
+        _ => panic!("a worktree read error must degrade to a worktree Unreadable notice"),
+    }
+}
+
 /// A file whose sides differ ONLY by line endings / trailing newline renders
 /// the explanatory notice instead of an empty diff pane.
 #[test]
