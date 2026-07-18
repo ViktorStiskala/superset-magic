@@ -178,7 +178,7 @@ fn two_sided_worktree_read_error_degrades_to_unreadable_not_abort() {
     let missing_wt = Path::new("/nonexistent-ss-magic-test-xyz/wt.env");
     let missing_main = Path::new("/nonexistent-ss-magic-test-xyz/main.env");
     match build_two_sided(missing_wt, missing_main) {
-        Ok(FileDiff::Unreadable { note }) => {
+        Ok(FileDiff::Unreadable { note, .. }) => {
             assert!(note.contains("worktree unreadable"), "note: {note}")
         }
         _ => panic!("a worktree read error must degrade to a worktree Unreadable notice"),
@@ -402,6 +402,7 @@ fn set_pull_is_noop_for_unreadable_main() {
         FileDiff::Unreadable {
             note: "main unreadable: permission denied — push only (pull/merge disabled)"
                 .to_string(),
+            side: UnreadableSide::Main,
         },
     )]);
     app.set_pull();
@@ -409,6 +410,29 @@ fn set_pull_is_noop_for_unreadable_main() {
         matches!(app.files[0].decision, Decision::Undecided),
         "pull must be a no-op for an unreadable-main file: {:?}",
         app.files[0].decision
+    );
+    // ...but a worktree-unreadable Differs file CAN be pulled (main is readable).
+    let mut app2 = app_with(vec![entry(
+        "wt.env",
+        DiffStatus::Differs,
+        Decision::Undecided,
+        FileDiff::Unreadable {
+            note: "worktree unreadable: permission denied — pull only (push/merge disabled)"
+                .to_string(),
+            side: UnreadableSide::Worktree,
+        },
+    )]);
+    app2.set_pull();
+    assert!(
+        matches!(app2.files[0].decision, Decision::Pull),
+        "pull must WORK for a worktree-unreadable file (main is readable): {:?}",
+        app2.files[0].decision
+    );
+    app2.set_push();
+    assert!(
+        matches!(app2.files[0].decision, Decision::Pull),
+        "push must be a no-op for a worktree-unreadable file (source unreadable): {:?}",
+        app2.files[0].decision
     );
 }
 
@@ -986,6 +1010,7 @@ fn unreadable_main_disables_merge() {
         FileDiff::Unreadable {
             note: "main unreadable: permission denied — push only (pull/merge disabled)"
                 .to_string(),
+            side: UnreadableSide::Main,
         },
     )]);
     app.try_open_merge();

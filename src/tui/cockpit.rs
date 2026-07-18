@@ -117,10 +117,25 @@ enum FileDiff {
     Binary { note: String },
     /// Either side is over the diff cap (R8) — whole-file push/pull only.
     TooLarge { note: String },
-    /// Main's copy could not be read (permissions / I/O — NOT missing). The
+    /// A side's copy could not be read (permissions / I/O — NOT missing). The
     /// error is surfaced verbatim; a diff/merge is NEVER built from a fabricated
-    /// empty buffer, so interactive merge is unavailable for this file.
-    Unreadable { note: String },
+    /// empty buffer, so interactive merge is unavailable. `side` records WHICH
+    /// copy failed so the still-possible direction stays enabled
+    /// (`set_push`/`set_pull`).
+    Unreadable { note: String, side: UnreadableSide },
+}
+
+/// Which side of a file could not be read — so the cockpit gates only the
+/// direction that actually needs the failed side: a MAIN-unreadable file can
+/// still be PUSHED (the worktree source is readable), a WORKTREE-unreadable file
+/// can still be PULLED (main's source is readable). Merge needs both and is
+/// unavailable either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnreadableSide {
+    /// The worktree copy couldn't be read — push/merge disabled, pull works.
+    Worktree,
+    /// The main copy couldn't be read — pull/merge disabled, push works.
+    Main,
 }
 
 /// One reconcile candidate as shown in the cockpit.
@@ -361,31 +376,47 @@ impl App {
         }
     }
 
-    /// Push writes the worktree copy into main, so it needs a worktree copy to
-    /// read from. A [`DiffStatus::MainOnly`] file has none, so `p` is a no-op
-    /// that sets a transient notice (mirroring [`set_pull`]'s guard for a
-    /// worktree-only file) — setting Push there would only fail at apply time
-    /// after backing up + gitignoring main.
+    /// Push reads the worktree copy and writes main, so it needs a READABLE
+    /// worktree source. It is a no-op (transient notice) for a
+    /// [`DiffStatus::MainOnly`] file (no worktree copy) or a WORKTREE-unreadable
+    /// file (source can't be read) — but a MAIN-unreadable file can still be
+    /// pushed (the worktree source is fine), so it is NOT gated here. Setting
+    /// Push where it can't work would only fail at apply time after backing up +
+    /// gitignoring main.
     fn set_push(&mut self) {
         if let Some(f) = self.files.get_mut(self.focused) {
-            if f.status != DiffStatus::MainOnly {
-                f.decision = Decision::Push;
-            } else {
+            if f.status == DiffStatus::MainOnly {
                 self.notice =
                     Some("push unavailable — this file exists only in main (l pulls it)".into());
+            } else if matches!(
+                f.diff,
+                FileDiff::Unreadable {
+                    side: UnreadableSide::Worktree,
+                    ..
+                }
+            ) {
+                self.notice = Some("push unavailable — the worktree copy is unreadable".into());
+            } else {
+                f.decision = Decision::Push;
             }
         }
     }
 
-    /// Pull requires a readable, existing main copy to read from. A worktree-only
-    /// file (main absent) or one whose main copy is [`FileDiff::Unreadable`]
-    /// (present but permission/I/O error) has none, so `l` is a no-op for both —
-    /// mirroring the diff pane, which already shows pull disabled. Setting Pull
-    /// there would only fail at apply time.
+    /// Pull reads main and writes the worktree, so it needs a READABLE main
+    /// source. It is a no-op for a worktree-only file (main absent) or a
+    /// MAIN-unreadable file (source can't be read) — but a WORKTREE-unreadable
+    /// file CAN be pulled: main is readable and overwrites the (unreadable)
+    /// worktree copy, which is the natural recovery, so it is NOT gated here.
     fn set_pull(&mut self) {
         if let Some(f) = self.files.get_mut(self.focused) {
             let main_readable = f.status != DiffStatus::WorktreeOnly
-                && !matches!(f.diff, FileDiff::Unreadable { .. });
+                && !matches!(
+                    f.diff,
+                    FileDiff::Unreadable {
+                        side: UnreadableSide::Main,
+                        ..
+                    }
+                );
             if main_readable {
                 f.decision = Decision::Pull;
             }
@@ -531,8 +562,11 @@ fn read_created_content(path: &Path, label: &str) -> Result<Option<String>> {
 fn build_new(wt_path: &Path) -> FileDiff {
     match read_created_content(wt_path, "worktree file") {
         Ok(content) => FileDiff::New { content },
+        // Worktree-only + unreadable: no main to pull, worktree can't be read, so
+        // no direction is possible — fix permissions and re-run.
         Err(err) => FileDiff::Unreadable {
-            note: format!("worktree unreadable: {err:#} — a push would fail"),
+            note: format!("worktree unreadable: {err:#} — fix permissions and re-run"),
+            side: UnreadableSide::Worktree,
         },
     }
 }
@@ -544,8 +578,11 @@ fn build_new(wt_path: &Path) -> FileDiff {
 fn build_main_only(main_path: &Path) -> FileDiff {
     match read_created_content(main_path, "main file") {
         Ok(content) => FileDiff::MainOnly { content },
+        // Main-only + unreadable: no worktree to push, main can't be read, so no
+        // direction is possible — fix permissions and re-run.
         Err(err) => FileDiff::Unreadable {
-            note: format!("main unreadable: {err:#} — pull disabled"),
+            note: format!("main unreadable: {err:#} — fix permissions and re-run"),
+            side: UnreadableSide::Main,
         },
     }
 }
@@ -586,21 +623,24 @@ fn build_two_sided(wt_path: &Path, main_path: &Path) -> Result<FileDiff> {
     Ok(build_text_diff(&wt_bytes, &main_bytes))
 }
 
-/// The [`FileDiff::Unreadable`] notice for a main-side read failure. Main is the
-/// pull/merge source, so an unreadable main copy leaves push as the only option.
+/// The [`FileDiff::Unreadable`] notice for a main-side read failure on a
+/// two-sided file. Main is the pull/merge source, so an unreadable main copy
+/// leaves PUSH as the only option (the worktree source is still readable).
 fn main_unreadable(err: &io::Error) -> FileDiff {
     FileDiff::Unreadable {
         note: format!("main unreadable: {err} — push only (pull/merge disabled)"),
+        side: UnreadableSide::Main,
     }
 }
 
-/// The [`FileDiff::Unreadable`] notice for a WORKTREE-side read failure. The
-/// worktree copy is the push/merge source, so an unreadable one can't be pushed
-/// or merged; the file is surfaced (never hidden, never aborting the cockpit) so
-/// the user fixes the permission and re-runs.
+/// The [`FileDiff::Unreadable`] notice for a worktree-side read failure on a
+/// two-sided file. The worktree is the push/merge source, so an unreadable
+/// worktree copy leaves PULL as the only option — main is readable and can
+/// overwrite the worktree copy (the natural recovery).
 fn wt_unreadable(err: &io::Error) -> FileDiff {
     FileDiff::Unreadable {
-        note: format!("worktree unreadable: {err} — fix permissions and re-run"),
+        note: format!("worktree unreadable: {err} — pull only (push/merge disabled)"),
+        side: UnreadableSide::Worktree,
     }
 }
 
@@ -957,7 +997,7 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, split: bool) {
         ),
         FileDiff::Binary { note }
         | FileDiff::TooLarge { note }
-        | FileDiff::Unreadable { note } => render_notice(frame, inner, note),
+        | FileDiff::Unreadable { note, .. } => render_notice(frame, inner, note),
         // Equal after EOL normalization: the raw bytes differ only by line
         // endings / trailing newline — say so instead of drawing an empty diff.
         FileDiff::Text { local, main } if local == main => {

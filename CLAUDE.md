@@ -114,12 +114,18 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   after normalization renders a "line endings only" notice instead of an empty
   diff), `New` for a worktree-only file (created in main by a push), `MainOnly`
   for a main-only file (created locally by a pull – the mirror of `New`, sourced
-  from main), `Binary`, `TooLarge`, or `Unreadable` when main's copy fails to
-  read (surfaced verbatim, NEVER a fabricated empty buffer, so interactive merge
-  is unavailable for it). `set_push` gates `p` off a `MainOnly` file (no
-  worktree source to read – a transient footer notice instead), mirroring
-  `set_pull`'s gate off a worktree-only or `Unreadable` file; `status_tag`
-  labels a `MainOnly` file `(main only)` in cyan. `m` on a DIFFERING TEXT file
+  from main), `Binary`, `TooLarge`, or `Unreadable { note, side }` when a side's
+  copy fails to read (permissions / I/O, NOT missing — surfaced verbatim, NEVER a
+  fabricated empty buffer; a read error on EITHER side degrades to `Unreadable`
+  rather than aborting the whole reconcile / cockpit load, and `side`
+  (`UnreadableSide::Worktree`/`Main`) records WHICH copy failed). The direction
+  gates are side-aware: `set_push` (`p`) is a no-op for a `MainOnly` file (no
+  worktree source) or a WORKTREE-unreadable file (source can't be read) — but a
+  MAIN-unreadable file can still be pushed; `set_pull` (`l`) is a no-op for a
+  worktree-only file or a MAIN-unreadable file — but a WORKTREE-unreadable file
+  CAN be pulled (main is readable and overwrites the local copy, the natural
+  recovery). Merge needs both sides and is unavailable for any `Unreadable`.
+  `status_tag` labels a `MainOnly` file `(main only)` in cyan. `m` on a DIFFERING TEXT file
   opens the per-hunk merge overlay (`Mode::Merge`, state in `App::merge`): it
   computes hunks with `merge::merge_segments`, holds one `MergeChoice` per `Diff`
   segment (default `Local`), walks them with the arrows, cycles keep-local /

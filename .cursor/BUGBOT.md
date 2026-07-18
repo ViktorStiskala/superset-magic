@@ -352,13 +352,22 @@ committable and must never leak.
   in raw mode. Flag a change that moves terminal setup/teardown outside the
   guard/panic-hook path, or that enters the alternate screen before the guard
   exists.
-- **A diff or merge is never built from fabricated content.** If main's copy
-  of a candidate fails to read for a reason OTHER than "does not exist"
-  (permissions, I/O), the cockpit surfaces `FileDiff::Unreadable` with the
-  real error and disables interactive merge for that file — it must NEVER
-  substitute an empty buffer and diff/merge against that. Flag a change that
-  treats a non-missing read error as empty content instead of propagating
-  `Unreadable`.
+- **A diff or merge is never built from fabricated content, and one unreadable
+  file never aborts the whole reconcile.** If EITHER side's copy of a candidate
+  fails to read for a reason OTHER than "does not exist" (permissions, I/O), the
+  cockpit surfaces `FileDiff::Unreadable { note, side }` with the real error and
+  disables interactive merge for that file — it must NEVER substitute an empty
+  buffer and diff/merge against that, and must NEVER propagate the error out of
+  `classify`/`build_two_sided`/`build_new`/`build_main_only` (that would abort
+  `compute_reconcile_set` or `App::new` for the whole session). `side`
+  (`UnreadableSide::Worktree`/`Main`) is load-bearing: the direction gates must
+  stay side-aware — `set_push` disabled only when the WORKTREE side is unreadable
+  (or the file is main-only), `set_pull` disabled only when the MAIN side is
+  unreadable (or the file is worktree-only). Flag a change that treats a
+  non-missing read error as empty content, that propagates it instead of
+  degrading to `Unreadable`, or that gates a direction on `Unreadable` without
+  checking `side` (e.g. blocking pull for a worktree-unreadable file whose main
+  copy is perfectly readable).
 - Interactive merge: pressing `m` on a DIFFERING TEXT file opens a per-hunk
   overlay (`Mode::Merge`) that assembles bytes with `merge::merge_segments` +
   `merge::assemble` and, on `Enter`, records `Decision::Merge(assembled)`; `Esc`

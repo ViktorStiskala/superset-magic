@@ -1,6 +1,6 @@
 [package]
 name = "ss-magic"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2021"
 repository = "https://github.com/ViktorStiskala/superset-magic"
 license = "MIT OR Apache-2.0"
