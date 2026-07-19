@@ -354,7 +354,7 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
     // reviewed status (see `review_baseline`), so the confirm and apply agree.
     let mut baseline: HashMap<PathBuf, Baseline> = HashMap::new();
     for c in &reconcile {
-        let (wt, main) = review_baseline(worktree_root, main_root, &c.rel, c.status)?;
+        let (wt, main) = review_baseline(worktree_root, main_root, &c.rel, c.status);
         baseline.insert(
             c.rel.clone(),
             Baseline {
@@ -576,7 +576,7 @@ pub fn run_bulk(worktree_root: &Path, main_root: &Path, no_backup: bool) -> Resu
     let mut baseline: HashMap<PathBuf, Baseline> = HashMap::new();
     let mut decisions: Vec<(PathBuf, Decision)> = Vec::new();
     for (rel, status) in &work {
-        let (wt, main) = review_baseline(worktree_root, main_root, rel, *status)?;
+        let (wt, main) = review_baseline(worktree_root, main_root, rel, *status);
         baseline.insert(
             rel.clone(),
             Baseline {
@@ -910,21 +910,46 @@ fn hash_file(path: &Path) -> Result<u64> {
 /// covered (`baseline None` vs a present file → [`Guard::Changed`]) and SKIPS
 /// it — instead of silently overwriting or deleting a copy the user was told did
 /// not exist.
+///
+/// Capture NEVER aborts the reconcile. A read side that fails to `stat` (or, on a
+/// mtime-less filesystem, to hash) degrades to `None` via [`baseline_side`]
+/// instead of propagating: one permission/I/O error on a single candidate must
+/// not tear down the whole session, exactly as the cockpit's `classify` /
+/// `load_entry` already degrade the same failures to a `FileDiff::Unreadable`.
+/// Folding the error to `None` is fail-closed — see [`baseline_side`].
 fn review_baseline(
     worktree_root: &Path,
     main_root: &Path,
     rel: &Path,
     status: DiffStatus,
-) -> Result<(Option<FileMeta>, Option<FileMeta>)> {
+) -> (Option<FileMeta>, Option<FileMeta>) {
     let wt = match status {
         DiffStatus::MainOnly => None,
-        _ => meta_of(&worktree_root.join(rel))?,
+        _ => baseline_side(meta_of(&worktree_root.join(rel))),
     };
     let main = match status {
         DiffStatus::WorktreeOnly => None,
-        _ => meta_of(&main_root.join(rel))?,
+        _ => baseline_side(meta_of(&main_root.join(rel))),
     };
-    Ok((wt, main))
+    (wt, main)
+}
+
+/// Fold one review-baseline side read into the captured metadata, degrading a
+/// read FAILURE to `None` (treat an unreadable side as absent for baseline
+/// purposes).
+///
+/// `Ok(Some)` / `Ok(None)` pass through as the side's real state. An `Err` —
+/// a non-`NotFound` `stat` error, or a content-hash failure on a mtime-less
+/// filesystem (see [`meta_of`]) — becomes `None`, so a single unreadable
+/// candidate cannot abort the whole reconcile. This is safe because it fails
+/// CLOSED: at apply time an unreadable-then-present side reads as `baseline
+/// None` vs a present target → [`Guard::Changed`] → SKIP, so nothing the review
+/// could not see is ever overwritten; only a genuinely-absent target is written
+/// (a create, with no prior bytes to lose).
+fn baseline_side(meta: Result<Option<FileMeta>>) -> Option<FileMeta> {
+    // Drop a read error and flatten to the side's captured state: `Ok(Some)` →
+    // `Some`, `Ok(None)` / `Err` → `None`.
+    meta.ok().flatten()
 }
 
 /// Whether two snapshots of the same path can be trusted as "unchanged".

@@ -1175,8 +1175,7 @@ fn review_baseline_pins_main_absent_for_worktree_only_status() {
         main.path(),
         Path::new("config.env"),
         DiffStatus::WorktreeOnly,
-    )
-    .unwrap();
+    );
     assert!(wt_meta.is_some());
     assert!(main_meta.is_none(), "worktree-only status pins main absent");
 
@@ -1214,9 +1213,35 @@ fn review_baseline_pins_main_absent_for_worktree_only_status() {
         main.path(),
         Path::new("config.env"),
         DiffStatus::Differs,
-    )
-    .unwrap();
+    );
     assert!(m.is_some(), "differs status captures main's metadata");
+}
+
+/// `baseline_side` degrades a read FAILURE to `None` (fail-closed) so one
+/// unreadable candidate never aborts the whole reconcile, while real reads
+/// (present or genuinely-absent) pass through unchanged.
+#[test]
+fn baseline_side_folds_read_error_to_none() {
+    // A genuine read error (a non-NotFound stat / hash failure) degrades to
+    // `None` instead of propagating.
+    let err: Result<Option<FileMeta>> = Err(anyhow::anyhow!("permission denied"));
+    assert!(baseline_side(err).is_none(), "a read error folds to None");
+
+    // A real existing file's metadata passes through untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let present = dir.path().join("secret.env");
+    fs::write(&present, "K=V\n").unwrap();
+    assert!(
+        baseline_side(meta_of(&present)).is_some(),
+        "an existing file's captured metadata passes through"
+    );
+
+    // A genuinely-absent path is `Ok(None)` and stays `None` (indistinguishable
+    // from a read error at this layer — both are the absent, fail-closed state).
+    assert!(
+        baseline_side(meta_of(&dir.path().join("nope.env"))).is_none(),
+        "an absent path stays None"
+    );
 }
 
 // ── Backup timestamps + retention ────────────────────────────────────────
@@ -1575,8 +1600,7 @@ fn review_baseline_pins_worktree_none_for_main_only() {
         main.path(),
         Path::new("config.env"),
         DiffStatus::MainOnly,
-    )
-    .unwrap();
+    );
     assert!(
         wt_meta.is_none(),
         "main-only status pins the worktree side absent"

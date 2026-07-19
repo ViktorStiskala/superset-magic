@@ -154,6 +154,18 @@ committable and must never leak.
   review→apply window is seen as `Guard::Changed` and SKIPPED, never overwritten
   or deleted without having been shown in the confirm. Flag a baseline capture
   that stats the disk for a side the review classified as absent.
+- **Baseline capture must never abort the whole reconcile for one unreadable
+  file.** `review_baseline` is infallible: a read side that fails to `stat` (or,
+  on a mtime-less filesystem, to hash) degrades to `None` via `baseline_side`
+  instead of propagating the error, so one permission/I/O error on a single
+  candidate does not tear down the entire interactive `run` (or `run_bulk`)
+  session — matching the cockpit's `classify`/`load_entry`, which already degrade
+  such reads to `FileDiff::Unreadable`. Folding to `None` is fail-closed: an
+  unreadable-then-present side reads as `baseline None` vs a present target →
+  `Guard::Changed` → SKIP (never a silent overwrite); only a genuinely-absent
+  target is written. Flag any reintroduction of a `?`/propagating read in the
+  baseline-capture loops that could abort the reconcile, or a degraded path that
+  overwrites a side whose baseline could not be read.
 - **A MainOnly pull is a non-destructive create; a MainOnly delete IS
   destructive.** For a main-only file a PULL creates the worktree copy (no
   worktree bytes are lost), so it MUST be excluded from the destructive

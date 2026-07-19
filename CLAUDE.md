@@ -243,6 +243,17 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   candidate's main side and a `MainOnly` candidate's worktree side are both
   `None`, so a copy that materializes on that side between classify and apply is
   skipped instead of clobbered without having been listed in the confirm.
+  `review_baseline` NEVER aborts the reconcile for one bad file: a side that
+  fails to `stat` (or, on a mtime-less filesystem, to hash) degrades to `None`
+  via `baseline_side` rather than propagating the error — one permission/I/O
+  error on a single candidate must not tear down the whole session (mirroring
+  `classify`/`load_entry`, which already degrade the same failures to a
+  `FileDiff::Unreadable`). Folding to `None` is fail-closed: an
+  unreadable-then-present side reads as `baseline None` vs a present target →
+  `Guard::Changed` → SKIP, so nothing the review could not see is overwritten;
+  only a genuinely-absent target is written (a create, no prior bytes to lose).
+  Both the interactive `run` capture loop and `run_bulk`'s are covered, since
+  the degradation lives in `review_baseline` itself.
   `backup_if_unchanged` takes a timestamped pre-write backup of the losing bytes
   under a gitignored `.superset/backups/<YYYYmmdd-HHMMSS>/{worktree,main}/…`
   (`apply_timestamp` → the pure `format_timestamp`, UTC civil-from-days, no date
