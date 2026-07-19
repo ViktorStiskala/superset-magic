@@ -181,11 +181,15 @@ committable and must never leak.
   of the root it overwrites: the interactive cockpit → the worktree root, the
   direct `reverse-sync` → the main root, the forward `sync` → the worktree (cwd)
   root (`backups_root_for`). That dir is gitignored at the closest `.gitignore`
-  via the single `gitignore::ensure_path_ignored(root, root, ".superset/backups",
-  PathKind::Dir)` helper (a `Dir` is queried/written with a trailing slash so a
-  `.superset/backups/` rule matches before the dir exists on disk). Flag a backup
-  written under the wrong root, or a backups dir gitignored by a hand-rolled path
-  instead of `ensure_path_ignored`.
+  via the single `ensure_backups_ignored` helper, which wraps
+  `gitignore::ensure_path_ignored(root, root, ".superset/backups", PathKind::Dir)`
+  (a `Dir` is queried/written with a trailing slash so a `.superset/backups/`
+  rule matches before the dir exists on disk). The SAME helper is called eagerly
+  by init/migrate (`ensure_bootstrap_gitignores`) so a fresh `ss-magic init`
+  gitignores the backups tree up front, exactly like `magic.local.json`. Flag a
+  backup written under the wrong root, a backups dir gitignored by a hand-rolled
+  path instead of `ensure_backups_ignored`/`ensure_path_ignored`, or an init/
+  migrate path that stops gitignoring the backups tree.
 - **`--no-backup` skips ONLY the backup copy – never the secret gitignore or the
   TOCTOU guard.** `ApplyContext.backup == false` (from `-n`/`--no-backup` on a
   direct path) no-ops the pre-overwrite backup copy, but `apply_decision` still

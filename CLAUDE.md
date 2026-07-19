@@ -198,10 +198,14 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   prompt. `run_init_noninteractive` is the TUI-free init behind
   `ss-magic init` (writes the layout from CLI patterns, no prompt, not
   gated by auto-update). All three write paths (`run_migrate`, `run_init`,
-  `run_init_noninteractive`) call `ensure_magic_local_ignored`, a thin wrapper
-  over `gitignore::ensure_path_ignored` that gitignores `magic.local.json` at
-  the closest existing `.gitignore` (or the git-root file) – git-tolerant, so it
-  degrades to a literal append in the non-git test tempdirs.
+  `run_init_noninteractive`) call `ensure_bootstrap_gitignores`, which gitignores
+  BOTH `magic.local.json` (a `gitignore::ensure_path_ignored` `File` rule) AND
+  the tool's `.superset/backups/` tree (via `reverse_sync::ensure_backups_ignored`,
+  the same `Dir` rule the first sync would otherwise add lazily) at the closest
+  existing `.gitignore` (or the git-root file) – git-tolerant, so each degrades to
+  a literal append in the non-git test tempdirs. Ignoring backups up front means
+  a fresh `ss-magic init` protects the backup tree before any secret bytes are
+  ever backed up.
 - `sync/reverse_sync.rs` — the sync engine: reconcile the configured files
   between a worktree and main, safely, in BOTH directions. Three entry points.
   `run` is the interactive unified Sync cockpit (the worktree menu's single
@@ -227,11 +231,14 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   best-effort `prune_old_backups`, print the applied/skipped/failed summary
   prefixed with the direction `label` – bidirectional "Sync" for `run`, one-way
   "Reverse sync" for `run_bulk` – and pick the exit code, non-zero iff a file
-  failed); `backups_root_for(root, ensure_ignore)` is the ONE place the
-  `.superset/backups` path + its ignore rule (via
-  `gitignore::ensure_path_ignored`) are wired, so backups always live under the
-  root being OVERWRITTEN: cockpit `run` → worktree, `run_bulk` → main, forward
-  `backup_forward_targets` → cwd. `apply_decision` is the backup-first apply
+  failed); `backups_root_for(root, ensure_ignore)` joins the `.superset/backups`
+  path under the root being OVERWRITTEN (cockpit `run` → worktree, `run_bulk` →
+  main, forward `backup_forward_targets` → cwd) and, when `ensure_ignore`,
+  gitignores it via `ensure_backups_ignored` – the ONE place the
+  `.superset/backups` ignore rule (a `gitignore::ensure_path_ignored` `Dir` rule)
+  is wired, shared with the eager init/migrate bootstrap
+  (`ensure_bootstrap_gitignores`) so a fresh `ss-magic init` adds the same rule up
+  front rather than waiting for the first sync. `apply_decision` is the backup-first apply
   seam: a path-safety guard; a review-time baseline re-check via `check_target`
   – per-file `(worktree, main)` `FileMeta` is captured via `review_baseline`
   BEFORE the cockpit opens (the `Baseline` passed into `apply_decision`) and

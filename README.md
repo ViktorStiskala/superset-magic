@@ -203,7 +203,11 @@ From the main-checkout menu, ss-magic branches on `config.json`'s `setup`:
 - A `magic.sh` / `ss-magic` marker only → **edit config**.
 - Neither marker (or absent `config.json`) → **init** the contract.
 
-Both flows preserve `config.json`'s `teardown` and `run` arrays verbatim. All
+Init and migration both gitignore two things up front: the per-machine
+`magic.local.json` overlay and the tool's `.superset/backups/` tree (where a
+sync stores the bytes it overwrites, which can include recovered secrets), so
+the backup tree is protected before the first sync ever writes to it. Both flows
+preserve `config.json`'s `teardown` and `run` arrays verbatim. All
 changes are staged into a tempdir and materialized only after the
 finishing-action prompt returns a non-cancel choice, so picking "done" or
 aborting leaves the old layout intact — never a half-migrated tree. Migration

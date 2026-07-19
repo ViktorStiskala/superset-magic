@@ -663,14 +663,27 @@ pub fn backup_forward_targets(main_root: &Path, cwd_root: &Path, patterns: &[Str
 /// Repo-relative path of the tool's per-batch backups tree.
 const BACKUPS_REL: &str = ".superset/backups";
 
-/// The backups root under `root`, first ensuring it is gitignored at the closest
-/// `.gitignore` when `ensure_ignore` is set (skipped when `--no-backup` disables
-/// backups — there is nothing to hide). The single place the `.superset/backups`
-/// path + its ignore rule are wired, shared by the cockpit [`run`], the direct
-/// [`run_bulk`], and the forward [`backup_forward_targets`].
+/// Ensure the tool's `.superset/backups/` tree is gitignored under `root` at the
+/// closest existing `.gitignore` (or the git-root file) — a no-op when git
+/// already ignores it. The ONE place the `.superset/backups` ignore rule is
+/// wired, shared by [`backups_root_for`] (lazy, at the first sync's backup) and
+/// the init/migrate bootstrap (eager, via `migrate`'s bootstrap step, so a fresh
+/// `ss-magic init` gitignores the backups tree up front — exactly like
+/// `magic.local.json`, and before any secret bytes are ever backed up).
+pub(crate) fn ensure_backups_ignored(root: &Path) -> Result<()> {
+    gitignore::ensure_path_ignored(root, root, Path::new(BACKUPS_REL), PathKind::Dir)?;
+    Ok(())
+}
+
+/// The backups root under `root`, first ensuring it is gitignored (via
+/// [`ensure_backups_ignored`]) when `ensure_ignore` is set — skipped when
+/// `--no-backup` disables backups (there is nothing to hide). Shared by the
+/// cockpit [`run`], the direct [`run_bulk`], and the forward
+/// [`backup_forward_targets`]; the `.superset/backups` path is joined here, the
+/// ignore rule is wired once in [`ensure_backups_ignored`].
 fn backups_root_for(root: &Path, ensure_ignore: bool) -> Result<PathBuf> {
     if ensure_ignore {
-        gitignore::ensure_path_ignored(root, root, Path::new(BACKUPS_REL), PathKind::Dir)?;
+        ensure_backups_ignored(root)?;
     }
     Ok(root.join(BACKUPS_REL))
 }
