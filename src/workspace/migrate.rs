@@ -35,6 +35,7 @@ use anyhow::{Context, Result};
 
 use crate::git;
 use crate::git::gitignore;
+use crate::sync::reverse_sync;
 use crate::workspace::superset_files::{self, Config};
 use crate::tui::style;
 use crate::tui::ui::{self, FinalAction};
@@ -56,9 +57,33 @@ pub const MAGIC_WRAPPER_ENTRY: &str = "./.superset/magic.sh sync";
 /// Relative path of the retired `setup.sh`, deleted on migration.
 const SETUP_SH_REL: &str = ".superset/setup.sh";
 
-/// Relative path of `magic.local.json` as it appears inside the repo. Added
-/// to the git-root `.gitignore` during migration and init.
+/// Relative path of `magic.local.json` as it appears inside the repo. Gitignored
+/// via `gitignore::ensure_path_ignored` during migration and init (the closest
+/// existing `.gitignore`, or the git-root file; a no-op if git already ignores it).
 const MAGIC_LOCAL_REL: &str = ".superset/magic.local.json";
+
+/// Ensure the workspace's bootstrap gitignore rules exist under `repo_root` —
+/// the step shared verbatim by `run_migrate`, `run_init`, and
+/// `run_init_noninteractive`. Two rules, each idempotent (a no-op when git
+/// already ignores it):
+///
+/// - `.superset/magic.local.json` — the per-machine overlay, unrecoverable if
+///   committed; and
+/// - `.superset/backups/` — the tool's pre-overwrite backup tree, which can hold
+///   recovered secret bytes. Ignored eagerly (via
+///   [`reverse_sync::ensure_backups_ignored`]) so a fresh `ss-magic init` gets
+///   the same rule the FIRST sync would otherwise add lazily — the backups tree
+///   is protected before any secret bytes are ever backed up.
+fn ensure_bootstrap_gitignores(repo_root: &Path) -> Result<()> {
+    gitignore::ensure_path_ignored(
+        repo_root,
+        repo_root,
+        Path::new(MAGIC_LOCAL_REL),
+        gitignore::PathKind::File,
+    )?;
+    reverse_sync::ensure_backups_ignored(repo_root)?;
+    Ok(())
+}
 
 /// Which branch the main-checkout bare invocation should take, decided from
 /// the parsed `config.json` `setup` array (KTD8).
@@ -254,7 +279,7 @@ and must be recreated."
     // ---- Materialize: copy staged files in, delete the retired setup.sh. ----
     superset_files::copy_into_repo(staging.path(), repo_root, &[SETUP_SH_REL])?;
     rename_setup_config(repo_root)?;
-    gitignore::ensure_entry(repo_root, MAGIC_LOCAL_REL)?;
+    ensure_bootstrap_gitignores(repo_root)?;
 
     println!();
     println!("{}", style::ok("Wrote .superset/magic.json"));
@@ -262,6 +287,7 @@ and must be recreated."
     println!("{}", style::ok("Updated .superset/config.json"));
     println!("{}", style::ok("Removed .superset/setup.sh"));
     println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
+    println!("{}", style::ok("Gitignored .superset/backups/"));
 
     execute_final_action(repo_root, action, MIGRATE_COMMIT_MESSAGE, "chore/ss-magic-migrate-")
 }
@@ -412,7 +438,7 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
 
     // ---- Materialize. ----
     superset_files::copy_into_repo(stage_root, repo_root, &[])?;
-    gitignore::ensure_entry(repo_root, MAGIC_LOCAL_REL)?;
+    ensure_bootstrap_gitignores(repo_root)?;
 
     println!();
     println!("{}", style::ok("Wrote .superset/magic.json"));
@@ -423,6 +449,7 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
     } else {
         println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
     }
+    println!("{}", style::ok("Gitignored .superset/backups/"));
 
     execute_final_action(repo_root, action, INIT_COMMIT_MESSAGE, "chore/ss-magic-init-")
 }
@@ -455,7 +482,7 @@ pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<
     }
 
     superset_files::copy_into_repo(stage_root, repo_root, &[])?;
-    gitignore::ensure_entry(repo_root, MAGIC_LOCAL_REL)?;
+    ensure_bootstrap_gitignores(repo_root)?;
 
     println!("{}", style::ok("Wrote .superset/magic.json"));
     println!("{}", style::ok("Wrote .superset/magic.sh"));
@@ -463,6 +490,7 @@ pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<
     if !had_local {
         println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
     }
+    println!("{}", style::ok("Gitignored .superset/backups/"));
     println!(
         "{}",
         style::info("Done. Changes are on disk; run `git status` to review.")

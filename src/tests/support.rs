@@ -7,8 +7,11 @@
 //! machine/system config (e.g. `commit.gpgsign`) is neutralized so commits
 //! never block on a gpg agent.
 
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Stdio};
+
+use tempfile::TempDir;
 
 /// Neutralize the developer's GLOBAL git ignore for a freshly-initialized test
 /// repo by pointing its local `core.excludesFile` at an empty source
@@ -54,4 +57,66 @@ pub fn git_run(args: &[&str], cwd: &Path) {
         cwd.display(),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+// ── Crate-root sync-flow test fixtures (shared by `tests::sync` +
+//    `tests::reverse_sync_flow`) ──────────────────────────────────────────────
+
+/// Convert an [`ExitCode`] to a u8 for assertions (`ExitCode` has no
+/// `From<ExitCode> for u8`): `SUCCESS` → 0, anything else → 1 (these flows only
+/// ever return 0 or 1).
+pub(crate) fn exit_code_to_u8(code: ExitCode) -> u8 {
+    if code == ExitCode::SUCCESS {
+        0
+    } else {
+        1
+    }
+}
+
+/// Initialise a bare-ish main repo on `branch` with one initial commit.
+pub(crate) fn init_main_repo(branch: &str) -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    git_run(&["init", "-q", "-b", branch], dir.path());
+    neutralize_global_excludes(dir.path());
+    fs::write(dir.path().join("README.md"), "hi").unwrap();
+    git_run(&["add", "."], dir.path());
+    git_run(&["commit", "-q", "-m", "init"], dir.path());
+    dir
+}
+
+/// Write `magic.json` with the given patterns into `root/.superset/`.
+pub(crate) fn write_magic(root: &Path, patterns: &[&str]) {
+    fs::create_dir_all(root.join(".superset")).unwrap();
+    let files: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
+    let cfg = crate::workspace::superset_files::MagicConfig { files };
+    let body = format!("{}\n", serde_json::to_string_pretty(&cfg).unwrap());
+    fs::write(root.join(".superset/magic.json"), body).unwrap();
+}
+
+/// Write a file at `root/rel` with the given body (creates parents).
+pub(crate) fn write_file(root: &Path, rel: &str, body: &str) {
+    let p = root.join(rel);
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    fs::write(p, body).unwrap();
+}
+
+/// Create a linked worktree from `main_dir` at a new temp path. Returns
+/// `(worktree_tempdir, worktree_root_path)`. The branch name is arbitrary (no
+/// test asserts on it).
+pub(crate) fn make_worktree(main_dir: &Path) -> (TempDir, PathBuf) {
+    let wt = tempfile::tempdir().unwrap();
+    let wt_path = wt.path().join("wt");
+    git_run(
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature/sync-flow-test",
+            wt_path.to_str().unwrap(),
+        ],
+        main_dir,
+    );
+    let wt_root = wt_path.canonicalize().unwrap();
+    (wt, wt_root)
 }

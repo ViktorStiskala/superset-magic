@@ -237,11 +237,17 @@ pub fn pr_create(repo_root: &Path, base: &str) -> Result<String> {
 pub fn untracked_files(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<PathBuf>> {
     let mut args: Vec<&str> = vec!["ls-files", "--others", "-z", "--"];
     args.extend_from_slice(pathspecs);
-    let out = git(&args, Some(repo_root))?;
-    // `-z` gives NUL-separated, unquoted paths so filenames with spaces or
-    // special characters survive intact (the default output quotes them).
-    // `git`'s trim() above strips a trailing NUL, so split on NUL and drop
-    // any empty trailing segment.
+    Ok(parse_ls_files_z(&git(&args, Some(repo_root))?))
+}
+
+/// Parse the NUL-separated (`-z`) stdout of a `git ls-files` invocation into
+/// repo-relative paths. `-z` gives unquoted paths so filenames with spaces or
+/// special characters survive intact; `git`'s `trim()` strips the trailing NUL,
+/// so an empty trailing segment is dropped. Any absolute or `..`-bearing entry
+/// is defensively dropped (git never emits such paths from the repo root, but
+/// BOTH [`untracked_files`] and [`tracked_files`] gate the secret-safety
+/// determination, so the filter lives in ONE place).
+fn parse_ls_files_z(out: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for raw in out.split('\0') {
         if raw.is_empty() {
@@ -249,12 +255,11 @@ pub fn untracked_files(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<PathB
         }
         let p = PathBuf::from(raw);
         if p.is_absolute() || raw.split('/').any(|seg| seg == "..") {
-            // Defensive: git never emits these from the repo root.
             continue;
         }
         paths.push(p);
     }
-    Ok(paths)
+    paths
 }
 
 /// True when `rel` (a repo-relative path) is gitignored in the working tree
@@ -268,6 +273,15 @@ pub fn is_ignored(repo_root: &Path, rel: &Path) -> Result<bool> {
     let rel_str = rel
         .to_str()
         .with_context(|| format!("non-UTF-8 path: {}", rel.display()))?;
+    is_ignored_str(repo_root, rel_str)
+}
+
+/// Raw-pathname variant of [`is_ignored`] so a caller can force git's
+/// directory-only match with a trailing slash: a `foo/bar/` rule matches the
+/// query `foo/bar/` even before the directory exists on disk, whereas `foo/bar`
+/// (no slash, dir absent) is treated as a file and MISSES it. Exit 0 → ignored,
+/// exit 1 → not ignored, any other exit is a real error.
+pub fn is_ignored_str(repo_root: &Path, rel_str: &str) -> Result<bool> {
     let out = git_raw(&["check-ignore", "-q", "--", rel_str], Some(repo_root))?;
     match out.status.code() {
         Some(0) => Ok(true),
@@ -277,6 +291,20 @@ pub fn is_ignored(repo_root: &Path, rel: &Path) -> Result<bool> {
             bail!("`git check-ignore -- {rel_str}` failed: {stderr}");
         }
     }
+}
+
+/// Git-TRACKED files among `pathspecs`, via `git ls-files --cached -z --`. The
+/// mirror of [`untracked_files`], used for POSITIVE tracked determination in the
+/// reverse-sync secret gate — a path NOT in this set is treated as untracked (a
+/// secret), so an unenumerable / oddly-normalized name fails closed. Output is
+/// repo-relative porcelain paths; leading-`..`/absolute paths are defensively
+/// dropped. A directory pathspec expands to the tracked files within it (same as
+/// [`untracked_files`]). Empty `pathspecs` list the WHOLE index, so callers
+/// should skip the probe when there are no matches.
+pub fn tracked_files(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<PathBuf>> {
+    let mut args: Vec<&str> = vec!["ls-files", "--cached", "-z", "--"];
+    args.extend_from_slice(pathspecs);
+    Ok(parse_ls_files_z(&git(&args, Some(repo_root))?))
 }
 
 /// Resolve the `.gitignore` rule that COVERS `rel` in the working tree rooted
@@ -340,60 +368,6 @@ fn parse_check_ignore_line(line: &str) -> Option<String> {
         return None;
     }
     Some(pattern.to_string())
-}
-
-/// Run `git diff --no-index` between two absolute paths and stream the
-/// (colored) output through the user's pager. `--no-index` lets git diff two
-/// arbitrary files outside any repo; `--color=always` forces color even when
-/// piped. The pager is `$PAGER` or `less -R` so a large diff isn't buried by
-/// the picker's re-render. A "files differ" exit (1) is NOT an error — git
-/// diff exits 1 when the inputs differ.
-///
-/// This is a TUI/manual-smoke path: it inherits the terminal and blocks until
-/// the pager is dismissed. It is not unit-tested (consistent with the repo's
-/// final-action convention).
-// consumed by U11 (reverse-sync picker "show diff" action)
-pub fn diff_no_index_paged(left: &Path, right: &Path) -> Result<()> {
-    let pager = std::env::var("PAGER").unwrap_or_else(|_| "less -R".to_string());
-
-    // `git diff --no-index --color=always <left> <right> | $PAGER`. Wire the
-    // pipeline through `git`'s own `core.pager` would require config; spawn
-    // the two processes explicitly so we control the pager and force color.
-    let mut diff = Command::new("git")
-        .args([
-            "diff",
-            "--no-index",
-            "--color=always",
-            "--",
-            left.to_str()
-                .with_context(|| format!("non-UTF-8 path: {}", left.display()))?,
-            right
-                .to_str()
-                .with_context(|| format!("non-UTF-8 path: {}", right.display()))?,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("failed to spawn `git diff --no-index`")?;
-
-    let diff_out = diff
-        .stdout
-        .take()
-        .context("git diff produced no stdout pipe")?;
-
-    // Run the pager via the shell so `$PAGER` may carry arguments (`less -R`).
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut pager_child = Command::new(shell)
-        .arg("-c")
-        .arg(&pager)
-        .stdin(Stdio::from(diff_out))
-        .spawn()
-        .with_context(|| format!("failed to spawn pager `{pager}`"))?;
-
-    // Wait for both: the pager drains stdout, git diff exits 0/1.
-    let _ = pager_child.wait();
-    let _ = diff.wait();
-    Ok(())
 }
 
 /// Shell out to `date +%Y%m%d-%H%M%S` for the feature-branch suffix.

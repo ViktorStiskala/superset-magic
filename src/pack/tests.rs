@@ -142,6 +142,58 @@ fn packs_matched_directory_recursively() {
     );
 }
 
+/// A LEAF match under the tool's own `.superset/backups/` tree is never packed:
+/// a broad glob that also matches a recovered secret copy must not archive it.
+#[test]
+fn excludes_backups_leaf_match_from_archive() {
+    let repo = init_repo();
+    write_magic(repo.path(), &["**/.env"]);
+    write_file(repo.path(), ".env", "REAL=1\n");
+    // A recovered secret copy left under the backups tree by a reverse sync.
+    write_file(
+        repo.path(),
+        ".superset/backups/20260101-000000/worktree/.env",
+        "RECOVERED=1\n",
+    );
+
+    let code = pack_core(repo.path(), |_| {}).unwrap();
+    assert!(exit_ok(code));
+    let entries = archive_entries(repo.path());
+    assert!(entries.contains(".env"), "the real secret must pack: {entries:?}");
+    assert!(
+        !entries.iter().any(|e| e.contains(".superset/backups/")),
+        "a backed-up secret copy must never be packed: {entries:?}"
+    );
+}
+
+/// An ANCESTOR directory match (`.superset`) recurses into the tree but PRUNES
+/// the `.superset/backups/` subtree — the regression guard for the pack blocker
+/// where a bare `.superset` (or a broad `**`) pattern would walk the live tree
+/// and archive recovered secrets.
+#[test]
+fn excludes_backups_subtree_from_ancestor_directory_match() {
+    let repo = init_repo();
+    write_magic(repo.path(), &[".superset"]);
+    write_file(repo.path(), ".superset/config.json", "{}\n");
+    write_file(
+        repo.path(),
+        ".superset/backups/20260101-000000/main/.env",
+        "RECOVERED=1\n",
+    );
+
+    let code = pack_core(repo.path(), |_| {}).unwrap();
+    assert!(exit_ok(code));
+    let entries = archive_entries(repo.path());
+    assert!(
+        entries.contains(".superset/config.json"),
+        "non-backup .superset files still pack: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| e.contains(".superset/backups/")),
+        "the backups subtree must be pruned from a directory match: {entries:?}"
+    );
+}
+
 #[test]
 fn add_events_emitted_per_entry() {
     let repo = init_repo();

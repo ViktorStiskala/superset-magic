@@ -1,5 +1,5 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -22,27 +22,32 @@ use crate::cli::{Command, Parsed};
 ///
 /// Truth table:
 ///
-/// | cmd                 | guard_active | result |
-/// |---------------------|--------------|--------|
-/// | `Bare`              | false        | true   |
-/// | `Sync`              | false        | true   |
-/// | `Pack`              | false        | true   |
-/// | `Update`            | false        | false  |
-/// | `Bare`/`Sync`/`Pack`| true         | false  |
-/// | `Update`            | true         | false  |
+/// | cmd                          | guard_active | result |
+/// |------------------------------|--------------|--------|
+/// | `Bare`                       | false        | true   |
+/// | `Sync`                       | false        | true   |
+/// | `ReverseSync`                | false        | true   |
+/// | `Pack`                       | false        | true   |
+/// | `Update`                     | false        | false  |
+/// | `Bare`/`Sync`/`ReverseSync`/`Pack` | true   | false  |
+/// | `Update`                     | true         | false  |
 ///
 /// `Command::Update` always bypasses the gate — it routes to the force path
 /// (U7's `update_command`) which is NOT gated by the 24h cache. When the loop
 /// guard is active (`SS_MAGIC_UPDATED` or `SS_MAGIC_NO_UPDATE` is set) the
 /// gate never fires regardless of command, preventing re-exec loops (AE4).
 ///
-/// `Command::Pack` is gated alongside `Bare`/`Sync`: it is a non-interactive
-/// "do work" command like `sync`, so gating keeps pack users self-updating.
+/// `Command::Pack` and `Command::ReverseSync` are gated alongside `Bare`/`Sync`:
+/// each is a non-interactive "do work" command, so gating keeps their users
+/// self-updating.
 pub fn should_run_update_gate(cmd: Command, guard_active: bool) -> bool {
     if guard_active {
         return false;
     }
-    matches!(cmd, Command::Bare | Command::Sync | Command::Pack)
+    matches!(
+        cmd,
+        Command::Bare | Command::Sync { .. } | Command::ReverseSync { .. } | Command::Pack
+    )
 }
 
 fn run() -> Result<ExitCode> {
@@ -109,7 +114,8 @@ fn dispatch(cmd: Command) -> Result<ExitCode> {
     let cwd = env::current_dir().context("getting current directory")?;
     match cmd {
         Command::Bare => tui::menu::run(&cwd),
-        Command::Sync => run_sync_flow(&cwd),
+        Command::Sync { no_backup } => run_sync_flow(&cwd, no_backup),
+        Command::ReverseSync { no_backup } => run_reverse_sync_flow(&cwd, no_backup),
         Command::Pack => run_pack_flow(&cwd),
         Command::Update => update_flow(),
     }
@@ -192,28 +198,27 @@ fn print_pack_event(ev: &pack::PackEvent) {
 }
 
 /// Non-interactive forward file copy: main checkout → current working tree.
-/// Handler for `ss-magic sync` and the worktree menu's "Forward sync".
+/// Handler for `ss-magic sync` (the worktree menu now routes to the interactive
+/// unified cockpit instead).
 ///
 /// Resolves the main checkout root, verifies `.superset/magic.json` exists
-/// there, loads the overlaid config (magic.json + magic.local.json), then
-/// runs the existing `sync::apply::run` engine into `cwd`. No git/gh operations,
-/// no setup commands.
+/// there, loads the overlaid config (magic.json + magic.local.json), backs up
+/// every worktree file about to be overwritten (under `<cwd>/.superset/backups/`,
+/// unless `no_backup`), then runs the existing `sync::apply::run` engine into
+/// `cwd`. No git/gh operations, no setup commands.
 ///
 /// Hard errors (non-zero exit):
 /// - Cannot resolve the main checkout root (not in a git repo, or git fails).
 /// - `.superset/magic.json` absent in the resolved main root.
 /// - Malformed `magic.json` or `magic.local.json` in the main root.
-pub fn run_sync_flow(cwd: &Path) -> Result<ExitCode> {
-    sync_core(cwd, print_event)
+pub fn run_sync_flow(cwd: &Path, no_backup: bool) -> Result<ExitCode> {
+    sync_core(cwd, no_backup, print_event)
 }
 
-/// Extracted core of `sync_flow` so tests can inject a no-op event handler
-/// without side-effects on stdout/stderr.
-fn sync_core<F>(cwd: &Path, on_event: F) -> Result<ExitCode>
-where
-    F: FnMut(&Event),
-{
-    // 1. Resolve the current repo root (the working tree cwd belongs to).
+/// Resolve the current repo root and the main checkout root for the sync flows,
+/// printing the same styled error and returning the exit code on failure. Shared
+/// by `sync_core` (forward) and `run_reverse_sync_flow` (reverse).
+fn resolve_sync_roots(cwd: &Path) -> std::result::Result<(PathBuf, PathBuf), ExitCode> {
     let cwd_root = match git::cwd_repo_root(cwd) {
         Ok(r) => r,
         Err(err) => {
@@ -224,22 +229,32 @@ where
                     cwd.display()
                 ))
             );
-            return Ok(ExitCode::from(1));
+            return Err(ExitCode::from(1));
         }
     };
-
-    // 2. Resolve the main checkout root (parent of git-common-dir).
     let main_root = match git::main_checkout_root(&cwd_root) {
         Ok(r) => r,
         Err(err) => {
             eprintln!(
                 "{}",
-                tui::style::err(format!(
-                    "error: cannot resolve main checkout root: {err:#}"
-                ))
+                tui::style::err(format!("error: cannot resolve main checkout root: {err:#}"))
             );
-            return Ok(ExitCode::from(1));
+            return Err(ExitCode::from(1));
         }
+    };
+    Ok((cwd_root, main_root))
+}
+
+/// Extracted core of `sync_flow` so tests can inject a no-op event handler
+/// without side-effects on stdout/stderr.
+fn sync_core<F>(cwd: &Path, no_backup: bool, on_event: F) -> Result<ExitCode>
+where
+    F: FnMut(&Event),
+{
+    // 1-2. Resolve the current repo root and the main checkout root.
+    let (cwd_root, main_root) = match resolve_sync_roots(cwd) {
+        Ok(roots) => roots,
+        Err(code) => return Ok(code),
     };
 
     // 3-4. Probe + load the overlaid magic.json (hard error on absent/malformed).
@@ -255,6 +270,18 @@ where
             tui::style::info("magic.json `files` is empty — nothing to sync.")
         );
         return Ok(ExitCode::SUCCESS);
+    }
+
+    // 5b. Pre-copy backup pass: back up every worktree file the copy will
+    // overwrite (under `<cwd>/.superset/backups/`, gitignored there) so a
+    // mistaken forward sync is recoverable. Skipped by `--no-backup`.
+    if !no_backup {
+        if let Err(err) =
+            sync::reverse_sync::backup_forward_targets(&main_root, &cwd_root, &cfg.files)
+        {
+            eprintln!("{}", tui::style::err(format!("error: {err:#}")));
+            return Ok(ExitCode::from(1));
+        }
     }
 
     // 6. Run the apply engine: main_root → cwd_root.
@@ -278,6 +305,33 @@ where
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Non-interactive reverse copy (current worktree → main). Handler for
+/// `ss-magic reverse-sync`.
+///
+/// Resolves the current repo root and the main checkout root, hard-errors when
+/// run FROM the main checkout (`cwd_root == main_root` — there is nothing to
+/// push), then bulk-pushes every git-untracked candidate that differs from main
+/// via `sync::reverse_sync::run_bulk` (pre-overwrite backups under main's
+/// `.superset/backups/` unless `no_backup`, plus the gitignore-in-main secret
+/// gate on every write).
+pub fn run_reverse_sync_flow(cwd: &Path, no_backup: bool) -> Result<ExitCode> {
+    let (cwd_root, main_root) = match resolve_sync_roots(cwd) {
+        Ok(roots) => roots,
+        Err(code) => return Ok(code),
+    };
+    if cwd_root == main_root {
+        eprintln!(
+            "{}",
+            tui::style::err(
+                "error: `ss-magic reverse-sync` must run from a worktree, not the main \
+                 checkout — there is nothing to push."
+            )
+        );
+        return Ok(ExitCode::from(1));
+    }
+    sync::reverse_sync::run_bulk(&cwd_root, &main_root, no_backup)
 }
 
 /// `ss-magic update` (R4): force a self-update regardless of the 24h cache.

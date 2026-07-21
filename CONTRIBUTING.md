@@ -30,9 +30,10 @@ make clean     # cargo clean
 Both install paths drop `ss-magic` into `$CARGO_HOME/bin` (usually
 `~/.cargo/bin`). ss-magic is not yet published to crates.io.
 
-**Tip:** the binary self-updates on bare / `sync` / `pack` invocations. While
-testing a local build, export `SS_MAGIC_NO_UPDATE=1` so the auto-updater
-doesn't replace your development binary with the latest GitHub release.
+**Tip:** the binary self-updates on bare / `sync` / `reverse-sync` / `pack`
+invocations. While testing a local build, export `SS_MAGIC_NO_UPDATE=1` so the
+auto-updater doesn't replace your development binary with the latest GitHub
+release.
 
 ## Code layout
 
@@ -42,12 +43,20 @@ interactive layer, and grouped by purpose under `src/`:
 - `git/` — git plumbing (read-only probes and mutating primitives; all git/gh
   interaction shells out via `std::process::Command` — **no `git2`**).
 - `sync/` — pattern validation and the glob/exclude/copy engine shared by
-  forward sync, reverse sync, and pack.
-- `tui/` — the interactive layer (`inquire` menus and pickers, styling).
+  forward sync, reverse sync, and pack; `merge.rs` owns the reverse-sync
+  push/pull/merge decision model and per-hunk merge assembly (`similar`-based
+  diffing); `reverse_sync.rs` owns the backup-first, TOCTOU-guarded apply seam
+  that writes a cockpit decision to disk.
+- `tui/` — the interactive layer: `inquire` menus and pickers, styling, the
+  pure diff/decision models (`diffmodel`, also built on `similar`), and the
+  full-screen `ratatui`
+  reverse-sync merge cockpit (`cockpit`, on the `crossterm` backend).
 - `workspace/` — `.superset/` contract I/O and the init/migration lifecycle.
 - `update/` — the self-update check and apply paths.
 - `pack.rs`, `cli.rs`, `main.rs` — the pack engine, the hand-rolled arg parser
-  (**no `clap`**), and composition (update gate, dispatch, event rendering).
+  (**no `clap`** — this is also where the `-n`/`--no-backup` flag for
+  `sync`/`reverse-sync` is parsed), and composition (update gate, dispatch,
+  event rendering).
 
 `assets/magic.sh` is the canonical wrapper script, embedded into the binary
 via `include_str!` — edit it there, never in a repo's generated `.superset/`
@@ -78,7 +87,7 @@ Conventions worth knowing:
 - Each module declares `#[cfg(test)] mod tests;` with the body in a sibling
   child file (`<module>/tests.rs`), keeping private-item access. Crate-root
   integration tests and shared helpers live in `src/tests/` (`sync.rs`,
-  `update_gate.rs`, `support.rs`).
+  `reverse_sync_flow.rs`, `update_gate.rs`, `support.rs`).
 - Tests use `tempfile` plus shell-invoked `git init` / `git worktree add` to
   build real repos — no git mocking. They must not depend on or mutate your
   real repositories, global git config, clipboard, or installed `ss-magic`.
@@ -86,6 +95,12 @@ Conventions worth knowing:
   (commit/push/PR) have no unit tests; they are validated by manual smoke
   testing. If your change touches one of those surfaces, describe the manual
   path you exercised in the PR.
+- The reverse-sync merge cockpit (`tui/cockpit.rs`) is a partial exception:
+  its event loop and terminal lifecycle are manual-smoke like the rest of the
+  interactive layer, but its render path (`draw`) and pure key dispatch
+  (`handle_key`) ARE unit-tested by driving `ratatui::backend::TestBackend`
+  with synthetic key events — no real terminal required. Prefer extending
+  those tests over adding new manual-smoke-only cockpit behavior.
 
 CI (`.github/workflows/ci.yml`) runs the suite on Ubuntu and macOS for every
 PR commit and every push to `main`. The same workflow gates releases: the

@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ideation: Interactive Diff &amp; Merge UI for ss-magic reverse sync</title>
+<style>
+:root{
+  --bg:#fbfbfd; --surface:#ffffff; --surface-2:#f4f5f9; --text:#1b1d26; --muted:#5c6273;
+  --border:#e3e5ee; --border-strong:#cfd2de;
+  --accent:#4f46e5; --accent-soft:#ecebfb; --accent-text:#3d34c7;
+  --ok:#15803d; --ok-soft:#e4f4e9; --ok-text:#15683a;
+  --warn:#c2410c; --warn-soft:#fbeadf; --warn-text:#a83a0e;
+  --err:#b42318; --err-soft:#fbe6e4; --err-text:#a01f16;
+  --cyan:#0e7490; --cyan-soft:#e0f2f7;
+  --code-bg:#f1f2f7;
+  --diff-add:#e4f6e9; --diff-add-text:#12692f; --diff-add-hl:#a7e7bb;
+  --diff-del:#fbe6e4; --diff-del-text:#9d211a; --diff-del-hl:#f2b7b1;
+  --diff-ln:#8b90a2; --term-bg:#1d2027; --term-text:#e6e8ee;
+  --shadow:0 1px 2px rgba(20,22,40,.04), 0 6px 20px rgba(20,22,40,.05);
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"Apple Color Emoji",sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0f1117; --surface:#161922; --surface-2:#1c2029; --text:#e6e8ef; --muted:#9aa1b2;
+    --border:#262b37; --border-strong:#333a49;
+    --accent:#a5b4fc; --accent-soft:#232445; --accent-text:#b7c1ff;
+    --ok:#4ade80; --ok-soft:#16301f; --ok-text:#7fe0a0;
+    --warn:#fb923c; --warn-soft:#341f10; --warn-text:#fcae6d;
+    --err:#f87171; --err-soft:#361a19; --err-text:#f79b98;
+    --cyan:#22d3ee; --cyan-soft:#0e2b33;
+    --code-bg:#1e222c;
+    --diff-add:#132a1c; --diff-add-text:#7fe0a0; --diff-add-hl:#215436;
+    --diff-del:#331a1a; --diff-del-text:#f4a29d; --diff-del-hl:#5e2a27;
+    --diff-ln:#6c7386; --term-bg:#0b0d12; --term-text:#dfe2ea;
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 26px rgba(0,0,0,.35);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0f1117; --surface:#161922; --surface-2:#1c2029; --text:#e6e8ef; --muted:#9aa1b2;
+  --border:#262b37; --border-strong:#333a49;
+  --accent:#a5b4fc; --accent-soft:#232445; --accent-text:#b7c1ff;
+  --ok:#4ade80; --ok-soft:#16301f; --ok-text:#7fe0a0;
+  --warn:#fb923c; --warn-soft:#341f10; --warn-text:#fcae6d;
+  --err:#f87171; --err-soft:#361a19; --err-text:#f79b98;
+  --cyan:#22d3ee; --cyan-soft:#0e2b33;
+  --code-bg:#1e222c;
+  --diff-add:#132a1c; --diff-add-text:#7fe0a0; --diff-add-hl:#215436;
+  --diff-del:#331a1a; --diff-del-text:#f4a29d; --diff-del-hl:#5e2a27;
+  --diff-ln:#6c7386; --term-bg:#0b0d12; --term-text:#dfe2ea;
+  --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 26px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+  font-size:16px;line-height:1.62;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1020px;margin-inline:auto;padding:0 22px 96px}
+p,li{max-width:74ch}
+h1,h2,h3,h4{line-height:1.22;letter-spacing:-0.01em}
+h1{font-size:2.05rem;margin:.2em 0 .1em}
+h2{font-size:1.5rem;margin:2.4em 0 .5em;padding-bottom:.28em;border-bottom:2px solid var(--border)}
+h3{font-size:1.24rem;margin:1.6em 0 .35em}
+h4{font-size:1.02rem;margin:1.2em 0 .3em;color:var(--muted);text-transform:none}
+a{color:var(--accent-text);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--mono);font-size:.86em;background:var(--code-bg);
+  padding:.12em .38em;border-radius:5px;border:1px solid var(--border)}
+strong{font-weight:650}
+hr{border:none;border-top:1px solid var(--border);margin:2em 0}
+.eyebrow{font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--accent-text)}
+
+/* header */
+header.doc{padding:34px 0 8px}
+.topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:20px}
+.brandtag{font-family:var(--mono);font-size:.78rem;color:var(--muted);letter-spacing:.02em}
+#theme-toggle{font-family:var(--sans);font-size:.78rem;background:var(--surface);color:var(--text);
+  border:1px solid var(--border-strong);border-radius:999px;padding:5px 13px;cursor:pointer}
+#theme-toggle:hover{border-color:var(--accent)}
+.lede{font-size:1.12rem;color:var(--muted);max-width:76ch}
+.meta{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 6px}
+.meta .m{font-size:.78rem;font-family:var(--mono);background:var(--surface-2);border:1px solid var(--border);
+  border-radius:999px;padding:4px 11px;color:var(--muted)}
+.meta .m b{color:var(--text);font-weight:600}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:22px 0 6px}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow)}
+.stat .n{font-size:1.55rem;font-weight:700;letter-spacing:-.02em}
+.stat .l{font-size:.78rem;color:var(--muted);margin-top:2px}
+
+/* nav */
+nav.toc{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:14px 18px;margin:26px 0 4px;box-shadow:var(--shadow)}
+nav.toc ol{margin:0;padding-left:1.2em;columns:2;column-gap:34px}
+@media(max-width:640px){nav.toc ol{columns:1}}
+nav.toc li{margin:3px 0;font-size:.92rem}
+
+/* generic */
+section{margin-top:6px}
+.callout{border:1px solid var(--border);border-radius:12px;padding:14px 18px;margin:18px 0;background:var(--surface-2)}
+.callout.accent{background:var(--accent-soft);border-color:color-mix(in srgb,var(--accent) 30%,transparent)}
+.callout.warn{background:var(--warn-soft);border-color:color-mix(in srgb,var(--warn) 34%,transparent)}
+.callout.ok{background:var(--ok-soft);border-color:color-mix(in srgb,var(--ok) 34%,transparent)}
+.callout .k{font-size:.72rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;display:block;margin-bottom:4px}
+.callout.accent .k{color:var(--accent-text)} .callout.warn .k{color:var(--warn-text)} .callout.ok .k{color:var(--ok-text)}
+.callout p{margin:.3em 0;max-width:none}
+
+.figure{margin:24px 0;background:var(--surface);border:1px solid var(--border);border-radius:14px;
+  padding:18px;box-shadow:var(--shadow);overflow-x:auto}
+.figure svg{display:block;max-width:100%;height:auto;margin-inline:auto}
+.figcap{font-size:.82rem;color:var(--muted);margin-top:12px;max-width:none;text-align:center}
+.figcap b{color:var(--text)}
+
+/* chips */
+.chips{display:flex;flex-wrap:wrap;gap:7px;margin:8px 0}
+.chip{font-size:.74rem;font-family:var(--mono);border-radius:999px;padding:3px 10px;border:1px solid var(--border-strong);
+  background:var(--surface-2);color:var(--muted);white-space:nowrap}
+.chip.new{background:var(--warn-soft);color:var(--warn-text);border-color:color-mix(in srgb,var(--warn) 36%,transparent)}
+.chip.have{background:var(--ok-soft);color:var(--ok-text);border-color:color-mix(in srgb,var(--ok) 36%,transparent)}
+.chip.ref{background:var(--accent-soft);color:var(--accent-text);border-color:color-mix(in srgb,var(--accent) 30%,transparent)}
+
+/* tables */
+.tbl{width:100%;border-collapse:collapse;margin:16px 0;font-size:.92rem;overflow:hidden;
+  border:1px solid var(--border);border-radius:12px}
+.tbl th,.tbl td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+.tbl th{background:var(--surface-2);font-size:.78rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+.tbl tr:last-child td{border-bottom:none}
+.tbl code{font-size:.82em}
+.tag{display:inline-block;font-size:.72rem;font-weight:700;padding:1px 7px;border-radius:5px;font-family:var(--mono)}
+.tag.no{background:var(--err-soft);color:var(--err-text)}
+.tag.yes{background:var(--ok-soft);color:var(--ok-text)}
+.tag.part{background:var(--warn-soft);color:var(--warn-text)}
+
+/* terminal + diff mockups */
+.term{background:var(--term-bg);color:var(--term-text);font-family:var(--mono);font-size:.8rem;
+  border-radius:10px;padding:14px 14px 12px;line-height:1.5;overflow-x:auto;border:1px solid var(--border-strong)}
+.term .dim{color:#8b90a2}.term .cy{color:#5fd7ff}.term .gn{color:#5fd77f}.term .or{color:#ffaf5f}.term .rd{color:#ff8a80}.term .cur{background:#ffaf5f;color:#1d2027}
+.two-up{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0}
+@media(max-width:720px){.two-up{grid-template-columns:1fr}}
+.panelbl{font-size:.74rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin:0 0 6px}
+
+.diffbox{border:1px solid var(--border-strong);border-radius:10px;overflow:hidden;font-family:var(--mono);font-size:.8rem;background:var(--surface)}
+.diffhead{display:grid;grid-template-columns:1fr 1fr}
+.diffhead div{padding:7px 12px;font-weight:700;font-size:.76rem;letter-spacing:.03em;background:var(--surface-2);border-bottom:1px solid var(--border)}
+.diffhead .l{color:var(--ok-text)} .diffhead .r{color:var(--cyan);border-left:1px solid var(--border)}
+.diffgrid{display:grid;grid-template-columns:2.4em 1fr 2.4em 1fr}
+.diffgrid>div{padding:1px 8px;white-space:pre;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid color-mix(in srgb,var(--border) 55%,transparent)}
+.diffgrid .ln{color:var(--diff-ln);text-align:right;background:var(--surface-2);user-select:none;font-size:.72rem;padding-top:2px}
+.diffgrid .cr{border-left:1px solid var(--border)}
+.diffgrid .add{background:var(--diff-add);color:var(--diff-add-text)}
+.diffgrid .del{background:var(--diff-del);color:var(--diff-del-text)}
+.diffgrid .fold{grid-column:1/5;text-align:center;color:var(--muted);background:var(--surface-2);font-size:.72rem;font-style:italic;padding:3px}
+.hl-a{background:var(--diff-add-hl);border-radius:3px;padding:0 1px}
+.hl-d{background:var(--diff-del-hl);border-radius:3px;padding:0 1px}
+.keybar{font-family:var(--mono);font-size:.74rem;color:var(--muted);background:var(--surface-2);
+  padding:7px 12px;border-top:1px solid var(--border)}
+.keybar kbd{font-family:var(--mono);background:var(--code-bg);border:1px solid var(--border-strong);
+  border-bottom-width:2px;border-radius:5px;padding:0 5px;font-size:.9em;color:var(--text)}
+
+/* merge decision mockup */
+.mergefile{border:1px solid var(--border);border-radius:9px;padding:10px 12px;margin:8px 0;background:var(--surface)}
+.mergefile.sel{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+.mergefile .fn{font-family:var(--mono);font-size:.86rem;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.mergefile .fn .st{font-size:.72rem;padding:1px 7px;border-radius:5px;font-family:var(--mono)}
+.st.differs{background:var(--warn-soft);color:var(--warn-text)} .st.new{background:var(--ok-soft);color:var(--ok-text)}
+.seg{display:inline-flex;border:1px solid var(--border-strong);border-radius:8px;overflow:hidden;margin-top:8px;flex-wrap:wrap}
+.seg span{font-size:.75rem;font-family:var(--mono);padding:4px 10px;border-right:1px solid var(--border);color:var(--muted);white-space:nowrap}
+.seg span:last-child{border-right:none}
+.seg span.on{background:var(--accent);color:#fff;font-weight:600}
+.seg span.dis{opacity:.4;text-decoration:line-through}
+.mtimebadge{font-size:.72rem;color:var(--muted);margin-left:auto;font-family:var(--mono)}
+
+/* idea cards */
+.idea{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:22px 24px;
+  margin:22px 0;box-shadow:var(--shadow);scroll-margin-top:16px}
+.idea .rank{font-size:.78rem;font-family:var(--mono);color:var(--accent-text);font-weight:700}
+.idea h3{margin:.15em 0 .1em;font-size:1.32rem}
+.idea .idmeta{display:flex;flex-wrap:wrap;gap:7px;margin:10px 0 6px}
+.pill{font-size:.73rem;font-weight:600;border-radius:999px;padding:3px 11px;border:1px solid var(--border-strong);background:var(--surface-2)}
+.pill.conf-hi{background:var(--ok-soft);color:var(--ok-text);border-color:color-mix(in srgb,var(--ok) 34%,transparent)}
+.pill.conf-med{background:var(--warn-soft);color:var(--warn-text);border-color:color-mix(in srgb,var(--warn) 34%,transparent)}
+.pill.cx{background:var(--accent-soft);color:var(--accent-text);border-color:color-mix(in srgb,var(--accent) 28%,transparent)}
+.pill.axis{background:var(--cyan-soft);color:var(--cyan);border-color:color-mix(in srgb,var(--cyan) 30%,transparent)}
+.feat{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:14px 0}
+@media(max-width:720px){.feat{grid-template-columns:1fr}}
+.feat .fbox{border:1px solid var(--border);border-radius:10px;padding:11px 14px;background:var(--surface-2)}
+.feat .fbox h5{margin:0 0 4px;font-size:.82rem;letter-spacing:.02em}
+.feat .fbox.a h5{color:var(--ok-text)} .feat .fbox.b h5{color:var(--cyan)}
+.feat .fbox p{margin:0;font-size:.9rem;max-width:none}
+.prosk{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:12px 0}
+@media(max-width:640px){.prosk{grid-template-columns:1fr}}
+.prosk ul{margin:.3em 0;padding-left:1.15em}
+.prosk li{font-size:.9rem;margin:3px 0;max-width:none}
+.prosk .p h5{color:var(--ok-text);margin:0 0 2px;font-size:.8rem}
+.prosk .c h5{color:var(--err-text);margin:0 0 2px;font-size:.8rem}
+.basis{font-size:.9rem;border-left:3px solid var(--accent);padding:2px 0 2px 13px;margin:12px 0;color:var(--text)}
+.basis b{font-family:var(--mono);font-size:.82rem;color:var(--accent-text)}
+details{margin:10px 0;border:1px solid var(--border);border-radius:10px;background:var(--surface-2)}
+details>summary{cursor:pointer;padding:9px 14px;font-size:.86rem;font-weight:600;color:var(--muted)}
+details[open]>summary{border-bottom:1px solid var(--border)}
+details .body{padding:6px 14px 12px}
+
+footer.sig{margin-top:60px;padding-top:16px;border-top:1px solid var(--border);
+  font-family:var(--mono);font-size:.76rem;color:var(--muted)}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:.78rem;color:var(--muted);margin:6px 0 0}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.sw{width:12px;height:12px;border-radius:3px;display:inline-block;border:1px solid var(--border-strong)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <div class="topbar">
+    <span class="brandtag">ss-magic · docs/ideation</span>
+    <button id="theme-toggle" type="button">☾ Dark</button>
+  </div>
+  <div class="eyebrow">Ideation</div>
+  <h1>Interactive diff &amp; merge UI for reverse sync</h1>
+  <p class="lede">Kill the picker's re-print, add Space-to-toggle and →-to-diff, render a real
+  side-by-side diff (<em>Local file</em> vs <em>Main branch</em>), and grow the picker into a
+  git-mergetool-style Merge mode — five architectures, each delivering <strong>both</strong> features.</p>
+
+  <div class="meta">
+    <span class="m"><b>Date</b> <time datetime="2026-07-15">2026-07-15</time></span>
+    <span class="m"><b>Topic</b> interactive-diff-merge-ui</span>
+    <span class="m"><b>Focus</b> reverse-sync picker · side-by-side diff · interactive merge</span>
+    <span class="m"><b>Mode</b> repo-grounded</span>
+    <span class="m"><b>Crate</b> ss-magic 0.3.0 · edition 2021</span>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="n">5</div><div class="l">ranked architectures (each covers both features)</div></div>
+    <div class="stat"><div class="n">10</div><div class="l">research + adversarial-verify agents</div></div>
+    <div class="stat"><div class="n">1</div><div class="l">shared diff engine — <code>similar</code></div></div>
+    <div class="stat"><div class="n">9</div><div class="l">approaches considered &amp; cut</div></div>
+  </div>
+</header>
+
+<nav class="toc" aria-label="Contents">
+  <ol>
+    <li><a href="#problem">The problem &amp; the ask</a></li>
+    <li><a href="#grounding">Grounding Context</a></li>
+    <li><a href="#axes">Topic Axes</a></li>
+    <li><a href="#foundation">Shared foundation &amp; what both features look like</a></li>
+    <li><a href="#ideas">Ranked Ideas</a></li>
+    <li><a href="#rejection">Rejection Summary</a></li>
+    <li><a href="#sources">Sources &amp; References</a></li>
+  </ol>
+</nav>
+
+<!-- ============================ PROBLEM ============================ -->
+<section id="problem">
+<h2>The problem &amp; the ask</h2>
+<p>The reverse-sync picker (<code>pick_reverse_sync</code> in <a href="https://github.com/ViktorStiskala/superset-magic/blob/main/src/tui/ui.rs"><code>src/tui/ui.rs</code></a>)
+re-invokes <code>inquire::Select::new(…).prompt()</code> <em>inside a loop</em>. Every time you press Enter,
+inquire finalizes the prompt and prints a permanent "answered" line to scrollback — so each keypress
+stacks another <code>Untracked files to push back to main:</code> row. That is exactly the screenshot behavior.</p>
+
+<div class="two-up">
+  <div>
+    <p class="panelbl">Now — stacks on every Enter</p>
+    <div class="term">
+<span class="cy">— Reverse sync (untracked → main) —</span>
+<span class="dim">✓</span> Untracked files to push back to main: <span class="dim">↳ show diff</span>
+<span class="dim">✓</span> Untracked files to push back to main: [ ] .compound-engineering/config.local.yaml <span class="or">(differs)</span>
+<span class="dim">?</span> Untracked files to push back to main: <span class="cur"> </span>
+   [x] .compound-engineering/config.local.yaml <span class="or">(differs)</span>
+      <span class="dim">↳ show diff</span>
+ › <span class="gn">✓ Push selected</span>
+    </div>
+  </div>
+  <div>
+    <p class="panelbl">Proposed — one frame, redrawn in place</p>
+    <div class="term">
+<span class="cy">— Reverse sync (untracked → main) —</span>
+
+<span class="cur"> </span>[x] .compound-engineering/config.local.yaml  <span class="or">(differs)</span>
+ [ ] apps/api/.dev.vars                       <span class="gn">(new)</span>
+ [ ] .env.local                               <span class="or">(differs)</span>
+
+ <span class="gn">✓ Push selected (1)</span>
+<span class="dim">␣ toggle · → show diff · ↑↓ move · ⏎ apply · Esc cancel</span>
+    </div>
+  </div>
+</div>
+
+<p>On top of fixing the re-print, this ideation covers two features the picker should grow:</p>
+<div class="feat">
+  <div class="fbox a"><h5>Feature A — fixed picker + rich side-by-side diff</h5>
+    <p>Redraw in place; <strong>Space</strong> toggles a row, <strong>→</strong> opens its diff.
+    Side-by-side columns with per-side line numbers, ~3 lines of folded context around each change,
+    ANSI color, headers <em>“Local file”</em> / <em>“Main branch”</em>, and intra-line highlighting.</p></div>
+  <div class="fbox b"><h5>Feature B — interactive Merge mode</h5>
+    <p>Per file, cycle <strong>[push to main · pull from main · interactive merge · delete]</strong> with
+    <strong>←/→</strong>; a sensible default per file; navigate the side-by-side diff with <strong>↑/↓</strong>.
+    Mimics <code>git mergetool</code>: you decide what ends up in the local file, in main, or is deleted.</p></div>
+</div>
+</section>
+
+<!-- ============================ GROUNDING ============================ -->
+<section id="grounding">
+<h2>Grounding Context</h2>
+<p class="eyebrow">Codebase Context</p>
+
+<h3>Where the current design stands</h3>
+<ul>
+<li><b>The re-print is structural, not a missing flag.</b> inquire tracks its
+  <code>last_rendered_frame</code>/<code>current_frame</code> <em>inside one</em> <code>prompt()</code> call;
+  looping <code>Select::prompt()</code> leaves every submitted answer as scrollback. <code>RenderConfig</code>
+  only reskins colors/prefixes — there is <em>no</em> "suppress the answer line" switch, and the prompt set is
+  closed with no custom-key hook. <span class="chip ref">verified: docs.rs/inquire + frame_renderer.rs</span></li>
+<li><b>The current diff is <code>git diff --no-index</code> piped to a pager</b>
+  (<a href="https://github.com/ViktorStiskala/superset-magic/blob/main/src/git/mod.rs"><code>git::diff_no_index_paged</code></a>) —
+  a unified diff, no side-by-side, no per-side line numbers, no custom titles.</li>
+<li><b>Space-toggle was deliberately abandoned once.</b> The team moved off <code>inquire::MultiSelect</code> to a
+  <code>Select</code>-loop because action rows (<em>+ Add new…</em>, <em>Done</em>, <em>show diff</em>) don't work under
+  MultiSelect's Space/Enter split (see <a href="https://github.com/ViktorStiskala/superset-magic/blob/main/docs/solutions/design-patterns/inquire-action-loop-2026-05-26.md"><code>docs/solutions/…/inquire-action-loop</code></a>).
+  The consequence: <strong>getting Space-toggle + →-diff + no-stacking all at once requires leaving inquire for a raw-terminal layer</strong> — that is the central design axis of this whole ideation.</li>
+<li><b>The files are git-<em>untracked</em> secrets</b> (<code>.env</code>, <code>.dev.vars</code>, <code>magic.local.json</code>).
+  There is <strong>no common ancestor</strong>, so Merge is a <strong>2-way reconcile</strong>, not a 3-way merge.
+  <a href="https://github.com/ViktorStiskala/superset-magic/blob/main/src/sync/reverse_sync.rs"><code>reverse_sync::classify()</code></a>
+  already computes the byte-level split (<code>DiffStatus::{Differs, WorktreeOnly, Identical}</code>).</li>
+<li><b>The terminal backend is already in the tree.</b> <code>crossterm 0.29</code> <em>and</em> <code>console</code> are
+  already in <code>Cargo.lock</code> (via <code>inquire</code>'s default features and <code>supports-color</code>). So a
+  crossterm-based rewrite of just this one screen adds <em>zero</em> new terminal backend, and even ratatui adds
+  essentially only itself. <span class="chip have">verified against real Cargo.lock</span></li>
+</ul>
+
+<h3>The verified crate landscape</h3>
+<p>Ten agents researched and adversarially verified the ecosystem against docs.rs, crates.io, and repo sources.
+The one-line shape of the answer: <strong>one diff engine dominates (<code>similar</code>), no crate renders a proper
+side-by-side terminal diff out of the box, and the interactive layer is a three-way choice</strong>
+(hand-rolled crossterm · ratatui framework · borrow a purpose-built component).</p>
+
+<table class="tbl">
+<thead><tr><th>Crate / tool</th><th>Role</th><th>In tree?</th><th>Verified verdict</th></tr></thead>
+<tbody>
+<tr><td><code>similar</code> 3.1.1</td><td>Diff engine</td><td><span class="tag part">new</span></td>
+  <td><span class="tag yes">adopt</span> <code>grouped_ops(3)</code> = context folding; <code>iter_inline_changes</code> = intra-line highlight (behavior "may change"). 159M downloads, active. Drives <em>both</em> features from one diff pass.</td></tr>
+<tr><td><code>crossterm</code> 0.29</td><td>Raw terminal I/O</td><td><span class="tag yes">present</span></td>
+  <td>Already inquire's default backend. Direct use adds no new backend crate.</td></tr>
+<tr><td><code>console</code></td><td>Color · width · padding</td><td><span class="tag yes">present</span></td>
+  <td>Unicode-aware <code>pad_str</code>/<code>measure_text_width</code> + <code>Term::size()</code> — the hand-rolled two-column renderer's needs, free.</td></tr>
+<tr><td><code>ratatui</code> 0.30</td><td>TUI framework</td><td><span class="tag part">new (1 crate)</span></td>
+  <td>Its crossterm backend resolves to the <em>same</em> 0.29 already present, so it's additive. <code>gitui</code> (ratatui 0.30 + crossterm 0.29) proves the exact "list + diff pane + per-hunk action" shape.</td></tr>
+<tr><td><code>scm-record</code> 0.10</td><td>Base-less hunk-selection widget</td><td><span class="tag part">new</span></td>
+  <td>ratatui/crossterm; purpose-built for "select hunks between two versions, no ancestor"; used by Jujutsu &amp; git-branchless. Niche (105★); side-by-side layout unconfirmed.</td></tr>
+<tr><td><code>diffy</code> 0.5</td><td>Patch + conflict markers</td><td><span class="tag part">new</span></td>
+  <td><code>merge()</code> is 3-way (needs ancestor), but an <em>empty</em> ancestor mechanically yields git-style <code>&lt;&lt;&lt;/===/&gt;&gt;&gt;</code> markers for a 2-way case. Useful only for the editor-handoff path.</td></tr>
+<tr><td><code>prettydiff</code></td><td>"Side-by-side" (misnamed)</td><td>—</td>
+  <td><span class="tag no">reject as renderer</span> Verified single-column by inspecting its own screenshots. Its context-fold config is a design reference only.</td></tr>
+<tr><td><code>mergiraf</code>, <code>difftastic</code>, <code>cursive</code>, <code>imara-diff</code></td><td>merge / structural / TUI / fast-diff</td><td>—</td>
+  <td><span class="tag no">reject</span> base-required · needs parseable source · pulls C/ncurses · lower-level with no folding — see <a href="#rejection">Rejection Summary</a>.</td></tr>
+</tbody>
+</table>
+
+<h3>Past learnings that apply</h3>
+<ul>
+<li><b>The Select-loop action pattern</b> (row-as-action) is the deliberate current convention; any raw-terminal rewrite should preserve its ergonomics (cursor stays on the row after a toggle) while dropping the per-Enter re-print.</li>
+<li><b>Interactive TUI code is manual-smoke, not unit-tested</b> here by convention — but the <em>pure</em> logic (diff computation, the merge assembly, the decision truth-table) can and should stay unit-testable behind seams, exactly as <code>classify()</code>/<code>copy_candidate_into_main()</code> already are.</li>
+<li><b>Version bump is required</b> on any user-visible change (CLAUDE.md) — implementing any idea below bumps the minor version so the self-updater ships it.</li>
+</ul>
+</section>
+
+<!-- ============================ AXES ============================ -->
+<section id="axes">
+<h2>Topic Axes</h2>
+<p>The subject decomposes into five orthogonal surfaces. By the user's "<strong>both features per idea</strong>"
+constraint, every surviving idea spans axes A1–A4; the ideas genuinely diverge on <strong>A5 (footprint)</strong>
+and on <em>how</em> they realize <strong>A3 (rendering)</strong> and <strong>A4 (merge)</strong>.</p>
+<ul>
+<li><b>A1 · Re-print fix &amp; in-place redraw</b> — a single frame that repaints, never stacks.</li>
+<li><b>A2 · Selection ergonomics</b> — Space toggles, → opens the diff, arrows navigate.</li>
+<li><b>A3 · Side-by-side rendering</b> — two columns, per-side line numbers, ~3-line context fold, color, "Local file"/"Main branch" titles, intra-line highlight.</li>
+<li><b>A4 · Interactive merge model</b> — per-file decision cycle, base-less 2-way semantics, mtime as a <em>soft</em> default.</li>
+<li><b>A5 · Dependency &amp; architecture footprint</b> — how much enters the tree and how large the blast radius is on the existing inquire-based design.</li>
+</ul>
+</section>
+
+<!-- ============================ FOUNDATION ============================ -->
+<section id="foundation">
+<h2>Shared foundation &amp; what both features look like</h2>
+<p>All five architectures share the same spine, so it is described once here and not repeated per card:</p>
+<ol>
+<li><strong>One diff engine — <code>similar</code>.</strong> <code>TextDiff::from_lines(main, local).grouped_ops(3)</code> yields
+context-folded hunks whose <code>DiffOp</code>s carry both-side line indices — the <em>same</em> data drives the side-by-side
+<em>view</em> (Feature A) and the per-hunk merge <em>decisions</em> (Feature B). One diff, two consumers.</li>
+<li><strong>inquire stays</strong> for every other one-shot prompt (menu, bootstrap, config edit). Only the reverse-sync/merge screen moves off it.</li>
+<li><strong>The merge is 2-way, base-less</strong> (see the model below), with mtime as a <em>suggestion</em>, never authority.</li>
+</ol>
+
+<h3>Feature A — the side-by-side diff view</h3>
+<div class="figure">
+  <div class="diffbox">
+    <div class="diffhead"><div class="l">▍Local file — apps/api/.dev.vars</div><div class="r">▍Main branch — apps/api/.dev.vars</div></div>
+    <div class="diffgrid">
+      <div class="ln">11</div><div>API_TIMEOUT=30</div><div class="ln cr">11</div><div class="cr">API_TIMEOUT=30</div>
+      <div class="fold">⋯ 12 unchanged lines folded ⋯</div>
+      <div class="ln">24</div><div>DB_HOST=localhost</div><div class="ln cr">24</div><div class="cr">DB_HOST=localhost</div>
+      <div class="ln del">25</div><div class="del">TOKEN=<span class="hl-d">dev-abc123</span></div><div class="ln cr add">25</div><div class="cr add">TOKEN=<span class="hl-a">stg-xy789</span></div>
+      <div class="ln add">26</div><div class="add">FEATURE_X=on</div><div class="ln cr"> </div><div class="cr"> </div>
+      <div class="ln">27</div><div>LOG_LEVEL=debug</div><div class="ln cr">26</div><div class="cr">LOG_LEVEL=debug</div>
+      <div class="fold">⋯ 4 unchanged lines folded ⋯</div>
+    </div>
+    <div class="keybar"><kbd>↑↓</kbd> scroll &nbsp; <kbd>Space</kbd> toggle row &nbsp; <kbd>→</kbd> open diff &nbsp; <kbd>Esc</kbd> back to list</div>
+  </div>
+  <div class="legend">
+    <span><span class="sw" style="background:var(--diff-del)"></span> only in local</span>
+    <span><span class="sw" style="background:var(--diff-add)"></span> only in main</span>
+    <span><span class="sw" style="background:var(--diff-del-hl)"></span>/<span class="sw" style="background:var(--diff-add-hl)"></span> intra-line change</span>
+    <span><span class="sw" style="background:var(--surface-2)"></span> per-side line numbers &amp; folded context</span>
+  </div>
+  <p class="figcap"><b>Feature A concretely.</b> Two columns with independent line numbers, unchanged runs folded to ~3 lines
+  (<code>similar::grouped_ops(3)</code>), colored add/del rows, and word-level intra-line highlighting
+  (<code>iter_inline_changes</code>). No crate ships this — it is a hand-rolled renderer over <code>similar</code> + <code>console</code>.</p>
+</div>
+
+<h3>Feature B — the interactive Merge decision surface</h3>
+<div class="figure">
+  <div class="mergefile sel">
+    <div class="fn">▸ .compound-engineering/config.local.yaml <span class="st differs">differs</span>
+      <span class="mtimebadge">local newer · edited 2h ago → default: push</span></div>
+    <div class="seg"><span class="on">→ push to main</span><span>← pull from main</span><span>⇄ interactive merge</span><span>⌫ delete</span></div>
+  </div>
+  <div class="mergefile">
+    <div class="fn">&nbsp;&nbsp;apps/api/.dev.vars <span class="st new">new in worktree</span>
+      <span class="mtimebadge">main has no copy → merge/pull disabled</span></div>
+    <div class="seg"><span class="on">→ push to main</span><span class="dis">← pull from main</span><span class="dis">⇄ interactive merge</span><span>⌫ delete</span></div>
+  </div>
+  <div class="mergefile">
+    <div class="fn">&nbsp;&nbsp;.env.local <span class="st differs">differs</span>
+      <span class="mtimebadge">main newer → default: pull</span></div>
+    <div class="seg"><span>→ push to main</span><span class="on">← pull from main</span><span>⇄ interactive merge</span><span>⌫ delete</span></div>
+  </div>
+  <div class="keybar" style="border:1px solid var(--border);border-radius:8px;margin-top:10px">
+    <kbd>↑↓</kbd> move between files &nbsp; <kbd>←→</kbd> choose action &nbsp; <kbd>→</kbd>/<kbd>Tab</kbd> open side-by-side diff &nbsp; <kbd>Enter</kbd> apply all &nbsp; <kbd>Esc</kbd> cancel</div>
+  <p class="figcap"><b>Feature B concretely.</b> Each file carries a segmented decision cycled with <kbd>←→</kbd>; impossible actions
+  are greyed for the file's state; the default is pre-selected from mtime (shown, never hidden). "Interactive merge" opens a
+  hunk-level reconcile; "delete" asks an explicit scope.</p>
+</div>
+
+<h3>The base-less 2-way merge model</h3>
+<p>Because these are untracked secrets with no shared history, the model is <em>reconcile two states</em>, not
+diff3. This is the semantic core every idea's Merge mode implements.</p>
+<div class="figure">
+<svg viewBox="0 0 780 300" role="img" aria-labelledby="mm-t">
+  <title id="mm-t">Base-less 2-way reconcile: local and main files, no common ancestor, diffed by similar into per-hunk keep-local / keep-main / keep-both choices, assembled into a result written back gitignore-safely.</title>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker>
+  </defs>
+  <style>
+    .bx{fill:var(--surface-2);stroke:var(--border-strong);stroke-width:1.5;rx:10}
+    .lbl{font:600 13px var(--sans);fill:var(--text)}
+    .sub{font:11px var(--mono);fill:var(--muted)}
+    .ln2{stroke:var(--muted);stroke-width:1.6;fill:none}
+    .halo{paint-order:stroke;stroke:var(--surface);stroke-width:4px}
+  </style>
+  <!-- top row: local, ancestor(none), main -->
+  <rect x="30"  y="24" width="200" height="52" rx="10" fill="var(--diff-del)" stroke="var(--border-strong)"/>
+  <text x="130" y="46" text-anchor="middle" class="lbl" style="fill:var(--diff-del-text)">Local file (worktree)</text>
+  <text x="130" y="64" text-anchor="middle" class="sub">the secret you edited</text>
+
+  <rect x="290" y="24" width="200" height="52" rx="10" fill="none" stroke="var(--border-strong)" stroke-dasharray="5 4"/>
+  <text x="390" y="46" text-anchor="middle" class="sub" style="font-style:italic">common ancestor</text>
+  <text x="390" y="64" text-anchor="middle" class="sub" style="fill:var(--err-text)">— none · so no 3-way merge —</text>
+
+  <rect x="550" y="24" width="200" height="52" rx="10" fill="var(--diff-add)" stroke="var(--border-strong)"/>
+  <text x="650" y="46" text-anchor="middle" class="lbl" style="fill:var(--diff-add-text)">Main branch file</text>
+  <text x="650" y="64" text-anchor="middle" class="sub">may exist, differ, or be absent</text>
+
+  <!-- into similar -->
+  <line x1="130" y1="76" x2="360" y2="120" class="ln2" marker-end="url(#ah)"/>
+  <line x1="650" y1="76" x2="420" y2="120" class="ln2" marker-end="url(#ah)"/>
+  <rect x="300" y="120" width="180" height="42" rx="9" fill="var(--accent-soft)" stroke="color-mix(in srgb,var(--accent) 40%,transparent)"/>
+  <text x="390" y="140" text-anchor="middle" class="lbl" style="fill:var(--accent-text)">similar · 2-way diff</text>
+  <text x="390" y="155" text-anchor="middle" class="sub">grouped_ops(3) → hunks</text>
+
+  <!-- per-hunk choices -->
+  <line x1="390" y1="162" x2="390" y2="196" class="ln2" marker-end="url(#ah)"/>
+  <text x="390" y="188" text-anchor="middle" class="sub halo">per differing hunk, pick one</text>
+  <rect x="150" y="200" width="150" height="40" rx="9" fill="var(--diff-del)" stroke="var(--border-strong)"/>
+  <text x="225" y="224" text-anchor="middle" class="lbl" style="fill:var(--diff-del-text)">keep local hunk</text>
+  <rect x="315" y="200" width="150" height="40" rx="9" fill="var(--surface-2)" stroke="var(--border-strong)"/>
+  <text x="390" y="224" text-anchor="middle" class="lbl">keep both</text>
+  <rect x="480" y="200" width="150" height="40" rx="9" fill="var(--diff-add)" stroke="var(--border-strong)"/>
+  <text x="555" y="224" text-anchor="middle" class="lbl" style="fill:var(--diff-add-text)">keep main hunk</text>
+
+  <!-- assemble -->
+  <line x1="225" y1="240" x2="380" y2="270" class="ln2"/>
+  <line x1="390" y1="240" x2="390" y2="270" class="ln2"/>
+  <line x1="555" y1="240" x2="400" y2="270" class="ln2" marker-end="url(#ah)"/>
+  <rect x="250" y="270" width="280" height="26" rx="8" fill="var(--ok-soft)" stroke="color-mix(in srgb,var(--ok) 40%,transparent)"/>
+  <text x="390" y="287" text-anchor="middle" class="sub" style="fill:var(--ok-text);font-weight:600">assembled result → written gitignore-safe (same path as today)</text>
+</svg>
+<p class="figcap"><b>The merge model.</b> With no ancestor, "merge" is ordered per-hunk selection over a 2-way diff
+(the technique <code>git add -p</code> and Meld use). Every write into main still funnels through the existing
+<code>ensure_gitignored_in_main</code> secret-safety step.</p>
+</div>
+
+<div class="callout warn"><span class="k">Verified constraint · the mtime default is a suggestion, not authority</span>
+<p>The requested "default from mtime" is sound as a hint but <strong>unreliable as truth</strong>: <code>std::fs::copy</code>
+preserves mtime on macOS but not Linux, and <code>git checkout</code>/<code>worktree add</code> reset mtime to the checkout
+instant. So: always content-hash first (<code>classify()</code> already does — identical files never reach the picker),
+show <em>both</em> timestamps, and on a tie or untrustworthy signal default to <strong>Interactive merge</strong>, not a guessed direction.</p></div>
+
+<h3>The design space — where the five ideas sit</h3>
+<div class="figure">
+<svg viewBox="0 0 820 470" role="img" aria-labelledby="ds-t">
+  <title id="ds-t">A 2-axis map. Horizontal: terminal-layer footprint from crossterm-only (already in tree) through ratatui to embedding scm-record. Vertical: merge realization from editor handoff at the bottom to a self-contained in-terminal hunk picker at the top. Idea 2 sits low-left, Idea 5 low-mid-left, Idea 3 top-left, Idea 1 top-center, Idea 4 upper-right.</title>
+  <style>
+    .ax{stroke:var(--border-strong);stroke-width:1.5}
+    .axl{font:600 12px var(--sans);fill:var(--muted)}
+    .tick{font:11px var(--mono);fill:var(--muted)}
+    .bub{fill:var(--accent-soft);stroke:var(--accent);stroke-width:2}
+    .bub.top{fill:var(--ok-soft);stroke:var(--ok)}
+    .bnum{font:700 15px var(--sans);fill:var(--accent-text);text-anchor:middle}
+    .blab{font:600 12px var(--sans);fill:var(--text)}
+    .bsub{font:10.5px var(--mono);fill:var(--muted)}
+  </style>
+  <!-- axes -->
+  <line x1="150" y1="40" x2="150" y2="400" class="ax"/>
+  <line x1="150" y1="400" x2="790" y2="400" class="ax"/>
+  <text x="470" y="440" text-anchor="middle" class="axl">Terminal-layer footprint  →  more framework / borrowed</text>
+  <text x="34" y="220" text-anchor="middle" class="axl" transform="rotate(-90 34 220)">Merge realization  →  self-contained in-terminal</text>
+  <!-- x ticks -->
+  <text x="250" y="418" text-anchor="middle" class="tick">crossterm only</text>
+  <text x="250" y="432" text-anchor="middle" class="tick">(already in tree)</text>
+  <text x="470" y="418" text-anchor="middle" class="tick">ratatui (+1 crate)</text>
+  <text x="670" y="418" text-anchor="middle" class="tick">embed scm-record</text>
+  <!-- y ticks -->
+  <text x="140" y="360" text-anchor="end" class="tick">$EDITOR handoff</text>
+  <text x="140" y="230" text-anchor="end" class="tick">editor-native</text>
+  <text x="140" y="228" text-anchor="end" class="tick" dy="12">markers</text>
+  <text x="140" y="95"  text-anchor="end" class="tick">in-terminal</text>
+  <text x="140" y="93"  text-anchor="end" class="tick" dy="12">hunk picker</text>
+
+  <!-- Idea 2: crossterm + editor  (low-left) -->
+  <circle cx="250" cy="350" r="22" class="bub"/><text x="250" y="356" class="bnum">2</text>
+  <text x="284" y="346" class="blab">Surgical picker</text><text x="284" y="362" class="bsub">crossterm · $EDITOR merge</text>
+
+  <!-- Idea 5: diffy editor-native (low-mid-left) -->
+  <circle cx="320" cy="250" r="22" class="bub"/><text x="320" y="256" class="bnum">5</text>
+  <text x="354" y="246" class="blab">Editor-native merge</text><text x="354" y="262" class="bsub">+diffy conflict markers</text>
+
+  <!-- Idea 3: crossterm self-contained (top-left) -->
+  <circle cx="250" cy="105" r="22" class="bub top"/><text x="250" y="111" class="bnum">3</text>
+  <text x="284" y="101" class="blab">Self-contained minimalist</text><text x="284" y="117" class="bsub">crossterm · in-TUI hunks</text>
+
+  <!-- Idea 1: ratatui cockpit (top-center) -->
+  <circle cx="470" cy="95" r="26" class="bub top"/><text x="470" y="101" class="bnum">1</text>
+  <text x="504" y="90" class="blab">Merge cockpit ★</text><text x="504" y="106" class="bsub">ratatui split-pane · in-TUI hunks</text>
+
+  <!-- Idea 4: scm-record (upper-right) -->
+  <circle cx="670" cy="150" r="22" class="bub top"/><text x="670" y="156" class="bnum">4</text>
+  <text x="636" y="120" text-anchor="end" class="blab">Embed scm-record</text><text x="700" y="120" text-anchor="start" class="bsub"></text>
+  <text x="636" y="136" text-anchor="end" class="bsub">borrowed hunk widget</text>
+</svg>
+<p class="figcap"><b>Reading the map.</b> Left = cheapest footprint (crossterm is already present); up = the merge is resolved
+inside the terminal rather than by handing off to an editor. <b>★ Idea 1</b> is the top pick: it lands highest on both the
+richness the ask implies and the strongest prior art.</p>
+</div>
+</section>
+
+<!-- ============================ IDEAS ============================ -->
+<section id="ideas">
+<h2>Ranked Ideas</h2>
+<p>Five architectures, ranked. <strong>Every one delivers both Feature A and Feature B</strong> — they differ in the
+terminal layer, how the merge is resolved, and how much enters the dependency tree. Jump to any card:</p>
+<nav class="toc" aria-label="Ranked ideas">
+<ol>
+  <li><a href="#idea1">Idea 1 — ratatui “merge cockpit” (top pick)</a></li>
+  <li><a href="#idea2">Idea 2 — crossterm surgical picker + $EDITOR merge</a></li>
+  <li><a href="#idea3">Idea 3 — crossterm self-contained in-TUI merge</a></li>
+  <li><a href="#idea4">Idea 4 — embed scm-record (borrow the hunk UI)</a></li>
+  <li><a href="#idea5">Idea 5 — diffy editor-native conflict merge</a></li>
+</ol>
+</nav>
+
+<!-- IDEA 1 -->
+<article class="idea" id="idea1">
+  <div class="rank">RANKED #1 · TOP PICK</div>
+  <h3>Idea 1 — ratatui “merge cockpit”</h3>
+  <div class="idmeta">
+    <span class="pill axis">Axis: terminal layer = full TUI</span>
+    <span class="pill conf-hi">Confidence 85%</span>
+    <span class="pill cx">Complexity High</span>
+  </div>
+  <p>Replace the reverse-sync screen with a single full-screen <code>ratatui</code> app. A left <em>file-list</em> pane shows
+  each candidate with its decision chip; a right <em>diff</em> pane renders the live side-by-side view for the highlighted
+  file. Both features live in one cockpit — the diff view <em>is</em> the merge view <em>is</em> the picker — which is
+  exactly the "side-by-side diff is displayed but navigation is allowed" experience the ask describes.</p>
+
+  <div class="chips">
+    <span class="chip new">+ ratatui 0.30</span><span class="chip new">+ similar 3.1.1</span>
+    <span class="chip have">crossterm 0.29 (present)</span><span class="chip have">console (present)</span>
+    <span class="chip ref">prior art: gitui</span>
+  </div>
+
+  <div class="feat">
+    <div class="fbox a"><h5>Feature A</h5><p><code>List</code>+<code>ListState</code> give the in-place, arrow-navigable
+      picker (Space toggles state held in an <code>App</code> struct — no re-print by construction).
+      <code>Layout::horizontal([50,50])</code> makes the two titled columns; <code>Paragraph</code> + scroll renders
+      <code>grouped_ops(3)</code> hunks; <code>Span</code> styling carries color + <code>iter_inline_changes</code> highlights.</p></div>
+    <div class="fbox b"><h5>Feature B</h5><p>A per-file <code>Decision</code> enum cycled with <code>←/→</code>; default from mtime.
+      "Interactive merge" opens an in-pane hunk walk (<em>keep local / keep main / keep both</em>) assembled from the same
+      <code>DiffOp</code> stream. <code>↑/↓</code> moves files/hunks; "delete" prompts an explicit scope.</p></div>
+  </div>
+
+  <div class="figure" style="box-shadow:none;margin:14px 0">
+  <svg viewBox="0 0 720 210" role="img" aria-labelledby="i1">
+    <title id="i1">The cockpit layout: a left file-list pane with decision chips and a right side-by-side diff pane, under one help bar.</title>
+    <style>.f1{font:11px var(--mono);fill:var(--muted)}.f1b{font:600 12px var(--sans);fill:var(--text)}</style>
+    <rect x="8" y="8" width="704" height="168" rx="10" fill="var(--surface-2)" stroke="var(--border-strong)"/>
+    <rect x="20" y="20" width="210" height="144" rx="7" fill="var(--surface)" stroke="var(--border)"/>
+    <text x="32" y="40" class="f1b">Files</text>
+    <rect x="28" y="48" width="194" height="22" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
+    <text x="36" y="63" class="f1">▸ config.local.yaml  →main</text>
+    <text x="36" y="86" class="f1">  .dev.vars          →main</text>
+    <text x="36" y="106" class="f1">  .env.local         ←main</text>
+    <rect x="244" y="20" width="456" height="144" rx="7" fill="var(--surface)" stroke="var(--border)"/>
+    <text x="256" y="40" class="f1b" style="fill:var(--diff-del-text)">Local file</text>
+    <text x="474" y="40" class="f1b" style="fill:var(--cyan)">Main branch</text>
+    <line x1="472" y1="30" x2="472" y2="156" stroke="var(--border)"/>
+    <rect x="252" y="70" width="212" height="16" fill="var(--diff-del)"/><text x="258" y="82" class="f1">25 TOKEN=dev-abc</text>
+    <rect x="480" y="70" width="212" height="16" fill="var(--diff-add)"/><text x="486" y="82" class="f1">25 TOKEN=stg-xy7</text>
+    <text x="258" y="104" class="f1">⋯ folded ⋯</text><text x="486" y="104" class="f1">⋯ folded ⋯</text>
+    <text x="20" y="196" class="f1">↑↓ files · ←→ decision · ⇄ hunk-merge · Space include · ⏎ apply all · Esc cancel</text>
+  </svg>
+  </div>
+
+  <div class="basis"><b>external:</b> <code>gitui</code> (22k★) ships this exact "file list + hunk-level diff + per-hunk action"
+  pattern on <em>ratatui 0.30 + crossterm 0.29</em> — verified from its <code>Cargo.toml</code> — so the shape is proven, not speculative.
+  <b>reasoned:</b> crossterm is already resolved to 0.29 in <code>Cargo.lock</code>, so ratatui adds one crate rather than a new backend.</div>
+  <p style="font-size:.92rem"><b>Rationale.</b> This is the only option that unifies both features into one navigable screen instead of
+  a picker plus a separate diff pager plus a separate merge step. Immediate-mode redraw makes the re-print impossible and makes
+  "repaint on every keypress" (toggle, arrow, decision change) the natural model rather than something you fight.</p>
+
+  <div class="prosk">
+    <div class="p"><h5>Pros</h5><ul>
+      <li>Fullest match to the ask: live navigable side-by-side + in-place picker + in-TUI merge, one screen.</li>
+      <li>Verified-cheap: one new framework crate; backend already present.</li>
+      <li>Strong, current prior art (gitui) for the exact interaction shape.</li>
+      <li>Immediate-mode redraw is a natural fit for a keypress-driven screen.</li>
+    </ul></div>
+    <div class="c"><h5>Cons</h5><ul>
+      <li>Most code &amp; largest new surface for a small CLI — the richest but heaviest option.</li>
+      <li>ratatui's widget/text/style modules + a one-time immediate-mode learning curve.</li>
+      <li>The in-TUI hunk picker is the most bespoke part and needs its own careful manual-smoke pass.</li>
+      <li>Biggest binary-size delta of the five.</li>
+    </ul></div>
+  </div>
+  <details><summary>Effort &amp; sequencing notes</summary><div class="body">
+    <p style="font-size:.9rem;max-width:none">Ship in two commits: (1) the picker+diff pane (Feature A) — already a complete,
+    valuable fix for the re-print and the diff view; (2) the Merge decision + in-TUI hunk assembly (Feature B). Keep the merge
+    <em>assembly</em> (walk <code>grouped_ops</code>, concatenate chosen slices) as a pure, unit-tested function behind the TUI, mirroring
+    how <code>classify()</code>/<code>copy_candidate_into_main()</code> are already testable. Route all four decisions through the existing
+    <code>ensure_gitignored_in_main</code> seam.</p></div></details>
+  <p style="margin:.4em 0 0"><b>Confidence:</b> 85% &nbsp;·&nbsp; <b>Complexity:</b> High &nbsp;·&nbsp; <b>New crates:</b> ratatui, similar</p>
+</article>
+
+<!-- IDEA 2 -->
+<article class="idea" id="idea2">
+  <div class="rank">RANKED #2</div>
+  <h3>Idea 2 — crossterm surgical picker + $EDITOR merge handoff</h3>
+  <div class="idmeta">
+    <span class="pill axis">Axis: merge = editor handoff · min footprint</span>
+    <span class="pill conf-hi">Confidence 82%</span>
+    <span class="pill cx">Complexity Medium</span>
+  </div>
+  <p>The smallest-blast-radius option. Replace <em>only</em> <code>pick_reverse_sync</code> with a hand-rolled
+  <code>crossterm</code> raw-mode / alternate-screen loop — since crossterm is already in the tree, this adds no backend.
+  The list redraws in place (re-print gone); <code>Space</code> toggles; <code>→</code> opens a full-screen side-by-side diff
+  overlay and <code>Esc</code> returns. For Merge, <code>←/→</code> cycles the per-file decision; "interactive merge" synthesizes a
+  conflict-marked temp file and hands off to the user's <code>$EDITOR</code> / <code>git mergetool</code>.</p>
+
+  <div class="chips">
+    <span class="chip new">+ similar 3.1.1</span>
+    <span class="chip have">crossterm 0.29 (present)</span><span class="chip have">console (present)</span>
+    <span class="chip have">tempfile (present)</span><span class="chip ref">prior art: git add -p “e”</span>
+  </div>
+
+  <div class="feat">
+    <div class="fbox a"><h5>Feature A</h5><p>Own redraw loop (move cursor home, clear, reprint) — no stacking. Space/→ dispatched
+      from raw <code>KeyEvent</code>s. The <code>→</code> overlay renders the two-column diff from <code>similar::grouped_ops(3)</code>,
+      with <code>console::pad_str</code> for Unicode-correct columns and color.</p></div>
+    <div class="fbox b"><h5>Feature B</h5><p><code>←/→</code> cycles <code>[push · pull · merge · delete]</code> inline (default from mtime).
+      "Merge" writes <code>&lt;&lt;&lt; local / === / &gt;&gt;&gt; main</code> markers to a tempfile, launches <code>$EDITOR</code>, re-reads,
+      and <strong>rejects the result if any marker line remains</strong>.</p></div>
+  </div>
+
+  <div class="figure" style="box-shadow:none;margin:14px 0">
+  <svg viewBox="0 0 720 120" role="img" aria-labelledby="i2">
+    <title id="i2">Data flow: candidate files feed similar for the diff; push/pull/delete stay in-TUI while interactive merge branches out to the user's editor and back.</title>
+    <style>.g2{font:11px var(--mono);fill:var(--muted)}.b2{fill:var(--surface-2);stroke:var(--border-strong)}</style>
+    <defs><marker id="a2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect x="10" y="44" width="120" height="34" rx="8" class="b2"/><text x="70" y="65" text-anchor="middle" class="g2">candidates</text>
+    <line x1="130" y1="61" x2="176" y2="61" stroke="var(--muted)" marker-end="url(#a2)"/>
+    <rect x="180" y="44" width="120" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/><text x="240" y="65" text-anchor="middle" class="g2" style="fill:var(--accent-text)">similar diff</text>
+    <line x1="300" y1="61" x2="346" y2="61" stroke="var(--muted)" marker-end="url(#a2)"/>
+    <rect x="350" y="30" width="150" height="62" rx="8" class="b2"/><text x="425" y="52" text-anchor="middle" class="g2">crossterm TUI</text><text x="425" y="70" text-anchor="middle" class="g2">picker · diff · ←→</text>
+    <line x1="500" y1="45" x2="556" y2="30" stroke="var(--muted)" marker-end="url(#a2)"/>
+    <line x1="500" y1="76" x2="556" y2="90" stroke="var(--ok)" marker-end="url(#a2)"/>
+    <rect x="560" y="12" width="150" height="30" rx="8" fill="var(--warn-soft)" stroke="var(--warn)"/><text x="635" y="31" text-anchor="middle" class="g2" style="fill:var(--warn-text)">$EDITOR (merge only)</text>
+    <rect x="560" y="78" width="150" height="30" rx="8" fill="var(--ok-soft)" stroke="var(--ok)"/><text x="635" y="97" text-anchor="middle" class="g2" style="fill:var(--ok-text)">push/pull/delete in-TUI</text>
+  </svg>
+  </div>
+
+  <div class="basis"><b>external:</b> <code>git add -p</code>'s <code>e</code> (edit-hunk) escape hatch is the canonical "when the picker
+  can't decide, hand it to the editor" pattern. <b>reasoned:</b> the hard, freeform part of merging is exactly what an editor does best;
+  offloading it removes the riskiest code while keeping push/pull/delete fast and in-terminal.</div>
+  <p style="font-size:.92rem"><b>Rationale.</b> Matches the existing architecture's grain — one function changes, inquire stays for
+  everything else, and the "show diff via a shell-out/pager" convention is preserved (just upgraded to side-by-side). Lowest risk to ship.</p>
+
+  <div class="prosk">
+    <div class="p"><h5>Pros</h5><ul>
+      <li>Tiny footprint: one new crate (<code>similar</code>); no new backend; blast radius is a single function.</li>
+      <li>Offloads the riskiest work (freeform reconcile) to tools users already know.</li>
+      <li>Preserves the current Select-loop mental model, minus the re-print.</li>
+      <li>Fastest to implement and review.</li>
+    </ul></div>
+    <div class="c"><h5>Cons</h5><ul>
+      <li>The merge step leaves the TUI — a context switch, and it depends on <code>$EDITOR</code>/<code>git mergetool</code> being configured.</li>
+      <li>You hand-roll the overlay's scroll/layout (crossterm has no widgets).</li>
+      <li>Scales badly if you later want a persistent split-pane cockpit — that's re-deriving ratatui by hand.</li>
+      <li>Two contexts for the user (in-TUI vs editor) is less cohesive than Idea 1.</li>
+    </ul></div>
+  </div>
+  <p style="margin:.4em 0 0"><b>Confidence:</b> 82% &nbsp;·&nbsp; <b>Complexity:</b> Medium &nbsp;·&nbsp; <b>New crates:</b> similar</p>
+</article>
+
+<!-- IDEA 3 -->
+<article class="idea" id="idea3">
+  <div class="rank">RANKED #3</div>
+  <h3>Idea 3 — crossterm self-contained in-TUI merge (no editor, no framework)</h3>
+  <div class="idmeta">
+    <span class="pill axis">Axis: merge = self-contained in-TUI</span>
+    <span class="pill conf-med">Confidence 70%</span>
+    <span class="pill cx">Complexity Medium-High</span>
+  </div>
+  <p>Idea 2's minimal footprint, but the merge never leaves the terminal. On <code>crossterm</code> (no framework), build a
+  small hunk-walk overlay: for each differing hunk the user presses a key to <em>keep local / keep main / keep both</em>, and the
+  result is assembled from the <code>similar</code> <code>DiffOp</code> stream — no <code>$EDITOR</code> dependency at all. The right
+  answer when you can't assume a developer's editor is configured (a self-updating CLI often can't).</p>
+
+  <div class="chips">
+    <span class="chip new">+ similar 3.1.1</span>
+    <span class="chip have">crossterm 0.29 (present)</span><span class="chip have">console (present)</span>
+    <span class="chip ref">prior art: git add -p loop</span>
+  </div>
+
+  <div class="feat">
+    <div class="fbox a"><h5>Feature A</h5><p>Identical to Idea 2: own redraw loop, Space toggle, <code>→</code> side-by-side overlay
+      from <code>grouped_ops(3)</code>, colored columns via <code>console</code>.</p></div>
+    <div class="fbox b"><h5>Feature B</h5><p>"Interactive merge" enters a hunk-by-hunk overlay driven entirely by keys — <code>j/k</code>
+      to move hunks, <code>←/→</code> to pick the side, live preview of the assembled file. ~50–100 LOC of "walk hunks, concatenate
+      chosen slices" glue over <code>similar</code>. No editor, no external tool.</p></div>
+  </div>
+
+  <div class="basis"><b>reasoned:</b> <code>similar::grouped_ops</code> hands you exactly the per-hunk decision points; assembling a
+  merged file from per-hunk choices is a short, pure, unit-testable function (the same shape <code>git add -p</code> and Meld are — bespoke
+  glue over a diff engine). <b>external:</b> Meld's two-way mode proves per-chunk directional selection with no base is a coherent, shippable UX.</div>
+  <p style="font-size:.92rem"><b>Rationale.</b> Keeps the dependency story as small as Idea 2 <em>and</em> stays fully in-terminal and self-contained,
+  which matters for a tool that can't assume <code>$EDITOR</code>. The cost is that you own the hunk-picker's redraw/scroll on raw crossterm.</p>
+
+  <div class="prosk">
+    <div class="p"><h5>Pros</h5><ul>
+      <li>Smallest deps <em>and</em> fully self-contained — no <code>$EDITOR</code>/<code>git mergetool</code> reliance.</li>
+      <li>Cohesive single-tool experience; no context switch mid-merge.</li>
+      <li>Merge-assembly logic is pure and unit-testable behind the TUI.</li>
+    </ul></div>
+    <div class="c"><h5>Cons</h5><ul>
+      <li>Most bespoke of the crossterm options — you hand-build the hunk overlay's scroll, cursor, and preview.</li>
+      <li>No gitui-scale prior art for a hand-rolled crossterm hunk picker (unlike ratatui's).</li>
+      <li>Re-implements a slice of what ratatui/scm-record already provide; if scope grows, Idea 1 becomes the better home.</li>
+      <li>Freeform "type something neither side has" edits aren't possible without an editor fallback.</li>
+    </ul></div>
+  </div>
+  <p style="margin:.4em 0 0"><b>Confidence:</b> 70% &nbsp;·&nbsp; <b>Complexity:</b> Medium-High &nbsp;·&nbsp; <b>New crates:</b> similar</p>
+</article>
+
+<!-- IDEA 4 -->
+<article class="idea" id="idea4">
+  <div class="rank">RANKED #4</div>
+  <h3>Idea 4 — embed scm-record (borrow the hunk-selection UI)</h3>
+  <div class="idmeta">
+    <span class="pill axis">Axis: terminal layer = borrowed component</span>
+    <span class="pill conf-med">Confidence 62%</span>
+    <span class="pill cx">Complexity Medium · spike-first</span>
+  </div>
+  <p>Don't build the hardest part — <em>adopt</em> it. <a href="https://github.com/arxanas/scm-record"><code>scm-record</code></a>
+  is a maintained, ratatui-based, embeddable widget purpose-built for "interactively select which hunks/lines to keep between two
+  versions of a file with <strong>no common ancestor</strong>" — the exact base-less 2-way problem ss-magic has. It already ships as a
+  production git difftool (<code>scm-diff-editor</code>) inside Jujutsu and git-branchless (<code>git record -i</code>).</p>
+
+  <div class="chips">
+    <span class="chip new">+ scm-record 0.10</span><span class="chip new">(+ similar, optional)</span>
+    <span class="chip have">crossterm 0.29 (present)</span><span class="chip ref">used by: Jujutsu · git-branchless</span>
+  </div>
+
+  <div class="feat">
+    <div class="fbox a"><h5>Feature A</h5><p>Renders as a ratatui/crossterm component that redraws in place (re-print solved for free).
+      Its default is a hunk list; a genuine two-column <em>side-by-side</em> layout is <strong>unconfirmed</strong> and may need patching or a
+      contribution upstream.</p></div>
+    <div class="fbox b"><h5>Feature B</h5><p><code>Recorder</code>/<code>RecordState</code> with <code>Section</code> hunks and a
+      <code>Tristate</code> (full/none/partial) selection — very close to per-hunk keep-local/keep-main. Needs a thin adaptation layer to map
+      its stage-vs-not model onto ss-magic's 3-outcome <code>[push · pull · merge]</code>.</p></div>
+  </div>
+
+  <div class="basis"><b>external:</b> verified from docs.rs — <code>scm-record</code> depends on ratatui 0.30 + crossterm 0.29 and exposes
+  <code>Tristate</code>/<code>Section</code>/<code>SelectedContents</code>; it is the difftool front-end for Jujutsu. <b>reasoned:</b> the merge-UI is
+  the single most bespoke, highest-risk piece of every other idea — borrowing a proven implementation removes that risk if the fit holds.</div>
+  <p style="font-size:.92rem"><b>Rationale.</b> Potentially the least merge-UI code of any option. But it is niche (105★), its native semantics are
+  binary stage/don't-stage rather than a 3-way outcome, and its side-by-side support is unverified — so this earns a <strong>hands-on spike</strong>
+  (embed against a synthetic two-file case) before committing, not a blind adoption.</p>
+
+  <div class="prosk">
+    <div class="p"><h5>Pros</h5><ul>
+      <li>Purpose-built for base-less per-hunk selection — the exact problem, already solved.</li>
+      <li>Production-proven inside Jujutsu &amp; git-branchless.</li>
+      <li>Backend already present; adds the component, not a new terminal stack.</li>
+    </ul></div>
+    <div class="c"><h5>Cons</h5><ul>
+      <li>Niche (105★, thin docs) — expect to read source and possibly pin/patch it.</li>
+      <li>Native model is stage/don't-stage, not <code>[push·pull·merge]</code> — needs an adaptation layer.</li>
+      <li>Side-by-side layout &amp; custom titles unconfirmed — may require an upstream contribution.</li>
+      <li>Cedes control of the UX to an external component's evolution.</li>
+    </ul></div>
+  </div>
+  <p style="margin:.4em 0 0"><b>Confidence:</b> 62% &nbsp;·&nbsp; <b>Complexity:</b> Medium (spike-first) &nbsp;·&nbsp; <b>New crates:</b> scm-record</p>
+</article>
+
+<!-- IDEA 5 -->
+<article class="idea" id="idea5">
+  <div class="rank">RANKED #5</div>
+  <h3>Idea 5 — diffy editor-native conflict merge</h3>
+  <div class="idmeta">
+    <span class="pill axis">Axis: merge = editor-native markers</span>
+    <span class="pill conf-med">Confidence 65%</span>
+    <span class="pill cx">Complexity Medium</span>
+  </div>
+  <p>A variant of the editor-handoff path (Idea 2) that leans on <code>diffy</code> to make the merge feel exactly like resolving a git
+  conflict in your editor. The picker + side-by-side preview run on crossterm + similar; "interactive merge" produces
+  <strong>git-native <code>&lt;&lt;&lt;/===/&gt;&gt;&gt;</code> conflict markers</strong> that VS Code, vim, etc. recognize with their built-in
+  <em>accept-current / accept-incoming / accept-both</em> affordances — near-zero merge-UI code.</p>
+
+  <div class="chips">
+    <span class="chip new">+ similar 3.1.1</span><span class="chip new">+ diffy 0.5</span>
+    <span class="chip have">crossterm 0.29 (present)</span><span class="chip have">tempfile (present)</span>
+  </div>
+
+  <div class="feat">
+    <div class="fbox a"><h5>Feature A</h5><p>Same crossterm picker + <code>similar</code> side-by-side preview as Idea 2.</p></div>
+    <div class="fbox b"><h5>Feature B</h5><p>Uses <code>diffy</code>'s conflict-style formatting (via an empty/synthetic ancestor) to emit
+      editor-native markers, so the "interactive merge" file opens with the editor's own conflict UI. Push/pull/delete stay in-TUI.</p></div>
+  </div>
+
+  <div class="basis"><b>external:</b> git-native conflict markers are the most widely understood merge UX; every mainstream editor renders
+  accept-current/incoming buttons on them. <b>reasoned (with a verified caveat):</b> <code>diffy::merge</code> is a 3-way API, but the verifier
+  confirmed an <em>empty ancestor</em> is mechanically valid and yields markers for a 2-way case — a legitimate trick, though undocumented for
+  2-way, so it must be treated as leaning on unspecified behavior.</div>
+  <p style="font-size:.92rem"><b>Rationale.</b> Best possible merge ergonomics for the least merge-UI code — but it adds a <em>second</em> diff engine
+  (<code>diffy</code> alongside <code>similar</code>) and depends on <code>diffy</code>'s empty-ancestor behavior, which keeps its confidence below the
+  self-contained options. Markers can equally be hand-rolled from <code>similar</code> hunks if you'd rather not add <code>diffy</code>.</p>
+
+  <div class="prosk">
+    <div class="p"><h5>Pros</h5><ul>
+      <li>Merge output is instantly familiar — the editor's native conflict UI does the work.</li>
+      <li>Almost no bespoke merge code; <code>diffy</code> is mature (2026 release).</li>
+      <li>Same low-risk crossterm picker as Idea 2 for Feature A.</li>
+    </ul></div>
+    <div class="c"><h5>Cons</h5><ul>
+      <li>Two diff engines in the tree (<code>similar</code> + <code>diffy</code>) for overlapping purposes.</li>
+      <li>Relies on <code>diffy</code>'s empty-ancestor behavior — mechanically valid but not documented for 2-way.</li>
+      <li>Still leaves the TUI for the merge; still needs a configured editor.</li>
+      <li>Marker-in-a-secret hazard: must reject any saved file that still contains a marker line.</li>
+    </ul></div>
+  </div>
+  <p style="margin:.4em 0 0"><b>Confidence:</b> 65% &nbsp;·&nbsp; <b>Complexity:</b> Medium &nbsp;·&nbsp; <b>New crates:</b> similar, diffy</p>
+</article>
+</section>
+
+<!-- ============================ REJECTION ============================ -->
+<section id="rejection">
+<h2>Rejection Summary</h2>
+<p>Approaches considered and cut, with the verified reason each failed to make the survivor set. Several are common
+first instincts, so recording why they don't work is part of the value.</p>
+<table class="tbl">
+<thead><tr><th>#</th><th>Approach</th><th>Reason rejected</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Fix inquire in place via <code>RenderConfig</code></td><td>No knob suppresses the answered line; the prompt set is closed with no custom-key hook. Verified against docs.rs/inquire.</td></tr>
+<tr><td>2</td><td><code>inquire::MultiSelect</code> for Space-toggle</td><td>Redraws in place but can't intercept <code>→</code> for "show diff" and breaks on action rows — the exact reason the codebase already left it.</td></tr>
+<tr><td>3</td><td><code>dialoguer</code> MultiSelect</td><td>Fixes the cosmetic stacking but has no custom-key hook, and <code>→</code> is already bound to pagination — can't do →-diff or merge. Cosmetic-only.</td></tr>
+<tr><td>4</td><td><code>prettydiff</code> as the side-by-side renderer</td><td>Verified single-column (unified) despite the name — confirmed by inspecting its own screenshots. Its context-fold idea survives as a design reference only.</td></tr>
+<tr><td>5</td><td><code>mergiraf</code> (syntax-aware 3-way merge)</td><td>Structurally requires a base for both its GumTree merge and its diff3 fallback — ss-magic's files are base-less untracked secrets. Hard mismatch.</td></tr>
+<tr><td>6</td><td><code>difftastic</code> structural diff</td><td>Needs a tree-sitter grammar; target files (<code>.env</code>, arbitrary secrets) are frequently not parseable source. Overkill + wrong file universe.</td></tr>
+<tr><td>7</td><td><code>cursive</code> TUI framework</td><td>Default backend is ncurses (a C dependency) — conflicts with ss-magic's deliberate pure-Rust / no-C-toolchain stance. Strictly worse than ratatui.</td></tr>
+<tr><td>8</td><td><code>imara-diff</code> as the engine</td><td>Lower-level than <code>similar</code>: no <code>grouped_ops</code>-style folding, no intra-line diff; its speed edge is irrelevant at ss-magic's file sizes.</td></tr>
+<tr><td>9</td><td>Shell out to <code>delta</code> for side-by-side</td><td>Not a library — a standalone pager that parses git's diff <em>text</em>; would add an external-binary dependency. Reference for layout technique only.</td></tr>
+<tr><td>10</td><td><code>ratatui-interact</code> <code>DiffViewer</code> widget</td><td>Documents side-by-side + hunk-nav, but too immature (33★, v0.5, ~6 months, source unverified) to depend on in a self-updating CLI. Track for later.</td></tr>
+<tr><td>11</td><td>mtime as the <em>authoritative</em> merge default</td><td>Not rejected as a hint, but demoted: <code>fs::copy</code> mtime is platform-divergent and <code>git checkout</code> resets it. Kept only as a shown suggestion with a content-hash short-circuit and a merge-on-tie fallback.</td></tr>
+</tbody>
+</table>
+</section>
+
+<!-- ============================ SOURCES ============================ -->
+<section id="sources">
+<h2>Sources &amp; References</h2>
+<h4>ss-magic code the ideas build on</h4>
+<ul>
+<li><a href="https://github.com/ViktorStiskala/superset-magic/blob/main/src/tui/ui.rs">src/tui/ui.rs</a> — <code>pick_reverse_sync</code> (the Select-loop that re-prints)</li>
+<li><a href="https://github.com/ViktorStiskala/superset-magic/blob/main/src/sync/reverse_sync.rs">src/sync/reverse_sync.rs</a> — <code>classify()</code>, <code>DiffStatus</code>, <code>copy_candidate_into_main()</code>, <code>ensure_gitignored_in_main()</code></li>
+<li><a href="https://github.com/ViktorStiskala/superset-magic/blob/main/src/git/mod.rs">src/git/mod.rs</a> — <code>diff_no_index_paged</code> (today's diff)</li>
+<li><a href="https://github.com/ViktorStiskala/superset-magic/blob/main/docs/solutions/design-patterns/inquire-action-loop-2026-05-26.md">docs/solutions/…/inquire-action-loop</a> — why MultiSelect was dropped</li>
+</ul>
+<h4>Diff / merge engines</h4>
+<ul>
+<li><a href="https://docs.rs/similar/latest/similar/struct.TextDiff.html">similar — TextDiff / grouped_ops / iter_inline_changes</a> · <a href="https://github.com/mitsuhiko/similar">repo</a></li>
+<li><a href="https://docs.rs/diffy/latest/diffy/fn.merge.html">diffy — merge() (3-way; empty-ancestor caveat)</a></li>
+<li><a href="https://github.com/pascalkuthe/imara-diff">imara-diff</a> · <a href="https://github.com/dtolnay/dissimilar">dissimilar</a></li>
+</ul>
+<h4>Terminal / TUI layer</h4>
+<ul>
+<li><a href="https://github.com/crossterm-rs/crossterm">crossterm</a> · <a href="https://ratatui.rs/">ratatui</a> · <a href="https://github.com/console-rs/console">console</a></li>
+<li><a href="https://github.com/mikaelmello/inquire/blob/main/inquire/src/ui/frame_renderer.rs">inquire frame_renderer.rs</a> (re-print root cause)</li>
+<li><a href="https://github.com/arxanas/scm-record">scm-record</a> (base-less hunk-selection widget)</li>
+</ul>
+<h4>Prior art &amp; UX references</h4>
+<ul>
+<li><a href="https://github.com/gitui-org/gitui">gitui</a> — ratatui 0.30 + crossterm 0.29, the interaction-shape proof</li>
+<li><a href="https://raw.githubusercontent.com/dandavison/delta/main/ARCHITECTURE.md">delta ARCHITECTURE.md</a> — side-by-side layout &amp; word-highlight technique</li>
+<li><a href="https://git-scm.com/book/en/v2/Git-Tools-Interactive-Staging">git add -p</a> · <a href="https://meldmerge.org/help/file-mode.html">Meld two-way mode</a> — per-hunk decision UX</li>
+<li><a href="https://rustsec.org/advisories/RUSTSEC-2021-0139.html">RUSTSEC-2021-0139</a> — ansi_term unmaintained (use owo-colors/nu-ansi-term/console)</li>
+<li><a href="https://github.com/rust-lang/rust/issues/115982">rust#115982</a> — fs::copy mtime is platform-divergent (mtime-default caveat)</li>
+</ul>
+</section>
+
+<footer class="sig">
+Composed 2026-07-15 by ce-ideate (ultracode) from the user's prompt + a 10-agent research/verify workflow · repo-grounded · ss-magic 0.3.0<br>
+Point-in-time discovery artifact — not a plan or spec. Next: brainstorm one idea (<code>ce-brainstorm</code>) to turn it into requirements.
+</footer>
+
+</div>
+<script>
+(function(){
+  var btn=document.getElementById('theme-toggle');
+  var root=document.documentElement;
+  function apply(t){root.setAttribute('data-theme',t);btn.textContent=(t==='dark'?'☀ Light':'☾ Dark');try{localStorage.setItem('ssmagic-ideation-theme',t)}catch(e){}}
+  var saved=null;try{saved=localStorage.getItem('ssmagic-ideation-theme')}catch(e){}
+  if(saved){apply(saved);}else{btn.textContent=(matchMedia('(prefers-color-scheme: dark)').matches?'☀ Light':'☾ Dark');}
+  btn.addEventListener('click',function(){
+    var cur=root.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
+    apply(cur==='dark'?'light':'dark');
+  });
+})();
+</script>
+</body>
+</html>

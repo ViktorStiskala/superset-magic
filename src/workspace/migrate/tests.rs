@@ -477,6 +477,12 @@ fn run_init_noninteractive_writes_layout_from_patterns() {
 
     let gi = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
     assert!(gi.lines().any(|l| l == MAGIC_LOCAL_REL));
+    // The backups tree is gitignored up front by the same bootstrap step, so a
+    // recovered secret is never committed even before the first sync runs.
+    assert!(
+        gi.lines().any(|l| l == ".superset/backups/"),
+        "ss-magic init must gitignore the backups tree, got: {gi:?}"
+    );
 
     #[cfg(unix)]
     {

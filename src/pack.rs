@@ -25,6 +25,7 @@ use anyhow::{Context, Result};
 use bzip2::write::BzEncoder;
 use bzip2::Compression;
 use tempfile::NamedTempFile;
+use walkdir::WalkDir;
 
 use crate::sync::apply;
 use crate::git;
@@ -235,9 +236,18 @@ where
     //    drop any match that resolves to the repo root itself (a `.` pattern):
     //    `append_dir_all(".", root)` would walk the whole tree live — including
     //    the in-progress temp archive and `.git` — corrupting the archive and
-    //    bypassing the self-exclusion guard.
+    //    bypassing the self-exclusion guard. And drop any LEAF match under the
+    //    tool's own `.superset/backups/` tree so a recovered secret copy is
+    //    never packed. (An ancestor DIRECTORY match — e.g. a bare `.superset`
+    //    pattern — is handled separately in `write_archive`, whose directory
+    //    walk prunes the backups subtree; `under_backups_dir` needs both the
+    //    `.superset` and `backups` components, so it cannot catch the ancestor.)
     let file_name = archive_file_name(&root);
-    rels.retain(|r| !is_pack_archive_rel(r) && !is_repo_root_rel(r));
+    rels.retain(|r| {
+        !is_pack_archive_rel(r)
+            && !is_repo_root_rel(r)
+            && !crate::sync::reverse_sync::under_backups_dir(r)
+    });
 
     // 7. Nothing left to archive after filtering → success, no archive written.
     if rels.is_empty() {
@@ -352,8 +362,15 @@ where
                     .append_path_with_name(&abs, rel)
                     .with_context(|| format!("adding symlink {} to archive", rel.display()))?;
             } else if file_type.is_dir() {
-                builder
-                    .append_dir_all(rel, &abs)
+                // NOT a blind `append_dir_all`: a directory match that is an
+                // ANCESTOR of `.superset/backups` (a literal `.superset`
+                // pattern, or a broad glob like `**` that matches the bare
+                // `.superset` component) would otherwise walk the live tree and
+                // pack every recovered secret under `.superset/backups/…`. The
+                // guarded walk prunes that subtree no matter how the dir match
+                // reached `rels` — the flat `under_backups_dir` retain filter
+                // (step 6) only catches leaf matches, not ancestor dirs.
+                append_dir_excluding_backups(&mut builder, root, rel, &abs)
                     .with_context(|| format!("adding directory {} to archive", rel.display()))?;
             } else if file_type.is_file() {
                 builder
@@ -385,6 +402,49 @@ where
         .with_context(|| format!("persisting archive to {}", out_path.display()))?;
 
     Ok(count)
+}
+
+/// Recursively add the directory match `rel` (rooted at `abs`) to `builder`,
+/// EXCLUDING any descendant under the tool's own `.superset/backups/` tree so a
+/// recovered secret is never packed. Mirrors `append_dir_all`'s recursive walk
+/// but prunes the backups subtree (keyed on each entry's `root`-relative path,
+/// via [`crate::sync::reverse_sync::under_backups_dir`]) and never follows
+/// symlinks (a symlink is stored as a single symlink entry, matching the
+/// top-level classification and `apply.rs`). Entry names are `root`-relative so
+/// the archive keeps the same layout `append_dir_all` produced.
+fn append_dir_excluding_backups<W: Write>(
+    builder: &mut tar::Builder<W>,
+    root: &Path,
+    rel: &Path,
+    abs: &Path,
+) -> Result<()> {
+    let walker = WalkDir::new(abs)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| match e.path().strip_prefix(root) {
+            // Prune the backups subtree wherever it appears under the match.
+            Ok(r) => !crate::sync::reverse_sync::under_backups_dir(r),
+            Err(_) => true,
+        });
+    for entry in walker {
+        let entry = entry.with_context(|| format!("walking {} for the archive", abs.display()))?;
+        let path = entry.path();
+        // Archive under the entry's repo-relative name (falls back to `rel` for
+        // the walk root, which strips to exactly `rel`).
+        let name = path.strip_prefix(root).unwrap_or(rel);
+        let ft = entry.file_type();
+        if ft.is_dir() {
+            builder
+                .append_dir(name, path)
+                .with_context(|| format!("adding dir {} to archive", name.display()))?;
+        } else if ft.is_symlink() || ft.is_file() {
+            builder
+                .append_path_with_name(path, name)
+                .with_context(|| format!("adding {} to archive", name.display()))?;
+        }
+        // Special files (socket / fifo) are skipped, as at the top level.
+    }
+    Ok(())
 }
 
 #[cfg(test)]

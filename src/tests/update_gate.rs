@@ -22,8 +22,17 @@ fn ae3_bare_no_guard_gate_fires() {
 #[test]
 fn sync_no_guard_gate_fires() {
     assert!(
-        should_run_update_gate(Command::Sync, false),
+        should_run_update_gate(Command::Sync { no_backup: false }, false),
         "Sync + guard inactive → gate must fire"
+    );
+}
+
+/// ReverseSync command + no guard → gate fires.
+#[test]
+fn reverse_sync_no_guard_gate_fires() {
+    assert!(
+        should_run_update_gate(Command::ReverseSync { no_backup: false }, false),
+        "ReverseSync + guard inactive → gate must fire"
     );
 }
 
@@ -81,7 +90,16 @@ fn ae4_bare_guard_active_gate_does_not_fire() {
 #[test]
 fn sync_guard_active_gate_does_not_fire() {
     assert!(
-        !should_run_update_gate(Command::Sync, true),
+        !should_run_update_gate(Command::Sync { no_backup: false }, true),
         "Sync + guard active (SS_MAGIC_NO_UPDATE) → gate must not fire"
+    );
+}
+
+/// ReverseSync + guard active → gate does NOT fire.
+#[test]
+fn reverse_sync_guard_active_gate_does_not_fire() {
+    assert!(
+        !should_run_update_gate(Command::ReverseSync { no_backup: false }, true),
+        "ReverseSync + guard active → gate must not fire"
     );
 }

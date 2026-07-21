@@ -43,10 +43,10 @@ pub enum MenuOp {
     Init,
     /// Main-checkout, Branch::Normal: edit the committed `magic.json` patterns.
     EditConfig,
-    /// Worktree: non-interactive forward copy (main → this worktree).
-    ForwardSync,
-    /// Worktree: push git-untracked files back to main.
-    ReverseSync,
+    /// Worktree: the unified interactive sync cockpit — reconcile every
+    /// configured file against main in either direction (push / pull / merge /
+    /// delete per file).
+    Sync,
     /// Archive the configured files into `ss-magic-<repo>.tar.bz2` at the git
     /// root (name derived from the normalized `origin` remote, falling back to
     /// the primary worktree basename — see `pack::archive_file_name`). Offered
@@ -61,8 +61,7 @@ impl fmt::Display for MenuOp {
             MenuOp::Migrate => "Migrate to the magic.json layout",
             MenuOp::Init => "Initialize ss-magic",
             MenuOp::EditConfig => "Edit synced files (magic.json)",
-            MenuOp::ForwardSync => "Forward sync (copy files from main to this worktree)",
-            MenuOp::ReverseSync => "Reverse sync (push untracked files to main)",
+            MenuOp::Sync => "Sync with main (interactive — push, pull, merge, or delete per file)",
             MenuOp::Pack => "Pack configured files into a tar.bz2 archive",
         };
         f.write_str(label)
@@ -91,13 +90,13 @@ pub enum Location {
 ///
 /// | Location  | Branch            | Ops                                    |
 /// |-----------|-------------------|----------------------------------------|
-/// | Worktree  | (any)             | `[ForwardSync, ReverseSync, Pack]`     |
+/// | Worktree  | (any)             | `[Sync, Pack]`                         |
 /// | Main      | `Branch::Migrate` | `[Migrate]`                            |
 /// | Main      | `Branch::Init`    | `[Init]`                               |
 /// | Main      | `Branch::Normal`  | `[EditConfig, Pack]`                   |
 pub fn operations_for(location: Location, branch: Branch) -> Vec<MenuOp> {
     match location {
-        Location::Worktree => vec![MenuOp::ForwardSync, MenuOp::ReverseSync, MenuOp::Pack],
+        Location::Worktree => vec![MenuOp::Sync, MenuOp::Pack],
         Location::Main => match branch {
             Branch::Migrate => vec![MenuOp::Migrate],
             Branch::Init => vec![MenuOp::Init],
@@ -146,10 +145,9 @@ pub fn run(cwd: &Path) -> Result<ExitCode> {
 
         let ops = operations_for(Location::Worktree, Branch::Init); // branch unused for worktree
         dispatch_menu(ops, |op| match op {
-            MenuOp::ForwardSync => forward_sync_in_worktree(cwd),
-            MenuOp::ReverseSync => reverse_sync::run(&cwd_root, &main_root),
+            MenuOp::Sync => reverse_sync::run(&cwd_root, &main_root),
             MenuOp::Pack => crate::run_pack_flow(cwd),
-            _ => unreachable!("worktree only offers ForwardSync/ReverseSync/Pack"),
+            _ => unreachable!("worktree only offers Sync/Pack"),
         })
     } else {
         // Main checkout path: read config.json to detect the branch.
@@ -201,20 +199,6 @@ where
 }
 
 // ── Operation handlers ────────────────────────────────────────────────────────
-
-/// Forward sync from inside a worktree: resolves the main checkout root and
-/// runs `sync_core` (the U4 path, shared with `ss-magic sync`).
-fn forward_sync_in_worktree(cwd: &Path) -> Result<ExitCode> {
-    // Re-use the public sync_core via the module path. `sync_core` lives in
-    // `main.rs` and is not re-exported; call the top-level `sync_flow` instead,
-    // which wraps it with `print_event` — exactly what the non-interactive
-    // `sync` subcommand does.
-    //
-    // Because `menu.rs` cannot call `crate::sync_core` directly (it is a
-    // private fn in `main.rs`), we delegate to `crate::sync_flow_for_cwd`,
-    // which is a thin re-export added in main.rs for this purpose.
-    crate::run_sync_flow(cwd)
-}
 
 /// Edit-config flow for `Branch::Normal` (already migrated).
 ///
