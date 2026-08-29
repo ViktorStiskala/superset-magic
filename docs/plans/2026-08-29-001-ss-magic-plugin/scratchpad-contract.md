@@ -4,22 +4,16 @@ Companion to [the plan](../2026-08-29-001-feat-ss-magic-claude-plugin-plan.md).
 
 ## Identity — deterministic, from git only
 
-**The slug is `<repo>-<branch>`, derived entirely from git. It is never derived from the Superset
-workspace name.** This overturns a direction confirmed earlier in the session, on measurement.
+**The slug is `<repo>-<branch>`, derived entirely from git. It is never derived from the Superset workspace name.** This overturns a direction confirmed earlier in the session, on measurement.
 
 Why the workspace name fails:
 
 - `superset ws update --name <string>` exists — renaming is a one-command, zero-friction operation.
-- The schema carries `is_unnamed integer DEFAULT false`, which only makes sense if `name` starts as
-  a placeholder and is later changed.
-- **31 of 36** live workspaces have `name != branch`; **five** are named `main`; names contain
-  spaces, `+` and mixed case.
-- `worktreePath` tracks the **branch**, never the name — workspace `"Invoices"` lives at
-  `…/worktrees/<projectId>/computer-control-invoices`.
+- The schema carries `is_unnamed integer DEFAULT false`, which only makes sense if `name` starts as a placeholder and is later changed.
+- **31 of 36** live workspaces have `name != branch`; **five** are named `main`; names contain spaces, `+` and mixed case.
+- `worktreePath` tracks the **branch**, never the name — workspace `"Invoices"` lives at `…/worktrees/<projectId>/computer-control-invoices`.
 
-A name-derived directory silently orphans the whole scratchpad on a rename, with no error and no
-migration signal. Pairing the name with the immutable `createdAt` does not rescue it — the *mutable*
-half is the name half, and it additionally breaks on workspace re-create.
+A name-derived directory silently orphans the whole scratchpad on a rename, with no error and no migration signal. Pairing the name with the immutable `createdAt` does not rescue it — the *mutable* half is the name half, and it additionally breaks on workspace re-create.
 
 ### The derivation
 
@@ -34,41 +28,20 @@ dir      = <worktree-root>/.scratchpad/.ss-magic-plugin/sessions/<repo>-<branch>
 
 Four traps, each measured:
 
-- **Do not use `basename(git rev-parse --git-common-dir)`.** It is cwd-relative and returns `.git`
-  or `../.git` in any ordinary checkout — absolute only inside a linked worktree — so outside
-  Superset every repo would slug to `.git-<branch>`.
-- **Do not use `git rev-parse --abbrev-ref HEAD`.** It returns the literal string `HEAD` under
-  detached HEAD. `symbolic-ref` exits 1 instead, which is a usable signal: fall back to
-  `detached-<short-sha>`. Outside a repo (exit 128) the plugin does nothing at all.
-- **Do not append a path hash.** In the `worktrees/<projectId>/<branch>` layout it is merely a
-  function of (project, branch), adds no independent identity, and breaks on directory rename. It
-  is unnecessary anyway — the scratchpad lives *inside* the worktree and a worktree has exactly one
-  branch, so the slug only has to be unique within one directory.
-- **Sanitizing `/` is load-bearing.** A cross-repo PR workspace produces
-  `localBranchName = <forkOwner>/<headRefName>`.
+- **Do not use `basename(git rev-parse --git-common-dir)`.** It is cwd-relative and returns `.git` or `../.git` in any ordinary checkout — absolute only inside a linked worktree — so outside Superset every repo would slug to `.git-<branch>`.
+- **Do not use `git rev-parse --abbrev-ref HEAD`.** It returns the literal string `HEAD` under detached HEAD. `symbolic-ref` exits 1 instead, which is a usable signal: fall back to `detached-<short-sha>`. Outside a repo (exit 128) the plugin does nothing at all.
+- **Do not append a path hash.** In the `worktrees/<projectId>/<branch>` layout it is merely a function of (project, branch), adds no independent identity, and breaks on directory rename. It is unnecessary anyway — the scratchpad lives *inside* the worktree and a worktree has exactly one branch, so the slug only has to be unique within one directory.
+- **Sanitizing `/` is load-bearing.** A cross-repo PR workspace produces `localBranchName = <forkOwner>/<headRefName>`.
 
-**Implement slugify in Rust, not shell.** The spike's shell version used
-`sed -e 's/[^a-z0-9]\+/-/g'`, which **silently no-ops on BSD `sed`** (macOS default): `"Magic
-plugin"` kept its space and produced an invalid directory name, with no error. Two further cases
-the Rust implementation must handle, both found by running it: a name of `"---"` slugs to the
-**empty string**, and `"Ünïcödé Nàme"` mangles to `n-c-d-n-me`. Guard the empty result by falling
-through to the next identity source; NFD-decompose-and-strip for the accents.
+**Implement slugify in Rust, not shell.** The spike's shell version used `sed -e 's/[^a-z0-9]\+/-/g'`, which **silently no-ops on BSD `sed`** (macOS default): `"Magic plugin"` kept its space and produced an invalid directory name, with no error. Two further cases the Rust implementation must handle, both found by running it: a name of `"---"` slugs to the **empty string**, and `"Ünïcödé Nàme"` mangles to `n-c-d-n-me`. Guard the empty result by falling through to the next identity source; NFD-decompose-and-strip for the accents.
 
-**Superset is read for display only, never for identity.** `superset ws get` costs 0.73–0.98 s warm
-and 1.19 s cold versus **5–8 ms** for the whole git probe, which alone disqualifies it from any hook
-path. If a human-readable name is wanted for a printed line, read `~/.superset/host/<orgId>/host.db`
-(~4 ms) as a best-effort fast path — it is an undocumented internal schema, so any failure means
-"no name".
+**Superset is read for display only, never for identity.** `superset ws get` costs 0.73–0.98 s warm and 1.19 s cold versus **5–8 ms** for the whole git probe, which alone disqualifies it from any hook path. If a human-readable name is wanted for a printed line, read `~/.superset/host/<orgId>/host.db` (~4 ms) as a best-effort fast path — it is an undocumented internal schema, so any failure means "no name".
 
-Because identity never touches Superset, **there is one code path inside and outside a Superset
-workspace** — nothing to test for and nothing to fall back from.
+Because identity never touches Superset, **there is one code path inside and outside a Superset workspace** — nothing to test for and nothing to fall back from.
 
 ### Which directory the hook resolves against
 
-Read the **`cwd` field from the hook's stdin JSON**. Not `${CLAUDE_PROJECT_DIR}` — documented and
-directly load-bearing: *"`${CLAUDE_PROJECT_DIR}` stays put … `cwd` follows Claude"* when Claude
-enters a worktree. Not the process cwd either. Feed that `cwd` into `git::is_worktree` /
-`git::main_checkout_root`, not `resolve_sync_roots`' implicit cwd.
+Read the **`cwd` field from the hook's stdin JSON**. Not `${CLAUDE_PROJECT_DIR}` — documented and directly load-bearing: *"`${CLAUDE_PROJECT_DIR}` stays put … `cwd` follows Claude"* when Claude enters a worktree. Not the process cwd either. Feed that `cwd` into `git::is_worktree` / `git::main_checkout_root`, not `resolve_sync_roots`' implicit cwd.
 
 ## Layout
 
@@ -99,25 +72,15 @@ enters a worktree. Not the process cwd either. Feed that `cwd` into `git::is_wor
   "resolved_at": "2026-08-29T07:00:00Z" }
 ```
 
-ss-magic creates no symlink anywhere today — forward sync explicitly *skips* them
-(`sync/apply.rs:315`) and pack only classifies them no-follow. Introducing one would mean teaching
-three code paths a primitive they currently drop, or accepting that the registry vanishes from
-every sync and every archive. A regular file is copied, packed and diffed correctly by all of them.
+ss-magic creates no symlink anywhere today — forward sync explicitly *skips* them (`sync/apply.rs:315`) and pack only classifies them no-follow. Introducing one would mean teaching three code paths a primitive they currently drop, or accepting that the registry vanishes from every sync and every archive. A regular file is copied, packed and diffed correctly by all of them.
 
 ## The state files, and why these ones
 
-Grounded in a real, in-use scratchpad tree rather than invented. Observed there: **STATUS.md at 594
-lines / 88.7 KB**, refreshed every 20–40 minutes by a `/loop` cron; LEARNINGS and LINEAR strictly
-append-only with `## <timestamp> - <label>` blocks that are never edited; CONTEXT.md headed
-*"Context that would be expensive to rediscover"* and grouped by topic rather than time.
+Grounded in a real, in-use scratchpad tree rather than invented. Observed there: **STATUS.md at 594 lines / 88.7 KB**, refreshed every 20–40 minutes by a `/loop` cron; LEARNINGS and LINEAR strictly append-only with `## <timestamp> - <label>` blocks that are never edited; CONTEXT.md headed *"Context that would be expensive to rediscover"* and grouped by topic rather than time.
 
-**The file set is a floor, not a schema.** In the observed tree one sibling session had
-`DECISIONS.md` but no `LINEAR.md`; another had only `REPORT.md` and `findings/`. `ss-magic plugin
-session-start` scaffolds the five files if absent and **never rewrites an existing one** — the model
-owns their content.
+**The file set is a floor, not a schema.** In the observed tree one sibling session had `DECISIONS.md` but no `LINEAR.md`; another had only `REPORT.md` and `findings/`. `ss-magic plugin session-start` scaffolds the five files if absent and **never rewrites an existing one** — the model owns their content.
 
-STATUS.md follows the demote-never-delete pattern verbatim, because it is what made the observed
-tree survivable across compactions:
+STATUS.md follows the demote-never-delete pattern verbatim, because it is what made the observed tree survivable across compactions:
 
 ```markdown
 ## CURRENT STATE - <timestamp> (read this block first; everything below is history)
@@ -133,16 +96,8 @@ tree survivable across compactions:
 !README.md
 ```
 
-**This file is exactly what triggers the pre-existing rule-lifting bug.** With a broad reverse-sync
-pattern, `ensure_path_ignored` lifts the pattern text `*` out of this nested file and re-anchors it
-at the **main checkout's root** `.gitignore`, blinding git to the entire shared checkout —
-reproducible in three commands, covered by no test.
+**This file is exactly what triggers the pre-existing rule-lifting bug.** With a broad reverse-sync pattern, `ensure_path_ignored` lifts the pattern text `*` out of this nested file and re-anchors it at the **main checkout's root** `.gitignore`, blinding git to the entire shared checkout — reproducible in three commands, covered by no test.
 
-→ **The gitignore fix and the enumeration-layer exclusion are hard prerequisites**, sequenced before
-the plugin writes its first byte into `.scratchpad/`. See
-[architecture.md](./architecture.md#two-prerequisite-fixes-outside-srcplugin).
+→ **The gitignore fix and the enumeration-layer exclusion are hard prerequisites**, sequenced before the plugin writes its first byte into `.scratchpad/`. See [architecture.md](./architecture.md#two-prerequisite-fixes-outside-srcplugin).
 
-Gitignoring the tree is **not** sufficient protection on its own: ss-magic's untracked probe is
-`git ls-files --others` *without* `--exclude-standard` (deliberately — reverse sync must push
-gitignored secrets), and `walk_source` has no gitignore filter at all. `.scratchpad/` must be
-excluded at the **enumeration layer**, the way `.superset/backups/` already is.
+Gitignoring the tree is **not** sufficient protection on its own: ss-magic's untracked probe is `git ls-files --others` *without* `--exclude-standard` (deliberately — reverse sync must push gitignored secrets), and `walk_source` has no gitignore filter at all. `.scratchpad/` must be excluded at the **enumeration layer**, the way `.superset/backups/` already is.

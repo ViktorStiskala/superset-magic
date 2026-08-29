@@ -2,19 +2,13 @@
 
 Companion to [the plan](../2026-08-29-001-feat-ss-magic-claude-plugin-plan.md).
 
-Three skills ship inside the plugin. Because the manifest `name` is `ss-magic`, they are invoked
-`/ss-magic:scratchpad`, `/ss-magic:operator-checklist` and `/ss-magic:setup` — which is why the
-directories are **not** prefixed (`skills/scratchpad/`, not `skills/ss-scratchpad/`).
+Three skills ship inside the plugin. Because the manifest `name` is `ss-magic`, they are invoked `/ss-magic:scratchpad`, `/ss-magic:operator-checklist` and `/ss-magic:setup` — which is why the directories are **not** prefixed (`skills/scratchpad/`, not `skills/ss-scratchpad/`).
 
-A skill is Markdown with YAML frontmatter; `SKILL.md` is always scanned inside a plugin's `skills/`
-directory. Editing one does **not** hot-reload — the whole plugin is snapshotted at session start
-(measured), so a changed skill needs `/reload-plugins` or a restart.
+A skill is Markdown with YAML frontmatter; `SKILL.md` is always scanned inside a plugin's `skills/` directory. Editing one does **not** hot-reload — the whole plugin is snapshotted at session start (measured), so a changed skill needs `/reload-plugins` or a restart.
 
 ## `skills/scratchpad/SKILL.md`
 
-The one the user invokes right after `/ce-brainstorm`, `/ce-plan`, `/ce-ideate`, `/ce-work` and
-similar. Its job is small and mechanical: resolve identity, scaffold state, then hand back a
-discipline for keeping it current.
+The one the user invokes right after `/ce-brainstorm`, `/ce-plan`, `/ce-ideate`, `/ce-work` and similar. Its job is small and mechanical: resolve identity, scaffold state, then hand back a discipline for keeping it current.
 
 ```markdown
 ---
@@ -63,8 +57,7 @@ write-up. The scratchpad is working state, and it is never committed.
 
 ## `skills/operator-checklist/SKILL.md`
 
-Initialised by the `SessionStart` hook's `additionalContext`, which is why the skill itself stays
-thin — it describes the discipline, and the hook supplies the live pointer.
+Initialised by the `SessionStart` hook's `additionalContext`, which is why the skill itself stays thin — it describes the discipline, and the hook supplies the live pointer.
 
 ```markdown
 ---
@@ -86,9 +79,7 @@ Keep it honest: an item is only checked when it has actually been done and verif
 that turned out to be unnecessary is struck with a reason rather than deleted.
 ```
 
-`reference.md` carries the item shape and section conventions. It is deliberately **generic** — the
-koolman original's four fixed sections (`pre-deploy`, `post-deploy`, `verification`, `visual`) and
-its GSC/release-approval domain do not transfer to a CLI tool and are dropped.
+`reference.md` carries the item shape and section conventions. It is deliberately **generic** — the koolman original's four fixed sections (`pre-deploy`, `post-deploy`, `verification`, `visual`) and its GSC/release-approval domain do not transfer to a CLI tool and are dropped.
 
 ## `skills/setup/SKILL.md`
 
@@ -128,8 +119,4 @@ worktree's overlay is clobbered by the next `ss-magic sync`, because that file i
 
 ## What does not ship
 
-The koolman original's `ss-operator-checklist` carried an entire e-commerce release domain — four
-fixed checklist sections, Google Search Console verification, release-approval instructions, a CI
-job rendering the checklist into a PR comment, and a `CHECKLIST.md` migration. None of it transfers:
-ss-magic has no per-branch operator artifact reviewed on a PR, and no predecessor file to migrate.
-What ports is the *shape* — a per-worktree checklist the session hook keeps pointing at.
+The koolman original's `ss-operator-checklist` carried an entire e-commerce release domain — four fixed checklist sections, Google Search Console verification, release-approval instructions, a CI job rendering the checklist into a PR comment, and a `CHECKLIST.md` migration. None of it transfers: ss-magic has no per-branch operator artifact reviewed on a PR, and no predecessor file to migrate. What ports is the *shape* — a per-worktree checklist the session hook keeps pointing at.
