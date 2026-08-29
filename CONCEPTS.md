@@ -94,3 +94,42 @@ and git.
 A candidate present in main but absent from the worktree. Pulling it creates
 the file locally; deleting it removes main's copy; push is unavailable,
 since there is no worktree copy to push.
+
+## Claude Code plugin
+
+### Session scratchpad
+The per-worktree directory of durable working state – `STATUS.md`, `TASKS.md`,
+`DECISIONS.md`, `LEARNINGS.md`, `CONTEXT.md` and research artifacts – that
+survives a context compaction because it lives on disk rather than in the
+window. Its name is derived deterministically from the git repository and
+branch, so the same worktree always resolves to the same directory. Working
+state only: it is gitignored, never committed, and anything durable is promoted
+into the repo.
+
+### Read gate
+The `PreToolUse` hook that denies a `Read` of a file over the size threshold
+rather than letting its whole content enter the context window. `Read` is the
+one tool the harness never spills to disk, so an unguarded large read is
+re-read on every later request. The gate is advisory, not a security boundary:
+a timeout, a malformed hook envelope, or a missing binary all leave the read
+to proceed.
+
+### Conclusion cache
+The store of Explore-agent answers about oversized files, keyed by a file's
+identity rather than by the read's offset or limit. A first denied read routes
+the work to an agent that reads the file in its own context and writes back a
+conclusion; a later read of the same file is denied again, but that denial
+carries the conclusion inline. This is what keeps the gate from blocking the
+model permanently.
+
+### Cost ledger
+The append-only record of what each ended session cost, written once per
+session id from that session's own transcript tree. It reads the harness's own
+priced records where they exist and falls back to a versioned price table.
+A relative signal for comparing branches, never an authoritative bill.
+
+### Spill file
+A tool result the harness itself judged too large, written whole to disk and
+replaced in the model's context by a short envelope naming its path. Spill
+files outlive the session but carry unguessable names and no index, so
+`ss-magic plugin spill-index` lists the ones belonging to the current worktree.
