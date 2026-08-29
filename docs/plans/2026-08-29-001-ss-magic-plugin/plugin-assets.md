@@ -31,13 +31,25 @@ Only `name` is required — confirmed against the real minimal manifest shipped 
   "description": "Session scratchpad, context page-fault gate, and cost ledger for the Superset workspace contract",
   "repository": "https://github.com/ViktorStiskala/superset-magic",
   "license": "MIT",
-  "author": "Viktor Stiskala"
+  "author": { "name": "Viktor Stiskala" }
 }
 ```
 
 `version` tracks the crate version so `ss-magic plugin status` can report drift between the installed manifest and the running binary. It carries **no** install semantics of its own: *"Changing `version` in plugin.json doesn't flip existing user installations."*
 
 CI gates on `claude plugin validate ./plugin --strict`.
+
+`author` is an **object**, not a string — every plugin installed on this machine uses the object
+form (`compound-engineering`, `cloudflare`, and the rest all carry `{"name": …}`), and the
+structure reference documents `name`/`email`/`url` fields inside it.
+
+**No `${CLAUDE_PLUGIN_ROOT}` appears in the shipped assets, deliberately.** That variable exists so
+a plugin can reference files it ships; this plugin ships no scripts at all, and its hook command is
+the `ss-magic` binary resolved by bare name on PATH (KTD1, measured working with a real Mach-O
+binary). There is no intra-plugin path to make portable, so the rule has no case to apply to here —
+a future editor should not "fix" the bare command into a `${CLAUDE_PLUGIN_ROOT}` path, which would
+break the binary's independent self-update. The variable still arrives in the hook's environment and
+is read with `std::env::var` where the plugin root is genuinely needed.
 
 ## `hooks/hooks.json`
 
