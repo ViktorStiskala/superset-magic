@@ -57,7 +57,7 @@ Read is the largest un-spilled context sink in the harness. This independently r
 
 ### 2. A manifest
 
-Spill filenames are unguessable short ids — **1,277 of 1,303** on this machine — scattered across **92** per-session directories with no index, totalling **188 MB**. Once the envelope scrolls out of context or compaction clears the tool result (`[Old tool result content cleared]`), the path is gone and the corpus is unnavigable. This is the real gap the brief identified correctly.
+Spill filenames are unguessable short ids — **1,277 of 1,303** on this machine — scattered across **92** per-session directories with no index, totalling **188 MB**. Each session's directory resolves to `~/.claude/projects/<encoded-cwd>/<session-uuid>/tool-results/`; the `<session-uuid>` leaf is unguessable, so `spill-index` (R25) cannot reconstruct it and instead reads it back from the tool-result envelope that named it. Once the envelope scrolls out of context or compaction clears the tool result (`[Old tool result content cleared]`), the path is gone and the corpus is unnavigable. This is the real gap the brief identified correctly.
 
 ### 3. Head **+** tail
 
@@ -65,13 +65,23 @@ Foreground spills preview the **first** 2 KB; backgrounded task output previews 
 
 ## The mechanism, as ruled
 
-`PreToolUse` matcher `Read|Grep|Glob`, with a hash-keyed conclusion cache under `.scratchpad/.ss-magic-plugin/conclusions/`. **Both branches deny**; the difference is what the deny reason carries.
+`PreToolUse` matcher `Read|Grep|Glob`, with a hash-keyed conclusion cache under `.scratchpad/.ss-magic-plugin/conclusions/`. Two checks allow untouched before KTD4's own order even starts – a scratchpad path and a subagent-issued read, both reasoned about below – then KTD4 takes over: the non-text exemption (R43), one stat, the threshold, the bounded-window pass-through (R41), the one-shot bypass (R42), and only then the cache. **Both remaining branches deny**; the difference is what the deny reason carries.
 
 ```mermaid
 flowchart TD
-  R["Read(file_path)"] --> S{"size &gt; threshold?"}
-  S -- no --> A["allow untouched<br/>(emit nothing, exit 0)"]
-  S -- yes --> K["key = hash(realpath, size, mtime)"]
+  R["Read(file_path, offset?, limit?)"] --> SP{"path inside<br/>.scratchpad/?"}
+  SP -- yes --> OK["allow untouched<br/>(emit nothing, exit 0)"]
+  SP -- no --> AG{"issued inside a subagent?<br/>(agent_id/agent_type –<br/>unconfirmed on PreToolUse)"}
+  AG -- yes --> OK
+  AG -- no --> X{"extension on the<br/>non-text list? (R43)"}
+  X -- yes --> OK
+  X -- no --> ST["one stat of file_path"] --> S{"size &gt; threshold?"}
+  S -- no --> OK
+  S -- yes --> W{"offset + limit bound the<br/>window under threshold? (R41)"}
+  W -- yes --> OK
+  W -- no --> B{"one-shot bypass token<br/>pending for this file? (R42)"}
+  B -- yes --> CONSUME["consume token"] --> OK
+  B -- no --> K["key = hash(realpath, size, mtime)"]
   K --> H{"conclusions/&lt;key&gt;.md<br/>exists and non-empty?"}
   H -- "MISS" --> D["deny — reason names the cache path<br/>and says: route to an Explore agent"]
   D --> E["Explore agent reads the file in ITS window,<br/>writes a CONCLUSION (not the payload)"]
@@ -80,6 +90,14 @@ flowchart TD
 ```
 
 The HIT path is the **never-blocked-forever guarantee**: the same input is never denied *empty* twice. The second attempt returns the answer, in the deny reason itself.
+
+### Why `.scratchpad/` is exempt, unconditionally
+
+The gate must never deny a read whose path is inside `.scratchpad/`. The observed real `STATUS.md` is 594 lines / 88.7 KB (see [scratchpad-contract.md](./scratchpad-contract.md)), and the shipped scratchpad skill tells the model to read `STATUS.md` first on resume (see [skills.md](./skills.md)). A session that just survived compaction relies on exactly that read to re-orient; gating it on size would deny the read the scratchpad exists to serve, defeating the feature's own headline outcome – a session resumed after compaction re-orienting from the scratchpad alone. The check is a path prefix test, not a size check, so it costs nothing on the exempt path and never touches the cache key.
+
+### Why a subagent's own read must skip the gate
+
+The MISS branch's routing sends the oversized read to an Explore agent, which then reads the same file to write the conclusion. If that read is itself subject to the gate, it is denied too, and the deny reason routes it to dispatch another Explore agent – the dispatching agent is both required to read the file and blocked from doing so, forever. The gate must no-op for a `Read` issued inside a subagent. The identification signal is the envelope's `agent_id`/`agent_type` fields, confirmed present on `SubagentStop` (see [hook-contract.md](./hook-contract.md)); their presence on `PreToolUse` specifically was **not measured** in this spike, so implementation must confirm both fields arrive on a subagent-issued `PreToolUse` envelope before relying on them as the gate's identification signal.
 
 ### Why deny-with-inline-conclusion, and not an `updatedInput` redirect
 

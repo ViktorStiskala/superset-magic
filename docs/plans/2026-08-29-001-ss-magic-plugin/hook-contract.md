@@ -25,9 +25,9 @@ Consequences the plan is built on:
 
 | event | matcher | purpose | channel | why it can work |
 |---|---|---|---|---|
-| `PreToolUse` | `Read` | the page-fault gate | `deny` + reason, or `updatedInput` | deny verified to block on 2.1.251 |
-| `SessionStart` | `startup`,`resume`,`clear`,`compact` | operating guidance + checklist init | `additionalContext` (<10k) | one of only 3 model-visible-stdout events |
-| `PreCompact` | `manual`,`auto` | force durable state before context is lost | `additionalContext`; `decision:"block"` to refuse | exit 2 blocks compaction |
+| `PreToolUse` | `Read` | the page-fault gate | `deny` + reason | deny verified to block on 2.1.251 |
+| `SessionStart` | `startup`,`resume`,`clear`,`compact`,`fork` | operating guidance + checklist init | `additionalContext` (<10k) | one of only 3 model-visible-stdout events |
+| `PreCompact` | `manual`,`auto` | advise durable state before context is lost | `additionalContext` only, never a veto | a `manual` `/compact` fires when the user is already at the context wall, and refusing it costs a round trip at the worst moment — and a buggy `PreCompact` can wedge a session |
 | `SubagentStop` | — | artifact enforcement + salvage | top-level `{"decision":"block","reason":…}` | carries `last_assistant_message` + `agent_transcript_path` |
 | `SessionEnd` | — | append to the cost ledger | none (side effect only) | `transcript_path` present; transcript **is** complete |
 
@@ -35,11 +35,15 @@ Consequences the plan is built on:
 
 ## Per-event notes that change the implementation
 
-### `SessionStart` — four sources, and one is the compaction-survival hook
+### `SessionStart` — five sources, and one is the compaction-survival hook
 
-Captured sources: `startup`, `resume`, `clear`, and **`compact`** — which fires *after every compaction*. That last one is how scratchpad state is re-injected once the window has been cleared, and it is a better instrument than `PreCompact` alone. `resume` additionally carries `context_tokens` and `estimated_cache_write_usd`, the only place cost-shaped fields appear in a hook payload.
+Captured sources: `startup`, `resume`, `clear`, **`compact`**, and `fork` — `compact` fires *after every compaction*. That last one is how scratchpad state is re-injected once the window has been cleared, and it is a better instrument than `PreCompact` alone. `resume` additionally carries `context_tokens` and `estimated_cache_write_usd`, the only place cost-shaped fields appear in a hook payload; `fork` carries the same cost-shaped fields.
 
 `CLAUDE_ENV_FILE` is the documented env-persistence channel and Claude Code runs it as a script preamble before each Bash command.
+
+### `PreCompact` — observe-and-advise only, never a veto
+
+`PreCompact` never blocks, on either the `manual` or the `auto` trigger. A `manual` `/compact` fires when the user is already at the context wall, and refusing it costs a round trip at the worst possible moment; the evidence record separately shows that a buggy `PreCompact` hook can wedge a session. The hook only emits `additionalContext` nudging a scratchpad reconcile.
 
 ### `SessionEnd` — viable for the ledger, with a caveat about latency
 
@@ -93,7 +97,7 @@ Also: hooks matching via `if` conditions **spawn once per matching `&&` subcomma
 - **Exit 1 is silently ignored** — it never blocks. Only exit 2 blocks.
 - **Prefer JSON `deny` over exit 2.** Exit 2 works, but it wraps the message and **leaks the hook's configured command line** into the model's context: `PreToolUse:Bash hook error: [$CLAUDE_PROJECT_DIR/../../bin/hook.py A exit2]: <reason>`.
 
-→ The Read gate is a **context-economy measure, never a security boundary.** The plan states this explicitly, and ships `ss-magic plugin doctor` so a broken gate is detectable rather than silent.
+→ The Read gate is a **context-economy measure, never a security boundary.** The plan states this explicitly, and ships `ss-magic plugin status` so a broken gate is detectable rather than silent.
 
 ## Deliberately not shipped in v1
 

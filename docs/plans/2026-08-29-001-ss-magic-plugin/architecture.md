@@ -25,7 +25,9 @@ src/plugin/
 ├── scratchpad.rs          .scratchpad bootstrap, current.json pointer, state-file scaffolding
 ├── cache.rs               hash-keyed conclusion cache under .scratchpad/.ss-magic-plugin/
 ├── ledger.rs              cost attribution over transcript JSONL
+├── heartbeat.rs           hooks.jsonl append/read: one row per hook invocation, event + timestamp + cwd + outcome + error class (KTD6)
 ├── spill_index.rs         read-only manifest over the harness's tool-results/ spill files
+├── status.rs              status / status --json: resolved slug, state dirs, thresholds, install state, last-fired-at per event (R36)
 └── hook/
     ├── mod.rs             stdin decode -> route -> stdout encode; the fail-open policy
     ├── event.rs           typed payloads + responses (serde), one place for the wire format
@@ -33,7 +35,7 @@ src/plugin/
     ├── session_start.rs   additionalContext: operating guidance + checklist init
     ├── pre_compact.rs     block compaction until scratchpad state is durable
     ├── subagent_stop.rs   artifact enforcement (block once) + salvage
-    └── session_end.rs     detached ledger trigger (1.5 s budget — must not compute inline)
+    └── session_end.rs     inline ledger scan: reads that session's transcript tree and appends one idempotent row before returning (R27/KTD7; measured worst case 0.87 s against a 354.7 MiB tree)
 ```
 
 Tests follow the existing convention exactly: `#[cfg(test)] mod tests;` in each module with the body in a sibling `<module>/tests.rs`, so private items stay reachable.
@@ -90,6 +92,8 @@ graph TD
     SCR["scratchpad.rs"]
     CACHE["cache.rs"]
     LEDG["ledger.rs"]
+    HB["heartbeat.rs"]
+    STATUS["status.rs"]
     HOOK["hook/*"]
   end
   subgraph shared["Shared helpers (reused, not forked)"]
@@ -99,11 +103,12 @@ graph TD
     SF["workspace/superset_files.rs"]
   end
   CLI --> MAIN --> MOD
-  MOD --> CFG & INST & SCR & LEDG & HOOK
+  MOD --> CFG & INST & SCR & LEDG & HB & STATUS & HOOK
   INST --> ASSET & MAT
   SCR --> ID & GI
   CACHE --> HASH
-  HOOK --> CACHE & SCR & CFG
+  HOOK --> CACHE & SCR & CFG & HB
+  STATUS --> ID & INST & HB
   SF --> MAT
   LEDG --> HASH
 ```
@@ -113,6 +118,7 @@ Rules that fall out of the graph:
 - **`hook/` never touches `install.rs`.** A hook runs on the model's clock; installing is a `sync`-time concern. Mixing them would put a tree-write in a latency-critical path.
 - **`identity.rs` touches git and nothing else.** Superset is never consulted for identity — the workspace name is user-mutable (`superset ws update --name` exists; 31 of 36 live workspaces have `name != branch`, five are named `main`), so a name-derived directory silently orphans the whole scratchpad on a rename. `superset ws get` is also 0.73-1.19 s versus 5-8 ms for the whole git probe, which alone disqualifies it from a hook path. Superset may be read for a *display* name only, best-effort. The module is pure enough to unit-test the slug rules, which is where the real bugs are — an empty slug and a mangled non-ASCII name were both found by running it.
 - **`cache.rs` knows nothing about hooks.** It is a keyed store; `pre_tool_use.rs` is its only caller today, and `ledger.rs` may reuse the hashing.
+- **`heartbeat.rs` has exactly one writer: `hook/mod.rs`.** KTD1 puts the append in the centralized fail-open wrapper, not in each per-event module, so every hook verb gets a row because the wrapper that dispatches all five events owns the append — not because five call sites each remembered to make it. `status.rs` is heartbeat's other caller, reading the same log to report last-fired-at per event (R50).
 - **No symlink is created anywhere.** `scratchpad.rs` writes a plain `current.json` pointer file instead. ss-magic creates no symlink today — forward sync explicitly *skips* them (`sync/apply.rs:315`) and pack only classifies them no-follow — so introducing one would mean teaching three code paths a primitive they currently drop, or accepting that the registry vanishes from every sync and every archive.
 - **`assets.rs` is generated-shaped, hand-maintained.** One `include_str!` per shipped file plus a manifest table, mirroring the existing `MAGIC_SH` precedent. No `include_dir!` crate is a dependency and none is added.
 

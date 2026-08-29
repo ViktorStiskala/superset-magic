@@ -21,10 +21,16 @@ description: >
 
 # Session scratchpad
 
-Run `ss-magic plugin session-start --ensure` first. It resolves this worktree's deterministic
+Run `ss-magic plugin scratchpad ensure` first. It resolves this worktree's deterministic
 slug, creates `.scratchpad/.ss-magic-plugin/sessions/<repo>-<branch>/`, scaffolds any missing state
 file, and prints the resolved directory. It never rewrites a file that already exists — the content
 is yours.
+
+A dispatched agent that receives no injected context — an Explore subagent, for instance — can run
+`ss-magic plugin status --json` instead, to recover the resolved slug, session directory, and gate
+thresholds directly. When such an agent's findings are what a blocked `Read` should hand back, write
+them with `ss-magic plugin conclude <original-path>` so the Read gate serves that conclusion in
+place of the oversized file.
 
 If the directory already has content, **read `STATUS.md` first** and continue from it rather than
 starting over.
@@ -70,8 +76,7 @@ description: >
 
 # Operator checklist
 
-The checklist lives in this worktree's scratchpad as `OPERATOR-CHECKLIST.md`. `ss-magic plugin
-session-start` creates it empty on first run and the SessionStart hook points at it each session.
+The checklist lives in this worktree's scratchpad as `OPERATOR-CHECKLIST.md`. `ss-magic plugin scratchpad ensure` creates it empty on first run and the SessionStart hook points at it each session.
 
 See [reference.md](./reference.md) for the item shape and the section conventions.
 
@@ -115,6 +120,10 @@ To enable, add to `.superset/magic.json`:
 To opt out on one machine, set `{"plugin": {"enabled": false}}` in the **main checkout's**
 `.superset/magic.local.json` — non-`files` keys are local-wins, whole-value. Setting it in a
 worktree's overlay is clobbered by the next `ss-magic sync`, because that file is itself forward-synced.
+`ss-magic plugin disable --local` does the same edit from the command line.
+
+`disable` only flips that toggle — the installed tree at `~/.claude/skills/ss-magic/` stays in
+place, so re-enabling costs nothing. `ss-magic plugin uninstall` is what actually removes it.
 ```
 
 ## What does not ship

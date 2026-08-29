@@ -83,16 +83,16 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - R9. `ss-magic plugin` never runs the auto-update gate and never opens the TUI; a hook verb prints nothing to stdout beyond its JSON envelope and exits 0 on any internal error, while a human verb reports failure on stderr and exits non-zero.
 - R35. Hook and human entry points are separate commands – `plugin hook <event>` for stdin-driven hooks, named verbs for humans – and no command serves both roles; print and exit posture per R9.
 - R36. A `status --json` verb reports the resolved slug, state directories, thresholds, and install state, so any agent can discover them from Bash with no injected context.
-- R37. `enable`/`disable` (with `--local` targeting the main checkout's overlay per R7) and `config get`/`config set` edit the plugin configuration from the command line, writing through the unknown-key-preserving path of R4.
+- R37. `enable`/`disable` (with `--local` targeting the main checkout's overlay per R7) and `config get`/`config set` edit the plugin configuration from the command line, writing through the unknown-key-preserving path of R4; `disable` stops the hooks from acting and leaves the installed tree in place, which only `uninstall` removes.
 
 **Packaging and install**
 
 - R10. The plugin installs to the user's `~/.claude/skills/ss-magic/`, resolved from the home directory and honouring `CLAUDE_CONFIG_DIR`.
 - R11. Install verifies itself against the harness's own plugin listing and surfaces any reported errors and notes verbatim, ignoring the listing's exit code.
 - R12. The installed tree contains only JSON and Markdown; hooks invoke `ss-magic` by bare name.
-- R13. Install is content-addressed: identical bytes write nothing, and changed bytes print one
+- R13. Install is content-addressed: identical bytes write nothing, and changed bytes print one notice naming the reload command.
 - R38. No value from `magic.json` or `magic.local.json` reaches the rendered plugin manifest bytes; configuration only gates whether the binary-owned bytes are written.
-- R39. The first install on a machine prints a loud notice that machine-global hooks are being installed and what they do; a subsequent identical install stays silent per R13. notice naming the reload command.
+- R39. The first install on a machine prints a loud notice that machine-global hooks are being installed and what they do; a subsequent identical install stays silent per R13.
 
 **Session scratchpad**
 
@@ -101,8 +101,8 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - R16. The active session is recorded in a plain JSON pointer file, not a symlink.
 - R17. `session-start` scaffolds any missing state file and never rewrites one that exists.
 - R18. The scratchpad tree is gitignored, and its contents are never committed.
-- R19. `SessionStart` injects operating guidance and the checklist pointer, staying within the
-- R40. The scratchpad ignores itself through its own nested `.gitignore`, and no hook verb ever modifies a `.gitignore` outside `.scratchpad/`. channel's 10,000-character limit.
+- R19. `SessionStart` injects operating guidance and the checklist pointer, staying within the channel's 10,000-character limit.
+- R40. The scratchpad ignores itself through its own nested `.gitignore`, and no hook verb ever modifies a `.gitignore` outside `.scratchpad/`.
 
 **The Read gate**
 
@@ -112,19 +112,22 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - R23. The inline conclusion is bounded by ss-magic's own byte budget, because the channel imposes none.
 - R24. The cache key is derived from the file's identity, not from the read's offset or limit.
 - R25. `ss-magic plugin spill-index` lists the harness's own spill files for the current worktree, read-only.
-- R26. Every hook fails open: on timeout, malformed output, or a missing binary the session
+- R26. Every hook fails open: on timeout, malformed output, or a missing binary the session proceeds unchanged, and the plan documents the gate as a context measure rather than a boundary.
 - R41. The gate allows a `Read` whose `offset` and `limit` bound the requested window under the threshold, even when the whole file exceeds it; the cache key stays as R24 defines it.
 - R42. A one-shot `bypass` verb lets exactly the next gated `Read` of the named file through, and every deny reason names the bypass invocation verbatim.
-- R43. A `Read` target that is not plain text – decided by a binary-owned extension list – is never gated.
+- R43. A `Read` target that is not plain text – decided by a binary-owned extension list – is never gated, and neither is any path inside `.scratchpad/`.
 - R44. A `conclude` verb takes the original file path, computes the cache key, stamps the mandatory conclusion header, and writes the entry atomically; a `conclusions` companion lists the cache and prints one entry.
-- R45. The conclusion cache is pruned best-effort to a bounded count and age after each write, and a `gc` verb removes orphaned entries on demand. proceeds unchanged, and the plan documents the gate as a context measure rather than a boundary.
+- R45. The conclusion cache and the heartbeat log are each pruned best-effort to a bounded count and age after each write, and a `gc` verb removes orphaned entries on demand.
+- R52. A read issued from inside a subagent is never gated, so the Explore agent the gate routes to can read the file the gate denied.
+- R53. The gate resolves its size threshold, its inline byte budget, and its exemption list from the overlaid `plugin` configuration for the envelope's `cwd`, each with a binary-owned default and stated bounds.
+- R54. A conclusion or a salvaged transcript is delivered to the model marked as ss-magic-generated text derived from a file, never as the file's own content, because a cached entry authored under one repository becomes model-visible in later sessions.
 
 **Cost ledger**
 
 - R27. `SessionEnd` appends one idempotent row per session id, scanning that session's own transcript tree, within the default hook timeout.
 - R28. Cost is read from the harness's own priced records where present, falling back to a versioned price table snapshotted at ingest.
-- R29. `ss-magic plugin cost` reports the ledger and can backfill a session whose `SessionEnd`
-- R46. The authoritative cost ledger is machine-level, in ss-magic's existing OS cache root, and `cost` reports across all recorded worktree roots by default. never ran.
+- R29. `ss-magic plugin cost` reports the ledger and can backfill a session whose `SessionEnd` never ran.
+- R46. The authoritative cost ledger is machine-level, in ss-magic's existing OS cache root, and `cost` reports across all recorded worktree roots by default.
 
 **Compaction window**
 
@@ -135,14 +138,18 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 
 - R47. A hook verb owns stdout exclusively for its JSON envelope; every diagnostic goes to stderr, and color output is forced off.
 - R48. The ledger append, the transcript-offsets store, the pointer file, and every block-once flag are written under an atomic claim, safe under concurrent duplicate invocation.
-- R49. `PreCompact` emits advisory context only on the `auto` trigger, and may block at most once on `manual`.
-- R50. Every hook verb appends one heartbeat line before exiting – including on the fail-open path, with its error class – and `status` reports last-fired-at per event.
+- R49. `PreCompact` is advisory on both triggers and never blocks a compaction.
+- R50. Every hook verb appends one heartbeat line before exiting – including on the fail-open path, with its error class – recording the gate outcome for a `pre-tool-use` row, and `status` reports last-fired-at and the outcome counts per event.
+- R55. Every hook verb resolves the overlaid `plugin` configuration for the envelope's `cwd` and no-ops – heartbeat only – when the plugin is not enabled for that repository, so an install made from one repo does not act in another.
+- R56. A hook verb writes scratchpad state only after resolving the target path and confirming it stays inside the worktree, refusing to follow a symlink out of it.
+- R57. No hook verb writes configuration or installs the plugin; `enable`, `disable`, `config set` and `install` are reached only from an explicit `ss-magic` invocation.
+- R58. The machine-level store and the scratchpad's plugin directory are created with owner-only permissions.
 
 **Subagent artifacts**
 
-- R32. `SubagentStop` blocks a stop at most once when the subagent's contracted output file is missing or empty, and the block names the file.
-- R33. When a subagent's transcript ends with no reported result, its transcript is salvaged into a
-- R51. A dispatching agent declares a subagent's contracted output file with an `expect-artifact` verb before spawning it; with no declaration in effect, `SubagentStop` never blocks. file marked as incomplete.
+- R32. `SubagentStop` blocks a stop at most once when the subagent's contracted output file is missing or empty, the block names the file, and the handler returns immediately when the harness reports the stop hook is already active.
+- R33. When a subagent's transcript ends with no reported result, its transcript is salvaged into a file marked as incomplete.
+- R51. A dispatching agent declares a subagent's contracted output file with an `expect-artifact` verb before spawning it; with no declaration in effect, `SubagentStop` never blocks.
 
 **Documentation and release**
 
@@ -174,7 +181,7 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - AE15. The user already set an auto-compact window. **Covers R31.** ss-magic leaves it alone.
 - AE16. A subagent finishes without writing its contracted output file. **Covers R32.** Its stop is blocked once with the file named; if it stops again without the file, it is allowed to end.
 - AE17. A subagent's transcript ends with no reported result. **Covers R33.** A salvage file is written and marked incomplete, and the parent reads that instead of re-running the agent.
-- AE18. A pattern would match a path inside the scratchpad during forward sync. **Covers R18.** The
+- AE18. A pattern would match a path inside the scratchpad during forward sync. **Covers R18.** The scratchpad tree is skipped at enumeration, whatever the pattern's breadth.
 - AE19. `ss-magic plugin hook pre-tool-use` is run from a terminal with no stdin envelope. **Covers R35.** It exits 0 with nothing on stdout; `ss-magic plugin scratchpad ensure` run outside a git repository exits non-zero with a stderr message.
 - AE20. A dispatched Explore agent, which receives no `SessionStart` injection, runs `ss-magic plugin status --json` from Bash. **Covers R36.** It obtains the slug, the conclusions directory, and the gate threshold without any parent-prompt context.
 - AE21. An agent inside a worktree runs `ss-magic plugin config set plugin.enabled false --local`. **Covers R37.** The main checkout's `magic.local.json` is updated, and every key the command does not understand survives.
@@ -192,7 +199,15 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - AE33. Two `session-end` invocations for the same session id run concurrently. **Covers R48.** The ledger holds one row and the offsets store is not corrupted.
 - AE34. An `auto` compaction fires while scratchpad state is stale; later the user runs `/compact` in the same situation. **Covers R49.** The auto compaction is never blocked and receives advisory context only; the manual one is blocked at most once and proceeds on retry.
 - AE35. A hook verb fails internally and exits on the fail-open path. **Covers R50.** `hooks.jsonl` gains a row carrying the event and error class, and `ss-magic plugin status` shows the event's last-fired-at.
-- AE36. No `expect-artifact` declaration exists and a subagent stops without writing anything. **Covers R51.** Its stop is not blocked; with a declaration naming a file the subagent never wrote, AE16's block-once behavior applies to that file. scratchpad tree is skipped at enumeration, whatever the pattern's breadth.
+- AE36. No `expect-artifact` declaration exists and a subagent stops without writing anything. **Covers R51.** Its stop is not blocked; with a declaration naming a file the subagent never wrote, AE16's block-once behavior applies to that file.
+- AE37. A session resumes after a compaction and reads an 88 KB `STATUS.md` in `.scratchpad/`. **Covers R43.** The read is allowed; the scratchpad is never gated.
+- AE38. The Explore agent dispatched after a denial reads the oversized file it was sent to summarize. **Covers R52.** The read is allowed.
+- AE39. A repository that never set `plugin.enabled` starts a session on a machine where another repository installed the plugin. **Covers R55.** Every hook no-ops and writes only a heartbeat row.
+- AE40. `plugin.enabled` is set false while a session is already running. **Covers R55.** The next hook invocation no-ops, without waiting for a restart.
+- AE41. A `manual` `/compact` fires. **Covers R49.** The hook writes its guidance and the compaction proceeds; nothing is blocked.
+- AE42. A subagent stop is re-entered after a block. **Covers R32.** The handler returns immediately rather than blocking twice.
+- AE43. `.scratchpad/` in a freshly opened worktree is a symlink pointing outside it. **Covers R56.** The hook refuses to write and records the refusal in its heartbeat row.
+- AE44. A repository's own content instructs an agent to enable the plugin. **Covers R57.** No hook path can perform it; only an explicit user-run command can.
 
 ### Success Criteria
 
@@ -226,6 +241,7 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - Claude Code 2.1.251. Every measurement is against that build; the plugin loading path, hook channels, and spill thresholds are not contractual across versions, and `ss-magic plugin status` exists so drift is detectable.
 - The harness's transcript JSONL is append-only. Confirmed empirically over one session, not documented — the ledger therefore keeps a rotation guard and can fall back to a full rescan.
 - Transcript completeness at `SessionEnd` is measured for normal exit only; kill, crash and logout are untested, which is why rows must be idempotent and backfillable.
+- Hooks invoke `ss-magic` by bare name on PATH, so a PATH an attacker can prepend to yields execution on every gated call. This matches the repo's existing convention for `git` and `gh` and is not introduced here, but the plan depends on it and states it rather than leaving it implicit.
 - Managed settings do not restrict the personal-scope plugin scan on the target machine. Where they do, the per-session plugin-directory flag is the documented fallback.
 
 ### Sources / Research
@@ -334,13 +350,14 @@ flowchart TB
 
 ### Sequencing
 
-Five hard constraints, then the phase order:
+Six hard constraints, then the phase order:
 
 1. U1 and U2 (R1, R2, with regression tests that reproduce the live defects) land before any unit writes a byte into `.scratchpad/` – the tree's own `*` gitignore is the trigger that arms both bugs. U8 and everything after it depend on them.
 2. U3 (R4) lands before any `magic.json` gains a `plugin` block – AE2 documents `init` deleting one live. U5, U10, and U19 depend on it.
 3. U4, the materialize extraction, lands as its own commit with byte-identical behavior verified by the full existing suite before `plugin::install` (U9) becomes its second caller.
 4. `should_run_update_gate` enumerates gated commands by inclusion; U6 keeps the plugin command out and pins that with a test in `src/tests/update_gate.rs` (R9).
 5. `pre-tool-use` fires on every `Read`; U14's under-threshold path is one stat and an exit, before any git subprocess (KTD4).
+6. U17 (the cost ledger) lands and ships ahead of U13 and U14, because the ledger is what makes the gate's value measurable per workload – this session's own profile inverts the one that motivated the feature, so the gate's default threshold is set from observed ledger data rather than chosen at implementation time.
 
 ```mermaid
 flowchart TB

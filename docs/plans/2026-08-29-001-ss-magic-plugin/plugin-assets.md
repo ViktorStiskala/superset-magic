@@ -44,7 +44,7 @@ CI gates on `claude plugin validate ./plugin --strict`.
 The hook command is the **bare binary name on PATH** — measured working with a real Mach-O binary, no absolute path, no vendoring, no wrapper script:
 
 ```plaintext
-argv[0]=ss-magic  argv[1]=plugin  argv[2]=session-start
+argv[0]=ss-magic  argv[1]=plugin  argv[2]=hook  argv[3]=session-start
 CLAUDE_PLUGIN_ROOT=/…/ss-magic   CLAUDE_PLUGIN_DATA=/Users/…/.claude/plugins/data/ss-magic
 ```
 
@@ -55,7 +55,7 @@ CLAUDE_PLUGIN_ROOT=/…/ss-magic   CLAUDE_PLUGIN_DATA=/Users/…/.claude/plugins
       {
         "matcher": "startup|resume|clear|compact|fork",
         "hooks": [
-          { "type": "command", "command": "ss-magic", "args": ["plugin", "session-start"], "timeout": 10 }
+          { "type": "command", "command": "ss-magic", "args": ["plugin", "hook", "session-start"], "timeout": 10 }
         ]
       }
     ],
@@ -63,7 +63,7 @@ CLAUDE_PLUGIN_ROOT=/…/ss-magic   CLAUDE_PLUGIN_DATA=/Users/…/.claude/plugins
       {
         "matcher": "Read|Grep|Glob",
         "hooks": [
-          { "type": "command", "command": "ss-magic", "args": ["plugin", "pre-tool-use"], "timeout": 5 }
+          { "type": "command", "command": "ss-magic", "args": ["plugin", "hook", "pre-tool-use"], "timeout": 5 }
         ]
       }
     ],
@@ -71,21 +71,21 @@ CLAUDE_PLUGIN_ROOT=/…/ss-magic   CLAUDE_PLUGIN_DATA=/Users/…/.claude/plugins
       {
         "matcher": "manual|auto",
         "hooks": [
-          { "type": "command", "command": "ss-magic", "args": ["plugin", "pre-compact"], "timeout": 10 }
+          { "type": "command", "command": "ss-magic", "args": ["plugin", "hook", "pre-compact"], "timeout": 10 }
         ]
       }
     ],
     "SubagentStop": [
       {
         "hooks": [
-          { "type": "command", "command": "ss-magic", "args": ["plugin", "subagent-stop"], "timeout": 10 }
+          { "type": "command", "command": "ss-magic", "args": ["plugin", "hook", "subagent-stop"], "timeout": 10 }
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "ss-magic", "args": ["plugin", "session-end"] }
+          { "type": "command", "command": "ss-magic", "args": ["plugin", "hook", "session-end"] }
         ]
       }
     ]
@@ -96,7 +96,7 @@ CLAUDE_PLUGIN_ROOT=/…/ss-magic   CLAUDE_PLUGIN_DATA=/Users/…/.claude/plugins
 ### Why each detail is what it is
 
 - **`"matcher": "Read|Grep|Glob"` is a LIST, not a regex.** Matcher syntax stays list-shaped only while it contains just alphanumerics, `_`, `-`, spaces, `,` and `|`. Any other character makes it an **unanchored regex**, where `Edit.*` would also match `NotebookEdit`. Keep it clean.
-- **`SessionStart` matches all five sources**, including `fork`. `fork` carries the cost fields (`context_tokens`, `estimated_cache_write_usd`) alongside `resume`, so matching only four misses forks. `compact` is the reliable "a compaction actually happened" signal.
+- **`SessionStart` matches all five sources**, including `fork`. `fork` carries the cost fields (`context_tokens`, `estimated_cache_write_usd`) alongside `resume`, so matching only four misses forks. `compact` is the reliable "a compaction actually happened" signal. [hook-contract.md](./hook-contract.md) is the contract authority for these five sources and agrees on the count – do not "fix" this matcher back to four.
 - **`SubagentStop` and `SessionEnd` take no matcher** — those events support none.
 - **`SessionEnd` sets no `timeout`.** The 1500 ms default is per-hook and parallel; raising it is paid directly in user-visible exit latency (a `"timeout": 30` hook turned a ~3 s run into 8.39 s), and the measured worst-case scan is 0.87 s.
 - **`PreToolUse` gets the shortest timeout (5 s)** because a timed-out PreToolUse hook silently does not block. Returning fast is the difference between a gate and a no-op.

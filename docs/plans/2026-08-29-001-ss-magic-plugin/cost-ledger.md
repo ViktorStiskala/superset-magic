@@ -14,7 +14,7 @@ It is the falsifiability harness for everything else. The Read gate's threshold,
 | Does it carry `transcript_path`? | **Yes**, always, absolute | payload captured |
 | Is the transcript complete when it fires? | **Yes** | snapshot inside the hook was byte-identical to the post-exit file, twice |
 | Full scan time, 113 files / 23.82 MB | **0.072–0.079 s** in-process; ~0.09 s incl. interpreter start | 5 trials |
-| Fits the 1500 ms budget? | **Yes, ~15–20x headroom** | measured against ~1.15 s usable |
+| Fits the budget? | **Yes** — ~17x headroom against the 1500 ms nominal budget (0.09 s incl. interpreter start); ~15x against the ~1.15 s usable budget (0.072–0.079 s in-process, since spawn and interpreter start already eat the rest) | both figures given; the usable budget is the one that binds |
 | Is the JSONL append-only? | **Yes, empirically** | same SHA-256 over the first 500 KB while the file grew 1,535,811 → 1,628,651 bytes |
 
 → **Incremental tailing from a stored `(file_path, byte_offset)` is viable**, so the steady-state cost is far below the 0.09 s upper bound.
@@ -42,12 +42,14 @@ When the fallback table is used it must be **snapshotted and versioned at ingest
 
 **Ship the `SessionEnd` hook, and let it write the whole row. Do not detach, and do not make this an on-demand-only subcommand.** An on-demand tool can never observe a session that has already ended, which is the entire point of a ledger; a detached background write is unobservable and un-debuggable; and the budget objection is dead:
 
-| scope | time | vs the 1500 ms budget |
-|---|---|---|
-| this session's tree (113 files) | 0.078–0.099 s | **5%** |
-| worst tree in the whole 2.61 GiB corpus (1,256 files, 354.7 MiB) | 0.87 s cache-bypassed | **58%** |
+| scope | time | vs the 1500 ms nominal budget | vs the ~1.15 s usable budget |
+|---|---|---|---|
+| this session's tree (113 files) | 0.078–0.099 s | **5–7%** | **7–9%** |
+| worst tree in the whole 2.61 GiB corpus (1,256 files, 354.7 MiB) | 0.87 s cache-bypassed | **58%** | **76%** |
 
-The all-time worst case fits with ~40% headroom, and it is CPU-bound, so a cold cache does not change it.
+The 1500 ms figure is the hook's nominal timeout; the ~1.15 s figure is what the hook body actually gets to spend, since spawn plus interpreter start consume the rest (see the Feasibility table above). Measured against the number that actually binds, the all-time worst case has ~24% headroom, not ~42% — tighter, though it is still CPU-bound, so a cold cache does not change it. A CI runner with slower I/O has less of that margin than the author's machine measured here; a budget overrun during verification should be read as a signal to make the scan incremental, not treated as a test failure.
+
+**Storage is machine-level, not per-worktree.** The ledger lives under ss-magic's existing OS cache root — the same `ProjectDirs` app root self-update already resolves — not inside any single worktree; the offsets store and the heartbeat live beside it in that same root (R46, KTD7). That is what lets `ss-magic plugin cost` report on a worktree that has since been deleted (AE31).
 
 Constraints, each forced by a measurement:
 
