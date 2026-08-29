@@ -52,10 +52,13 @@ Read the **`cwd` field from the hook's stdin JSON**. Not `${CLAUDE_PROJECT_DIR}`
 └── .ss-magic-plugin/
     ├── current.json                 pointer to the active session dir (replaces the symlink)
     ├── conclusions/<key>.md         hash-keyed Explore conclusions for the Read gate
+    ├── bypass/<key>                 one-shot Read-gate bypass token per file (R42, KTD10); the gate consumes it on the next matching over-threshold Read
+    ├── expect-artifact/<key>        a dispatching agent's pending subagent-output-file declaration (R51); consumed by SubagentStop
     └── sessions/<repo>-<branch>/
         ├── CONTEXT.md               context expensive to rediscover; topic-grouped, not a timeline
         ├── DECISIONS.md             settled decisions with provenance
         ├── LEARNINGS.md             append-only; `## <timestamp> - <label>` blocks, never edited
+        ├── OPERATOR-CHECKLIST.md    operational steps before a change ships; the SessionStart pointer (R19) resolves here
         ├── STATUS.md                newest block first; older blocks demoted to history, never pruned
         ├── TASKS.md                 the task list and current status
         └── research-<topic>/*.md    durable research artifacts
@@ -83,7 +86,7 @@ ss-magic creates no symlink anywhere today — forward sync explicitly *skips* t
 └── hooks.jsonl                      the heartbeat; one row per hook invocation, including the fail-open path (R50)
 ```
 
-Per-worktree state (the scratchpad session files under `sessions/<repo>-<branch>/`, `current.json`, and the conclusion cache under `conclusions/`) lives inside `.scratchpad/.ss-magic-plugin/` and is deleted along with the worktree. Machine-level state (the ledger, the offsets store, and the heartbeat) lives in the `ProjectDirs` root instead, because R46 requires `cost` to keep reporting a worktree's sessions after that worktree is gone — state that must outlive the worktree cannot be stored inside it.
+Per-worktree state (the scratchpad session files under `sessions/<repo>-<branch>/`, `current.json`, the conclusion cache under `conclusions/`, and the one-shot `bypass/` and `expect-artifact/` claims) lives inside `.scratchpad/.ss-magic-plugin/` and is deleted along with the worktree. Machine-level state (the ledger, the offsets store, and the heartbeat) lives in the `ProjectDirs` root instead, because R46 requires `cost` to keep reporting a worktree's sessions after that worktree is gone — state that must outlive the worktree cannot be stored inside it.
 
 The conclusion cache is the one exception kept per-worktree on purpose: its keys fingerprint `(realpath, size, mtime)` (KTD3), and a realpath is worktree-specific, so a cache entry from one worktree would never hit in another.
 
@@ -91,7 +94,7 @@ The conclusion cache is the one exception kept per-worktree on purpose: its keys
 
 Grounded in a real, in-use scratchpad tree rather than invented. Observed there: **STATUS.md at 594 lines / 88.7 KB**, refreshed every 20–40 minutes by a `/loop` cron; LEARNINGS and LINEAR strictly append-only with `## <timestamp> - <label>` blocks that are never edited; CONTEXT.md headed *"Context that would be expensive to rediscover"* and grouped by topic rather than time.
 
-**The file set is a floor, not a schema.** In the observed tree one sibling session had `DECISIONS.md` but no `LINEAR.md`; another had only `REPORT.md` and `findings/`. `ss-magic plugin scratchpad ensure` scaffolds the five files if absent and **never rewrites an existing one** — the model owns their content.
+**The file set is a floor, not a schema.** In the observed tree one sibling session had `DECISIONS.md` but no `LINEAR.md`; another had only `REPORT.md` and `findings/`. `ss-magic plugin scratchpad ensure` scaffolds the six files (including `OPERATOR-CHECKLIST.md`, empty, for R19's pointer) if absent and **never rewrites an existing one** — the model owns their content.
 
 STATUS.md follows the demote-never-delete pattern verbatim, because it is what made the observed tree survivable across compactions:
 

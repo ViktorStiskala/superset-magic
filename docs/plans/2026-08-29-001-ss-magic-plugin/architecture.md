@@ -33,7 +33,7 @@ src/plugin/
     ├── event.rs           typed payloads + responses (serde), one place for the wire format
     ├── pre_tool_use.rs    the Read gate: deny-and-route on miss, deny-with-conclusion on hit
     ├── session_start.rs   additionalContext: operating guidance + checklist init
-    ├── pre_compact.rs     block compaction until scratchpad state is durable
+    ├── pre_compact.rs     write the scratchpad note on both triggers, then emit nothing and never block (R49) — the harness rejects hookSpecificOutput for this event, so there is no channel to emit on anyway
     ├── subagent_stop.rs   artifact enforcement (block once) + salvage
     └── session_end.rs     inline ledger scan: reads that session's transcript tree and appends one idempotent row before returning (R27/KTD7; measured worst case 0.87 s against a 354.7 MiB tree)
 ```
@@ -65,7 +65,7 @@ pub struct MaterializeOpts<'a> {
 
 ### 2. `src/hashing.rs` — one content fingerprint
 
-`reverse_sync::hash_file` (`DefaultHasher`, 64-bit, non-cryptographic, "the threat model is a concurrent edit, not an adversary") is private. `plugin::cache` needs the same property for cache keys — accidental collision matters, adversaries do not. Lift it to a shared module and have both call it. **No new crate**; `DefaultHasher` is std.
+`reverse_sync::hash_file` (`DefaultHasher`, 64-bit, non-cryptographic, "the threat model is a concurrent edit, not an adversary") is private. `plugin::cache` needs the same property for cache keys — accidental collision matters, adversaries do not. U4, the shared-helper extraction phase, lifts it to `src/hashing.rs` — not U13 — so that U17 can ship ahead of U13 per sequencing constraint 6 without depending on it. Both `cache.rs` and `ledger.rs` are callers. **No new crate**; `DefaultHasher` is std.
 
 Cache keys additionally hash the *identity* of a file, deliberately **not** its paging window — see [page-fault.md](./page-fault.md) for why `offset`/`limit` must be excluded.
 
@@ -94,6 +94,7 @@ graph TD
     LEDG["ledger.rs"]
     HB["heartbeat.rs"]
     STATUS["status.rs"]
+    SPILL["spill_index.rs"]
     HOOK["hook/*"]
   end
   subgraph shared["Shared helpers (reused, not forked)"]
@@ -103,7 +104,7 @@ graph TD
     SF["workspace/superset_files.rs"]
   end
   CLI --> MAIN --> MOD
-  MOD --> CFG & INST & SCR & LEDG & HB & STATUS & HOOK
+  MOD --> CFG & INST & SCR & CACHE & LEDG & HB & STATUS & SPILL & HOOK
   INST --> ASSET & MAT
   SCR --> ID & GI
   CACHE --> HASH

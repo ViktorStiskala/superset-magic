@@ -25,9 +25,9 @@ Consequences the plan is built on:
 
 | event | matcher | purpose | channel | why it can work |
 |---|---|---|---|---|
-| `PreToolUse` | `Read` | the page-fault gate | `deny` + reason | deny verified to block on 2.1.251 |
+| `PreToolUse` | `Read\|Grep\|Glob` | the page-fault gate | `deny` + reason | deny verified to block on 2.1.251; `Grep`/`Glob` ship inert — neither tool exists in this user's session, so the matcher is shipped for forward-compatibility only |
 | `SessionStart` | `startup`,`resume`,`clear`,`compact`,`fork` | operating guidance + checklist init | `additionalContext` (<10k) | one of only 3 model-visible-stdout events |
-| `PreCompact` | `manual`,`auto` | advise durable state before context is lost | `additionalContext` only, never a veto | a `manual` `/compact` fires when the user is already at the context wall, and refusing it costs a round trip at the worst moment — and a buggy `PreCompact` can wedge a session |
+| `PreCompact` | `manual`,`auto` | write the compaction-survival note to the scratchpad | none — side effect only | `hookSpecificOutput{hookEventName:"PreCompact"}` is rejected outright, so there is no model-facing channel on this event at all; guidance ships instead on `SessionStart(source:"compact")`, see below |
 | `SubagentStop` | — | artifact enforcement + salvage | top-level `{"decision":"block","reason":…}` | carries `last_assistant_message` + `agent_transcript_path` |
 | `SessionEnd` | — | append to the cost ledger | none (side effect only) | `transcript_path` present; transcript **is** complete |
 
@@ -41,9 +41,13 @@ Captured sources: `startup`, `resume`, `clear`, **`compact`**, and `fork` — `c
 
 `CLAUDE_ENV_FILE` is the documented env-persistence channel and Claude Code runs it as a script preamble before each Bash command.
 
-### `PreCompact` — observe-and-advise only, never a veto
+### `PreCompact` — writes the scratchpad, emits nothing on the wire, never a veto
 
-`PreCompact` never blocks, on either the `manual` or the `auto` trigger. A `manual` `/compact` fires when the user is already at the context wall, and refusing it costs a round trip at the worst possible moment; the evidence record separately shows that a buggy `PreCompact` hook can wedge a session. The hook only emits `additionalContext` nudging a scratchpad reconcile.
+`PreCompact` is absent from the `hookSpecificOutput` schema map — `hookSpecificOutput{hookEventName:"PreCompact"}` is rejected outright — so there is no model-facing channel on this event at all, on either trigger. The hook writes the compaction-survival note straight to the scratchpad and emits nothing back: no `additionalContext`, no decision, empty stdout, exit 0.
+
+`PreCompact` never blocks, on either the `manual` or the `auto` trigger. A `manual` `/compact` fires when the user is already at the context wall, and refusing it costs a round trip at the worst possible moment; the evidence record separately shows that a buggy `PreCompact` hook can wedge a session.
+
+The model-facing guidance instead lives on `SessionStart` with the `compact` source (see above) — it is both the designed channel for this and the only reliable signal that a compaction actually happened, since `PreCompact` itself fires even when no compaction follows (a `/compact` on a session too small to compact still fires the hook).
 
 ### `SessionEnd` — viable for the ledger, with a caveat about latency
 
