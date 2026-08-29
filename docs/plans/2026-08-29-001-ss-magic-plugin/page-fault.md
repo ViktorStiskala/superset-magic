@@ -57,7 +57,7 @@ Read is the largest un-spilled context sink in the harness. This independently r
 
 ### 2. A manifest
 
-Spill filenames are unguessable short ids — **1,277 of 1,303** on this machine — scattered across **92** per-session directories with no index, totalling **188 MB**. Each session's directory resolves to `~/.claude/projects/<encoded-cwd>/<session-uuid>/tool-results/`; the `<session-uuid>` leaf is unguessable, so `spill-index` (R25) cannot reconstruct it and instead reads it back from the tool-result envelope that named it. Once the envelope scrolls out of context or compaction clears the tool result (`[Old tool result content cleared]`), the path is gone and the corpus is unnavigable. This is the real gap the brief identified correctly.
+Spill filenames are unguessable short ids — **1,277 of 1,303** on this machine — scattered across **92** per-session directories with no index, totalling **188 MB**. Each session's directory is `~/.claude/projects/<encoded-cwd>/<session-uuid>/tool-results/`. The individual spill FILENAMES are unguessable, but `<encoded-cwd>` is derivable from the worktree root, so `spill-index` (R25) enumerates every `<session-uuid>/tool-results/` directory beneath it and lists their contents newest-first. It never reconstructs a single leaf, and it never needs a tool-result envelope – it is an argv-driven human verb run from a shell, which sees no envelope at all.
 
 ### 3. Head **+** tail
 

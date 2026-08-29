@@ -106,8 +106,7 @@ CLAUDE_PLUGIN_ROOT=/…/ss-magic   CLAUDE_PLUGIN_DATA=/Users/…/.claude/plugins
 
 There is **no declarative way** to express it. `dependencies` covers other plugins only; the undocumented `binaries` map fetches by digest from Anthropic's own asset API and is gated off by default; and the only automatic install is Node packages from a lockfile.
 
-Follow the documented LSP precedent: README install instructions, plus a **SessionStart self-check** that emits a `systemMessage` when `ss-magic` is missing or older than the manifest. A missing binary is measured **non-fatal** — the hook simply does not run and the session is normal — which is precisely why no ss-magic hook may ever be a security gate.
-
+Follow the documented LSP precedent: README install instructions, plus a **SessionStart self-check** that emits a `systemMessage` when the running binary's version differs from the installed manifest's. A missing binary cannot be reported from inside a hook at all – the hook simply never starts – so that case is covered only by the README and by `ss-magic plugin status`.
 ## Install verification
 
 ```bash

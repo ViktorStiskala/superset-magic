@@ -213,7 +213,7 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 
 - A session resumed after compaction can re-orient from the scratchpad alone, without re-reading the work that produced it.
 - The ledger makes the Read gate's value measurable per workload rather than assumed — this session's own profile inverts the one that motivated the feature, so the threshold must be tunable against evidence rather than fixed.
-- `cargo test` stays green, and the three prerequisite defects gain regression tests, none of which exist today.
+- `cargo test` stays green, and the prerequisite requirements R1-R3 gain regression tests, none of which exist today.
 
 ### Scope Boundaries
 
@@ -224,7 +224,7 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - A `Stop` hook, gated on re-entry, if the SessionStart and SubagentStop pair proves insufficient.
 - `Grep` and `Glob` gating as active behavior — the matcher ships, but neither tool exists in this environment, so nothing may depend on it firing.
 - Sharing or syncing the conclusion cache across worktrees.
-- Heartbeat analytics beyond last-fired-at and error class.
+- Heartbeat analytics beyond last-fired-at, error class, and the per-event outcome counts R50 requires.
 - Any bypass policy richer than one-shot-per-invocation.
 
 **Outside this work**
@@ -259,7 +259,7 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - KTD1. **One hook entry point with a centralized fail-open wrapper.** All five events route through `plugin hook <event>` into `src/plugin/hook/mod.rs`, which owns stdin decode, event dispatch, the JSON envelope on stdout, the fail-open catch, and the heartbeat append – per-event modules never print or exit themselves. This is what makes R9's hook posture and R47's stdout ownership structural rather than per-call-site care. *Governs R8, R9, R26, R35, R47, R50.*
 - KTD2. **Generalize `copy_into_repo` into `src/workspace/materialize.rs`; do not fork it.** One atomic stage-then-materialize writer with recursion as a declared option; `superset_files::copy_into_repo` becomes a thin non-recursive caller and `plugin::install` the recursive second caller. Shape and options per [architecture.md](./2026-08-29-001-ss-magic-plugin/architecture.md). *Governs R10, R12, R13.*
 - KTD3. **One 64-bit content fingerprint in `src/hashing.rs`.** Lift the private `reverse_sync::hash_file` (std `DefaultHasher`, non-cryptographic – the threat is accidental collision, not an adversary) and have reverse sync, the conclusion cache, and the ledger all call it; the cache key fingerprints `(realpath, size, mtime)` per R24. No new crate. *Governs R24, R44, R45.*
-- KTD4. **Gate decision order: scratchpad, subagent, non-text, one stat, threshold, window, bypass, cache.** The three exemptions come first and cost nothing, then the under-threshold path is a single `stat` and exit before any git subprocess, because `pre-tool-use` fires on every `Read`; only an over-threshold file pays for window arithmetic, bypass lookup, and key hashing. *Governs R21, R41, R42, R43, R52.*
+- KTD4. **Gate decision order: scratchpad, subagent, non-text, config, one stat, threshold, window, bypass, cache.** The three exemptions come first and cost nothing; config resolution (R55, R53) locates the repo root by walking up from the envelope's `cwd` for `.superset/magic.json` – a bounded filesystem walk, never a git subprocess – and memoizes the result per `cwd` for the process; then the under-threshold path is a single `stat` and exit. Only an over-threshold file pays for window arithmetic, bypass lookup, and key hashing. *Governs R21, R41, R42, R43, R52, R55.*
 - KTD5. **Atomic claims reuse `fd-lock`.** The claim scheme for R48 is the advisory `fd_lock::RwLock` pattern already shipped in `src/update/apply.rs` – one lock file per protected store, `try_write` for one-shot claims (block-once flags, bypass tokens) and blocking write for appends – never a second locking scheme. *Governs R42, R48.*
 - KTD6. **The heartbeat is one appended line, machine-level.** `hooks.jsonl` lives beside the ledger in the machine-level store, one row per hook invocation carrying event, timestamp, cwd, outcome, and error class on the fail-open path – machine-level because a hook can fire outside any git repo and the row must survive worktree deletion; `status` filters by cwd when inside a worktree. *Governs R50.*
 - KTD7. **The machine-level store is ss-magic's existing `ProjectDirs` root.** Ledger, heartbeat, offsets store, and price-table snapshots live under the same OS app root `src/update/check.rs` already resolves, in a `plugin/` subdirectory; rows carry the resolved worktree root and branch as labels so `cost` groups cross-branch by default. *Governs R27, R29, R46, R50.*
@@ -269,7 +269,7 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - KTD11. **The non-text exemption is a binary-owned extension list.** Images, PDFs, and notebooks are never gated; the list ships in the binary and configuration cannot shrink it, so no config state can make a binary unviewable. *Governs R43.*
 - KTD12. **Identity derivation follows [scratchpad-contract.md](./2026-08-29-001-ss-magic-plugin/scratchpad-contract.md) exactly.** `symbolic-ref` with the `detached-<short-sha>` fallback, Rust slugify with the empty-result and non-ASCII guards, repo name from pack's origin derivation, and the hook resolving against the envelope's `cwd` field. *Governs R14, R15.*
 - KTD13. **The enumeration filter generalizes `under_backups_dir` into an excluded-trees check applied at the walk layer.** `EXCLUDED_TREES = [".superset/backups", ".scratchpad", ".git"]`, enforced in `walk_source`, in reverse sync's candidate set, and in pack's recursive directory walk – the point-of-final-enumeration rule [architecture.md](./2026-08-29-001-ss-magic-plugin/architecture.md) records. *Governs R2, R18.*
-- KTD14. **Conclusion-cache lifecycle mirrors `prune_old_backups`.** Bounded count and age, best-effort, warn-never-fail, run after each cache write; `gc` is the explicit on-demand sweep for orphaned keys. *Governs R45.*
+- KTD14. **Conclusion-cache and heartbeat-log lifecycle mirror `prune_old_backups`.** Bounded count and age, best-effort, warn-never-fail, run after each cache write; `gc` is the explicit on-demand sweep for orphaned keys. *Governs R45.*
 - KTD15. **Assets are embedded per file with a single version substitution.** One `include_str!` per shipped file plus a manifest table (the `MAGIC_SH` precedent); rendering substitutes only the crate version into `plugin.json`, which is what makes R38 checkable as byte equality. *Governs R12, R13, R38.*
 
 ### High-Level Technical Design
@@ -404,7 +404,13 @@ flowchart TB
   U6 --> U9
   U6 --> U11
   U8 --> U12
-  U8 --> U13 --> U14
+  U4 --> U13 --> U14
+  U4 --> U17
+  U8 --> U13
+  U8 --> U16
+  U5 --> U19
+  U6 --> U19
+  U7 --> U18
   U11 --> U12 & U14 & U15 & U16 & U17
   U12 --> U15
   U11 --> U18
@@ -444,9 +450,9 @@ src/plugin/
 ├── scratchpad.rs                        # + scratchpad/tests.rs – bootstrap, pointer, scaffolding
 ├── cache.rs                             # + cache/tests.rs – conclusion cache, prune, gc
 ├── ledger.rs                            # + ledger/tests.rs – transcript scan, attribution, backfill
-├── heartbeat.rs                         # + heartbeat/tests.rs – hooks.jsonl append + read (G13 delta to architecture.md)
+├── heartbeat.rs                         # + heartbeat/tests.rs – hooks.jsonl append + read
 ├── spill_index.rs                       # + spill_index/tests.rs – read-only spill manifest
-├── status.rs                            # + status/tests.rs – status / status --json (G10/G13 delta to architecture.md)
+├── status.rs                            # + status/tests.rs – status / status --json
 └── hook/
     ├── mod.rs                           # tests in hook/tests.rs – decode/route/encode, fail-open
     ├── tests.rs
@@ -614,10 +620,10 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
 ### U8. Scratchpad bootstrap and pointer
 
 - **Goal:** the per-worktree scratchpad tree exists, self-ignored, with a claimed pointer file and never-rewritten state files.
-- **Requirements:** R16, R17, R40, R48 (pointer claim), R56. AE19 (human-verb half), AE24, AE43.
+- **Requirements:** R16, R17, R40, R48 (pointer claim), R56, R58 (the scratchpad plugin directory). AE19 (human-verb half), AE24, AE43.
 - **Dependencies:** U1, U2, U6, U7.
 - **Files:** `src/plugin/scratchpad.rs`, `src/plugin/scratchpad/tests.rs`, `src/plugin/mod.rs` (the `scratchpad ensure` verb).
-- **Approach:** create the [scratchpad-contract.md](./2026-08-29-001-ss-magic-plugin/scratchpad-contract.md) layout: nested self-ignoring `.gitignore` and README, session dir from U7's slug, the five state files scaffolded only when absent (R17), and `current.json` written under a KTD5 claim (R16, R48). No call touches any `.gitignore` outside `.scratchpad/` (R40). `plugin scratchpad ensure` is the loud argv-driven entry (R9, R35).
+- **Approach:** create the [scratchpad-contract.md](./2026-08-29-001-ss-magic-plugin/scratchpad-contract.md) layout: nested self-ignoring `.gitignore` and README, session dir from U7's slug, the six state files scaffolded only when absent, `OPERATOR-CHECKLIST.md` included so R19's pointer resolves (R17), and `current.json` written under a KTD5 claim (R16, R48). No call touches any `.gitignore` outside `.scratchpad/` (R40). `plugin scratchpad ensure` is the loud argv-driven entry (R9, R35).
 - **Patterns to follow:** `bootstrap_magic_local_json` in `src/workspace/superset_files.rs` for scaffold-if-absent; the `fd-lock` usage in `src/update/apply.rs` for the claim.
 - **Test scenarios:**
   - Covers AE24. Running ensure in a repo with a tracked root `.gitignore` leaves that file byte-identical; the tree is ignored by its own nested file.
@@ -626,6 +632,7 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
   - Two concurrent ensures produce one coherent `current.json`.
   - Covers AE43. `.scratchpad/` is a symlink pointing outside the worktree: the write is refused, nothing outside the worktree is touched, and a heartbeat row records the refusal (R56).
   - The scaffolded set includes `OPERATOR-CHECKLIST.md`, so the pointer `SessionStart` injects (R19) resolves to a file that exists.
+  - `.scratchpad/.ss-magic-plugin/` is created owner-only (R58).
 - **Verification:** the scratchpad tree is invisible to sync and pack (relies on U2's tests staying green with the tree present).
 
 ### U9. Assets, install, uninstall, verify
@@ -666,24 +673,25 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
 ### U11. Hook runtime core and heartbeat
 
 - **Goal:** one stdin-to-stdout hook pipeline with structural fail-open, stdout ownership, and an always-written heartbeat.
-- **Requirements:** R9 (hook half), R26, R47, R50, R55, R57 (hook half), R58. AE9 (posture), AE10, AE19 (hook half), AE32, AE35, AE39, AE40.
+- **Requirements:** R9 (hook half), R26, R45 (heartbeat log), R47, R50, R55, R57 (hook half), R58 (machine store). AE9 (posture), AE10, AE19 (hook half), AE32, AE35, AE39, AE40.
 - **Dependencies:** U6.
 - **Files:** `src/plugin/hook/mod.rs`, `src/plugin/hook/tests.rs`, `src/plugin/hook/event.rs`, `src/plugin/hook/event/tests.rs`, `src/plugin/heartbeat.rs`, `src/plugin/heartbeat/tests.rs`, `src/tui/style.rs`.
 - **Approach:**
   1. `event.rs` types the five envelopes and responses per [hook-contract.md](./2026-08-29-001-ss-magic-plugin/hook-contract.md) – one place for the wire format, including the `SubagentStop` top-level block shape.
   2. `hook/mod.rs` implements KTD1: decode, route, encode; any internal error is caught, heartbeat-recorded with its class, and exits 0 with empty stdout (R9, R26, R50).
   3. Diagnostics go to stderr only; style init runs forced-no-color for hook verbs (R47).
-  4. `heartbeat.rs` appends the KTD6 row to the machine-level `hooks.jsonl` under a KTD5 claim, best-effort – a heartbeat failure never fails the hook.
+  4. `heartbeat.rs` appends the KTD6 row to the machine-level `hooks.jsonl` under a KTD5 claim, best-effort – a heartbeat failure never fails the hook – then prunes the log to its bounded count and age on the same KTD14 posture (R45).
 - **Patterns to follow:** `tui/style.rs`'s `OnceLock` color decision (add the forced-off entry); `src/update/apply.rs` for the lock.
 - **Test scenarios:**
   - Covers AE10. Malformed stdin: exit 0, empty stdout, heartbeat row with error class.
   - Covers AE19 (hook half). No stdin at all: exit 0, silent.
   - Covers AE32. A routed handler that emits a diagnostic: stderr carries it uncolored, stdout parses as exactly one envelope.
   - Covers AE35. An internally-failing handler leaves a heartbeat row naming event and error class.
+  - The heartbeat log is trimmed to its bound after a write, and a prune failure never fails the hook (R45).
   - A well-formed envelope routes to the right per-event module.
   - Covers AE39. An envelope whose `cwd` is a repository that never enabled the plugin: every event no-ops with only a heartbeat row (R55).
   - Covers AE40. Config flipped to disabled between two invocations: the second no-ops without a restart (R55).
-  - The machine-level store and the scratchpad plugin directory are created owner-only (R58).
+  - The machine-level store is created owner-only (R58); U8 owns the scratchpad half.
 - **Verification:** no per-event module can write stdout directly – the encode seam is the only writer, checked by the module's visibility structure and review.
 
 ### U12. session_start hook
@@ -745,7 +753,7 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
   - Covers AE37. An 88 KB file inside `.scratchpad/`: allowed, no cache interaction (R43).
   - Covers AE38. An envelope carrying subagent identity: allowed regardless of size (R52).
   - Threshold, byte budget and exemption list come from the config resolved for the envelope's `cwd`, not from a constant (R53).
-  - Under-threshold file: exit 0 with empty stdout and no git subprocess spawned.
+  - Under-threshold file: exit 0 with empty stdout, config resolved by filesystem walk only, and no git subprocess spawned.
 - **Verification:** the gate's full decision table is covered by envelope-driven tests that never require a live harness.
 
 ### U15. pre_compact hook
@@ -815,7 +823,7 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
 - **Dependencies:** U7, U9, U11.
 - **Files:** `src/plugin/status.rs`, `src/plugin/status/tests.rs`, `src/plugin/spill_index.rs`, `src/plugin/spill_index/tests.rs`, `src/plugin/mod.rs`.
 - **Approach:**
-  1. `status` reports install location and drift (installed manifest version versus binary), harness visibility (via KTD9's listing call when available), resolved slug and directories, thresholds, and last-fired-at per event from the heartbeat (R36, R50); `--json` emits the machine-readable form.
+  1. `status` reports install location and drift (installed manifest version versus binary), harness visibility (via KTD9's listing call when available), resolved slug and directories, thresholds, and – per event, from the heartbeat – last-fired-at plus the outcome counts (R36, R50); `--json` emits the machine-readable form.
   2. `spill_index` locates the harness's per-session `tool-results/` directories for the current worktree and lists them read-only with path, size, and mtime (R25), resolution per [page-fault.md](./2026-08-29-001-ss-magic-plugin/page-fault.md).
 - **Patterns to follow:** `print_event`-style rendering separation in `src/main.rs` (pure core, rendering at the edge).
 - **Test scenarios:**
@@ -875,8 +883,9 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
 | Unit and integration suite | `cargo test` | Green, including every new `<module>/tests.rs` and `src/tests/plugin_flow.rs` |
 | Release build | `cargo build --release` | Clean build, no warnings introduced by new modules |
 | Gate denies an oversized read | Pipe a captured `PreToolUse` envelope for an over-threshold fixture file into `ss-magic plugin hook pre-tool-use` | stdout is exactly one JSON envelope with a deny decision whose reason names the cache path and the bypass invocation; a heartbeat row is appended |
-| Fail-open is observable | Pipe malformed JSON into any `plugin hook <event>` | Exit 0, empty stdout, and a `hooks.jsonl` row carrying the event and error class (this heartbeat is what turns AE9/AE10 into executable checks) |
-| Under-threshold fast path | Pipe an envelope for a small file into `pre-tool-use` | Exit 0, empty stdout; no git subprocess observable in the run |
+| Fail-open is observable | Pipe malformed JSON into any `plugin hook <event>` | Exit 0, empty stdout, and a `hooks.jsonl` row carrying the event and error class (this heartbeat is what turns AE10 into an executable check) |
+| Missing binary is non-fatal (AE9) | Run a session with the plugin installed and `ss-magic` renamed off PATH, then issue an oversized `Read` | The session behaves normally, the read is not blocked, no error surfaces, and no `hooks.jsonl` row is written – the binary never starts, so nothing can report |
+| Under-threshold fast path | Pipe an envelope for a small file into `pre-tool-use` | Exit 0, empty stdout; config resolved by filesystem walk and no git subprocess observable in the run |
 | Hook firing reported | `ss-magic plugin status` (and `--json`) after the three checks above | last-fired-at per event matches; error class shown for the fail-open run |
 | Idempotent install | Run `ss-magic plugin install` twice against a scratch `CLAUDE_CONFIG_DIR` | Second run writes nothing (byte and mtime comparison) and prints nothing |
 | Manifest validity | `claude plugin validate` with `--strict` against the rendered tree, where the `claude` CLI exists | Validation passes; in CI without the CLI the check is recorded as skipped, not passed |
@@ -893,7 +902,7 @@ Harness-dependent rows (validate, list) are environment-gated: they run wherever
 
 - Every requirement R1–R58 (R8 and R9 as amended) is implemented, or explicitly moved to Scope Boundaries with the user's sign-off; none is silently dropped.
 - Every acceptance example AE1–AE44 is enforced by a named automated test, or – where it needs a live harness (AE9's missing-binary posture) – by a named Verification Contract row.
-- `cargo test` and `cargo build --release` pass; the three prerequisite defects (R1–R3) have regression tests that fail on pre-fix code.
+- `cargo test` and `cargo build --release` pass; the prerequisite requirements R1-R3 have regression tests that fail on pre-fix code.
 - The six sequencing constraints held in the actual commit history: prerequisites first, the materialize extraction isolated, the update gate untouched by inclusion, the gate's under-threshold path free of a git subprocess, and the cost ledger landed ahead of the Read gate.
 - Docs are synchronized per R34, `.cursor/BUGBOT.md` restates the new conventions self-contained, and the crate version is minor-bumped in `Cargo.toml` and `Cargo.lock`.
 - The plan's companion documents agree with the shipped surface (five `SessionStart` sources, `status` as the diagnostic verb, `plugin hook <event>` as the entry point).
