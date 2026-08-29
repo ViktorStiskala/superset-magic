@@ -25,21 +25,55 @@ Consequences the plan is built on:
 
 | event | matcher | purpose | channel | why it can work |
 |---|---|---|---|---|
-| `PreToolUse` | `Read\|Grep\|Glob` | the page-fault gate | `deny` + reason | deny verified to block on 2.1.251; `Grep`/`Glob` ship inert — neither tool exists in this user's session, so the matcher is shipped for forward-compatibility only |
-| `SessionStart` | `startup`,`resume`,`clear`,`compact`,`fork` | operating guidance + checklist init | `additionalContext` (<10k) | one of only 3 model-visible-stdout events |
+| `SessionStart` | `startup` | bootstrap the pinned binary into `${CLAUDE_PLUGIN_DATA}` (R70, R76) | none – silent on the success path | `startup` alone keeps it off every resume, clear, compaction and fork, where the pin cannot have moved |
+| `SessionStart` | – (all five sources) | operating guidance + checklist pointer | `additionalContext` (<10k) | one of only 3 model-visible-stdout events |
+| `PreToolUse` | `Read\|Edit\|Write\|NotebookEdit\|Grep\|Glob` | the checklist deny (all four write-capable tools) and the page-fault gate (`Read` only) | `deny` + reason | deny verified to block on 2.1.251; `Grep`/`Glob` ship inert – neither tool exists in this user's session, so the matcher is shipped for forward-compatibility only |
+| `PreToolUse` | `Bash` | advisory checklist nudge on `git commit` / `git push` / `gh pr` (R91) | `additionalContext` **only** | it emits no `updatedInput`, so it cannot discard a co-installed rewriting hook's output – the narrowed prohibition, below |
 | `PreCompact` | `manual`,`auto` | write the compaction-survival note to the scratchpad | none — side effect only | `hookSpecificOutput{hookEventName:"PreCompact"}` is rejected outright, so there is no model-facing channel on this event at all; guidance ships instead on `SessionStart(source:"compact")`, see below |
 | `SubagentStop` | — | artifact enforcement + salvage | top-level `{"decision":"block","reason":…}` | carries `last_assistant_message` + `agent_transcript_path` |
 | `SessionEnd` | — | append to the cost ledger | none (side effect only) | `transcript_path` present; transcript **is** complete |
+| `file-changed` | — | direnv export into `CLAUDE_ENV_FILE` on a `.env` / `.envrc` change (R92) | none – side effect only | `CLAUDE_ENV_FILE` is the documented env-persistence channel, see below |
 
 `Stop` and `PostToolUse` are **not** shipped in the first version — see "Deliberately not shipped".
 
+## How a hook entry is declared – exec form, variables, matchers, timeouts
+
+**Exec form is what ships** (KTD18): an entry carrying `command` plus `args` is spawned directly, with **no shell**.
+
+```json
+{ "type": "command",
+  "command": "bash",
+  "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/bootstrap.sh"],
+  "timeout": 60 }
+```
+
+- `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` are substituted **per element** inside `args` and inside the `command` string, as plain strings – no word splitting, no glob expansion – so a plugin path holding a quote, `$` or backtick never reaches a parser. Shell form (a bare `command` string with no `args`) *additionally* substitutes the bare `$NAME` spelling; exec form does not. The braced form is therefore used everywhere, because it is the only one both forms understand.
+- **Both variables are plugin-only.** A hook declared in a skills directory, or in a `settings.json`, that references `${CLAUDE_PLUGIN_DATA}` is a **hard error** – not an empty expansion that degrades quietly.
+- **Neither variable is exported to the Bash tool.** A skill body cannot name `${CLAUDE_PLUGIN_DATA}/bin/ss-magic` and have it resolve; that gap is exactly what the shipped `bin/` wrapper (R75) exists to close.
+
+**The default hook timeout is 600 seconds**, per entry, overridable with `"timeout": <seconds>` – seconds, not milliseconds. On expiry the process is **killed**, and a killed `PreToolUse` hook does not block (see Failure posture). 600 s is far too long for anything on a session-start or per-tool path, so every ss-magic entry declares its own much smaller timeout, and the bootstrap separately time-bounds its own fetch (R76).
+
+`SessionEnd` is the exception that proves the shape: it is bounded by the CLI's ~1500 ms *shutdown* deadline rather than by the 600 s hook default, and that deadline is shared across every hook on the event (see below).
+
+**Matcher hazard.** A matcher built only from alphanumerics, `_`, `-`, space, `,` and `|` is treated as a literal alternation. Introduce any character outside that set and the matcher is compiled as an **unanchored regex** instead – so `Edit.*` also matches `NotebookEdit`, and a matcher written to narrow the set silently widens it. Ship plain alternations only, and name every tool explicitly rather than reaching for a wildcard.
+
 ## Per-event notes that change the implementation
 
-### `SessionStart` — five sources, and one is the compaction-survival hook
+### `SessionStart` – five sources, one compaction-survival hook, and one bootstrap
 
 Captured sources: `startup`, `resume`, `clear`, **`compact`**, and `fork` — `compact` fires *after every compaction*. That last one is how scratchpad state is re-injected once the window has been cleared, and it is a better instrument than `PreCompact` alone. `resume` additionally carries `context_tokens` and `estimated_cache_write_usd`, the only place cost-shaped fields appear in a hook payload; `fork` carries the same cost-shaped fields.
 
-`CLAUDE_ENV_FILE` is the documented env-persistence channel and Claude Code runs it as a script preamble before each Bash command.
+**With no matcher, one entry re-runs on all five sources.** `"matcher": "startup"` restricts it to a fresh start – verified by driving a `-c` resume, which did not fire the restricted entry. That is why the guidance hook ships unmatched (it *wants* the compaction re-injection) while the binary bootstrap ships as a second entry matched to `startup` alone (R76): the pin cannot have moved between a session and its own resume.
+
+Three measured facts make `SessionStart` the most expensive event to get wrong:
+
+1. **It blocks session start.** The session does not begin until the hook returns. A deliberately slow 6-second hook made a `claude -p` run take **~10.35 s** end to end. Every millisecond here is paid by the user on every session.
+2. **Its stdout becomes the model-facing `content` of a transcript attachment** – it is one of the three events whose plain stdout reaches the model at all. So anything printed is **paid for in tokens on every single session**, which is why the bootstrap prints nothing on its success path (R72). `stderr` is recorded in the transcript but is **not** model-facing, and is the right channel for the one-line failure report.
+3. **`async: true` is a trap for a bootstrap.** It does make startup non-blocking, but the binary is then not ready for the first turn – the very session that most needs it runs with every ss-magic hook inert – and in `claude -p` the backgrounded hook is **killed when the session exits**: a 10-second async hook never reached its second line. Prefer sync-but-fast, with a small explicit `timeout`, over async.
+
+### `file-changed` – the direnv export
+
+`CLAUDE_ENV_FILE` is the documented env-persistence channel: Claude Code runs that file as a script preamble before each Bash command, so writing exports into it is how a hook changes the environment later tool calls see. The `file-changed` handler uses it to re-export a `.env` / `.envrc` change through direnv (R92) – and only for an `.envrc` direnv **already** reports as allowed, never by granting that trust itself. It emits nothing on the wire; the export *is* the effect.
 
 ### `PreCompact` — writes the scratchpad, emits nothing on the wire, never a veto
 
@@ -66,18 +100,20 @@ The model-facing guidance instead lives on `SessionStart` with the `compact` sou
 
 This event is the only one addressing genuine **data loss** rather than context economy: agent reports are tail-truncated by `TASK_MAX_OUTPUT_LENGTH` with the explicit marker *"the earlier part of the report is not retrievable"* — not spilled, lost.
 
-## Composition with the user's existing hooks
+## Concurrency – handlers do not chain, and rewrites are folded last-write-wins
 
-`PreToolUse` handlers **run concurrently on the ORIGINAL input**. They do *not* form a chain, and a later handler does *not* see an earlier one's rewrite — an earlier draft of this document said otherwise and was refuted by measurement:
+This is the single most consequential fact in the document, and it binds two design rules stated at the end of the section.
+
+Every handler registered on one event **runs concurrently against the ORIGINAL tool input**. They do *not* form a chain, and a later handler does *not* observe an earlier one's rewrite – an earlier draft of this document said otherwise and was refuted by measurement:
 
 ```plaintext
 A rewrite 1787978231.847 pid 16203 {"command":"echo ORIGINAL"...}
 B log     1787978231.847 pid 16204 {"command":"echo ORIGINAL"...}
 ```
 
-Same millisecond, adjacent PIDs, and the logging hook `B` received the **original** command while `A` was rewriting it. Reproduced with a real plugin loaded via `--plugin-dir`: the plugin hook and the settings hook fired 1 ms apart, both on the original input.
+Same millisecond, adjacent PIDs, and the logging hook `B` received the **original** command while `A` was rewriting it. Reproduced with a real plugin loaded via `--plugin-dir`: the plugin hook and the settings hook fired **1 ms apart**, both on the original input.
 
-Rewrites are then folded **last-write-wins, unconditionally**:
+The results are then folded, and the two channels fold differently. Permission decisions are **monotonic by rank** (`deny` > `ask` > `allow` > `none`) and cannot be downgraded. `updatedInput` has no such protection – it is simply **overwritten by whichever handler finishes last, unconditionally**:
 
 ```js
 var o9e = {deny:3, ask:2, allow:1, none:0};   // permission decisions are monotonic by RANK
@@ -85,9 +121,12 @@ var o9e = {deny:3, ask:2, allow:1, none:0};   // permission decisions are monoto
 if (F !== void 0) u = F;                      // <- LAST updatedInput wins, unconditionally
 ```
 
-Measured consequences: the **slow, first-declared** hook won twice, so declaration order does not decide — completion order does; an identical pair flipped between two back-to-back runs of the same command; and with the user's live `rtk hook claude` attached, a hook rewriting to `echo MINE_WON` **silently and completely discarded rtk's rewrite**.
+Measured consequences: the **slow, first-declared** hook won twice, so declaration order does not decide – **completion order does**; an identical pair **flipped between two back-to-back runs** of the same command; and with the user's live `rtk hook claude` attached, a hook rewriting the command to `echo MINE_WON` **silently and completely discarded rtk's rewrite**.
 
-→ **Ruling: ss-magic ships no `PreToolUse[Bash]` hook and emits `updatedInput` on no event at all.** Two rewriting hooks on one event is a race with a nondeterministic winner whose loser vanishes silently. `deny` and exit 2 compose safely because the decision is monotonic by `RANK` and cannot be downgraded — so the gate uses `deny`, which is order-independent.
+→ **Two rules follow, and the plan holds both (R20, R80, R81):**
+
+1. **No ss-magic handler ever emits a tool-input rewrite** – on any event, for any reason. Two rewriting hooks on one event is a race with a nondeterministic winner whose loser vanishes with no error anywhere, and the user's `rtk` wrapper is the live loser. `deny` and exit 2 compose safely because the decision is monotonic by `RANK`, so the gate uses `deny`, which is order-independent. This is a ban on **rewrites**, not on Bash matchers: an advisory `PreToolUse[Bash]` handler emitting only `additionalContext` composes safely and is what R91's commit nudge uses.
+2. **Coordination between ss-magic's own concurrent handlers goes through a lock file**, under the temporary root of R80 (see [scratchpad-contract.md](./scratchpad-contract.md#volatile-coordination-state--the-temporary-root)) – **never through ordering assumptions.** Nothing may assume the bootstrap finished before its sibling hooks fired; the session in which a bootstrap first runs has ss-magic's hooks inert by design (R77).
 
 Also: hooks matching via `if` conditions **spawn once per matching `&&` subcommand with the same `tool_use_id`**, and plugin hook copies are **not** deduplicated against a settings copy of the same handler. Every handler must be idempotent.
 
@@ -105,7 +144,7 @@ Also: hooks matching via `if` conditions **spawn once per matching `&&` subcomma
 
 ## Deliberately not shipped in v1
 
-- **`PreToolUse[Bash]`** — the harness spills natively and rtk already digests it. See [page-fault.md](./page-fault.md).
+- **Any `PreToolUse[Bash]` handler that rewrites the tool input or page-faults Bash *output*.** The harness spills natively and rtk already digests it. See [page-fault.md](./page-fault.md). **The prohibition has been narrowed to exactly those two things:** an advisory `PreToolUse[Bash]` matcher emitting only `additionalContext` **is** shipped (R91's commit-time checklist nudge), because it adds context without entering the last-write-wins fold.
 - **`PreToolUse[Grep|Glob]` as active gates** — these tools do not exist in this user's session at all; the matchers ship inert for forward-compatibility with their thresholds behind config.
 - **`Stop`** — its `additionalContext` behavior is contradicted between docs and shipping code and was not settled; `SessionStart(source:"compact")` covers the reconcile need with a verified channel.
 - **`PostToolUse`** — it fires after the tool ran and its output already reached the model, so it cannot shrink context. It *is* the right place for subagent cost capture in a later version.

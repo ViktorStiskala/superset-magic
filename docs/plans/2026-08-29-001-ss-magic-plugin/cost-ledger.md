@@ -76,3 +76,11 @@ Recorded because it **contradicts** the source ideation doc, and the plan should
 The Pareto shape reproduces; the main/subagent split **inverts**. This session delegated almost everything to workflows, so its cost lives in subagents and its main thread never called `Read` directly at all.
 
 **Consequence for the plan, stated plainly:** the Read gate's value is *workload-dependent*, not universal. It pays in a session that reads files on the main thread; it does nothing in a workflow-heavy session like this one. That is an argument for the ledger existing — so the gate's worth can be measured per-workload rather than assumed — and an argument against hard-coding a threshold. Both land in the plan as requirements.
+
+**What the ledger cannot supply: the gate's default threshold.** A ledger row is one cumulative
+cost figure per session, keyed on worktree root and branch; the harness's cost records are
+session-cumulative and do not decompose, so nothing in the ledger exposes a distribution of read
+sizes or their cache-creation cost. The gate's defaults are chosen at implementation time from the
+measured read-size profile in [validation-evidence.md](./validation-evidence.md), and the ledger
+tunes them after release – the ledger ships first so the gate's value can be measured once it
+lands, not so the threshold can be derived from it.

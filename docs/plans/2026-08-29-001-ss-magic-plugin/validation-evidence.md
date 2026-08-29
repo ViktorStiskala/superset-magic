@@ -44,6 +44,38 @@ The decisive part is not headlessness – a pre-trusted path loads fine – it i
 Superset worktree is a brand-new realpath under `~/.superset/worktrees/<projectId>/<branch>`**,
 so it is untrusted by construction. ss-magic's entire domain is fresh worktrees.
 
+> **CORRECTION – 2026-08-29 review. The paragraph immediately above is wrong.**
+> Trust is not keyed on the worktree's own realpath. Claude Code keys workspace trust on the
+> git repository root and, **in a worktree, on the main checkout's root** – the same way it
+> keys saved rules. A fresh Superset worktree therefore *inherits* the main checkout's trust
+> rather than arriving untrusted. Verified two ways: the documented behavior in
+> `permissions#what-runs-before-you-trust-a-folder`, and this machine's own `~/.claude.json`,
+> where `~/Work/personal/superset-magic` carries `hasTrustDialogAccepted: true` while the
+> worktree this plan was written in has no `projects` entry at all.
+>
+> The **ruling stands**; only this basis for it does not. What actually rules out project
+> scope as the enablement path, measured after the correction:\
+> – Committing `extraKnownMarketplaces` + `enabledPlugins` to a repo does **not** install the
+> plugin for a collaborator. The docs are explicit that an externally-sourced plugin enabled
+> in a project's settings is reported as not installed until each user runs
+> `claude plugin install` themselves – so project scope buys no zero-touch onboarding.\
+> – A repo's `extraKnownMarketplaces` entries are ignored **without a message** in a folder
+> the user has not trusted, so the failure is silent when it does bite.\
+> – `~/.claude/skills/<name>/` is a *documented* personal-scope plugin path (loaded as
+> `<name>@skills-dir`, scaffoldable with `claude plugin init`) with no trust gate, no network
+> and no install step. The original write-up treated it as an undocumented load path.
+>
+> Two caveats this section did not carry and should have:\
+> – The Q1 probe was run under `-p` only. An interactive trust acceptance was never exercised,
+> so "measured" overstates coverage of that specific path.\
+> – Pre-seeding `hasTrustDialogAccepted = true` in a throwaway config did **not** un-suppress
+> the project-scope plugin. That result is unexplained and is *not* accounted for by the
+> correction above; anyone reopening project scope should start there.
+>
+> See the install-scope Key Decisions in
+> [the plan](../2026-08-29-001-feat-ss-magic-claude-plugin-plan.md), which now splits
+> distribution from enablement.
+
 **[NEW] The target worktree is untrusted right now, in situ.** `~/.claude.json` holds 20
 `projects` entries and **none** of them is
 `/Users/viktorstiskala/.superset/worktrees/487339a1-…/ss-magic-plugin` – the key is absent
@@ -95,7 +127,8 @@ managed-settings-only, and none applies to this worktree.
   `operator-checklist` and `setup`, not `ss-operator-checklist` / `ss-magic-setup`, so they
   read `/ss-magic:operator-checklist` and `/ss-magic:setup` rather than stuttering.
 
-Confidence: **measured**.
+Confidence: **measured**, for the ruling – with the correction above applied to its stated
+basis, and with the interactive trust-acceptance path recorded as untested.
 
 ---
 
@@ -799,6 +832,145 @@ is ever wanted it belongs in a skill the user invokes, not in a hook.
 
 Confidence: **measured** (no TTY, submit-by-default, unknown response schema); **inferred** (the
 replacement).
+
+---
+
+## Q13 – Marketplace distribution [NEW, 2026-08-29 review]
+
+**RULING. Ship a marketplace from the public repo as a distribution channel. Keep personal
+scope as the enablement scope.** This is the "distribution and enablement are separate
+decisions" Key Decision; Q1's correction block carries the enablement half.
+
+Measured on Claude Code 2.1.251 against a throwaway `CLAUDE_CONFIG_DIR`:
+
+- **A marketplace may live in the same repo as the plugin it serves.** With `.claude-plugin/`
+  holding both `plugin.json` and `marketplace.json`, and the entry `{"name": "ss-magic",
+  "source": "."}`, the install succeeds:
+
+  ```plaintext
+  ✔ Successfully added marketplace: ss-magic
+  ✔ Successfully installed plugin: ss-magic@ss-magic (scope: user)
+  ```
+
+- **Project-scope install writes exactly two settings keys**, and they are the shapes the plan
+  assumes: `extraKnownMarketplaces` (marketplace name → `{"source": {...}}`) and
+  `enabledPlugins` (`plugin@marketplace` → boolean), in `.claude/settings.json`.
+- **Committing those keys does not install for anyone else.** The docs are explicit: an
+  externally-sourced plugin enabled in a project's settings is reported as *not installed* on
+  every path that loads plugins until each user runs `claude plugin install` themselves. This
+  is the finding that decides the enablement half – project scope buys no zero-touch.
+- **Version is the cache key**, resolved from `plugin.json`'s `version`, then the marketplace
+  entry's, then the source commit SHA. Declaring an explicit version makes updates
+  release-gated; omitting it makes every push an update. The repo's existing convention (bump
+  the crate version on any behavior change) makes the explicit-version path the fit.
+- **Offline is safe.** An installed plugin loads from its local cache with no network at
+  startup; marketplace refresh runs in the background after startup with a randomized delay,
+  and a failed refresh falls back to the cached catalog.
+- **`claude plugin list --json` returns a bare top-level array on 2.1.251**, not the
+  `{"plugins": [...]}` object the docs show. Entries carry `id`, `version`, `scope`, `enabled`,
+  `installPath`, `installedAt`, `lastUpdated`, `projectPath`; `errors[]` / `notes[]` appear
+  only when there is something to report, which is how Q1's trust suppression surfaced.
+  Duplicate ids appear once per `projectPath`. `claude plugin validate` has no `--json`, so CI
+  relies on the exit code (`--strict` treats warnings as errors).
+- **No separate hook-approval prompt exists** for plugin-supplied hooks. The gate is enabling
+  the plugin, plus workspace trust for a project-scope `@skills-dir` plugin. The only
+  plugin-hook-specific UI is a `[plugin:<name>]` provenance label on an `ask` decision.
+
+**Not measured, and load-bearing if the enablement half is ever reopened:** whether a
+*relative-path* source inside the same repo counts as "external" for the no-auto-install rule
+(the docs enumerate only GitHub repos and npm packages), and whether the harness loads or
+deduplicates two registrations sharing the manifest name `ss-magic` from different scopes. The
+plan assumes it loads both, which is what makes the one-enabled-registration rule necessary.
+
+Confidence: **measured**, except the two items named above, which are **assumed**.
+
+---
+
+## Q14 – Marketplace-only delivery and the SessionStart bootstrap [NEW, 2026-08-30]
+
+**RULING. The marketplace is the ONLY delivery path, its entry is a `git-subdir` source, and a
+`SessionStart` hook bootstraps a pinned binary into `${CLAUDE_PLUGIN_DATA}`.** `ss-magic` installs
+nothing: there is no `plugin install` verb, no personal-scope tree under `~/.claude/skills/`, and no
+sync-time plugin step. `plugin.enabled` **stays**, as the per-repository gate for a
+machine-globally installed plugin.
+
+This section is **additive**. It does not revise Q1's or Q13's probe records; it records what was
+measured on 2026-08-30, against Claude Code 2.1.251, that forces the change on top of them.
+
+### The marketplace source
+
+- **`git-subdir` schema.** `url` (the repository), `path` (the committed plugin subdirectory,
+  resolved **from the repository root**, not from `.claude-plugin/`), optional `ref`, and optional
+  `sha` which must be **lowercase hex** – an uppercase `sha` is rejected, so a malformed pin cannot
+  reach a release. **measured.**
+- **String vs object is the branch that costs the collaborator auto-install.** The 2.1.251 plugin
+  loader branches on whether a source is a *string* or an *object*. A relative-path string source
+  (`"./plugin"`) is resolved inside the already-cloned marketplace and is **not** treated as
+  external. **Every object source – `git-subdir` included – takes the external branch**, and an
+  externally-sourced plugin that only a project's `.claude/settings.json` enables is reported as
+  *not installed* on every path that loads plugins until each user runs `claude plugin install`
+  themselves. Choosing `git-subdir` therefore **forgoes collaborator auto-install**, knowingly, in
+  exchange for an explicit release pin. **measured** (the loader branch); the no-auto-install
+  consequence is the same finding Q13 already recorded.
+- **`claude plugin validate` is non-strict about unknown keys inside a source object.** An
+  unrecognised key there is silently ignored rather than flagged – so validation passing is *not*
+  evidence that a source field is being honoured, and CI cannot use it to prove the pin is read.
+  **measured.**
+- **Whether a `git-subdir` install can pin to a tag or release rather than tracking the default
+  branch in practice was not exercised end to end.** The schema accepts `ref` and `sha`, and the CLI
+  refuses to install when a pinned commit does not match; that a released pin survives a later
+  background marketplace refresh unchanged is **assumed, not measured**. R95's release ordering is
+  written so a wrong assumption here fails loudly – a pin naming an unpublished release 404s and the
+  bootstrap no-ops – rather than silently upgrading.
+
+### Plugin data, and variable substitution
+
+- **`${CLAUDE_PLUGIN_DATA}` resolves to a per-plugin directory named `<plugin>-<marketplace>`, with
+  the `@` replaced** – `ss-magic@ss-magic` becomes `ss-magic-ss-magic`. That directory **survives a
+  plugin update**, whereas `${CLAUDE_PLUGIN_ROOT}` is version-scoped and is replaced on every bump,
+  which is why the root can never be the install target (R70). **measured.**
+- **Substitution works in both `command` and `args`** – per element inside `args`, and inside the
+  `command` string – for both variables. Shell form *additionally* substitutes the bare `$NAME`
+  spelling; exec form does not, so the braced form is used everywhere (R74, KTD18). **measured.**
+- **Both variables are plugin-only, and neither is exported to the Bash tool.** A skills-dir hook or
+  a `settings.json` hook referencing `${CLAUDE_PLUGIN_DATA}` is a **hard error**, not an empty
+  expansion; and a skill body cannot name the path at all, which is what the shipped `bin/` wrapper
+  (R75) exists to close. **measured.**
+
+### The hook the bootstrap rides on
+
+- **The default hook timeout is 600 seconds**, overridable per entry with `timeout` in **seconds**;
+  on expiry the process is killed. **measured.**
+- **`SessionStart` blocks session start.** A deliberately slow 6-second hook made a `claude -p` run
+  take **~10.35 s** end to end. **measured.**
+- **`SessionStart` stdout enters the model's context**, as the `content` of a transcript attachment –
+  so anything printed is paid for in tokens on *every* session. `stderr` is recorded in the
+  transcript but is **not** model-facing. This is what makes R72's silence-on-success a budget rule
+  rather than a style preference. **measured.**
+- **`"matcher": "startup"` restricts the entry to a fresh start** – verified by driving a `-c`
+  resume, which did not fire it. With no matcher, one entry re-runs on all of `startup`, `resume`,
+  `clear`, `compact` and `fork`. **measured.**
+- **`async: true` is a trap for a bootstrap.** It does make startup non-blocking, but the binary is
+  then not ready for the first turn, and in `claude -p` the backgrounded hook is **killed when the
+  session exits** – a 10-second async hook never reached its second line. Sync-but-fast, with a small
+  explicit `timeout`, is the shape that works. **measured.**
+
+### Installing the pinned binary
+
+- **The published `ss-magic-installer.sh` (cargo-dist 0.32.0) honours three install-dir variables**,
+  in this order: `SS_MAGIC_INSTALL_DIR`, then `CARGO_DIST_FORCE_INSTALL_DIR`, then
+  `UNMANAGED_INSTALL`. The first two select the `cargo-home` layout – binary under `<dir>/bin/`, a
+  receipt written outside the plugin data directory, the user's shell profile edited, and a
+  self-updater installed. **`SS_MAGIC_UNMANAGED_INSTALL` selects the flat layout and sets
+  `NO_MODIFY_PATH=1` and `INSTALL_UPDATER=0` in one step**, which is the only one of the three
+  compatible with a pinned binary living inside a directory the plugin manager owns: no PATH edit,
+  and no second updater to fight the pin (R69). The `--no-modify-path` flag is deprecated in favour
+  of the environment variable. Verified against the real published asset for v0.9.0. **measured.**
+- **No Windows target is published**, so the bootstrap no-ops there and reports the reason once on
+  stderr (R78) rather than failing on every session start. **measured.**
+
+Confidence: **measured** throughout, except the `git-subdir` tag/release pinning behaviour named
+above, which is **assumed**.
 
 ---
 

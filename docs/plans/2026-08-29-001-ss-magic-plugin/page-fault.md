@@ -4,7 +4,7 @@ Companion to [the plan](../2026-08-29-001-feat-ss-magic-claude-plugin-plan.md). 
 
 ## The original idea, and what measurement did to it
 
-The brief proposed: a `PreToolUse[Bash]` hook that tees oversized output to `.scratchpad/.ss-magic-plugin/spill/<id>.txt` and returns a head/tail digest plus a descriptor, paired with a `PreToolUse[Read]` deny that names the size and says "range-read or grep".
+The brief proposed: a `PreToolUse[Bash]` hook that tees oversized output to `.superset/.magic/spill/<id>.txt` and returns a head/tail digest plus a descriptor, paired with a `PreToolUse[Read]` deny that names the size and says "range-read or grep".
 
 **The Bash half is already built, by the harness, and better.** Claude Code has a *tool-agnostic* result-persistence layer: over a per-tool threshold it writes the full untruncated result to disk and hands the model a ~2.3 KB envelope naming the file.
 
@@ -65,13 +65,26 @@ Foreground spills preview the **first** 2 KB; backgrounded task output previews 
 
 ## The mechanism, as ruled
 
-`PreToolUse` matcher `Read|Grep|Glob`, with a hash-keyed conclusion cache under `.scratchpad/.ss-magic-plugin/conclusions/`. Two checks allow untouched before KTD4's own order even starts – a scratchpad path and a subagent-issued read, both reasoned about below – then KTD4 takes over: the non-text exemption (R43), one stat, the threshold, the bounded-window pass-through (R41), the one-shot bypass (R42), and only then the cache. **Both remaining branches deny**; the difference is what the deny reason carries.
+`PreToolUse` matcher `Read|Edit|Write|NotebookEdit|Grep|Glob`, with a hash-keyed conclusion cache under `.superset/.magic/conclusions/`. The decision order is KTD4's, and its **first two steps are not size checks at all**:
+
+1. **Config resolution runs first** (R55, R53). A repository where the plugin is disabled must no-op before anything else happens, so the repo root is located by walking up from the envelope's `cwd` looking for `.superset/magic.json` – a bounded filesystem walk, never a git subprocess – and the result is memoized per `cwd` for the life of the process. The gate's threshold, byte budget and exemption list come from that same resolved configuration.
+2. **Checklist classification runs next** (R88), against the **resolved realpath**, and it is **size-independent**. It fires for `Read`, `Edit`, `Write` and notebook edits alike, and it denies **ahead of** every exemption below – see "Why the checklist deny precedes every exemption".
+3. Only then the three exemptions: the state tree, a subagent-issued read, and the non-text extension list.
+4. Only then, and **only for `Read`**, the size machinery: one stat, the threshold, the bounded-window pass-through (R41), the one-shot bypass (R42), and finally the cache.
+
+**The gate now sees four tools, but only the checklist branch is four-tool wide.** An `Edit`, `Write` or notebook edit that is not a checklist path is allowed immediately – the size gate remains `Read`-only, because there is no context to save on a write. **Three branches deny**; the difference is what the deny reason carries.
 
 ```mermaid
 flowchart TD
-  R["Read(file_path, offset?, limit?)"] --> SP{"path inside<br/>.scratchpad/?"}
-  SP -- yes --> OK["allow untouched<br/>(emit nothing, exit 0)"]
-  SP -- no --> AG{"issued inside a subagent?<br/>(agent_id/agent_type –<br/>unconfirmed on PreToolUse)"}
+  R["PreToolUse: Read / Edit / Write / notebook edit"] --> CFG{"plugin enabled for<br/>this cwd? (R55, R53)"}
+  CFG -- no --> OK["allow untouched<br/>(emit nothing, exit 0)"]
+  CFG -- yes --> CL{"resolved realpath is<br/>a checklist file? (R88)"}
+  CL -- yes --> CD["deny – reason says:<br/>use ss-magic plugin checklist<br/>(size-independent, ahead of every exemption)"]
+  CL -- no --> ED{"tool is Edit / Write /<br/>notebook edit?"}
+  ED -- yes --> OK
+  ED -- no --> SP{"path inside<br/>.superset/.magic/? (R43)"}
+  SP -- yes --> OK
+  SP -- no --> AG{"issued inside a subagent? (R52)<br/>(agent_id/agent_type –<br/>unconfirmed on PreToolUse)"}
   AG -- yes --> OK
   AG -- no --> X{"extension on the<br/>non-text list? (R43)"}
   X -- yes --> OK
@@ -91,13 +104,28 @@ flowchart TD
 
 The HIT path is the **never-blocked-forever guarantee**: the same input is never denied *empty* twice. The second attempt returns the answer, in the deny reason itself.
 
-### Why `.scratchpad/` is exempt, unconditionally
+### Why the checklist deny precedes every exemption
 
-The gate must never deny a read whose path is inside `.scratchpad/`. The observed real `STATUS.md` is 594 lines / 88.7 KB (see [scratchpad-contract.md](./scratchpad-contract.md)), and the shipped scratchpad skill tells the model to read `STATUS.md` first on resume (see [skills.md](./skills.md)). A session that just survived compaction relies on exactly that read to re-orient; gating it on size would deny the read the scratchpad exists to serve, defeating the feature's own headline outcome – a session resumed after compaction re-orienting from the scratchpad alone. The check is a path prefix test, not a size check, so it costs nothing on the exempt path and never touches the cache key.
+A checklist file (`docs/actions/<YYYY-MM-slug>.checklist.json`, R82) is denied because the model is meant to reach it through the `ss-magic plugin checklist` verbs, which render it through the binary's own renderer inside an untrusted-data envelope – not by pulling the raw JSON into the window. That deny has to be classified **before** the exemptions, not after, for a specific reason: **the subagent exemption alone would hand a dispatched agent the raw file.** An agent dispatched to "go read the checklist" is exempt by R52, so an order that checked exemptions first would leak the whole document into the subagent's context, and from there into its report. The state-tree exemption fails the same way for a checklist reached through the R89 pointer inside `.superset/.magic/`.
+
+Two consequences worth stating plainly:
+
+- **The deny reason for a checklist path is the "use the checklist verb" text, never the Explore-routing page-fault text** – even though a real checklist is easily large enough to trip the size threshold as well. The two denials are different instructions, and the model must receive the one that leads to the right verb.
+- Because the match is on the **resolved realpath**, reaching the file through the R89 pointer and reaching it directly are the same case, and a **dangling** pointer is still classified as a checklist path rather than falling through to a stat (see [scratchpad-contract.md](./scratchpad-contract.md)).
+
+The deny does not fire when the binary is absent – the gate is fail-open by construction (R26) – which is exactly why the checklist file must stay valid, hand-editable JSON (R82).
+
+### Why `.superset/.magic/` is exempt, unconditionally
+
+The gate must never deny a read whose path is inside `.superset/.magic/`. The observed real `STATUS.md` is 594 lines / 88.7 KB (see [scratchpad-contract.md](./scratchpad-contract.md)), and the shipped scratchpad skill tells the model to read `STATUS.md` first on resume (see [skills.md](./skills.md)). A session that just survived compaction relies on exactly that read to re-orient; gating it on size would deny the read the scratchpad exists to serve, defeating the feature's own headline outcome – a session resumed after compaction re-orienting from the scratchpad alone. The check is a path prefix test, not a size check, so it costs nothing on the exempt path and never touches the cache key. The match is on the exact two-component prefix (`.superset/.magic/`), and must never widen to `.superset/` itself – an over-threshold `.superset/magic.json` is still gated.
+
+"Unconditionally" means *within the exemption stage*. It does not outrank the checklist deny, which is classified one step earlier: a checklist reached through the R89 pointer inside `.superset/.magic/` is still denied with the checklist text.
 
 ### Why a subagent's own read must skip the gate
 
 The MISS branch's routing sends the oversized read to an Explore agent, which then reads the same file to write the conclusion. If that read is itself subject to the gate, it is denied too, and the deny reason routes it to dispatch another Explore agent – the dispatching agent is both required to read the file and blocked from doing so, forever. The gate must no-op for a `Read` issued inside a subagent. The identification signal is the envelope's `agent_id`/`agent_type` fields, confirmed present on `SubagentStop` (see [hook-contract.md](./hook-contract.md)); their presence on `PreToolUse` specifically was **not measured** in this spike, so implementation must confirm both fields arrive on a subagent-issued `PreToolUse` envelope before relying on them as the gate's identification signal.
+
+This exemption is the narrowest of the three, and it is the reason the checklist deny is classified ahead of it (R52, R88): "a subagent may read anything" is correct for the *size* gate, whose whole purpose is to move the read into the agent's own window, and wrong for the checklist, where routing to an agent is precisely the leak. The exemption waives the threshold, never the checklist classification.
 
 ### Why deny-with-inline-conclusion, and not an `updatedInput` redirect
 
@@ -109,6 +137,10 @@ A working `updatedInput` redirect was built and verified end to end — the hook
 4. **`updatedInput` fails closed on a type error.** A wrong type inside it is a hard deny indistinguishable from a policy block, and it REPLACES rather than merges — a dropped required key produced *"The required parameter `command` is missing"*. Not emitting it at all removes an entire failure mode.
 
 **Budget requirement.** The uncapped channel has **no runaway protection** — 16 MiB produced a 34 MB transcript and a `Prompt is too long` API error. ss-magic must impose its own byte budget on the inline conclusion, sized against the context window at roughly `bytes / 4` tokens.
+
+### Why the conclusion is wrapped, not just marked
+
+A conclusion – and a salvaged subagent transcript – is delivered inside an explicit **untrusted-data envelope** instructing the model to treat the contents as evidence and to ignore any instruction inside them (R64). Provenance marking (R54) already says *where* the text came from – ss-magic-generated, derived from a file, never the file's own content – but that marking alone does not stop imperative text a repository controls from being read as instruction: an Explore agent summarises the denied file into the cache, and the gate then injects that summary straight into a denial the model is primed to read as guidance. The envelope closes that gap without taking over provenance marking's job. It is owned by the cache module, not the gate, so `conclusions` (the read-back verb) and the deny path render the identical wrapper around the identical text.
 
 ### Verified by running it
 
@@ -133,4 +165,4 @@ GitHub issue **#43407** (deny silently not blocking on v2.1.87) **does not repro
 
 The brief named `Read`, `Grep` and `Glob`. In this user's environment **`Grep` and `Glob` do not exist as tools** — a live session enumerated its tools and neither was present; `ToolSearch select:Grep` returned no match, and the model falls back to `Bash grep` (which rtk already digests). A `PreToolUse[Grep|Glob]` matcher would never fire here.
 
-**Ruling:** target `Read`. Ship the `Grep`/`Glob` matchers as forward-compatibility with their thresholds behind config, and mark them **unverified** — they could not be exercised.
+**Ruling:** the *size* gate targets `Read`. Ship the `Grep`/`Glob` matchers as forward-compatibility with their thresholds behind config, and mark them **unverified** — they could not be exercised. `Edit`, `Write` and notebook edits are matched for a different reason entirely – R88's checklist deny, which is size-independent – and reach no part of the size machinery.

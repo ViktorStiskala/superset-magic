@@ -17,9 +17,38 @@ execution: code
 
 **Product authority.** The requirements below are settled. Every design fork was closed by measurement against Claude Code 2.1.251 and the `ss-magic` crate at v0.9.0; the evidence is in [validation-evidence.md](./2026-08-29-001-ss-magic-plugin/validation-evidence.md). Six pieces of the original request were rewritten or dropped on that evidence, each with a named replacement — see [Key Decisions](#key-decisions).
 
-**Open blockers.** None. Every question is ruled.
+**Open blockers.** None. Every question is ruled, with one correction carried in: the
+2026-08-29 review found that the install-scope decision's stated premise was factually
+wrong (see [Key Decisions](#key-decisions)). The decision survives on corrected reasons;
+the premise does not.
 
 **Product Contract preservation.** Restructured, no scope change. R1-R34 keep their IDs and meaning; R8 and R9 were rewritten in place after planning research found each was two rules wearing one ID — R8 now separates the stdin-driven hook entry point from the argv-driven human verbs, and R9 splits the fail posture that differs between them. R35-R58 and AE19-AE44 are additions closing gaps planning and review found, not revisions of settled product scope.
+
+**2026-08-29 revision.** Two user-directed changes landed after the third review round,
+each with the requirements and units they touch rewritten rather than renamed:\
+**(1) Plugin state moved from `.scratchpad/` to `.superset/.magic/`**, ignored by a rule in
+the repository's `.gitignore` instead of a nested self-ignoring file. This inverts R40 and
+AE24, re-grounds R1/U1's motivation, and changes who owns the ignore rule (R59, R63).\
+**(2) The install-scope decision was split into two axes** – distribution and enablement –
+so a plugin marketplace can ship from the public repo without moving the enablement scope
+(R59-R62, R65). R59-R65 and AE45-AE53 are that revision's additions.
+
+**2026-08-30 revision.** Five further user-directed changes, after a second review round:\
+**(A) The local install path is deleted.** No `ss-magic plugin install`, no personal-scope
+tree, no sync-time install step. The marketplace is the only way the plugin reaches a
+machine. **`plugin.enabled` stays** – it remains the per-repository gate for a
+machine-globally installed plugin, and the `plugin` object continues to carry the rest of
+the plugin's configuration.\
+**(B) The binary is bootstrapped by the plugin, not shipped in it.** A `SessionStart` hook
+installs a pinned `ss-magic` into `${CLAUDE_PLUGIN_DATA}` and hooks invoke it from there
+(R68-R79).\
+**(C) A project-agnostic operator checklist**, whose JSON schema and Markdown renderer ship
+inside the binary (R82-R87).\
+**(D) `/ss-magic:setup` is replaced by `/ss-magic:setup-github-ci`** (R93-R95).\
+**(E) Checklist runtime behavior** – init, a path-based Read/Edit deny, a commit-time nudge,
+a direnv export, and CI rendering into a PR comment (R88-R92).\
+R66-R95 and AE54-AE78 are this revision's additions; the local-install requirements are
+retired into Scope Boundaries rather than deleted, so the trace stays readable.
 
 ## Companion documents
 
@@ -49,14 +78,19 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 
 ### Key Decisions
 
-- **Install to personal scope, never project scope.** A project-scope plugin is gated on `hasTrustDialogAccepted`, and every Superset worktree is a new realpath — untrusted by construction, which is exactly ss-magic's domain. *Governs R10, R11.*
-- **The plugin is a manifest; the binary is the behavior.** Hooks call `ss-magic` by bare name on PATH, so nothing is vendored and hook behavior rides the existing self-update. *Governs R12, R13.*
+- **The marketplace is the only delivery path.** `ss-magic` installs nothing: there is no `plugin install` verb, no personal-scope tree, and no sync-time install step. A marketplace published from the public `ViktorStiskala/superset-magic` repo is how the plugin reaches a machine, via `claude plugin marketplace add` + `claude plugin install`. *Governs R66; retires R10-R13, R38, R39, R60, R61.*
+- **The marketplace source is `git-subdir`, with a stated cost.** The entry points at a committed plugin subdirectory with `url`, `path`, and a `ref`/`sha` pin (schema verified on 2.1.251). This buys explicit release pinning – the `sha` is the effective pin when both are set, and the CLI refuses to install when the pinned commit does not match – and it keeps working when the marketplace is added by direct URL to `marketplace.json`. **The cost, measured in the 2.1.251 loader:** the plugin loader branches on whether a source is a string or an object. A relative-path string source (`"./plugin"`) is resolved inside the already-cloned marketplace and is *not* external; every object source, `git-subdir` included, takes the external branch, so a plugin that only a project's `.claude/settings.json` enables is reported as not installed until each user runs `claude plugin install`. `git-subdir` therefore forgoes collaborator auto-install. It also requires `git` >= 2.25 on the client for sparse-checkout cone mode. *Governs R66, R67.* (session-settled: user-directed – `git-subdir` chosen after the tradeoff above was measured.)
+- **`plugin.enabled` stays.** A marketplace install is machine-global, so the per-repository gate is what keeps an install made for one repo from acting in every other. The overlaid `plugin` object remains both the gate (`enabled`) and the home for the rest of the plugin's configuration – thresholds, byte budgets, exemption lists (R53), and whatever later needs a per-repository value. *Governs R5-R7, R55, R65.* (session-settled: user-directed – kept after the review proposed four replacements for it.)
+- **Personal scope was never the answer, and the trust premise was wrong.** The original decision claimed a project-scope plugin is gated on `hasTrustDialogAccepted` and "every Superset worktree is a new realpath — untrusted by construction". **That premise is wrong** – Claude Code keys workspace trust on the git repository root and, in a worktree, on the *main checkout's* root. The point is now moot for a different reason: nothing is installed to `~/.claude/skills/ss-magic/` at all. Note that a leftover skills-dir copy would be *suppressed* rather than doubled – the loader resolves by plugin **name** and a marketplace install outranks `@skills-dir`, reporting the shadowed copy in the `/plugin` Errors tab – so migration deletes it rather than relying on precedence. *Governs R66.*
+- **The plugin is a manifest plus one bootstrap script; the binary is the behavior.** The plugin ships JSON, Markdown and a single shell script. That script installs a pinned `ss-magic` into `${CLAUDE_PLUGIN_DATA}` – the one directory that survives a plugin update, since `${CLAUDE_PLUGIN_ROOT}` is a version-scoped path that is replaced on every bump. Hooks then invoke the binary from that fixed path rather than by bare name, so hook behavior rides the plugin's pin instead of the binary's own self-update. *Governs R66-R73.*
+- **The version pin, not the marketplace, decides which binary runs – and the pin is a supply-chain boundary.** Whoever can write the pinned-version file in the marketplace repo decides what every installed machine downloads and executes at session start. Round 1's answer to the same channel (re-verify installed bytes against the binary's embedded assets) died with the install verb, so the replacement control lives in the bootstrap: the pin is validated as a version literal before it reaches a URL, and the downloaded archive is checksum-verified against the release's published digest before anything executes. *Governs R70, R71.*
+- **`ss-magic plugin` never auto-updates, and `--version` never opens a menu.** The plugin's binary is pinned deliberately: the skills, hooks and Markdown the marketplace ships are versioned together with the binary that reads them, so a silent self-update would desynchronise the two. The whole `plugin` verb family is therefore excluded from the update gate, `--version`/`-V` short-circuits before it, and the interactive menu refuses to open without a TTY. Bare `ss-magic` keeps its existing update behavior – the plugin never invokes it. *Governs R9, R68, R69.* (session-settled: user-directed.)
 - **Drop the Bash page-fault half entirely.** The harness already spills every tool's output to a named file with a size label and preview, `BASH_MAX_OUTPUT_LENGTH` provably cannot raise the 30,000-char literal, and a rewrite would race the user's live rtk hook. Replaced by a read-only spill manifest. *Governs R20, R25.* (session-settled: user-directed — the user's own ideation named this as idea 3; measurement showed the mechanism already exists, so the manifest is what survives.)
 - **The gate denies; it never rewrites.** `updatedInput` works but the transcript keeps the original tool call, so the model is never told its input changed — and rewrites race last-write-wins. `permissionDecisionReason` is uncapped, so the cached conclusion rides inline instead. *Governs R21, R22, R23.* (session-settled: user-directed — chosen over the brief's "deny and tell the model to range-read or grep": that leaves the model to re-derive, and its own note flagged the looping risk.)
 - **Route denied reads to an Explore agent and cache the conclusion by file identity.** The saving is not the agent's tokens, it is every later request that never re-reads the payload. *Governs R21, R24.* (session-settled: user-directed.)
 - **Key the scratchpad on `<repo>-<branch>` from git, never on the Superset workspace name.** This overturns a direction confirmed earlier in the session: the name is user-mutable, 31 of 36 live workspaces have `name != branch`, and five are named `main`, so a rename would silently orphan the scratchpad. *Governs R14, R15.*
 - **No symlink registry.** ss-magic creates no symlink anywhere today — forward sync skips them and pack only classifies them — so a plain `current.json` pointer is used instead. *Governs R16.*
-- **Fix two pre-existing defects first.** Reverse sync can append `*` to the main checkout's root `.gitignore`, and the sync/pack enumeration layer is gitignore-blind. The plugin's own state lives under `.scratchpad/`, so shipping without these turns a private scratchpad into a leak surface. *Governs R1, R2, R3.*
+- **Fix two pre-existing defects first.** Reverse sync can append `*` to the main checkout's root `.gitignore`, and the sync/pack enumeration layer is gitignore-blind. Neither is armed by the plugin's own state any more – with state at `.superset/.magic/` ignored by a repository-level rule, `ensure_path_ignored` lifts a root rule to a root rule and the re-anchor defect is not reachable through this plan's own writes. Both stay Phase A on live evidence instead: `.scratchpad/.gitignore` containing `*` **already exists in this worktree**, written by the planning tooling, so any broad reverse-sync pattern can still lift it into the main checkout today; and the enumeration layer must exclude the relocated state tree before the first byte lands in it. *Governs R1, R2, R3.*
 - **Every hook is advisory, never a security gate.** Three independent fail-open paths: a missing binary, a timed-out `PreToolUse` hook, and an envelope-level typo. The real secret boundary stays in the sync engine. *Governs R26.*
 - **Ship the cost ledger on `SessionEnd`.** The "1.5 s rules out a full scan" premise was wrong by a factor of three — the worst session tree in a 2.61 GiB corpus scans in 0.87 s. *Governs R27, R28.*
 - **Tune the compaction window with `autoCompactWindow`, not `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`.** The env var is a percent bound to a field named `testPctOverride`, absent from `/autocompact` and `/config`, and can only lower the window. *Governs R30, R31.*
@@ -67,7 +101,7 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 **Prerequisites — these land before the plugin writes a byte**
 
 - R1. `ensure_path_ignored` must not re-anchor a covering rule at a broader scope than it had in the source tree; reuse a pattern only when the target has a `.gitignore` at the same relative directory, else fall through to an anchored literal.
-- R2. The sync engine's enumeration layer must exclude `.superset/backups`, `.scratchpad` and `.git` as whole trees, in `walk_source` and in `pack`, including when a directory match is an ancestor of an excluded subtree.
+- R2. The sync engine's enumeration layer must exclude `.superset/backups`, `.superset/.magic`, `.scratchpad` and `.git` as whole trees, in `walk_source` and in `pack`, including when a directory match is an ancestor of an excluded subtree. `.scratchpad` stays on the list as a third-party tree ss-magic does not own but must never push into main; `.superset/.magic` is added, not substituted. The match is on the exact two-component path – it must never widen to `.superset` itself, which would exclude the contract files (`config.json`, `magic.sh`, `magic.json`) from sync and pack.
 - R3. `pack` must report the number of unique paths it archived, not the number of tar entries.
 
 **Configuration**
@@ -79,34 +113,53 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 
 **CLI surface**
 
-- R8. `ss-magic plugin` provides one stdin-driven hook entry point, `plugin hook <event>`, for the events `session-start`, `pre-tool-use`, `pre-compact`, `subagent-stop` and `session-end`, plus argv-driven human verbs including `install`, `uninstall`, `status`, `cost`, `spill-index`, `scratchpad`, `conclude`, `conclusions`, `gc`, `bypass`, `expect-artifact`, `enable`, `disable`, `config` and `compact-window`.
+- R8. `ss-magic plugin` provides one stdin-driven hook entry point, `plugin hook <event>`, for the events `session-start`, `pre-tool-use`, `pre-compact`, `subagent-stop`, `session-end` and `file-changed` (R92), plus argv-driven human verbs including `status`, `cost`, `spill-index`, `scratchpad`, `conclude`, `conclusions`, `gc`, `bypass`, `expect-artifact`, `enable`, `disable`, `config`, `compact-window`, `setup-github-ci` (R93), and the `checklist` family of R90. There is no `install` verb: the marketplace is the only delivery path (R66).
 - R9. `ss-magic plugin` never runs the auto-update gate and never opens the TUI; a hook verb prints nothing to stdout beyond its JSON envelope and exits 0 on any internal error, while a human verb reports failure on stderr and exits non-zero.
 - R35. Hook and human entry points are separate commands – `plugin hook <event>` for stdin-driven hooks, named verbs for humans – and no command serves both roles; print and exit posture per R9.
 - R36. A `status --json` verb reports the resolved slug, state directories, thresholds, and install state, so any agent can discover them from Bash with no injected context.
+- R65. The overlaid `plugin.enabled` (R5-R7) remains the single behavioral switch: hooks no-op when it is false regardless of how the harness loaded the plugin (R55). Because enablement now has two layers – the harness decides through trust plus the plugin registrations it loaded, ss-magic decides through its own overlay – `status` and `status --json` report both, naming the harness-side scope, registration id and enabled flag alongside ss-magic's own resolved value, so "why is the plugin not acting" has one place that answers it.
 - R37. `enable`/`disable` (with `--local` targeting the main checkout's overlay per R7) and `config get`/`config set` edit the plugin configuration from the command line, writing through the unknown-key-preserving path of R4; `disable` stops the hooks from acting and leaves the installed tree in place, which only `uninstall` removes.
 
 **Packaging and install**
 
-- R10. The plugin installs to the user's `~/.claude/skills/ss-magic/`, resolved from the home directory and honouring `CLAUDE_CONFIG_DIR`.
-- R11. Install verifies itself against the harness's own plugin listing and surfaces any reported errors and notes verbatim, ignoring the listing's exit code.
-- R12. The installed tree contains only JSON and Markdown; hooks invoke `ss-magic` by bare name.
-- R13. Install is content-addressed: identical bytes write nothing, and changed bytes print one notice naming the reload command.
-- R38. No value from `magic.json` or `magic.local.json` reaches the rendered plugin manifest bytes; configuration only gates whether the binary-owned bytes are written.
-- R39. The first install on a machine prints a loud notice that machine-global hooks are being installed and what they do; a subsequent identical install stays silent per R13.
+- ~~R10-R13, R38, R39~~. **Retired 2026-08-30 – the local install path is deleted.** They described installing to `~/.claude/skills/ss-magic/`, verifying that tree, content-addressing it, keeping repository values out of rendered manifest bytes, and the first-install notice. See Scope Boundaries → "Retired with the local install path"; R66-R73 replace them.
+- R66. The plugin reaches a machine only through the marketplace. `ss-magic` has no `install` verb, writes no plugin tree anywhere, and `ss-magic sync` runs no plugin step. Migration deletes any pre-existing `~/.claude/skills/ss-magic/`, because a marketplace install outranks a skills-dir copy by plugin name and would otherwise leave a shadowed copy reported in the harness's plugin-errors view.
+- R67. The marketplace manifest declares one `git-subdir` entry naming the repository URL, the committed plugin subdirectory as `path` (resolved from the repository root, not from `.claude-plugin/`), and a `ref` plus lowercase-hex `sha` pin. A release advances the pin; installs are therefore release-gated rather than tracking the default branch.
+- R68. `ss-magic --version` / `-V` short-circuits argument parsing before any subcommand dispatch, prints the crate version on stdout, runs no update check, and never constructs the interactive menu. Without this the flag falls through to bare invocation, which is on the update-gate list and routes to the TUI – so the bootstrap's freshness probe would trigger a network self-update and open a menu with no terminal attached.
+- R69. No `ss-magic plugin` invocation ever runs the auto-update gate, and the interactive menu refuses to open when stdout or stdin is not a TTY, reporting the reason on stderr. The plugin's binary is pinned so that it stays in step with the skills, hooks and Markdown the marketplace ships alongside it; a silent self-update would desynchronise them. Bare `ss-magic` keeps its existing update behavior, and no plugin path invokes it.
+
+**The bootstrap**
+
+- R70. A `SessionStart` hook installs the pinned `ss-magic` into `${CLAUDE_PLUGIN_DATA}` when it is absent or its version does not match the pin, and does nothing otherwise. The pin lives in a file beside `plugin.json`, so a plugin update is what triggers a binary update. `${CLAUDE_PLUGIN_ROOT}` is never the install target: it is version-scoped and replaced on every plugin update.
+- R71. Before any URL is composed, the bootstrap validates the pin against a strict `MAJOR.MINOR.PATCH` pattern. It then fetches the **platform release archive directly** and verifies it against that archive's published `.sha256` before extracting anything, rather than piping the installer script into a shell. This is not a stylistic preference: the release publishes `.sha256` siblings for the `.tar.gz` archives but **not** for `ss-magic-installer.sh`, so a piped installer is the one executed artifact no published digest covers – the script does verify the archive it downloads, but nothing verifies the script. Fetching the archive directly makes the verified thing and the executed thing the same thing. A fetch or verification failure leaves any already-installed binary in place.
+- R72. The bootstrap never fails a session. It exits 0 on every path – no network, DNS failure, proxy, 404, checksum mismatch, unwritable data directory, or unsupported platform – emits nothing on stdout when the pin already matches, and reports at most one line on stderr otherwise. A hook's stdout enters the model's context on every session start, so silence on the success path is a token budget rule, not a style preference.
+- R73. The bootstrap serialises against concurrent sessions through a lock under the temporary root of R80, installs to a temporary directory and moves the result into place, and removes its success marker when an install fails so the next session retries rather than trusting a half-written tree.
+- R74. Hooks invoke the binary at `${CLAUDE_PLUGIN_DATA}/bin/ss-magic`. Both `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` are substituted by the harness inside a hook entry's `command` string and per-element inside `args` (measured on 2.1.251), and the braced form is used everywhere because the bare `$NAME` form is substituted only in shell form.
+- R75. The plugin ships `bin/ss-magic-plugin`, a wrapper that execs the bootstrapped binary with the `plugin` verb already injected (`exec "$BIN" plugin "$@"`), so a skill body reads `ss-magic-plugin checklist list`. Two reasons for the shape: `${CLAUDE_PLUGIN_DATA}` is exported to hook and MCP/LSP processes but **not** to the Bash tool, so a skill cannot name that path directly; and a wrapper named plainly `ss-magic` would resolve non-deterministically against whatever the user has on PATH. Injecting the verb also makes R69's no-update-gate, no-TUI posture structural rather than a convention. The wrapper is what every shipped skill invokes; no skill body names `${CLAUDE_PLUGIN_DATA}` or a bare `ss-magic`.
+- R76. The plugin declares **two** `SessionStart` groups, and collapsing them breaks one half or the other. The **bootstrap** entry carries `"matcher": "startup"`, so it runs once per fresh session rather than again on every resume, clear, compaction and fork. The **ss-magic session-start handler** stays unmatched and therefore fires on all five sources, because the `compact` source is the compaction-survival signal F2 and R19 are built around. Both declare an explicit timeout well below the harness's 600-second default, with the bootstrap's fetch separately time-bounded.
+- R77. The first session that installs or upgrades the binary runs with every ss-magic hook inert, and the plan states this rather than leaving it to be discovered. Hooks on one event run concurrently, so the bootstrap cannot be relied on to finish before its sibling hooks fire. `status` reports bootstrap state: the pinned version, the resolved binary path, and the last bootstrap outcome.
+- R78. The bootstrap is a no-op on platforms with no published release target, reporting the reason once on stderr rather than failing on every session start.
+- R79. A one-time disclosure names the machine-global hooks being registered, the binary being downloaded and the release it comes from, emitted by the bootstrap on its first successful run on a machine; a later run is silent. This replaces the retired R39, whose only trigger was the deleted install path.
+- R59. The repository publishes a plugin marketplace manifest. It is the sole delivery path (R66); the shape is R67's.
+- ~~R60, R61~~. **Retired 2026-08-30** – both were enforced by `ss-magic plugin install` and `ss-magic sync`, which no longer exist. Name collision is now resolved by the harness itself (R66), and R71 replaces R61's byte-verification with checksum verification of the downloaded release.
+- R80. Volatile coordination state – lock files and anything else guarding a race – lives under a private per-machine temporary root: `/tmp/ss-magic-plugin/<frozen-identifier>/`, falling back to `$TMPDIR/ss-magic-plugin/<frozen-identifier>/` where `/tmp` cannot host a writable private root, as under a sandbox that allowlists only `$TMPDIR`. The root is created owner-only, the identifier is stable for the machine and does not encode a repository path, and nothing durable is kept there. This is what lets two hooks on one event coordinate – notably a synchronous hook and an asynchronous sibling – without either writing into the worktree.
+- R81. Hook handlers on one event run **concurrently against the original tool input**; they do not chain, and a later handler never observes an earlier one's rewrite. Where two handlers do emit a rewrite, the harness folds them last-write-wins unconditionally, so completion order decides and the result is not stable across runs. Two consequences bind this plan: no ss-magic handler ever emits a tool-input rewrite (R20), because doing so would silently discard a co-installed hook's rewrite – the user's own `rtk` wrapper being the live example; and any coordination between ss-magic's own concurrent handlers goes through R80's lock rather than through ordering assumptions.
+- R62. Any `ss-magic plugin hook …` argv the binary cannot route exits 0 with empty stdout, never falling through to the unknown-subcommand error path. Without this, an installed manifest naming a hook event an older binary does not know would exit non-zero, which the harness reads as a block – turning every `Read` into a failure carrying the hook's command line into the model's context, and breaking R26's advisory guarantee for someone who never chose the plugin.
 
 **Session scratchpad**
 
-- R14. The scratchpad directory name is derived from the git repository and branch alone, and is stable across sessions, days, and workspace renames.
+- R14. The scratchpad lives under `.superset/.magic/` in the worktree, and its session directory name is derived from the git repository and branch alone, stable across sessions, days, and workspace renames. `.superset/.magic` is the single state-root definition every other rule refers to (R2, R40, R43, R56, R58, R63).
 - R15. A branch name that cannot be resolved falls back to a detached-HEAD form; outside a git repository the plugin does nothing.
 - R16. The active session is recorded in a plain JSON pointer file, not a symlink.
-- R17. The scratchpad bootstrap scaffolds any missing state file – including the operator checklist the `SessionStart` pointer names – and never rewrites one that exists.
-- R18. The scratchpad tree is gitignored, and its contents are never committed.
-- R19. `SessionStart` injects operating guidance and the checklist pointer, staying within the channel's 10,000-character limit.
-- R40. The scratchpad ignores itself through its own nested `.gitignore`, and no hook verb ever modifies a `.gitignore` outside `.scratchpad/`.
+- R17. The scratchpad bootstrap scaffolds any missing state file and never rewrites one that exists. It does **not** scaffold an operator checklist: the checklist is committed repository content at `docs/actions/` owned by R82, and what lives in the state root is only R89's pointer to it. The two were one artifact before 2026-08-30 and are now distinct.
+- R18. The `.superset/.magic/` tree is gitignored, and its contents are never committed.
+- R19. `SessionStart` injects operating guidance and the resolved checklist location – the path R89's pointer names, plus the `ss-magic plugin checklist` verbs that are the only way to edit it – staying within the channel's 10,000-character limit.
+- R40. **No hook verb ever writes a `.gitignore`.** The `.superset/.magic/` ignore rule is written only by explicit `ss-magic` invocations – `ensure_bootstrap_gitignores` on `init`/`migrate`, and the sync-time plugin step – through `gitignore::ensure_path_ignored` as a `Dir` rule, the same eager-plus-lazy pairing `reverse_sync::ensure_backups_ignored` already uses for `.superset/backups/`. The rule lands in the closest existing `.gitignore` among the path's ancestors, which is the repository root in the ordinary case but is `.superset/.gitignore` where a repo carries one; the requirement is that the tree ends up ignored, not that a specific file is edited.
+- R63. A hook verb writes no state at all while git does not report `.superset/.magic/` as ignored, recording the refusal and its reason in its heartbeat row. This replaces the create-and-ignore atomicity the old nested `.gitignore` gave for free: with the rule owned by a non-hook path, a repo that flips `plugin.enabled` without re-running `init`, `migrate` or `sync` would otherwise have its first session write private state into a directory git can see.
 
 **The Read gate**
 
-- R20. `ss-magic` ships no hook on `PreToolUse[Bash]` and emits no tool-input rewrite on any event.
+- R20. `ss-magic` emits **no tool-input rewrite on any event**, and ships no hook that reads or page-faults Bash *output*. That is the invariant the dropped Bash page-fault half leaves behind; it is not a blanket ban on Bash matchers. An advisory `PreToolUse[Bash]` handler that only emits `additionalContext` is permitted, and is what R91's commit nudge uses. The rewrite half is absolute for the reason R81 records: concurrent handlers are folded last-write-wins, so a rewrite of ours would silently discard a co-installed hook's – the user's live `rtk` wrapper being the case that would break.
 - R21. A `Read` whose target exceeds the configured size is denied, and the denial names the cache path and instructs the model to route the work to an Explore agent.
 - R22. When a conclusion exists for that file, the denial carries the conclusion inline, verbatim.
 - R23. The inline conclusion is bounded by ss-magic's own byte budget, because the channel imposes none.
@@ -115,12 +168,13 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - R26. Every hook fails open: on timeout, malformed output, or a missing binary the session proceeds unchanged, and the plan documents the gate as a context measure rather than a boundary.
 - R41. The gate allows a `Read` whose `offset` and `limit` bound the requested window under the threshold – the window's byte cost estimated from the file's own average line length, with an absent `limit` treated as unbounded – even when the whole file exceeds it; the cache key stays as R24 defines it.
 - R42. A one-shot `bypass` verb lets exactly the next gated `Read` of the named file through, and every deny reason names the bypass invocation verbatim.
-- R43. A `Read` target that is not plain text – decided by a binary-owned extension list – is never gated, and neither is any path inside `.scratchpad/`.
+- R43. A `Read` target that is not plain text – decided by a binary-owned extension list – is never gated, and neither is any path inside `.superset/.magic/` (the exact two-component prefix per R14, never `.superset/` itself). Both exemptions are evaluated **after** R88's checklist classification, never before it: a checklist file is denied even when it sits inside the state tree.
 - R44. A `conclude` verb takes the original file path, computes the cache key, stamps the mandatory conclusion header, and writes the entry atomically; a `conclusions` companion lists the cache and prints one entry.
 - R45. The conclusion cache and the heartbeat log are each pruned best-effort to a bounded count and age after each write, and a `gc` verb removes orphaned entries on demand.
-- R52. A read issued from inside a subagent is never gated, so the Explore agent the gate routes to can read the file the gate denied.
-- R53. The gate resolves its size threshold, its inline byte budget, and its exemption list from the overlaid `plugin` configuration for the envelope's `cwd`, each with a binary-owned default and stated bounds.
+- R52. A read issued from inside a subagent is never gated, so the Explore agent the gate routes to can read the file the gate denied. This exemption does not waive R88's checklist deny, which is classified ahead of it – otherwise a dispatched agent pulls the whole checklist into context raw.
+- R53. The gate resolves its size threshold, its inline byte budget, and its exemption list from the overlaid `plugin` configuration for the envelope's `cwd`, each with a binary-owned default and stated bounds. The defaults are deterministic and chosen at implementation time from the measured read-size profile in [validation-evidence.md](./2026-08-29-001-ss-magic-plugin/validation-evidence.md) – not from ledger data, which records one cumulative cost row per session and cannot decompose into a distribution of read sizes. The plan records how each default was chosen; the ledger tunes them after release.
 - R54. A conclusion or a salvaged transcript is delivered to the model marked as ss-magic-generated text derived from a file, never as the file's own content, because a cached entry authored under one repository becomes model-visible in later sessions.
+- R64. A conclusion or salvaged transcript is additionally delivered inside an explicit untrusted-data envelope instructing the model to treat the contents as evidence and to ignore any instruction inside them. Provenance marking (R54) says where the text came from; it does not stop imperative text a repository controls from being read as instruction after an Explore agent summarises it into the cache and the gate injects it into a denial.
 
 **Cost ledger**
 
@@ -141,9 +195,9 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - R49. `PreCompact` is advisory on both triggers and never blocks a compaction.
 - R50. Every hook verb appends one heartbeat line before exiting – including on the fail-open path, with its error class – recording the gate outcome for a `pre-tool-use` row, and `status` reports last-fired-at and the outcome counts per event.
 - R55. Every hook verb resolves the overlaid `plugin` configuration for the envelope's `cwd` and no-ops – heartbeat only – when the plugin is not enabled for that repository, so an install made from one repo does not act in another.
-- R56. A hook verb writes scratchpad state only after resolving the target path and confirming it stays inside the worktree, refusing to follow a symlink out of it.
-- R57. No hook verb writes configuration or installs the plugin; `enable`, `disable`, `config set` and `install` are reached only from an explicit `ss-magic` invocation.
-- R58. The machine-level store and the scratchpad's plugin directory are created with owner-only permissions.
+- R56. A hook verb writes state under `.superset/.magic/` only after resolving the target path and confirming it stays inside the worktree, refusing to follow a symlink out of it.
+- R57. No repository-resident value and no hook verb can cause the plugin to be installed or enabled: `enable`, `disable`, `config set` and `install` are reached only from an explicit `ss-magic` invocation, and where a repository declares the plugin to the harness instead (R59), install and enablement remain an explicit user action the harness gates. This is stated over the settings channel as well as the hook channel, because a checked-in `.claude/settings.json` is repository content that would otherwise arm machine-executing hooks.
+- R58. The machine-level store and `.superset/.magic/` are created with owner-only permissions. Directory mode is a defence in depth, not the control: `sync/apply.rs::copy_dir_recursive` creates destination directories with default permissions, so R2's enumeration exclusion is what actually keeps the tree out of a copy.
 
 **Subagent artifacts**
 
@@ -151,15 +205,34 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - R33. When a subagent's transcript ends with no reported result, its transcript is salvaged into a file marked as incomplete.
 - R51. A dispatching agent declares a subagent's contracted output file with an `expect-artifact` verb before spawning it; with no declaration in effect, `SubagentStop` never blocks.
 
+**Operator checklist**
+
+- R82. The checklist is committed repository content at `docs/actions/<YYYY-MM-slug>.checklist.json`, not scratchpad state. `ss-magic` owns its JSON schema and its Markdown renderer; the file stays valid and hand-editable, because the Read/Edit deny of R88 does not fire when the binary is absent (R26).
+- R83. The schema is project-agnostic. `sections` is an **ordered array** of `{ id, title, items }` with a binary-owned default set, replacing the source format's four fixed deploy-lifecycle keys; there is no fixed trailing release-approval block; and `priority` is defined in domain-neutral terms – blocking, decision-blocking, follow-up – rather than as "blocks the deploy". Item identity is a kebab-case `id` beginning with a letter, unique across the changelog and every section jointly, never renamed.
+- R84. The stored order is canonical: changelog entries ascend by `created`, and items within a section sort by `(done, priority rank, created)` with unranked last. Timestamps are ISO-8601 with an offset and are compared by parsed instant, never as strings, because a differently-offset timestamp sorts wrong lexically.
+- R85. Rendering is deterministic and free of the source prototype's project coupling: no shelling out to a forge CLI for a repository URL, no hard-coded timezone or locale date format, and no plan-file grep. Dates render through ss-magic's existing UTC timestamp formatter over an instant parsed by a binary-owned ISO-8601 reader; no date or timezone crate is added.
+- R86. The renderer emits the same untrusted-data envelope R64 defines for conclusions, and owns it, so `checklist list`, `checklist verify`, the commit-time nudge and the CI comment all render it identically. Checklist action steps, descriptions and reference labels are free-form prose a repository controls.
+- R87. `checklist verify` enforces what the format leaves implicit: required fields present, ids unique and well-formed, `expected: null` only on a record- or decision-kind item, a done item carrying a completion timestamp, at least one action step, and every reference an absolute URL. The `$schema` value is a stable identifier the binary owns, never a relative path into the version-scoped plugin directory.
+- R88. A `Read`, `Edit`, `Write` or notebook edit whose resolved realpath is a checklist file is denied, with the denial naming the `ss-magic plugin checklist` verb to use instead. The deny is size-independent and is evaluated **ahead of** the state-tree, subagent and non-text exemptions of R43 and R52 – otherwise the subagent exemption alone hands an Explore agent the raw file. It matches on the resolved target, so reaching the file through the R89 pointer or directly are the same case.
+- R89. `checklist init` records the active checklist in `.superset/.magic/`, inside the single state root, never in `.scratchpad/`. The pointer is a manifest file rather than a symlink where a plain file suffices; where a symlink is used it is the one symlink ss-magic creates, it is created only after the containment and ignored-tree checks of R56 and R63 pass on the resolved parent, and a dangling pointer is classified as a checklist path by R88 rather than falling through to a stat.
+- R90. The checklist CLI is the only write path, so its surface is explicit: `init`, `add-item`, `add-entry`, `set <id> <dotted-key> <value>`, `done <id>`, `list`, `verify`, `render-md`. Multi-line field bodies are read from stdin; ids are caller-supplied and validated; dotted keys follow the convention R37 already establishes for `config get`/`config set`.
+- R91. On a Bash invocation matching `git commit`, `git push` or `gh pr`, the plugin emits advisory `additionalContext` when the checklist is absent from the commit. The matcher scans the whole command line and tolerates a wrapper prefix (`rtk git commit`), command chaining and heredocs; it pre-filters on the raw string and spawns a git subprocess only on a match. It never rewrites the tool input (R20, R81).
+- R92. On a `.env` or `.envrc` change the plugin refreshes the environment through direnv, exporting into `CLAUDE_ENV_FILE`. It exports only for an `.envrc` that direnv already reports as **allowed**, never invokes `direnv allow` or any equivalent trust-granting command, and never copies exported values into ss-magic's state, heartbeat or ledger. Opening a session in a cloned repository must not execute that repository's `.envrc`.
+
 **Documentation and release**
 
 - R34. `CLAUDE.md`, `README.md`, `CONTRIBUTING.md` and `.cursor/BUGBOT.md` describe the new behavior, and the crate version bumps a minor.
+- R93. `/ss-magic:setup` is removed. `/ss-magic:setup-github-ci` replaces it: an interactive guide over a binary verb that writes a GitHub Actions workflow into the consuming repository, pinning the ss-magic version it installs. A Markdown skill cannot write a workflow file, so the verb owns the bytes and the skill owns the conversation – its decision points are workflow absent, present and identical, present and differing, and pin stale; its exit states are written, or declined at a named step. The diagnostic content the removed skill carried moves into `status`'s human-readable output, which R65 already makes the single answer to "why is the plugin not acting".
+- R94. The shipped workflow triggers on `pull_request` with an explicit least-privilege `permissions:` block, never `pull_request_target`, and never checks out pull-request head code in a job holding write permissions. It pins and checksum-verifies the ss-magic it installs, and passes every checklist-derived value to the forge CLI through a file or stdin rather than interpolating it into a shell step.
+- R95. One release advances every version surface together – the crate version, the plugin manifest version, the marketplace entry's `ref`/`sha`, the binary pin file, and the workflow's pin – and CI fails when they disagree. The pin is advanced only by a commit landing **after** the named release's assets are published, because a pin naming an unpublished release kills the plugin silently: the fetch 404s, no binary installs, every hook fails open, and the only drift detector is the binary that failed to install.
 
 ### Key Flows
 
-- F1. **Enabling the plugin.** **Trigger:** a repo sets `plugin.enabled` and runs `ss-magic sync`. The plugin step runs after the configuration loads and before the empty-`files` early return, so a repo that syncs no files still gets the plugin. It renders the tree, compares to disk, writes only on change, verifies the install, and prints a reload notice if bytes changed. *Covers R5, R10, R11, R13.*
-- F2. **A session starts.** **Trigger:** any of the five `SessionStart` sources. The hook resolves the slug from git, creates the session directory and pointer file, scaffolds missing state files, and injects guidance plus the checklist pointer. On the `compact` source this is what restores orientation after the window was cleared. *Covers R14, R16, R17, R19.*
+- ~~F1~~. **Retired 2026-08-30** – there is no install flow to describe. Delivery is F5. Original trigger, kept for trace: a repo sets `plugin.enabled` and runs `ss-magic sync`. The plugin step runs after the configuration loads and before the empty-`files` early return, so a repo that syncs no files still gets the plugin. It ensures the `.superset/.magic/` ignore rule, renders the tree, compares bytes against the embedded assets, writes only on change, verifies the install against the harness listing – refusing when another scope already registers the plugin – and prints a reload notice if bytes changed. *Covers R5, R10, R11, R13, R40, R60, R61.*
+- F2. **A session starts.** **Trigger:** any of the five `SessionStart` sources. The hook confirms git reports the state tree ignored – refusing with a heartbeat row if not – then resolves the slug from git, creates the session directory and pointer file, scaffolds missing state files, and injects guidance plus the checklist pointer. On the `compact` source this is what restores orientation after the window was cleared. *Covers R14, R16, R17, R19, R63.*
 - F3. **An oversized read is intercepted.** **Trigger:** the model calls `Read` on a file over the threshold. On a cache miss the call is denied with routing instructions; the model dispatches an Explore agent that reads the file in its own window and writes a conclusion. The model retries, and the second denial carries the conclusion inline. *Covers R21, R22, R24.*
+- F5. **Getting the plugin.** **Trigger:** a user runs `claude plugin marketplace add` then `claude plugin install`. The harness fetches the pinned subdirectory; nothing from `ss-magic` participates. The next fresh session's `SessionStart` bootstrap installs the pinned binary into the plugin data directory and every later session finds it already there. A repository still has to set `plugin.enabled` before any hook acts in it. *Covers R66, R67, R70, R76, R55.*
+- F6. **Working a checklist.** **Trigger:** an agent needs the operator checklist. `checklist init` records the active file under the state root; any attempt to read or edit the file directly is denied with the verb to use instead; the verbs mutate it in canonical order and validate before persisting; a commit without it draws an advisory nudge; and CI renders it into the PR comment. *Covers R82, R88, R89, R90, R91.*
 - F4. **A session ends.** **Trigger:** `SessionEnd`. The hook walks that session's transcript tree, reads the harness's priced records where available, and appends one row keyed on session id. *Covers R27, R28.*
 
 ### Acceptance Examples
@@ -176,18 +249,18 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - AE10. The hook emits malformed JSON. **Covers R26.** The tool call proceeds unchanged.
 - AE11. `SessionEnd` runs twice for one session id. **Covers R27.** The ledger holds one row.
 - AE12. The CLI is killed and `SessionEnd` never runs. **Covers R29.** `ss-magic plugin cost` backfills the row from the transcript.
-- AE13. A reverse sync matches a file under `.scratchpad/` whose nested `.gitignore` contains `*`. **Covers R1, R2.** The file is not pushed, and the main checkout's root `.gitignore` is unchanged.
-- AE14. `pack` runs with a `**` pattern. **Covers R2, R3.** `.git/`, `.scratchpad/` and the backups tree are absent from the archive, and the reported count equals the number of unique paths.
+- AE13. A reverse sync matches a file under a synthetic nested tree whose own `.gitignore` contains `*` – a fixture the plugin does not create, standing for the `.scratchpad/` tree the planning tooling already leaves in Superset worktrees. **Covers R1, R2.** The file is not pushed, and the main checkout's root `.gitignore` is unchanged.
+- AE14. `pack` runs with a `**` pattern. **Covers R2, R3.** `.git/`, `.superset/.magic/`, `.scratchpad/` and the backups tree are absent from the archive, `.superset/config.json` and `.superset/magic.json` are present, and the reported count equals the number of unique paths.
 - AE15. The user already set an auto-compact window. **Covers R31.** ss-magic leaves it alone.
 - AE16. A subagent finishes without writing its contracted output file. **Covers R32.** Its stop is blocked once with the file named; if it stops again without the file, it is allowed to end.
 - AE17. A subagent's transcript ends with no reported result. **Covers R33.** A salvage file is written and marked incomplete, and the parent reads that instead of re-running the agent.
-- AE18. A pattern would match a path inside the scratchpad during forward sync. **Covers R18.** The scratchpad tree is skipped at enumeration, whatever the pattern's breadth.
+- AE18. A `.superset/**` pattern would match a path inside `.superset/.magic/` during forward sync. **Covers R18.** The state tree is skipped at enumeration whatever the pattern's breadth, while `.superset/magic.json` still syncs.
 - AE19. `ss-magic plugin hook pre-tool-use` is run from a terminal with no stdin envelope. **Covers R35.** It exits 0 with nothing on stdout; `ss-magic plugin scratchpad ensure` run outside a git repository exits non-zero with a stderr message.
 - AE20. A dispatched Explore agent, which receives no `SessionStart` injection, runs `ss-magic plugin status --json` from Bash. **Covers R36.** It obtains the slug, the conclusions directory, and the gate threshold without any parent-prompt context.
 - AE21. An agent inside a worktree runs `ss-magic plugin config set plugin.enabled false --local`. **Covers R37.** The main checkout's `magic.local.json` is updated, and every key the command does not understand survives.
-- AE22. A repo's `magic.json` `plugin` block carries a command-shaped string value. **Covers R38.** The rendered `hooks.json` is byte-identical to the binary's embedded asset (version substitution aside); the hostile value appears nowhere in the installed tree.
-- AE23. The plugin is installed for the first time on a machine, then installed again unchanged. **Covers R39.** The first run prints the machine-global-hooks notice; the second prints nothing.
-- AE24. `session-start` fires in a repo whose root `.gitignore` is git-tracked. **Covers R40.** That file is byte-identical afterwards; the scratchpad is ignored solely by `.scratchpad/.gitignore`.
+- ~~AE22~~ *(retired 2026-08-30 with the local install path)*. A repo's `magic.json` `plugin` block carries a command-shaped string value. **Covers R38.** The rendered `hooks.json` is byte-identical to the binary's embedded asset (version substitution aside); the hostile value appears nowhere in the installed tree.
+- ~~AE23~~ *(retired 2026-08-30 with the local install path)*. The plugin is installed for the first time on a machine, then installed again unchanged. **Covers R39.** The first run prints the machine-global-hooks notice; the second prints nothing.
+- AE24. `session-start` fires in a repo whose tracked `.gitignore` carries no rule for the state tree. **Covers R40, R63.** The hook writes no state and leaves that file byte-identical, recording the refusal in its heartbeat row; a subsequent `ss-magic sync` appends exactly the `.superset/.magic/` line, changes nothing else in the file, and the next `session-start` proceeds normally.
 - AE25. The model issues `Read` with `offset` and `limit` bounding a window under the threshold, on a file over it. **Covers R41.** The read proceeds and returns file content.
 - AE26. The model issues `Read` with a `limit` whose window still exceeds the threshold. **Covers R41.** The read is denied like an unbounded one.
 - AE27. A deny reason names the bypass invocation; the model runs it, retries the same `Read`, then reads the file once more later. **Covers R42.** The first retry succeeds; the later read is denied again.
@@ -200,14 +273,54 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - AE34. An `auto` compaction fires while scratchpad state is stale. **Covers R49.** It is never blocked; the hook writes its note and emits nothing.
 - AE35. A hook verb fails internally and exits on the fail-open path. **Covers R50.** `hooks.jsonl` gains a row carrying the event and error class, and `ss-magic plugin status` shows the event's last-fired-at.
 - AE36. No `expect-artifact` declaration exists and a subagent stops without writing anything. **Covers R51.** Its stop is not blocked; with a declaration naming a file the subagent never wrote, AE16's block-once behavior applies to that file.
-- AE37. A session resumes after a compaction and reads an 88 KB `STATUS.md` in `.scratchpad/`. **Covers R43.** The read is allowed; the scratchpad is never gated.
+- AE37. A session resumes after a compaction and reads an 88 KB `STATUS.md` in `.superset/.magic/`. **Covers R43.** The read is allowed; the state tree is never gated, while an over-threshold `.superset/magic.json` still is.
 - AE38. The Explore agent dispatched after a denial reads the oversized file it was sent to summarize. **Covers R52.** The read is allowed.
 - AE39. A repository that never set `plugin.enabled` starts a session on a machine where another repository installed the plugin. **Covers R55.** Every hook no-ops and writes only a heartbeat row.
 - AE40. `plugin.enabled` is set false while a session is already running. **Covers R55.** The next hook invocation no-ops, without waiting for a restart.
 - AE41. A `manual` `/compact` fires. **Covers R49.** The hook writes its guidance and the compaction proceeds; nothing is blocked.
 - AE42. A subagent stop is re-entered after a block. **Covers R32.** The handler returns immediately rather than blocking twice.
-- AE43. `.scratchpad/` in a freshly opened worktree is a symlink pointing outside it. **Covers R56.** The hook refuses to write and records the refusal in its heartbeat row.
-- AE44. A repository's own content instructs an agent to enable the plugin. **Covers R57.** No hook path can perform it; only an explicit user-run command can.
+- AE43. `.superset/.magic/` in a freshly opened worktree is a symlink pointing outside it. **Covers R56.** The hook refuses to write and records the refusal in its heartbeat row.
+- AE44. A repository's own content instructs an agent to enable the plugin, and the same repository commits a `.claude/settings.json` declaring the plugin to the harness. **Covers R57.** No hook path can enable it, no `ss-magic` path acts on the repository's instruction, and the committed declaration installs nothing on its own – the harness still requires an explicit user install.
+- AE45. A repo enables the plugin by hand-editing `magic.json` and starts a session without ever running `sync`, `init` or `migrate`. **Covers R63.** No state directory is written, `git status` stays clean, and the heartbeat row names the missing ignore rule.
+- AE46. The repo carries its own `.superset/.gitignore`. **Covers R40.** The rule lands there rather than at the repository root, and git reports the tree ignored either way.
+- ~~AE47~~ *(retired 2026-08-30 with the local install path)*. A marketplace-sourced `ss-magic` is enabled and `ss-magic sync` runs with `plugin.enabled` true. **Covers R60.** The personal-scope tree is not written, the notice names the competing registration id, and `status` reports the marketplace copy as the active source.
+- ~~AE48~~ *(retired 2026-08-30 with the local install path)*. Two enabled registrations whose manifest name is `ss-magic` are present. **Covers R60.** `status` reports both with their scopes and ids and flags the conflict; `install` refuses rather than writing a second tree.
+- ~~AE49~~ *(retired 2026-08-30 with the local install path)*. The installed tree's `hooks.json` differs from the binary's embedded asset. **Covers R61.** `install` reports the mismatch loudly and rewrites from the embedded bytes; it never accepts the installed content as authoritative.
+- AE50. An installed manifest names `plugin hook notification`, an event the running binary does not know. **Covers R62.** The invocation exits 0 with empty stdout, the `Read` proceeds, and a heartbeat row records the unroutable event. (The fixture event is deliberately one the plan never ships – `file-changed` became a real routed event under R92.)
+- AE51. A file the gate denies contains text instructing the reader to run a command; an Explore agent summarises it and the model retries the `Read`. **Covers R64.** The denial carries the conclusion inside the untrusted-data envelope, and the envelope's own instruction to treat the contents as evidence precedes the quoted text.
+- AE52. A session runs in a repo whose harness-side registration is disabled while `plugin.enabled` is true. **Covers R65.** Hooks no-op, and `status --json` reports both layers so the disabled one is identifiable.
+- AE53. `pack` runs with a bare `.superset` directory pattern. **Covers R2.** `.superset/.magic/` and `.superset/backups/` are pruned during the recursive walk while `config.json`, `magic.sh` and `magic.json` are archived.
+
+*Distribution and bootstrap*
+
+- AE54. A user runs `claude plugin marketplace add` then `claude plugin install` against the public repo. **Covers R66, R67.** The plugin installs at the pinned commit; no `ss-magic` command was involved, and nothing was written to `~/.claude/skills/`.
+- AE55. The marketplace manifest declares a `sha` in uppercase hex. **Covers R67.** `claude plugin validate` rejects it, so the malformed pin never reaches a release.
+- AE56. `ss-magic --version` runs inside a hook with no TTY. **Covers R68, R69.** It prints the crate version, spawns no network call, and constructs no menu. A bare `ss-magic` in the same environment reports that it cannot open the menu without a TTY rather than hanging.
+- AE57. A session starts on a machine where the pinned binary is already installed. **Covers R70, R72.** The bootstrap writes nothing, prints nothing on stdout, and adds no measurable startup latency.
+- AE58. A session starts on a machine with no network. **Covers R71, R72.** The bootstrap exits 0, one line reaches stderr, nothing reaches stdout, the session proceeds, and every ss-magic hook no-ops exactly as AE9 describes.
+- AE59. The fetched release archive's checksum does not match its published `.sha256`. **Covers R71.** Nothing is extracted or executed, any previously installed binary is left in place, and the failure is reported once. A separate check asserts the bootstrap never pipes a remote script into a shell.
+- AE60. The version pin file contains `v1.2.3; rm -rf /` or any other non-version text. **Covers R71.** The bootstrap refuses before composing a URL.
+- AE61. Two sessions start simultaneously on one machine with no binary installed. **Covers R73, R80.** One installs while the other waits on the lock under the temporary root; exactly one binary results and neither session fails.
+- AE62. An install fails partway. **Covers R73.** No success marker is left behind, and the next session retries rather than trusting a half-written tree.
+- AE63. A plugin update advances the pin. **Covers R70, R77.** The next fresh session installs the new binary; the session in which that happens runs with ss-magic hooks inert, and `status` afterwards reports the pinned version, the resolved path and the last bootstrap outcome.
+- AE64. A session is resumed, cleared, compacted and forked. **Covers R76.** The bootstrap runs on none of them – only on a fresh start.
+- AE65. A shipped skill needs to invoke the binary from a Bash step. **Covers R75.** It calls the plugin's own `bin/` wrapper, which resolves the bootstrapped binary; the skill never names the plugin data directory, which is not exported to the Bash tool.
+- AE66. The plugin is installed on a platform with no published release target. **Covers R78.** The bootstrap no-ops with one stderr line and does not repeat it every session.
+- AE67. The plugin is installed on a machine for the first time. **Covers R79.** One disclosure names the hooks being registered and the release the binary comes from; the next session is silent.
+
+*Operator checklist*
+
+- AE68. A checklist is authored in a repository that has no `docs/actions/`. **Covers R82.** The directory and file are created, the file is valid against the shipped schema, and it remains hand-editable afterwards.
+- AE69. A project declares its own section set. **Covers R83.** Rendering follows the declared order; a project that declares none gets the binary's default set, and no release-approval block is appended.
+- AE70. A checklist mixes timestamps at two different UTC offsets. **Covers R84.** Ordering matches the parsed instants, not the lexical strings.
+- AE71. `render-md` runs twice on one unchanged checklist, on two machines in different timezones. **Covers R85.** The output is byte-identical, and no forge CLI was invoked to obtain it.
+- AE72. A checklist item's action step contains an imperative command. **Covers R86.** Every surface that renders it – `list`, `verify`, the commit nudge, the CI comment – wraps it in the untrusted-data envelope ahead of the quoted text.
+- AE73. A checklist marks an item done with no completion timestamp, and another has `expected: null` on a check-kind item. **Covers R87.** `verify` reports both and exits non-zero; the renderer is never handed the malformed file.
+- AE74. An agent issues `Read` on a checklist file inside a subagent, and another issues `Edit` on it from the main thread. **Covers R88, R43, R52.** Both are denied and both denials name the `checklist` verb – the subagent exemption and the state-tree exemption do not waive it.
+- AE75. `checklist init` runs on a branch with no checklist yet. **Covers R89.** The pointer records the intended path inside `.superset/.magic/`, nothing is written into `.scratchpad/`, and a subsequent read of the not-yet-existing target is classified as a checklist path rather than falling through to a stat.
+- AE76. An agent runs `rtk git commit -m …` with an out-of-date checklist. **Covers R91.** The same advisory context fires as for a bare `git commit`, and the tool input is not rewritten.
+- AE77. A session opens a freshly cloned repository whose `.envrc` direnv has never been allowed. **Covers R92.** Nothing is executed, no values are exported, and a heartbeat row records the refusal.
+- AE78. `/ss-magic:setup-github-ci` runs in a repo that already has the workflow at an older pin. **Covers R93, R94, R95.** The guide reports the difference, writes only on confirmation, and the resulting workflow triggers on `pull_request` with a least-privilege permissions block and a checksum-verified pinned install.
 
 ### Success Criteria
 
@@ -230,11 +343,24 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 **Outside this work**
 
 - Injecting `/compact` into a terminal. Hooks have no controlling terminal, terminal-send submits by default, and the goal is met declaratively by the window setting.
-- A `FileChanged` hook and any direnv workstream.
 - Any hook acting as a security or policy gate.
 - Exact billing reconciliation. The ledger is a relative signal, not an invoice.
 - Syncing the machine-level ledger between machines.
 - Any harness-version compatibility shim beyond `status` drift reporting.
+- **Migrating existing `.scratchpad/.ss-magic-plugin/` trees.** Nothing has shipped, so no such tree was written by `ss-magic`. Any that exist came from other tooling and are left alone.
+- **Windows.** No release target is published for it, so the bootstrap no-ops there (R78) rather than the plan pretending to support it.
+
+**Retired with the local install path (2026-08-30)**
+
+These were implemented against `ss-magic plugin install` and the sync-time plugin step, both deleted by R66. They are recorded here rather than removed so the trace from round 1 stays readable, and so the Definition of Done can close over them.
+
+- **R10-R13** – the personal-scope install target, its self-verification, the JSON-and-Markdown-only tree, and content-addressed writing. The marketplace owns delivery now; R74 fixes the invocation path and R75 the Bash-reachable wrapper.
+- **R38, AE22** – no repository value reaching rendered manifest bytes. Nothing is rendered: the manifest is committed content the marketplace serves.
+- **R39, AE23** – the first-install machine-global notice. R79 re-homes the disclosure in the bootstrap, which is where the machine-global behavior now begins.
+- **R60, AE47, AE48** – the one-enabled-registration rule and its enforcement by `install` and `sync`. The harness resolves name collisions itself, suppressing a shadowed copy rather than loading both.
+- **R61, AE49** – byte-for-byte re-verification against embedded assets. R71's checksum verification of the downloaded release replaces it; note this is a *weaker* property, which is why R71 pairs it with pin validation and R95 with release ordering.
+- **KTD9, KTD15, F1, U9, U10** – install-path resolution, the embed-and-substitute asset pipeline, the enable-the-plugin flow, and both install units.
+- **KTD2's second caller** – `plugin::install` was the recursive consumer that justified generalizing the materialize writer. See KTD2 for what survives.
 
 ### Dependencies / Assumptions
 
@@ -242,7 +368,9 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 - The harness's transcript JSONL is append-only. Confirmed empirically over one session, not documented — the ledger therefore keeps a rotation guard and can fall back to a full rescan.
 - Transcript completeness at `SessionEnd` is measured for normal exit only; kill, crash and logout are untested, which is why rows must be idempotent and backfillable.
 - Hooks invoke `ss-magic` by bare name on PATH, so a PATH an attacker can prepend to yields execution on every gated call. This matches the repo's existing convention for `git` and `gh` and is not introduced here, but the plan depends on it and states it rather than leaving it implicit.
-- Managed settings do not restrict the personal-scope plugin scan on the target machine. Where they do, the per-session plugin-directory flag is the documented fallback.
+- Managed settings do not restrict the personal-scope plugin scan on the target machine. Where they do, the per-session plugin-directory flag is the documented fallback. This assumption covers personal scope only; enterprise policy over marketplaces (allowlists, admin-blocked marketplaces, `allowManagedHooksOnly`) is unassessed and bears on R59's distribution channel, not on what `ss-magic sync` installs.
+- Workspace trust keys on the git repository root, and in a worktree on the **main checkout's** root – a fresh Superset worktree therefore inherits the main checkout's trust. This corrects the original scope decision's premise. It does not change the ruling: what actually rules out project scope as the enablement path is that a committed declaration installs nothing for a collaborator on its own, and that a repo's marketplace entries are ignored without a message in an untrusted folder.
+- The marketplace repository and its refresh path are a named trust boundary, alongside the existing bare-name PATH assumption. A marketplace refresh fetches repo state with no checksum and no cargo-dist attestation, which is why R61 makes the binary's embedded assets the only bytes `ss-magic` trusts. A marketplace-installed plugin loads from its local cache and needs no network at session start; refresh happens in the background after startup and a failed refresh keeps the cached version.
 
 ### Sources / Research
 
@@ -257,24 +385,27 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 ### Key Technical Decisions
 
 - KTD1. **One hook entry point with a centralized fail-open wrapper.** All five events route through `plugin hook <event>` into `src/plugin/hook/mod.rs`, which owns stdin decode, event dispatch, the JSON envelope on stdout, the fail-open catch, and the heartbeat append – per-event modules never print or exit themselves. This is what makes R9's hook posture and R47's stdout ownership structural rather than per-call-site care. *Governs R8, R9, R26, R35, R47, R50.*
-- KTD2. **Generalize `copy_into_repo` into `src/workspace/materialize.rs`; do not fork it.** One atomic stage-then-materialize writer with recursion as a declared option; `superset_files::copy_into_repo` becomes a thin non-recursive caller and `plugin::install` the recursive second caller. Shape and options per [architecture.md](./2026-08-29-001-ss-magic-plugin/architecture.md). *Governs R10, R12, R13.*
+- KTD2. **The materialize generalization is dropped; `copy_into_repo` keeps its shape and gains one invariant.** The recursion, exec-suffix and staging options existed for exactly one consumer, `plugin::install`, which R66 deletes – so building a generalized writer for a caller that no longer exists is work with no consumer. What survives, and is the part that matters, is the **invariant: `copy_into_repo` never removes a destination entry that is not named in its explicit `delete` list.** It satisfies this today by accident – it reads only `is_file()` entries from a flat stage and unlinks only named paths – but plugin state lives at `.superset/.magic/`, *inside* the destination root this writer owns, so any future change that pruned destination entries absent from the stage would silently destroy live session files, the conclusion cache and pending one-shot claims on the next `init` or `migrate`. State the invariant and test it. *Governs R18.*
 - KTD3. **One 64-bit content fingerprint in `src/hashing.rs`.** Lift the private `reverse_sync::hash_file` (std `DefaultHasher`, non-cryptographic – the threat is accidental collision, not an adversary) and have reverse sync, the conclusion cache, and the ledger all call it; the cache key fingerprints `(realpath, size, mtime)` per R24. No new crate. *Governs R24, R44, R45.*
-- KTD4. **Gate decision order: scratchpad, subagent, non-text, config, one stat, threshold, window, bypass, cache.** The three exemptions come first and cost nothing; config resolution (R55, R53) locates the repo root by walking up from the envelope's `cwd` for `.superset/magic.json` – a bounded filesystem walk, never a git subprocess – and memoizes the result per `cwd` for the process; then the under-threshold path is a single `stat` and exit. Only an over-threshold file pays for window arithmetic, bypass lookup, and key hashing. *Governs R21, R41, R42, R43, R52, R55.*
+- KTD4. **Gate decision order: config, checklist, scratchpad, subagent, non-text, one stat, threshold, window, bypass, cache.** Config resolution (R55, R53) comes first, because a repository where the plugin is disabled must no-op before anything else runs; it locates the repo root by walking up from the envelope's `cwd` for `.superset/magic.json` – a bounded filesystem walk, never a git subprocess – and memoizes the result per `cwd` for the process. **The checklist classification (R88) comes next, ahead of the three exemptions**, because it must deny a path that the state-tree and subagent exemptions would otherwise allow; it matches on the resolved realpath, is size-independent, and applies to `Read`, `Edit`, `Write` and notebook edits rather than `Read` alone. The exemptions then cost nothing, and the under-threshold path is a single `stat` and exit. Only an over-threshold file pays for window arithmetic, bypass lookup, and key hashing. *Governs R21, R41, R42, R43, R52, R55, R88.*
 - KTD5. **Atomic claims reuse `fd-lock`.** The claim scheme for R48 is the advisory `fd_lock::RwLock` pattern already shipped in `src/update/apply.rs` – one lock file per protected store, `try_write` for one-shot claims (block-once flags, bypass tokens) and blocking write for appends – never a second locking scheme. *Governs R42, R48.*
 - KTD6. **The heartbeat is one appended line, machine-level.** `hooks.jsonl` lives beside the ledger in the machine-level store, one row per hook invocation carrying event, timestamp, cwd, outcome, and error class on the fail-open path – machine-level because a hook can fire outside any git repo and the row must survive worktree deletion; `status` filters by cwd when inside a worktree. *Governs R50.*
 - KTD7. **The machine-level store is ss-magic's existing `ProjectDirs` root.** Ledger, heartbeat, offsets store, and price-table snapshots live under the same OS app root `src/update/check.rs` already resolves, in a `plugin/` subdirectory; rows carry the resolved worktree root and branch as labels so `cost` groups cross-branch by default. *Governs R27, R29, R46, R50.*
 - KTD8. **Unknown keys survive via a flattened extras map on `MagicConfig`, and every writer load-modifies-writes.** No writer builds a fresh config from parts again; `init`, `migrate`, the edit-config menu, and the new `config set`/`enable`/`disable` verbs all read the file, change the one key, and re-serialize. *Governs R4, R5, R6, R37.*
-- KTD9. **Install path and verification per the companions.** Resolve `~/.claude` from the home directory honoring `CLAUDE_CONFIG_DIR` (never `ProjectDirs`), and verify with `claude plugin list --json`, matching id and enabled while ignoring the exit code – rules owned by [architecture.md](./2026-08-29-001-ss-magic-plugin/architecture.md) and [plugin-assets.md](./2026-08-29-001-ss-magic-plugin/plugin-assets.md). *Governs R10, R11.*
+- ~~KTD9, KTD15~~. **Retired 2026-08-30 with the local install path.** They owned install-target resolution and the embed-and-substitute asset pipeline. KTD16 replaces both: the plugin is committed content the marketplace serves, so nothing is resolved at install time and nothing is rendered. *See Scope Boundaries.*
 - KTD10. **The bypass is a one-shot claim file.** `plugin bypass <path>` records a token under the worktree's plugin state dir; the gate consumes it (KTD5 claim semantics) on the next matching over-threshold `Read` and every deny reason prints the exact invocation to run. *Governs R42.*
 - KTD11. **The non-text exemption is a binary-owned extension list.** Images, PDFs, and notebooks are never gated; the list ships in the binary and configuration cannot shrink it, so no config state can make a binary unviewable. *Governs R43.*
 - KTD12. **Identity derivation follows [scratchpad-contract.md](./2026-08-29-001-ss-magic-plugin/scratchpad-contract.md) exactly.** `symbolic-ref` with the `detached-<short-sha>` fallback, Rust slugify with the empty-result and non-ASCII guards, repo name from pack's origin derivation, and the hook resolving against the envelope's `cwd` field. *Governs R14, R15.*
-- KTD13. **The enumeration filter generalizes `under_backups_dir` into an excluded-trees check applied at the walk layer.** `EXCLUDED_TREES = [".superset/backups", ".scratchpad", ".git"]`, enforced in `walk_source`, in reverse sync's candidate set, and in pack's recursive directory walk – the point-of-final-enumeration rule [architecture.md](./2026-08-29-001-ss-magic-plugin/architecture.md) records. *Governs R2, R18.*
+- KTD13. **The enumeration filter generalizes `under_backups_dir` into an excluded-trees check applied at the walk layer.** `EXCLUDED_TREES = [".superset/backups", ".superset/.magic", ".scratchpad", ".git"]`, enforced in `walk_source`, in reverse sync's candidate set, and in pack's recursive directory walk – the point-of-final-enumeration rule [architecture.md](./2026-08-29-001-ss-magic-plugin/architecture.md) records. Each entry matches its exact component path, never a prefix of it: widening `.superset/.magic` to `.superset` would exclude the contract files from sync and pack and exempt them from the gate. `.scratchpad` is kept, not replaced – ss-magic does not own that tree but must never push it into main. *Governs R2, R18.*
 - KTD14. **Conclusion-cache and heartbeat-log lifecycle mirror `prune_old_backups`.** Bounded count and age, best-effort, warn-never-fail, run after each cache write; `gc` is the explicit on-demand sweep for orphaned keys. *Governs R45.*
-- KTD15. **Assets are embedded per file with a single version substitution.** One `include_str!` per shipped file plus a manifest table (the `MAGIC_SH` precedent); rendering substitutes only the crate version into `plugin.json`, which is what makes R38 checkable as byte equality. *Governs R12, R13, R38.*
+- KTD16. **The plugin is a committed subdirectory, and the marketplace points at it with `git-subdir`.** `plugin/` at the repository root holds `.claude-plugin/plugin.json`, the version pin file, `hooks/hooks.json`, `bin/` (the R75 wrapper), `hooks/bootstrap.sh` and `skills/`. `.claude-plugin/marketplace.json` at the repository root declares one entry whose source is `{ "source": "git-subdir", "url": …, "path": "plugin", "ref": …, "sha": … }` – `path` resolves from the repository root, and the `sha` must be lowercase hex or the manifest is rejected. The former `assets/plugin/` embed-and-render pipeline is gone with KTD15: these are committed bytes the marketplace serves, not bytes the binary writes. `claude plugin validate` runs against both the marketplace root and the plugin subdirectory, and note it is non-strict – an unknown key inside a source object is silently ignored rather than flagged. *Governs R66, R67.*
+- KTD17. **The bootstrap fetches the release archive directly; the installer script is the fallback, not the path.** The published release carries `.sha256` siblings for each platform `.tar.gz` but none for `ss-magic-installer.sh`, so piping the script into a shell executes the one artifact no published digest covers. The bootstrap therefore resolves the platform triple, downloads `ss-magic-<triple>.tar.gz`, verifies it against its published digest, and extracts the binary itself – the verified artifact and the executed artifact are the same. Where the installer script is used instead, the variable is `SS_MAGIC_UNMANAGED_INSTALL`: the installer resolves its destination as `SS_MAGIC_INSTALL_DIR`, then `CARGO_DIST_FORCE_INSTALL_DIR`, then `UNMANAGED_INSTALL`, and the first two select the `cargo-home` layout – binary at `<dir>/bin/`, a PATH edit, and a bundled self-updater inside a directory the plugin manager owns. `SS_MAGIC_UNMANAGED_INSTALL` selects the flat layout and sets `NO_MODIFY_PATH=1` and `INSTALL_UPDATER=0` in one step, and writes no receipt because the receipt is written only when the updater is installed. The `--no-modify-path` flag is deprecated in favour of `SS_MAGIC_NO_MODIFY_PATH=1`. Verified against the real published asset for v0.9.0. *Governs R70, R71, R73.*
+- KTD18. **Hook entries use exec form.** `{"command": "bash", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/bootstrap.sh"]}` rather than a shell string. Exec form passes each argument as a plain string, so a plugin path containing a quote, `$` or backtick never reaches a shell parser, and it removes the dependency on the script's executable bit surviving distribution – which it does, but fails silently when it does not. The braced variable form is used everywhere, because the bare `$NAME` form is substituted only in shell form. *Governs R74.*
+- KTD19. **The checklist is one module family, not a bolt-on.** `src/plugin/checklist/` owns the typed schema, validation, canonical ordering, the Markdown renderer and the verb dispatch, and knows nothing about hooks – the same dependency direction the conclusion cache follows. Serde modeling is uneventful: no untagged unions, no heterogeneous arrays and no free-form maps, but two distinct optionality conventions must not be mixed – `expected` and the completion timestamp are keys that are always present and may be null, while `priority`, `why` and `refs` are omitted when unset. Ordered sections need an order-preserving map or an explicit array; a hash map would destroy render order. *Governs R82-R90.*
 
 ### High-Level Technical Design
 
-**Hook dispatch topology.** The harness invokes the installed `hooks.json` entries, each of which runs `ss-magic plugin hook <event>` with the event payload on stdin. `src/plugin/hook/mod.rs` decodes the envelope, routes to the per-event module, and encodes exactly one JSON response on stdout (or nothing, for allow/no-op). A fail-open wrapper around the whole dispatch guarantees exit 0 with empty stdout on any internal error (R9, R26), and the heartbeat append runs on every path including that one (R50). Per-worktree state (pointer, session files, conclusions, one-shot flags) lives under `.scratchpad/.ss-magic-plugin/`; machine-level state (ledger, heartbeat, offsets, price snapshots) lives in the `ProjectDirs` store (KTD7).
+**Hook dispatch topology.** The harness invokes the installed `hooks.json` entries, each of which runs `ss-magic plugin hook <event>` with the event payload on stdin. `src/plugin/hook/mod.rs` decodes the envelope, routes to the per-event module, and encodes exactly one JSON response on stdout (or nothing, for allow/no-op). A fail-open wrapper around the whole dispatch guarantees exit 0 with empty stdout on any internal error (R9, R26), and the heartbeat append runs on every path including that one (R50). Per-worktree state (pointer, session files, conclusions, one-shot flags) lives under `.superset/.magic/`; machine-level state (ledger, heartbeat, offsets, price snapshots) lives in the `ProjectDirs` store (KTD7).
 
 ```mermaid
 flowchart TB
@@ -293,7 +424,7 @@ flowchart TB
     HB["heartbeat append (all paths)"]
   end
   subgraph state["State"]
-    WT["per worktree:<br/>.scratchpad/.ss-magic-plugin/<br/>pointer, sessions, conclusions, flags"]
+    WT["per worktree:<br/>.superset/.magic/<br/>pointer, sessions, conclusions, flags"]
     MACH["machine level (ProjectDirs):<br/>ledger.jsonl, hooks.jsonl,<br/>offsets.json, price snapshots"]
   end
   EV --> HJ --> ROUTE
@@ -311,7 +442,13 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-  R["PreToolUse: Read(file_path, offset?, limit?)"] --> SP{"path inside<br/>.scratchpad/? (R43)"}
+  R["PreToolUse: Read / Edit / Write / notebook edit"] --> CFG{"plugin enabled for<br/>this cwd? (R55)"}
+  CFG -- no --> OK
+  CFG -- yes --> CL{"resolved realpath is<br/>a checklist file? (R88)"}
+  CL -- yes --> CDENY["deny – use ss-magic plugin checklist<br/>(size-independent, ahead of every exemption)"]
+  CL -- no --> ED{"tool is Edit / Write /<br/>notebook edit?"}
+  ED -- yes --> OK
+  ED -- no --> SP{"path inside<br/>.superset/.magic/? (R43)"}
   SP -- yes --> OK
   SP -- no --> SA{"issued inside<br/>a subagent? (R52)"}
   SA -- yes --> OK
@@ -328,18 +465,27 @@ flowchart TB
   C -- miss --> MISS["deny – names cache path, Explore routing,<br/>and the bypass invocation (R21, R42)"]
 ```
 
-**Install and refresh.** The plugin step runs inside `sync_core` after configuration loads and before the empty-`files` early return (F1). It reads the overlaid `plugin` block (R6, R7), and when enabled renders the embedded assets with only the version substituted (KTD15), compares bytes against the installed tree, materializes atomically through the shared writer only on change (KTD2, R13), verifies against the harness's own listing (R11), and prints the reload notice plus – on a machine's first install – the loud hooks notice (R39). `ss-magic plugin install` is the same path invoked directly.
+**Delivery and bootstrap.** `ss-magic` installs nothing. The user adds the marketplace and installs the plugin through the harness (R66), which fetches the pinned subdirectory (R67, KTD16). From then on the plugin is self-sufficient: a `SessionStart` entry restricted to the `startup` source (R76 – the ss-magic handler itself stays unmatched so `compact` still reaches it) runs the shipped bootstrap in exec form (KTD18), which compares the pin beside `plugin.json` against the binary already in `${CLAUDE_PLUGIN_DATA}` and returns silently when they match. On a mismatch it takes the lock under the temporary root (R80), validates the pin, downloads and checksum-verifies the release archive, fetches and checksum-verifies the platform archive and extracts it into a temporary directory (KTD17), then moves the result into place. Every failure path exits 0 (R72); a failed install leaves no success marker (R73). The session in which a bootstrap first runs has ss-magic's hooks inert, because sibling hooks on the same event fire concurrently (R77, R81).
 
 ```mermaid
 flowchart TB
-  SYNC["ss-magic sync / plugin install"] --> LOAD["load overlaid config (R6, R7)"]
-  LOAD --> EN{"plugin.enabled?"}
-  EN -- no --> SKIP["skip plugin step"]
-  EN -- yes --> REND["render binary-owned assets,<br/>version substituted (R38, KTD15)"]
-  REND --> CMP{"bytes differ from<br/>installed tree?"}
-  CMP -- no --> VER["verify: claude plugin list --json,<br/>exit code ignored (R11)"]
-  CMP -- yes --> MAT["materialize atomically (KTD2)"] --> NOTE["reload notice;<br/>first-install notice (R13, R39)"] --> VER
-  VER --> CONT["sync continues to the files step"]
+  subgraph once["Once, by the user"]
+    ADD["claude plugin marketplace add"] --> INST["claude plugin install ss-magic@ss-magic"]
+    INST --> FETCH["harness fetches the pinned<br/>git-subdir at ref/sha (R67)"]
+  end
+  subgraph every["Every fresh session (matcher: startup)"]
+    SS["SessionStart bootstrap entry<br/>(matcher: startup, exec form)"] --> CMP{"pin == installed<br/>binary version?"}
+    CMP -- yes --> QUIET["exit 0, no stdout (R72)"]
+    CMP -- no --> LOCK["take lock under<br/>/tmp or $TMPDIR root (R80)"]
+    LOCK --> VAL{"pin is a valid<br/>version literal? (R71)"}
+    VAL -- no --> FAIL
+    VAL -- yes --> DL["download release archive"]
+    DL --> SUM{"checksum matches<br/>published digest? (R71)"}
+    SUM -- no --> FAIL["exit 0; one stderr line;<br/>leave any existing binary;<br/>remove success marker (R72, R73)"]
+    SUM -- yes --> MV["extract to a temp dir,<br/>then move into place (KTD17, R73)"]
+    MV --> MARK["write success marker;<br/>first-run disclosure (R79)"]
+  end
+  FETCH -.-> SS
 ```
 
 ### Assumptions
@@ -356,12 +502,12 @@ flowchart TB
 
 Six hard constraints, then the phase order:
 
-1. U1 and U2 (R1, R2, with regression tests that reproduce the live defects) land before any unit writes a byte into `.scratchpad/` – the tree's own `*` gitignore is the trigger that arms both bugs. U8 and everything after it depend on them.
+1. U2 (R2, with a regression test that reproduces the live defect) lands before any unit writes a byte into `.superset/.magic/` – the enumeration layer is gitignore-blind, so the state tree must be excluded before it exists. U8 and everything after it depend on it. U1 (R1) stays in Phase A on independent evidence: the plugin no longer creates a nested `*` gitignore, so this plan does not arm the re-anchor defect, but `.scratchpad/.gitignore` containing `*` already exists in Superset worktrees today and any broad reverse-sync pattern can still lift it. U8 no longer depends on U1.
 2. U3 (R4) lands before any `magic.json` gains a `plugin` block – AE2 documents `init` deleting one live. U5, U10, and U19 depend on it.
-3. U4, the materialize extraction, lands as its own commit with byte-identical behavior verified by the full existing suite before `plugin::install` (U9) becomes its second caller.
+3. U4 no longer extracts a writer – `plugin::install` was its only consumer and R66 deletes it. What remains is the no-prune invariant on `copy_into_repo`, which must land with its state-survival test before U27 writes the first checklist pointer under `.superset/.magic/`.
 4. `should_run_update_gate` enumerates gated commands by inclusion; U6 keeps the plugin command out and pins that with a test in `src/tests/update_gate.rs` (R9).
 5. `pre-tool-use` fires on every `Read`; U14's under-threshold path is one stat and an exit, before any git subprocess (KTD4).
-6. U17 (the cost ledger) lands and ships ahead of U13 and U14, because the ledger is what makes the gate's value measurable per workload – this session's own profile inverts the one that motivated the feature, so the gate's default threshold is set from observed ledger data rather than chosen at implementation time.
+6. U17 (the cost ledger) lands and ships ahead of U13 and U14, so the gate's value can be **measured** per workload once it lands – this session's own profile inverts the one that motivated the feature, and without the ledger there is no way to tell afterwards whether the gate paid for itself. The gate's default threshold is *not* derived from ledger data: a ledger row is one cumulative cost figure per session and cannot decompose into a distribution of read sizes, so waiting for it would be circular. R53's defaults are chosen at implementation time from the measured read-size profile, and the ledger tunes them after release.
 
 ```mermaid
 flowchart TB
@@ -396,7 +542,6 @@ flowchart TB
     U20["U20 compaction window"]
     U21["U21 docs + release"]
   end
-  U1 --> U8
   U2 --> U8
   U3 --> U5 --> U10
   U4 --> U9 --> U10
@@ -427,25 +572,34 @@ flowchart TB
 New files this plan creates (repo-relative; every `<module>.rs` pairs with a sibling `<module>/tests.rs` per the repo's test-layout convention):
 
 ```plaintext
-assets/plugin/          # source layout; KTD15 maps it to the installed shape
-                        # (plugin.json -> .claude-plugin/, hooks.json -> hooks/)
-├── plugin.json                          # version placeholder, substituted at render (KTD15)
-├── hooks.json                           # verbatim per plugin-assets.md, args ["plugin","hook","<event>"]
+.claude-plugin/marketplace.json          # one git-subdir entry -> plugin/ at a ref+sha (KTD16)
+
+plugin/                 # the committed plugin the marketplace serves; no build step
+├── .claude-plugin/plugin.json
+├── ss-magic.version                     # the binary pin the bootstrap reads (R70)
+├── hooks/
+│   ├── hooks.json                       # exec form, matcher "startup" on SessionStart (KTD18)
+│   └── bootstrap.sh                     # R70-R79; the one script the plugin ships
+├── bin/ss-magic                         # wrapper on the Bash tool's PATH (R75)
 └── skills/
     ├── scratchpad/SKILL.md
     ├── operator-checklist/SKILL.md
     ├── operator-checklist/reference.md
-    └── setup/SKILL.md
+    └── setup-github-ci/SKILL.md         # replaces setup/ (R93)
+
+assets/workflow/checklist.yml            # written into a consuming repo by setup-github-ci (U31)
 
 src/hashing.rs                           # + src/hashing/tests.rs (KTD3)
-src/workspace/materialize.rs             # + src/workspace/materialize/tests.rs (KTD2)
 
 src/plugin/
 ├── mod.rs                               # verb dispatch; tests in src/plugin/tests.rs
 ├── tests.rs
 ├── config.rs                            # + config/tests.rs – plugin block + overlay precedence
-├── assets.rs                            # + assets/tests.rs – embedded tree + manifest table
-├── install.rs                           # + install/tests.rs – materialize/refresh/verify/uninstall
+├── tmproot.rs                           # + tmproot/tests.rs – private temp root + locks (R80)
+├── setup_ci.rs                          # + setup_ci/tests.rs – workflow writer (R93-R95)
+├── checklist/                           # KTD19; knows nothing about hooks
+│   ├── mod.rs, schema.rs, order.rs, validate.rs, render.rs, verbs.rs
+│   └── (each with a sibling tests.rs)
 ├── identity.rs                          # + identity/tests.rs – <repo>-<branch> slug
 ├── scratchpad.rs                        # + scratchpad/tests.rs – bootstrap, pointer, scaffolding
 ├── cache.rs                             # + cache/tests.rs – conclusion cache, prune, gc
@@ -461,12 +615,13 @@ src/plugin/
     ├── session_start.rs                 # + session_start/tests.rs
     ├── pre_compact.rs                   # + pre_compact/tests.rs
     ├── subagent_stop.rs                 # + subagent_stop/tests.rs
-    └── session_end.rs                   # + session_end/tests.rs
+    ├── session_end.rs                   # + session_end/tests.rs
+    └── file_changed.rs                  # + file_changed/tests.rs – direnv export (R92)
 
 src/tests/plugin_flow.rs                 # end-to-end verb tests (crate-level)
 ```
 
-Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/apply.rs`, `src/sync/reverse_sync.rs`, `src/sync/mod.rs`, `src/pack.rs`, `src/workspace/superset_files.rs`, `src/workspace/mod.rs`, `src/tui/style.rs`, `src/tests/update_gate.rs`, `CLAUDE.md`, `README.md`, `CONTRIBUTING.md`, `CONCEPTS.md`, `.cursor/BUGBOT.md`, `Cargo.toml`, `Cargo.lock`.
+Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/apply.rs`, `src/sync/reverse_sync.rs`, `src/sync/mod.rs`, `src/pack.rs`, `src/workspace/superset_files.rs`, `src/workspace/mod.rs`, `src/workspace/migrate.rs`, `src/tui/style.rs`, `src/tests/update_gate.rs`, `CLAUDE.md`, `README.md`, `CONTRIBUTING.md`, `CONCEPTS.md`, `.cursor/BUGBOT.md`, `Cargo.toml`, `Cargo.lock`.
 
 ---
 
@@ -476,16 +631,25 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
 
 | U-ID | Title | Key files | Depends on |
 |---|---|---|---|
-| U1 | Covering-rule re-anchor fix | `src/git/gitignore.rs` | – |
+| U1 | Covering-rule re-anchor fix (standalone) | `src/git/gitignore.rs` | – |
 | U2 | Excluded-trees enumeration filter + pack count | `src/sync/apply.rs`, `src/pack.rs`, `src/sync/reverse_sync.rs` | – |
 | U3 | Unknown-key round-trip | `src/workspace/superset_files.rs` | – |
-| U4 | Materialize extraction | `src/workspace/materialize.rs` | – |
+| U4 | `copy_into_repo` no-prune invariant + `src/hashing.rs` lift | `src/workspace/superset_files.rs`, `src/hashing.rs` | – |
 | U5 | Plugin config block + overlay | `src/plugin/config.rs`, `src/workspace/superset_files.rs` | U3 |
 | U6 | CLI verb tree + dispatch | `src/cli.rs`, `src/main.rs`, `src/plugin/mod.rs` | – |
 | U7 | Identity slug | `src/plugin/identity.rs`, `src/pack.rs` | U6 |
-| U8 | Scratchpad bootstrap + pointer | `src/plugin/scratchpad.rs` | U1, U2, U6, U7 |
-| U9 | Assets + install/uninstall/verify | `src/plugin/assets.rs`, `src/plugin/install.rs`, `assets/plugin/` | U4, U6 |
-| U10 | Sync integration | `src/main.rs` | U5, U9 |
+| U8 | Scratchpad bootstrap + pointer | `src/plugin/scratchpad.rs` | U2, U6, U7 |
+| ~~U9, U10~~ | *Retired – assets/install/verify and sync integration; see Scope Boundaries* | – | – |
+| U22 | Marketplace plugin tree + manifest | `plugin/`, `.claude-plugin/marketplace.json` | – |
+| U23 | Bootstrap script + version pin | `plugin/hooks/bootstrap.sh`, `plugin/bin/`, `plugin/ss-magic.version` | U22 |
+| U24 | Temporary-root locks | `src/plugin/tmproot.rs` | U6 |
+| U25 | Checklist schema + validation | `src/plugin/checklist/` | U6 |
+| U26 | Checklist Markdown renderer | `src/plugin/checklist/render.rs` | U25 |
+| U27 | Checklist verbs + init pointer | `src/plugin/checklist/verbs.rs`, `src/plugin/mod.rs` | U8, U25 |
+| U28 | Checklist Read/Edit deny | `src/plugin/hook/pre_tool_use.rs` | U14, U27 |
+| U29 | Commit nudge (PreToolUse Bash) | `src/plugin/hook/pre_tool_use.rs` | U11, U27 |
+| U30 | file-changed hook + direnv export | `src/plugin/hook/file_changed.rs` | U11, U24 |
+| U31 | setup-github-ci verb + workflow asset | `src/plugin/setup_ci.rs`, `assets/workflow/` | U6, U26 |
 | U11 | Hook runtime core + heartbeat | `src/plugin/hook/mod.rs`, `event.rs`, `src/plugin/heartbeat.rs`, `src/tui/style.rs` | U6 |
 | U12 | session_start hook | `src/plugin/hook/session_start.rs` | U8, U11 |
 | U13 | Conclusion cache + conclude/conclusions/gc | `src/hashing.rs`, `src/plugin/cache.rs` | U4, U8 |
@@ -502,38 +666,40 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
 
 ### U1. Covering-rule re-anchor fix
 
-- **Goal:** `ensure_path_ignored` stops lifting a nested covering pattern to a broader scope, closing the `*`-to-root-gitignore leak before `.scratchpad/.gitignore` arms it.
+- **Goal:** `ensure_path_ignored` stops lifting a nested covering pattern to a broader scope, closing the `*`-to-root-gitignore leak that the `.scratchpad/.gitignore` already present in Superset worktrees keeps armed.
 - **Requirements:** R1. AE13 (with U2).
-- **Dependencies:** none.
+- **Dependencies:** none. Nothing depends on this unit either: the plugin's own state no longer creates a nested `*` gitignore, so U8 does not wait on it. It stays in Phase A because the defect is live in this repo today, not because this plan arms it.
 - **Files:** `src/git/gitignore.rs`, `src/git/gitignore/tests.rs`.
 - **Approach:**
   1. Make `find_covering_rule` report which `.gitignore` file owned the matched rule (`git check-ignore -v` already names it).
   2. In `ensure_path_ignored`, reuse the covering pattern only when the target root has a `.gitignore` at the same relative directory as the owning file in the rule-source root; otherwise fall through to `anchored_literal` (R1).
-  3. Regression test reproducing the live three-command defect: source tree with `.scratchpad/.gitignore` containing `*`, reverse-sync-shaped call, assert the target root `.gitignore` never gains `*`.
+  3. Regression test reproducing the live three-command defect: source tree with a nested `.gitignore` containing `*`, reverse-sync-shaped call, assert the target root `.gitignore` never gains `*`. The fixture is synthetic – the plugin no longer creates such a file – and stands for the `.scratchpad/` trees the planning tooling leaves behind.
 - **Patterns to follow:** the existing git-tolerant degradation in `ensure_path_ignored` (a git failure reads as "not ignored"); tests use `tempfile` + shell `git init` per `src/git/gitignore/tests.rs`.
 - **Test scenarios:**
   - Covers AE13 (gitignore half). Nested `*` gitignore in the source, no same-relative-dir gitignore in the target: the appended rule is an anchored literal at the closest existing target `.gitignore`, and the target root file carries no `*`.
+  - Covers AE46. A root-level `Dir` rule for a path whose ancestors carry a `.gitignore` closer than the root: the rule lands in that closer file, and git reports the path ignored. This is the shape R40's ignore rule takes, and it must not re-arm the re-anchor defect.
   - Target has a `.gitignore` at the same relative directory: the covering pattern is reused there, unchanged behavior.
   - Non-git target tempdir: degrades to the literal append, as today.
 - **Verification:** full suite green; the new regression test fails on the pre-fix code.
-- **Execution note:** prerequisite fix – commit separately with its regression test before any plugin code, so the fix is bisectable and provably precedes the first `.scratchpad/` write.
+- **Execution note:** prerequisite fix – commit separately with its regression test before any plugin code, so the fix is bisectable. It no longer gates U8 – the plugin does not arm this defect any more – but it closes a leak that is live in Superset worktrees today.
 
 ### U2. Excluded-trees enumeration filter and pack count
 
-- **Goal:** the sync and pack enumeration layers exclude `.superset/backups`, `.scratchpad`, and `.git` as whole trees at the point of final enumeration, and pack reports unique paths.
-- **Requirements:** R2, R3, R18. AE13, AE14, AE18.
+- **Goal:** the sync and pack enumeration layers exclude `.superset/backups`, `.superset/.magic`, `.scratchpad`, and `.git` as whole trees at the point of final enumeration, and pack reports unique paths.
+- **Requirements:** R2, R3, R18. AE13, AE14, AE18, AE53.
 - **Dependencies:** none.
 - **Files:** `src/sync/mod.rs`, `src/sync/apply.rs`, `src/sync/apply/tests.rs`, `src/sync/reverse_sync.rs`, `src/sync/reverse_sync/tests.rs`, `src/pack.rs`, `src/pack/tests.rs`.
 - **Approach:**
-  1. Generalize `under_backups_dir` into an excluded-trees check over KTD13's list, hosted in `src/sync/mod.rs`; keep `under_backups_dir` as a thin caller where backup-only semantics are still meant (e.g. `backups_root_for`).
-  2. Apply it in `walk_source` (`src/sync/apply.rs`), in reverse sync's candidate enumeration, and generalize `append_dir_excluding_backups` so a directory match that is an ancestor of any excluded subtree prunes it during the recursive walk (KTD13).
+  1. Generalize `under_backups_dir` into an excluded-trees check over KTD13's list, hosted in `src/sync/mod.rs`; keep `under_backups_dir` as a thin caller where backup-only semantics are still meant (e.g. `backups_root_for`). Match on exact path components – `under_backups_dir` already compares the two components `.superset` + `backups`, and `.superset/.magic` takes the same shape; a prefix comparison would swallow `.superset` itself.
+  2. Apply it in `walk_source` (`src/sync/apply.rs`), in reverse sync's candidate enumeration, and generalize `append_dir_excluding_backups` so a directory match that is an ancestor of any excluded subtree prunes it during the recursive walk (KTD13). Two excluded trees now share the `.superset` ancestor, so the recursive prune must handle a directory match yielding more than one pruned subtree.
   3. Change `write_archive` to count unique file paths added rather than tar entries, feeding `PackEvent::Done { count }` (R3).
 - **Patterns to follow:** the existing `append_dir_excluding_backups` prune shape in `src/pack.rs`; the secret-safety rule in `CLAUDE.md` ("enforce the filter at the point of final enumeration") – this unit is that rule applied to two more trees.
 - **Test scenarios:**
-  - Covers AE14. Pack with a `**` pattern over a tree containing `.git/`, `.scratchpad/`, and `.superset/backups/`: none appear in the archive, and the reported count equals the number of unique paths.
-  - Covers AE18. Forward-sync pattern matching a path inside `.scratchpad/`: `walk_source` never yields it.
-  - Covers AE13 (enumeration half). Reverse-sync candidate set over a broad pattern: no `.scratchpad/` file is offered.
-  - A directory match that is an ancestor of `.scratchpad` (a bare `.` or broad pattern): the walk prunes the subtree, not just the flat list.
+  - Covers AE14. Pack with a `**` pattern over a tree containing `.git/`, `.scratchpad/`, `.superset/.magic/`, and `.superset/backups/`: none appear in the archive, `.superset/config.json` and `.superset/magic.json` do, and the reported count equals the number of unique paths.
+  - Covers AE18. Forward-sync pattern `.superset/**` matching a path inside `.superset/.magic/`: `walk_source` never yields it, but still yields `.superset/magic.json`.
+  - Covers AE13 (enumeration half). Reverse-sync candidate set over a broad pattern: no `.scratchpad/` and no `.superset/.magic/` file is offered.
+  - Covers AE53. A **bare `.superset` directory match** – the ancestor shape the flat filter cannot catch – prunes both `.magic` and `backups` during the recursive walk while keeping the contract files. Test this shape explicitly, not only a bare `.` or `**`: `.superset` is a plausible user pattern, which is what makes it the dangerous one.
+  - Exclusion matches the exact component path: a sibling named `.superset/.magicked` or a file named `.magic` is not excluded, and `.superset/` itself is never excluded.
 - **Verification:** full suite green; the pack directory-match shape is tested, not just the leaf shape.
 - **Execution note:** prerequisite fix – same posture as U1: own commit, regression tests that fail pre-fix, landed before Phase C.
 
@@ -553,22 +719,19 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
 
 **Phase B – foundations.**
 
-### U4. Materialize extraction
+### U4. `copy_into_repo` no-prune invariant and the hashing lift
 
-- **Goal:** one atomic stage-to-destination writer shared by `.superset/` sync and the plugin install.
-- **Requirements:** KTD2 (enables R10, R12, R13). Also lands the `src/hashing.rs` lift, so U13 and U17 both depend on this unit rather than on each other.
-- **Dependencies:** none (lands before U9 per Sequencing constraint 3).
-- **Files:** `src/workspace/materialize.rs`, `src/workspace/materialize/tests.rs`, `src/workspace/superset_files.rs`, `src/workspace/mod.rs`.
-- **Approach:** extract `copy_into_repo`'s core into `materialize` with the options [architecture.md](./2026-08-29-001-ss-magic-plugin/architecture.md) specifies (recursion, exec suffixes, write-last ordering, delete set); `copy_into_repo` becomes a thin non-recursive caller with unchanged semantics, including `config.json` written last and `*.sh` chmod.
-- **Patterns to follow:** `copy_into_repo` in `src/workspace/superset_files.rs` (the behavior being preserved); `NamedTempFile`-then-persist atomicity as in `src/pack.rs::write_archive`.
+- **Goal:** state and test the invariant that keeps plugin state alive inside the directory `copy_into_repo` owns, and land the shared fingerprint helper.
+- **Requirements:** R18, KTD2, KTD3. Lands the `src/hashing.rs` lift, so U13 and U17 depend on this unit rather than on each other.
+- **Dependencies:** none.
+- **Files:** `src/workspace/superset_files.rs`, its tests, `src/hashing.rs`, `src/hashing/tests.rs`, `src/sync/reverse_sync.rs` (delegate `hash_file`).
+- **Approach:** the materialize extraction is **dropped** – its only consumer was `plugin::install`, which R66 deletes, so generalizing the writer would build recursion for no caller. Instead, document and pin the invariant `copy_into_repo` already satisfies by accident: it never removes a destination entry that is not named in its explicit `delete` list. Then lift `reverse_sync::hash_file` into `src/hashing.rs` and have reverse sync delegate.
+- **Patterns to follow:** the existing `copy_into_repo` semantics being preserved – `config.json` written last, `*.sh` chmod 0755, the named delete set.
 - **Test scenarios:**
-  - Existing `copy_into_repo` behavior is byte-identical: overwrite, chmod, delete set, write-last ordering all covered by targeted tests plus the untouched existing suite.
-  - Recursive mode materializes a nested tree without the silent-drop defect (a nested directory arrives complete).
-  - A failed stage never leaves a partially-written destination.
-- **Verification:** the full existing suite passes unmodified before any second caller exists.
-- **Execution note:** land as its own commit with byte-identical behavior verified by the whole suite before U9 makes `plugin::install` the second caller (Sequencing constraint 3). Do not batch it with plugin code.
-
-### U5. Plugin config block and overlay precedence
+  - **State survival (KTD2's invariant).** A pre-existing `.superset/.magic/` subtree with content – a session directory, a cached conclusion, a pending one-shot claim, the checklist pointer – survives `ss-magic init` and `migrate` byte-for-byte, even though it sits inside the destination root and appears in no stage.
+  - Existing behavior is unchanged: overwrite, chmod, delete set and write-last ordering stay covered by the untouched existing suite.
+  - `hash_file` delegation leaves reverse sync's baseline hashing behavior unchanged.
+- **Verification:** the full existing suite passes unmodified.
 
 - **Goal:** `magic.json` carries a typed `plugin` block, overlaid per the local-wins rules.
 - **Requirements:** R5, R6, R7, R53 (the schema: gate threshold, inline byte budget, exemption list, each with a default and stated bounds).
@@ -585,17 +748,21 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
 ### U6. CLI verb tree, dispatch, and update-gate exclusion
 
 - **Goal:** `ss-magic plugin …` parses into the split hook/human verb tree and dispatches without the auto-update gate or TUI.
-- **Requirements:** R8, R9, R35, R57 (only the human verbs reach config-writing and install). AE44.
+- **Requirements:** R8, R9, R35, R57, R68, R69. AE44, AE56.
 - **Dependencies:** none.
 - **Files:** `src/cli.rs`, `src/cli/tests.rs`, `src/main.rs`, `src/plugin/mod.rs`, `src/plugin/tests.rs`, `src/tests/update_gate.rs`.
 - **Approach:**
   1. `cli::parse` recognizes `plugin` as the first token and carries the remaining argv apart from the `Copy` `Command` enum, following the `Parsed::Init` precedent.
   2. `src/plugin/mod.rs` owns the second-level parse: `hook <event>` versus human verbs (R8, R35); unknown plugin verbs error like `Parsed::Error` does today – for human invocations only, per R9.
   3. `main.rs` dispatches plugin invocations outside `should_run_update_gate`'s inclusion list; pin that with a test (Sequencing constraint 4).
+  4. Add `--version` / `-V` as a terminal short-circuit beside the existing `--help` arm, returning a `Parsed::Version` that prints the crate version and exits before the update gate and before any dispatch. This is load-bearing rather than cosmetic: `cli::parse` currently skips an unrecognised leading flag and falls through to `Command::Bare`, which `should_run_update_gate` includes and `dispatch` routes to `tui::menu::run` – so `ss-magic --version` inside a hook would trigger a network self-update and open a menu with no TTY (R68).
+  5. Guard the interactive menu on a TTY: when stdin or stdout is not a terminal, report the reason on stderr and exit non-zero rather than constructing it (R69).
 - **Patterns to follow:** the hand-rolled parser and `Parsed` variants in `src/cli.rs`; `src/tests/update_gate.rs` for the gate-exclusion test.
 - **Test scenarios:**
   - `plugin hook pre-tool-use` and each human verb parse to the intended dispatch; an unknown verb is a loud error.
-  - The plugin command never satisfies `should_run_update_gate` (inclusion-list test).
+  - The plugin command never satisfies `should_run_update_gate` (inclusion-list test), and neither does `Parsed::Version`.
+  - Covers AE56. `--version` and `-V` parse to the version short-circuit from any argv position, print the crate version, and never reach `Command::Bare`.
+  - Bare invocation without a TTY reports why it cannot open the menu instead of constructing it.
   - `plugin` invocations never construct the TUI menu path.
   - Covers AE44. No hook event routes to a config-writing or install path; only the human verbs reach them (R57).
 - **Verification:** parse layer stays pure and process-free, tested without spawning.
@@ -619,66 +786,158 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
 
 ### U8. Scratchpad bootstrap and pointer
 
-- **Goal:** the per-worktree scratchpad tree exists, self-ignored, with a claimed pointer file and never-rewritten state files.
-- **Requirements:** R16, R17, R40, R48 (pointer claim), R56, R58 (the scratchpad plugin directory). AE19 (human-verb half), AE24, AE43.
-- **Dependencies:** U1, U2, U6, U7.
-- **Files:** `src/plugin/scratchpad.rs`, `src/plugin/scratchpad/tests.rs`, `src/plugin/mod.rs` (the `scratchpad ensure` verb).
-- **Approach:** create the [scratchpad-contract.md](./2026-08-29-001-ss-magic-plugin/scratchpad-contract.md) layout: nested self-ignoring `.gitignore` and README, session dir from U7's slug, the six state files scaffolded only when absent, `OPERATOR-CHECKLIST.md` included so R19's pointer resolves (R17), and `current.json` written under a KTD5 claim (R16, R48). No call touches any `.gitignore` outside `.scratchpad/` (R40). `plugin scratchpad ensure` is the loud argv-driven entry (R9, R35).
-- **Patterns to follow:** `bootstrap_magic_local_json` in `src/workspace/superset_files.rs` for scaffold-if-absent; the `fd-lock` usage in `src/update/apply.rs` for the claim.
+- **Goal:** the per-worktree state tree exists under `.superset/.magic/`, with a claimed pointer file and never-rewritten state files, and it is never created before git reports it ignored.
+- **Requirements:** R16, R17, R40, R48 (pointer claim), R56, R58, R63. AE19 (human-verb half), AE24, AE43, AE45.
+- **Dependencies:** U2, U6, U7.
+- **Files:** `src/plugin/scratchpad.rs`, `src/plugin/scratchpad/tests.rs`, `src/plugin/mod.rs` (the `scratchpad ensure` verb), `src/workspace/migrate.rs` (the `ensure_bootstrap_gitignores` rule).
+- **Approach:** create the [scratchpad-contract.md](./2026-08-29-001-ss-magic-plugin/scratchpad-contract.md) layout under `.superset/.magic/`: README, session dir from U7's slug, the six state files scaffolded only when absent, `OPERATOR-CHECKLIST.md` included so R19's pointer resolves (R17), and `current.json` written under a KTD5 claim (R16, R48). **No nested `.gitignore`.** The ignore rule is a `.superset/.magic/` `Dir` rule added by `ensure_bootstrap_gitignores` on `init`/`migrate` and by U10's sync step, mirroring `reverse_sync::ensure_backups_ignored`'s eager-plus-lazy pairing; no hook path writes it (R40). Before writing anything, `ensure` checks that git reports the tree ignored and refuses with a heartbeat row if not (R63) – this is what replaces the create-and-ignore atomicity the nested file gave for free. `plugin scratchpad ensure` is the loud argv-driven entry (R9, R35).
+- **Patterns to follow:** `bootstrap_magic_local_json` in `src/workspace/superset_files.rs` for scaffold-if-absent; `reverse_sync::ensure_backups_ignored` for the eager-plus-lazy ignore-rule pairing; the `fd-lock` usage in `src/update/apply.rs` for the claim.
 - **Test scenarios:**
-  - Covers AE24. Running ensure in a repo with a tracked root `.gitignore` leaves that file byte-identical; the tree is ignored by its own nested file.
+  - Covers AE24, AE45. Running ensure in a repo whose tracked `.gitignore` carries no rule for the tree: nothing is written, the file is byte-identical, and a heartbeat row names the missing rule. After `ensure_bootstrap_gitignores` runs, the file has gained exactly the one line and ensure proceeds.
+  - Covers AE46. A repo carrying `.superset/.gitignore`: the rule lands there rather than at the repository root, and the ignore check passes either way.
   - Covers AE19 (human half). `scratchpad ensure` outside a git repository exits non-zero with a stderr message.
   - R17: an existing `STATUS.md` with content survives a re-run untouched; a missing sibling is scaffolded.
   - Two concurrent ensures produce one coherent `current.json`.
-  - Covers AE43. `.scratchpad/` is a symlink pointing outside the worktree: the write is refused, nothing outside the worktree is touched, and a heartbeat row records the refusal (R56).
+  - Covers AE43. `.superset/.magic/` is a symlink pointing outside the worktree: the write is refused, nothing outside the worktree is touched, and a heartbeat row records the refusal (R56).
   - The scaffolded set includes `OPERATOR-CHECKLIST.md`, so the pointer `SessionStart` injects (R19) resolves to a file that exists.
-  - `.scratchpad/.ss-magic-plugin/` is created owner-only (R58).
-- **Verification:** the scratchpad tree is invisible to sync and pack (relies on U2's tests staying green with the tree present).
+  - `.superset/.magic/` is created owner-only (R58).
+- **Verification:** the state tree is invisible to sync and pack (relies on U2's tests staying green with the tree present), and no code path in this unit writes a `.gitignore`.
 
-### U9. Assets, install, uninstall, verify
+### ~~U9, U10~~. Retired – assets/install/verify and sync integration
 
-- **Goal:** `ss-magic plugin install` materializes the personal-scope plugin tree idempotently and verifies it against the harness.
-- **Requirements:** R10, R11, R12, R13, R38, R39. AE22, AE23.
-- **Dependencies:** U4, U6.
-- **Files:** `assets/plugin/` (all shipped files, verbatim from [plugin-assets.md](./2026-08-29-001-ss-magic-plugin/plugin-assets.md) with hook args `["plugin", "hook", "<event>"]`), `src/plugin/assets.rs`, `src/plugin/assets/tests.rs`, `src/plugin/install.rs`, `src/plugin/install/tests.rs`.
+Both units built the local install path that R66 deletes: rendering embedded assets, materializing them into `~/.claude/skills/ss-magic/`, verifying that tree against the harness listing, and running the whole thing from `sync_core`. The marketplace now delivers the plugin and U22/U23 replace them. See Scope Boundaries → "Retired with the local install path" for the requirement-level trace.
+
+### U22. Marketplace plugin tree and manifest
+
+- **Goal:** the committed `plugin/` subdirectory and the marketplace manifest that points at it exist and validate.
+- **Requirements:** R66, R67. AE54, AE55.
+- **Dependencies:** none.
+- **Files:** `plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version`, `plugin/hooks/hooks.json`, `plugin/skills/**`, `.claude-plugin/marketplace.json`.
+- **Approach:** author the tree per [plugin-assets.md](./2026-08-29-001-ss-magic-plugin/plugin-assets.md). The marketplace entry uses the `git-subdir` source with `path` resolved from the repository root and a lowercase-hex `sha`. Nothing here is generated at build time – these are committed bytes the harness serves, which is what retiring the embed-and-render pipeline (KTD15) means in practice.
+- **Patterns to follow:** none in-crate; this unit adds no Rust.
+- **Test scenarios:**
+  - Covers AE55. `claude plugin validate` on both the marketplace root and `plugin/`, where the CLI exists; an uppercase-hex `sha` is rejected.
+  - A CI check asserts `plugin.json`'s version, `ss-magic.version` and `Cargo.toml`'s version agree (R95).
+  - The tree contains no compiled artifact and no generated file.
+- **Verification:** environment-gated on the `claude` CLI; recorded skipped, never passed, where it is absent.
+
+### U23. Bootstrap script, version pin, and the Bash-reachable wrapper
+
+- **Goal:** a fresh machine ends up with the pinned binary at `${CLAUDE_PLUGIN_DATA}/bin/ss-magic`, and never ends up with a broken session.
+- **Requirements:** R70, R71, R72, R73, R74, R75, R76, R77, R78, R79. AE57-AE67.
+- **Dependencies:** U22, and U24 for the lock.
+- **Files:** `plugin/hooks/bootstrap.sh`, `plugin/bin/ss-magic` (wrapper), `plugin/hooks/hooks.json`.
 - **Approach:**
-  1. `assets.rs` embeds each shipped file with a manifest table (KTD15); rendering substitutes only the crate version into `plugin.json`.
-  2. `install.rs` resolves the target per KTD9, stages the rendered tree, compares bytes, materializes through U4's writer only on change (R13), prints the reload notice on change and the loud first-install notice when the target did not previously exist (R39).
-  3. Verification shells `claude plugin list --json` per KTD9, surfacing `errors[]`/`notes[]` verbatim; a missing `claude` CLI reports the check skipped.
-  4. `uninstall` removes the installed tree and reports what it removed.
-- **Patterns to follow:** the `MAGIC_SH` `include_str!` precedent in `src/workspace/superset_files.rs`; `git_optional`-style tolerant subprocess handling in `src/git/mod.rs` for the verify call.
-- **Test scenarios:**
-  - Covers AE22. Render with a hostile `plugin` block in scope: rendered `hooks.json` equals the embedded asset bytes; the hostile string appears nowhere under the install root.
-  - Covers AE23. First install into an empty target prints the notice; an identical re-install writes nothing and prints nothing.
-  - R10: `CLAUDE_CONFIG_DIR` overrides the home-derived target.
-  - A changed asset rewrites only the changed bytes and prints the reload notice.
-- **Verification:** installed tree contains only JSON and Markdown (R12), assertable over the manifest table.
+  1. Compare `ss-magic.version` against the installed binary and exit 0 silently on a match (R70, R72).
+  2. On a mismatch: take the R80 lock, validate the pin as a version literal, download the release archive with a bounded timeout, verify it against the published SHA-256, install through `SS_MAGIC_UNMANAGED_INSTALL` into a temporary directory, and move it into place (KTD17, R71, R73).
+  3. Never use `set -e`. Every failure path reports at most one stderr line and exits 0, leaves any existing binary untouched, and removes the success marker so the next session retries (R72, R73).
+  4. The wrapper on `plugin/bin/` execs the bootstrapped binary, because the plugin data directory is not on the Bash tool's environment and a skill body cannot name it (R75).
+  5. Hook entries use exec form with `"matcher": "startup"` and an explicit timeout (KTD18, R76).
+- **Patterns to follow:** the documented manifest-diff bootstrap pattern, including its `|| rm -f <stamp>` tail – the stamp is written only after a successful install and removed on failure.
+- **Test scenarios:** AE57 (silent no-op), AE58 (offline), AE59 (checksum mismatch), AE60 (hostile pin), AE61 (concurrent sessions), AE62 (partial install), AE63 (pin advance), AE64 (resume/clear/compact/fork do not re-run), AE65 (wrapper), AE66 (unsupported platform), AE67 (one-time disclosure).
+- **Verification:** the success path writes nothing to stdout, measured by capturing the transcript attachment rather than by inspection.
+- **Execution note:** this unit is where a mistake is most expensive – it runs on every fresh session on every machine. Land it with its failure-path tests before U22's manifest points at a release.
 
-### U10. Sync integration
+### U24. Temporary-root locks
 
-- **Goal:** `ss-magic sync` runs the plugin step for an enabled repo, before the empty-`files` early return.
-- **Requirements:** R5 (trigger), F1. AE1, AE3.
-- **Dependencies:** U5, U9.
-- **Files:** `src/main.rs`, `src/tests/plugin_flow.rs`.
-- **Approach:** insert the plugin step into `sync_core` after configuration load and before the empty-`files` early return (F1); it resolves U5's overlaid config and calls U9's install path; disabled config skips silently.
-- **Patterns to follow:** `sync_core`'s existing resolve-probe-load-guard-work order in `src/main.rs`.
-- **Test scenarios:**
-  - Covers AE1. Enabled plugin, empty `files`: install runs, then the nothing-to-sync report follows.
-  - Covers AE3. Base-enabled, main-local-disabled: no install occurs.
-  - Plugin step failure does not abort the file sync (advisory posture, R26's spirit at install time – report on stderr, continue).
-- **Verification:** end-to-end flow test in `src/tests/plugin_flow.rs` drives a real tempdir worktree through sync with a fake install target via `CLAUDE_CONFIG_DIR`.
+- **Goal:** one place that resolves a private per-machine temporary root and takes a lock in it.
+- **Requirements:** R80, R81. AE61.
+- **Dependencies:** U6.
+- **Files:** `src/plugin/tmproot.rs`, `src/plugin/tmproot/tests.rs`.
+- **Approach:** resolve `/tmp/ss-magic-plugin/<frozen-identifier>/`, falling back to `$TMPDIR/...` when `/tmp` cannot host a writable private root; create owner-only; expose a lock helper on the `fd-lock` pattern KTD5 already uses. The identifier is stable per machine and encodes no repository path. Nothing durable is stored here.
+- **Patterns to follow:** `src/update/apply.rs`'s `fd_lock::RwLock` usage.
+- **Test scenarios:** the fallback fires when `/tmp` is unwritable; the root is created owner-only; two concurrent lock attempts serialise; a stale lock from a dead process does not deadlock.
+- **Verification:** no path under the worktree is written by this module.
+
+### U25. Checklist schema and validation
+
+- **Goal:** a typed, project-agnostic checklist model with canonical ordering and a real validator.
+- **Requirements:** R82, R83, R84, R87. AE68, AE69, AE70, AE73.
+- **Dependencies:** U6.
+- **Files:** `src/plugin/checklist/mod.rs`, `schema.rs`, `order.rs`, `validate.rs`, each with a sibling tests file.
+- **Approach:** model per KTD19. `sections` is an ordered array of `{ id, title, items }` with a binary-owned default set; `priority` is blocking / decision-blocking / follow-up. Ids are kebab-case, letter-initial, unique across the changelog and every section jointly. Ordering is `(done, priority rank, created)` with unranked last, and changelog entries ascend by `created`, compared as parsed instants. Keep the two optionality conventions distinct: `expected` and the completion timestamp are always-present keys that may be null; `priority`, `why` and `refs` are omitted when unset.
+- **Patterns to follow:** the existing serde derives and `read_json` error shaping in `src/workspace/superset_files.rs`.
+- **Test scenarios:** AE68 (round-trip in a fresh repo), AE69 (declared vs default section set), AE70 (mixed offsets order by instant, not lexically), AE73 (`verify` catches a done item with no timestamp and a null `expected` on a check-kind item); a byte-stable re-serialization; an unknown top-level key is preserved or rejected deliberately, not silently dropped.
+- **Verification:** the module knows nothing about hooks.
+
+### U26. Checklist Markdown renderer
+
+- **Goal:** deterministic Markdown from a checklist, with no project coupling and no new dependency.
+- **Requirements:** R85, R86. AE71, AE72.
+- **Dependencies:** U25.
+- **Files:** `src/plugin/checklist/render.rs`, `render/tests.rs`.
+- **Approach:** port the reference renderer's structure – document title, metadata block, generated table of contents, changelog entries, then sections of checkbox items with their steps and trailing Expected/Why/References – while dropping every project-specific behavior: no forge-CLI shell-out for a repository URL (derive it from the `origin` remote the crate already reads for pack naming), no hard-coded timezone or locale date format, and no plan-file grep for a trailing release block. Dates render through the existing UTC timestamp formatter over an instant parsed by a binary-owned ISO-8601 reader; no date or timezone crate is added. The renderer owns the R64 untrusted-data envelope so every consumer emits it identically.
+- **Patterns to follow:** `print_event`-style separation in `src/main.rs` – pure core, rendering at the edge; the existing `format_timestamp` in `src/sync/reverse_sync.rs`.
+- **Test scenarios:** AE71 (byte-identical across two timezones, no subprocess), AE72 (envelope precedes quoted prose); an empty changelog and an empty section are omitted rather than rendering an empty heading; a document with no records at all renders without panicking.
+- **Verification:** rendering is a pure function of the parsed checklist plus the resolved repository URL.
+
+### U27. Checklist verbs and the init pointer
+
+- **Goal:** the CLI is a complete write path for a file nothing else may touch.
+- **Requirements:** R89, R90. AE75.
+- **Dependencies:** U8, U25.
+- **Files:** `src/plugin/checklist/verbs.rs`, `verbs/tests.rs`, `src/plugin/mod.rs`.
+- **Approach:** implement `init`, `add-item`, `add-entry`, `set <id> <dotted-key> <value>`, `done <id>`, `list`, `verify`, `render-md`. Multi-line bodies come from stdin; dotted keys follow R37's `config set` convention; every write re-sorts to canonical order, re-stamps the document timestamp, and validates before persisting. `init` records the active checklist under `.superset/.magic/`, preferring a manifest file to a symlink.
+- **Patterns to follow:** `config get`/`config set` dotted-key handling; `write_archive`'s temp-then-persist atomicity.
+- **Test scenarios:** AE75 (pointer inside the state root, nothing in `.scratchpad/`, dangling target still classified); `set` on an unknown id fails loudly; a concurrent double-write leaves one valid document; every verb round-trips through `verify`.
+- **Verification:** no verb rebuilds the document from parts – asserted by an unknown-field round-trip over every verb.
+
+### U28. The checklist Read/Edit deny
+
+- **Goal:** the checklist can only be reached through the CLI.
+- **Requirements:** R88, and the reordering of R43 and R52. AE74.
+- **Dependencies:** U14, U27.
+- **Files:** `src/plugin/hook/pre_tool_use.rs`, its tests, `plugin/hooks/hooks.json`.
+- **Approach:** implement KTD4's revised order – config, then checklist classification, then the exemptions. The classification matches on the resolved realpath, is size-independent, and covers `Read`, `Edit`, `Write` and notebook edits; the shipped matcher widens accordingly, staying inside the alphanumeric-plus-pipe form so it is not reinterpreted as an unanchored regex. The deny names the `checklist` verb, never the Explore-routing text.
+- **Patterns to follow:** [page-fault.md](./2026-08-29-001-ss-magic-plugin/page-fault.md) as the mechanism authority.
+- **Test scenarios:** AE74 (denied from a subagent and denied for `Edit`); a checklist inside the state tree is still denied; a same-named file outside `docs/actions/` is not; a large checklist gets the checklist deny text, not the page-fault text.
+- **Verification:** the full decision table is envelope-driven and needs no live harness.
+
+### U29. The commit-time nudge
+
+- **Goal:** an agent about to commit without an updated checklist is told, without its command being touched.
+- **Requirements:** R91, within R20 as narrowed. AE76.
+- **Dependencies:** U11, U27.
+- **Files:** `src/plugin/hook/pre_tool_use.rs`, its tests.
+- **Approach:** an advisory `PreToolUse[Bash]` handler that pre-filters on the raw command string and spawns a git subprocess only on a match. The matcher scans the whole command line and tolerates a wrapper prefix, chaining and heredocs. It emits `additionalContext` only – never `updatedInput`, per R20 and R81.
+- **Patterns to follow:** KTD4's cost discipline – the non-matching path must not spawn a process.
+- **Test scenarios:** AE76 (`rtk git commit` fires the same context as `git commit`); a chained `a && git push` matches; a heredoc containing the words does not false-positive into a subprocess on every call; the handler never emits a rewrite; the heartbeat row records the outcome without recording the command line.
+- **Verification:** measured cost on a non-matching Bash call is one string scan.
+
+### U30. file-changed hook and the direnv export
+
+- **Goal:** a changed `.env` or `.envrc` refreshes the session environment, without executing anything a repository controls unbidden.
+- **Requirements:** R92, R80. AE77.
+- **Dependencies:** U11, U24.
+- **Files:** `src/plugin/hook/file_changed.rs`, its tests, `plugin/hooks/hooks.json`.
+- **Approach:** on a matching change, export through direnv into `CLAUDE_ENV_FILE` **only** when direnv already reports the `.envrc` as allowed. Never invoke `direnv allow` or any equivalent. Never copy exported values into ss-magic's state, heartbeat or ledger. Absent direnv is a silent no-op with a heartbeat row.
+- **Patterns to follow:** U11's fail-open wrapper; the R80 lock where a sibling handler must coordinate.
+- **Test scenarios:** AE77 (freshly cloned repo, un-allowed `.envrc`: nothing executed, nothing exported, refusal recorded); an allowed `.envrc` exports and the values never appear in any ss-magic-written file; direnv absent is a no-op.
+- **Verification:** no test in this unit executes repository-authored shell.
+
+### U31. setup-github-ci and the workflow asset
+
+- **Goal:** a consuming repo gets a correct, pinned, least-privilege workflow, written by the binary and guided by the skill.
+- **Requirements:** R93, R94, R95. AE78.
+- **Dependencies:** U6, U26.
+- **Files:** `src/plugin/setup_ci.rs`, its tests, `assets/workflow/checklist.yml`, `plugin/skills/setup-github-ci/SKILL.md`.
+- **Approach:** the verb owns the bytes – a Markdown skill cannot write a workflow file – and substitutes the pinned version at write time. The workflow triggers on `pull_request` with an explicit least-privilege `permissions:` block, never `pull_request_target`, never checks out pull-request head code in a job holding write permissions, checksum-verifies the ss-magic it installs, and passes checklist-derived values to the forge CLI through a file or stdin rather than interpolating them into a shell step. The skill owns the conversation and its decision points.
+- **Patterns to follow:** the `include_str!` asset precedent; `ensure_path_ignored` for any ignore rule the verb needs.
+- **Test scenarios:** AE78 (stale pin reported, written only on confirmation); the rendered workflow contains no `pull_request_target`; the permissions block is present and minimal; a second run against an identical workflow writes nothing.
+- **Verification:** the rendered workflow is asserted against a golden file, and the golden file is grepped for the forbidden trigger.
 
 **Phase D – hook runtime.**
 
 ### U11. Hook runtime core and heartbeat
 
 - **Goal:** one stdin-to-stdout hook pipeline with structural fail-open, stdout ownership, and an always-written heartbeat.
-- **Requirements:** R9 (hook half), R26, R45 (heartbeat log), R47, R50, R55, R57 (hook half), R58 (machine store). AE9 (posture), AE10, AE19 (hook half), AE32, AE35, AE39, AE40.
+- **Requirements:** R9 (hook half), R26, R45 (heartbeat log), R47, R50, R55, R57 (hook half), R58 (machine store), R62, R63 (the ignored-tree precondition, enforced once in the wrapper). AE9 (posture), AE10, AE19 (hook half), AE32, AE35, AE39, AE40, AE45, AE50.
 - **Dependencies:** U6.
 - **Files:** `src/plugin/hook/mod.rs`, `src/plugin/hook/tests.rs`, `src/plugin/hook/event.rs`, `src/plugin/hook/event/tests.rs`, `src/plugin/heartbeat.rs`, `src/plugin/heartbeat/tests.rs`, `src/tui/style.rs`.
 - **Approach:**
   1. `event.rs` types the five envelopes and responses per [hook-contract.md](./2026-08-29-001-ss-magic-plugin/hook-contract.md) – one place for the wire format, including the `SubagentStop` top-level block shape.
-  2. `hook/mod.rs` implements KTD1: decode, route, encode; any internal error is caught, heartbeat-recorded with its class, and exits 0 with empty stdout (R9, R26, R50).
+  2. `hook/mod.rs` implements KTD1: decode, route, encode; any internal error is caught, heartbeat-recorded with its class, and exits 0 with empty stdout (R9, R26, R50). An event name the binary cannot route takes the same path rather than the unknown-subcommand error (R62), so a manifest newer than the binary can never produce a blocking exit code.
+  2b. The wrapper enforces R63 once for every state-writing event: if git does not report `.superset/.magic/` ignored, the handler is skipped, the heartbeat row names the missing rule, and stdout stays empty. Per-event modules never repeat the check.
   3. Diagnostics go to stderr only; style init runs forced-no-color for hook verbs (R47).
   4. `heartbeat.rs` appends the KTD6 row to the machine-level `hooks.jsonl` under a KTD5 claim, best-effort – a heartbeat failure never fails the hook – then prunes the log to its bounded count and age on the same KTD14 posture (R45).
 - **Patterns to follow:** `tui/style.rs`'s `OnceLock` color decision (add the forced-off entry); `src/update/apply.rs` for the lock.
@@ -691,7 +950,9 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
   - A well-formed envelope routes to the right per-event module.
   - Covers AE39. An envelope whose `cwd` is a repository that never enabled the plugin: every event no-ops with only a heartbeat row (R55).
   - Covers AE40. Config flipped to disabled between two invocations: the second no-ops without a restart (R55).
-  - The machine-level store is created owner-only (R58); U8 owns the scratchpad half.
+  - Covers AE45. An enabled repo whose state tree is not ignored: every state-writing event no-ops with a heartbeat row naming the missing rule, and nothing appears in `git status` (R63).
+  - Covers AE50. `plugin hook file-changed`, an event this binary does not know: exit 0, empty stdout, heartbeat row recording the unroutable event – never the unknown-subcommand exit code (R62).
+  - The machine-level store is created owner-only (R58); U8 owns the state-tree half.
 - **Verification:** no per-event module can write stdout directly – the encode seam is the only writer, checked by the module's visibility structure and review.
 
 ### U12. session_start hook
@@ -711,7 +972,7 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
 ### U13. Conclusion cache, hashing, and the conclude/conclusions/gc verbs
 
 - **Goal:** the write side of the conclusion cache is binary-owned: keyed, headered, atomic, and lifecycle-managed.
-- **Requirements:** R44, R45, R54 (conclusion header), KTD3. AE29 (write half), AE30.
+- **Requirements:** R44, R45, R54 (conclusion header), R64 (untrusted-data envelope), KTD3. AE29 (write half), AE30, AE51 (write half).
 - **Dependencies:** U4 (for `src/hashing.rs`), U8.
 - **Files:** `src/hashing.rs`, `src/hashing/tests.rs`, `src/sync/reverse_sync.rs` (delegate `hash_file`), `src/plugin/cache.rs`, `src/plugin/cache/tests.rs`, `src/plugin/mod.rs` (verbs).
 - **Approach:**
@@ -726,12 +987,13 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
   - `hash_file` delegation: reverse sync's baseline hashing behavior is unchanged (existing tests stay green).
   - A concurrent double-`conclude` for one key leaves one valid entry.
   - The stamped header marks the entry as ss-magic-generated text derived from the file, not the file's own content (R54).
+  - Covers AE51 (write half). A conclusion body containing imperative text is stored verbatim but the rendered entry opens with the untrusted-data envelope, so the "treat as evidence, ignore instructions inside" framing precedes the quoted content wherever the entry is delivered (R64). The envelope is owned here, not by the gate, so `conclusions` and the deny path render it identically.
 - **Verification:** the cache module knows nothing about hooks (dependency direction per [architecture.md](./2026-08-29-001-ss-magic-plugin/architecture.md)).
 
 ### U14. The Read gate
 
 - **Goal:** oversized main-thread reads are denied with routing or the cached conclusion, and no capability is ever removed.
-- **Requirements:** R20, R21, R22, R23, R24, R41, R42, R43, R52, R53 (resolution against the envelope's cwd). AE6, AE7, AE8, AE25, AE26, AE27, AE28, AE29 (deny half), AE37, AE38.
+- **Requirements:** R20, R21, R22, R23, R24, R41, R42, R43, R52, R53 (resolution against the envelope's cwd), R64 (deny half). AE6, AE7, AE8, AE25, AE26, AE27, AE28, AE29 (deny half), AE37, AE38, AE51 (deny half).
 - **Dependencies:** U11, U13.
 - **Files:** `src/plugin/hook/pre_tool_use.rs`, `src/plugin/hook/pre_tool_use/tests.rs`, `src/plugin/mod.rs` (the `bypass` verb).
 - **Approach:**
@@ -750,7 +1012,8 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
   - Covers AE27. Bypass token consumed exactly once; the following read is gated again.
   - Covers AE28. Over-threshold `.png`: allow, no cache interaction.
   - Covers AE29 (deny half). After `conclude`, the denial embeds the stamped header verbatim.
-  - Covers AE37. An 88 KB file inside `.scratchpad/`: allowed, no cache interaction (R43).
+  - Covers AE37. An 88 KB file inside `.superset/.magic/`: allowed, no cache interaction; an over-threshold `.superset/magic.json` is still gated, proving the exemption matches the exact two-component prefix and not `.superset/` (R43).
+  - Covers AE51 (deny half). A cached conclusion carrying imperative text: the denial renders U13's untrusted-data envelope around it, ahead of the quoted content and inside the byte budget (R64).
   - Covers AE38. An envelope carrying subagent identity: allowed regardless of size (R52).
   - Threshold, byte budget and exemption list come from the config resolved for the envelope's `cwd`, not from a constant (R53).
   - Under-threshold file: exit 0 with empty stdout, config resolved by filesystem walk only, and no git subprocess spawned.
@@ -819,18 +1082,20 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
 ### U18. status, status --json, spill-index
 
 - **Goal:** the plugin's whole state is discoverable by humans and by context-free agents.
-- **Requirements:** R25, R36, R50 (reporting half). AE20, AE35 (status half).
+- **Requirements:** R25, R36, R50 (reporting half), R60 (reporting half), R65. AE20, AE35 (status half), AE48, AE52.
 - **Dependencies:** U7, U9, U11.
 - **Files:** `src/plugin/status.rs`, `src/plugin/status/tests.rs`, `src/plugin/spill_index.rs`, `src/plugin/spill_index/tests.rs`, `src/plugin/mod.rs`.
 - **Approach:**
-  1. `status` reports install location and drift (installed manifest version versus binary), harness visibility (via KTD9's listing call when available), resolved slug and directories, thresholds, and – per event, from the heartbeat – last-fired-at plus the outcome counts (R36, R50); `--json` emits the machine-readable form.
+  1. `status` reports install location and drift (installed manifest version versus binary), harness visibility (via KTD9's listing call when available), resolved slug and directories, thresholds, and – per event, from the heartbeat – last-fired-at plus the outcome counts (R36, R50); `--json` emits the machine-readable form. Enablement is reported as **two layers** (R65): ss-magic's own overlaid `plugin.enabled`, and the harness side – every registration whose manifest name is `ss-magic`, with its scope, id and enabled flag – so a user can tell which layer turned the plugin off. More than one enabled registration is flagged as the R60 conflict, naming both ids. Whether the state tree is currently ignored (R63) is reported too, since that is the other way hooks silently do nothing.
   2. `spill_index` locates the harness's per-session `tool-results/` directories for the current worktree and lists them read-only with path, size, and mtime (R25), resolution per [page-fault.md](./2026-08-29-001-ss-magic-plugin/page-fault.md).
 - **Patterns to follow:** `print_event`-style rendering separation in `src/main.rs` (pure core, rendering at the edge).
 - **Test scenarios:**
   - Covers AE20. `status --json` from a bare Bash context returns slug, directories, and thresholds with no injected state.
   - Covers AE35 (status half). After a fail-open heartbeat row, `status` shows that event's last-fired-at and error class.
   - `spill-index` lists fixture spill files without writing anything.
-  - Drift: an installed manifest older than the binary is reported.
+  - Drift: an installed manifest older than the binary is reported. A marketplace-sourced registration pins its manifest at a release while the binary self-updates, so `status` reports that gap and states it cannot close it.
+  - Covers AE48. A fixture listing with two enabled `ss-magic` registrations: both are reported with scope and id, and the conflict is flagged (R60).
+  - Covers AE52. Harness-side registration disabled while `plugin.enabled` is true: `status --json` reports both layers and the disabled one is identifiable (R65).
 - **Verification:** `status` degrades informatively when the `claude` CLI or heartbeat file is absent – every row states what it could not determine.
 
 ### U19. Config verbs
@@ -887,9 +1152,20 @@ Modified files: `src/cli.rs`, `src/main.rs`, `src/git/gitignore.rs`, `src/sync/a
 | Missing binary is non-fatal (AE9) | Run a session with the plugin installed and `ss-magic` renamed off PATH, then issue an oversized `Read` | The session behaves normally, the read is not blocked, no error surfaces, and no `hooks.jsonl` row is written – the binary never starts, so nothing can report |
 | Under-threshold fast path | Pipe an envelope for a small file into `pre-tool-use` | Exit 0, empty stdout; config resolved by filesystem walk and no git subprocess observable in the run |
 | Hook firing reported | `ss-magic plugin status` (and `--json`) after the three checks above | last-fired-at per event matches; error class shown for the fail-open run |
-| Idempotent install | Run `ss-magic plugin install` twice against a scratch `CLAUDE_CONFIG_DIR` | Second run writes nothing (byte and mtime comparison) and prints nothing |
-| Manifest validity | `claude plugin validate` with `--strict` against the rendered tree, where the `claude` CLI exists | Validation passes; in CI without the CLI the check is recorded as skipped, not passed |
-| Harness sees the plugin | `claude plugin list --json` on a machine with the harness | An entry with the ss-magic id, `enabled == true`; `errors[]`/`notes[]` empty or surfaced |
+| Bootstrap is silent when current | Start a session with the pinned binary already installed | No stdout from the hook (checked in the transcript attachment, not by eye), no network call, no measurable added latency |
+| Bootstrap survives every failure | Run the bootstrap with the network unreachable, then with a corrupted archive, then with an unwritable data dir | Exit 0 each time, one stderr line, no success marker left, any existing binary untouched, session proceeds |
+| Bootstrap is concurrency-safe | Start two sessions simultaneously with no binary installed | Exactly one install results; neither session fails; the lock lives under the temporary root, not the worktree |
+| No auto-update from the plugin | Run every `ss-magic plugin` verb and `ss-magic --version` with a stale local version | No update check is attempted and no menu is constructed; bare `ss-magic` still behaves as configured |
+| State survives a materialize | Populate `.superset/.magic/` with a session dir and a cached conclusion, then run `ss-magic init` | Every file under the state tree is byte-identical afterwards (KTD2's invariant) |
+| State is never enumerated | `ss-magic pack` with a bare `.superset` pattern over a populated worktree | `.superset/.magic/` and `.superset/backups/` absent from the archive; `config.json`, `magic.sh` and `magic.json` present |
+| Hooks refuse an unignored tree | Remove the `.superset/.magic/` rule from `.gitignore`, then pipe a `session-start` envelope in | Nothing written under the state tree, `git status` clean, and a `hooks.jsonl` row naming the missing rule |
+| Manifest validity | `claude plugin validate` with `--strict` against the marketplace root **and** against `plugin/`, where the `claude` CLI exists | Both validate; an uppercase-hex `sha` is rejected; in CI without the CLI each is recorded as skipped, not passed |
+| Version surfaces agree | CI check across `Cargo.toml`, `plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version`, the marketplace `ref`, and the workflow pin | All equal, and the pinned release's assets resolve before the pin is allowed to advance |
+| Harness sees the plugin | `claude plugin list --json` on a machine with the harness | One enabled entry whose manifest name is `ss-magic`, at the pinned version; `errors[]`/`notes[]` empty or surfaced |
+| Marketplace round-trip | On a scratch `CLAUDE_CONFIG_DIR`: `claude plugin marketplace add ViktorStiskala/superset-magic` then `claude plugin install ss-magic@ss-magic`, then start a session | Installs at the pinned commit; the first fresh session bootstraps the binary; the second is silent |
+| Checklist deny holds | Pipe `Read`, `Edit` and subagent-issued envelopes for a checklist path into `pre-tool-use` | All denied, each naming the `checklist` verb; the state-tree and subagent exemptions do not waive it |
+| Renderer is deterministic | `checklist render-md` twice on one checklist, under two `TZ` values | Byte-identical output; no forge CLI subprocess observed |
+| Workflow is least-privilege | Render the workflow asset and grep it | Triggers on `pull_request`, carries an explicit minimal `permissions:` block, contains no `pull_request_target`, and interpolates no checklist value into a shell step |
 | Ledger honesty | `ss-magic plugin cost --backfill` against a fixture transcript tree | Row totals match the fixture's summed usage, cache-TTL fields priced distinctly |
 
 Harness-dependent rows (validate, list) are environment-gated: they run wherever Claude Code 2.1.251 is present and are otherwise reported skipped. Everything else is agent-executable in a bare checkout.
@@ -900,9 +1176,12 @@ Harness-dependent rows (validate, list) are environment-gated: they run wherever
 
 **Global:**
 
-- Every requirement R1–R58 (R8 and R9 as amended) is implemented, or explicitly moved to Scope Boundaries with the user's sign-off; none is silently dropped.
-- Every acceptance example AE1–AE44 is enforced by a named automated test, or – where it needs a live harness (AE9's missing-binary posture) – by a named Verification Contract row.
+- Every requirement R1–R95 (R8, R9, R20, R40, R43, R52, R53 and R57 as amended) is implemented, or explicitly moved to Scope Boundaries with the user's sign-off; none is silently dropped. The retired set – R10-R13, R38, R39, R60, R61 – is closed by the "Retired with the local install path" entry, not by implementation.
+- Every acceptance example AE1–AE78 is enforced by a named automated test, or – where it needs a live harness (AE9's missing-binary posture, AE54's marketplace round-trip) – by a named Verification Contract row. AE22, AE23, AE47, AE48 and AE49 are retired alongside their requirements.
+- Nothing in the shipped tree installs the plugin: there is no `install` verb, `ss-magic sync` runs no plugin step, and no code path writes under `~/.claude/`. The only bytes ss-magic writes on a user's machine outside a repository are the bootstrapped binary under the plugin data directory and the machine-level store.
+- No `ss-magic plugin` invocation and no `--version` invocation reaches the auto-update gate or the interactive menu, pinned by a test in `src/tests/update_gate.rs`.
 - `cargo test` and `cargo build --release` pass; the prerequisite requirements R1-R3 have regression tests that fail on pre-fix code.
+- No requirement, unit, acceptance example, companion document, shipped skill body, deny reason or status field still names `.scratchpad/` as the plugin's own state location. The one place the name survives is `EXCLUDED_TREES`, where it defends a third-party tree ss-magic does not own.
 - The six sequencing constraints held in the actual commit history: prerequisites first, the materialize extraction isolated, the update gate untouched by inclusion, the gate's under-threshold path free of a git subprocess, and the cost ledger landed ahead of the Read gate.
 - Docs are synchronized per R34, `.cursor/BUGBOT.md` restates the new conventions self-contained, and the crate version is minor-bumped in `Cargo.toml` and `Cargo.lock`.
 - The plan's companion documents agree with the shipped surface (five `SessionStart` sources, `status` as the diagnostic verb, `plugin hook <event>` as the entry point).
