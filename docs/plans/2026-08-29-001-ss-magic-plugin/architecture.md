@@ -49,8 +49,9 @@ src/plugin/
 **Two modules a reader of the first draft will look for are gone.** `assets.rs` and `install.rs`
 died with R66: there is no embedded plugin tree, because the plugin is committed bytes the
 marketplace serves, and there is no install target, because `ss-magic` installs nothing. Nothing
-replaced them inside `src/plugin/` – the work moved out of the crate entirely, into `plugin/` and
-`.claude-plugin/marketplace.json` (see [plugin-assets.md](./plugin-assets.md)).
+replaced them inside `src/plugin/` – the work moved out of the crate entirely, into `plugin/`,
+`.claude-plugin/marketplace.json`, `scripts/build-plugin-zip.py` and `.gitattributes` (see
+[plugin-assets.md](./plugin-assets.md) and [Marketplace](#marketplace) below).
 
 Tests follow the existing convention exactly: `#[cfg(test)] mod tests;` in each module with the body in a sibling `<module>/tests.rs`, so private items stay reachable.
 
@@ -174,7 +175,7 @@ There is **no install target**, because there is no install code (R66). The two 
 
 | what | who resolves it | where it lands |
 |---|---|---|
-| the plugin tree (manifest, hooks, skills, bootstrap, wrapper) | the harness, from the marketplace's pinned `git-subdir` entry | `${CLAUDE_PLUGIN_ROOT}` – version-scoped, replaced on every plugin update |
+| the plugin tree (manifest, hooks, skills, bootstrap, wrapper) | the harness, from the marketplace's `archive` entry – a release-asset zip pinned by `sha256`, verified client-side before extraction | `${CLAUDE_PLUGIN_ROOT}` – version-scoped, replaced on every plugin update |
 | the `ss-magic` binary the hooks run | `plugin/hooks/bootstrap.sh`, from the pin beside `plugin.json` | `${CLAUDE_PLUGIN_DATA}/bin/ss-magic` – survives plugin updates |
 
 `ss-magic` writes neither. `ss-magic sync` runs no plugin step, and migration *deletes* any pre-existing `~/.claude/skills/ss-magic/` rather than maintaining it: the loader resolves by plugin **name**, a marketplace install outranks a `@skills-dir` copy, and a leftover copy is suppressed and reported in the `/plugin` Errors tab rather than loaded. Deleting it beats relying on that precedence.
@@ -187,9 +188,21 @@ Three consequences bind the code that remains:
 
 ### Marketplace
 
-`.claude-plugin/marketplace.json` sits at the **repository root**, and `plugin/` is the committed subdirectory it points at with a `git-subdir` source pinned by `ref` plus lowercase-hex `sha` (KTD16, R67). No code path in `src/plugin/` opens either file at runtime; they are repository content the harness reads. The full manifest, the `git-subdir`-is-external tradeoff, and the `claude plugin list --json` field shapes are in [plugin-assets.md](./plugin-assets.md).
+Four paths at the repository root carry the whole delivery path, and **not one of them is Rust**:
 
-One release advances every version surface together – the crate version, `plugin.json`, `plugin/ss-magic.version`, the marketplace entry's `ref`/`sha`, and the workflow's pin – and CI fails when they disagree (R95). That check is the only place this repository's build reasons about the marketplace at all.
+```plaintext
+<repo root>/
+├── .claude-plugin/marketplace.json   # one `archive` entry: release-asset URL + sha256 (R67, KTD16)
+├── plugin/                           # the committed tree the builder zips (see plugin-assets.md)
+├── scripts/build-plugin-zip.py       # the deterministic builder (R96)
+└── .gitattributes                    # pins the plugin tree's line endings (R97)
+```
+
+The source is **`archive`, pinned by content digest** (KTD16, R67): the entry names an https release-asset URL for the plugin zip plus a `sha256` of that zip (64 hex, case-insensitive), and the client verifies the digest before extracting anything – a mismatch installs nothing and is re-checked on `claude plugin update`. This replaced `git-subdir` on 2026-08-30 because a commit cannot pin itself: the commit hash covers `marketplace.json`, so a `sha` can only ever name an ancestor commit, and moving a tag to fix that is forbidden under release immutability. `plugin/` and `.claude-plugin/marketplace.json` are disjoint subtrees, so `archive` has no such circularity. The full manifest, the ZIP-only and URL constraints, the object-source-is-external tradeoff, the version-is-the-update-signal trap, and the `claude plugin list --json` field shapes are in [plugin-assets.md](./plugin-assets.md).
+
+**`scripts/build-plugin-zip.py` is the one artifact both a human and CI execute, and its reproducibility is the entire basis of the pin.** The digest is committed *before* the tag exists, which is only sound because the builder's output is a pure function of file contents and paths – sorted entries, a fixed 1980 timestamp, normalised modes, forced unix `create_system`, stored not deflated, and a loud refusal on a symlink or non-ASCII filename (R96). If a human's run and CI's run could ever disagree, the committed pin would name bytes nobody can reproduce and the release would be unshippable rather than merely wrong. `.gitattributes` (R97) closes the layer below the builder: a checkout with `core.autocrlf` enabled must yield the same file bytes as the Linux CI runner, or the builder's care buys nothing.
+
+**Nothing in `src/` reads the marketplace manifest at runtime** – not `src/plugin/`, not any other module. `marketplace.json`, the zip and the builder are repository content and release tooling; the crate neither opens them nor knows they exist. The one exception is a *build-time* consistency check, not a runtime read: one release advances every version surface together – the crate version, `plugin.json`, `plugin/ss-magic.version`, the marketplace entry's `url` and `sha256`, and the workflow's pin – and CI fails when they disagree (R95, R98). That check is the only place this repository's build reasons about the marketplace at all.
 
 ## Two prerequisite fixes, outside `src/plugin/`
 

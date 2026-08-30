@@ -897,6 +897,13 @@ machine-globally installed plugin.
 This section is **additive**. It does not revise Q1's or Q13's probe records; it records what was
 measured on 2026-08-30, against Claude Code 2.1.251, that forces the change on top of them.
 
+> **Amendment, later the same day.** The `git-subdir` half of this ruling is **superseded by
+> [Q15](#q15--archive-source-reproducible-packaging-and-forge-protections-new-2026-08-30)**: the
+> source is now `archive`, pinned by `sha256`, because a commit cannot pin itself. Everything else
+> below – plugin data, variable substitution, the `SessionStart` hook, the pinned-binary install –
+> stands unchanged, since none of it depends on which source type delivers the tree. The probe
+> records in this section are left exactly as they were taken.
+
 ### The marketplace source
 
 - **`git-subdir` schema.** `url` (the repository), `path` (the committed plugin subdirectory,
@@ -971,6 +978,193 @@ measured on 2026-08-30, against Claude Code 2.1.251, that forces the change on t
 
 Confidence: **measured** throughout, except the `git-subdir` tag/release pinning behaviour named
 above, which is **assumed**.
+
+---
+
+## Q15 – Archive source, reproducible packaging, and forge protections [NEW, 2026-08-30]
+
+**RULING. The marketplace source is `archive`, pinned by a `sha256` the client enforces; the plugin
+zip is produced by a byte-reproducible builder so the digest can be committed before the tag exists;
+and tag and release mutability are closed at the forge rather than worked around in the client.**
+
+This section is **additive**, exactly as Q14 was. It does not rewrite Q13's or Q14's probe records.
+It **supersedes the source half of Q14's ruling** – `git-subdir` is out – and leaves the rest of Q14
+(plugin data, variable substitution, the `SessionStart` hook, the pinned-binary install) standing
+unchanged, because none of it depends on which source type delivers the tree. Everything below was
+measured on 2026-08-30 against Claude Code **2.1.251** and against the real
+`ViktorStiskala/superset-magic` repository, unless a line says otherwise.
+
+### Why `git-subdir` could not stay: a commit cannot pin itself
+
+- **The circularity is irreducible, not an ergonomics complaint.** The commit hash covers
+  `.claude-plugin/marketplace.json`, so writing a `sha` into that file changes the commit the `sha`
+  would have had to name. The pin can therefore only ever name an **ancestor** commit, and the
+  released tag's own plugin content is never the content being pinned. **inferred** – forced by git's
+  content addressing, not produced by a probe.
+- **The two-phase workaround is forbidden, not merely ugly.** Tag, build, commit the digest, move the
+  tag – that requires moving a published tag, which the tag ruleset (below) refuses with HTTP 422 and
+  which GitHub's documentation rules out in as many words: *"Git tags cannot be moved."* **measured**
+  (the 422; the documentation sentence is quoted, not inferred).
+- **`archive` has no circularity, and this was verified rather than argued.** `plugin/` and
+  `.claude-plugin/marketplace.json` are **disjoint subtrees**: rewriting the digest in
+  `marketplace.json` to a dummy value and re-zipping `plugin/` produced an **identical** hash.
+  **measured.**
+
+### The `archive` source, exact schema
+
+- **Two fields.** `url` (required) and `sha256` (optional, 64 hex, **case-insensitive**). This is a
+  relaxation from `git-subdir`, whose `sha` had to be lowercase. **measured.**
+- **The digest is enforced client-side**, before extraction. A deliberate mismatch produces, verbatim:
+
+  ```plaintext
+  Plugin archive integrity check failed for <plugin>: expected sha256 <x>, got <y>. The archive was not installed.
+  ```
+
+  Nothing is extracted. **measured.**
+- **The check is re-run on `claude plugin update`**, not only at first install – so a swapped asset is
+  refused on the update path too. **measured.**
+- **ZIP only.** A `.tar.gz` behind an `archive` URL is rejected with `invalid zip data`; the container
+  format decides it, not the extension. **measured.**
+- **Two accepted layouts, no third.** `.claude-plugin/` must sit at the **zip root** or inside a
+  **single top-level wrapper directory**. Deeper nesting is not found. **measured.**
+- **URL restrictions.** https only, and the host must not resolve to a **loopback, link-local or
+  cloud-metadata** address – an SSRF guard, which also rules out a localhost-served archive as a
+  local testing shortcut. **measured.**
+- **Limits.** Body capped at **256 MiB**, fetch at **120 s**, redirects at **5**. **measured.**
+- **A GitHub Release asset URL works unauthenticated on a public repo**, including the redirect to
+  `objects.githubusercontent.com` – well inside the 5-redirect budget. **measured.**
+- **No client dependencies.** The archive path needs **no `git`** – where `git-subdir` requires
+  `git` >= 2.25 for sparse-checkout cone mode – and **no external `unzip`**; the CLI unpacks it
+  itself. (Adding the marketplace by `owner/repo` shorthand still clones the marketplace repository
+  the usual way; the dependency that disappears is on the *plugin payload* path.) **measured.**
+- **The non-strict-validation hazard is sharper under `archive` than it was under `git-subdir`.**
+  Q14 measured that an unknown key inside a source object is silently ignored; `sha256` is measured
+  to be *optional*. Composing the two: writing `"sha"` for `"sha256"` passes `claude plugin validate`
+  **and installs successfully with no integrity check at all**, because an absent `sha256` simply
+  means unpinned. CI must assert the source object's keys itself. **inferred**, from two measured
+  facts; the composed failure was not itself executed.
+
+### One plugin name, once – there is no fallback source
+
+- **A marketplace cannot declare the same plugin name twice.** `claude plugin validate` errors with
+  `Duplicate plugin name`, and at runtime the **first** matching entry silently wins. **measured.**
+- **There is no fallback or alternate-source field** on an entry. **measured.**
+- Consequence for this plan: the `archive` URL is a single point of availability by construction, so
+  the asset it names must be immutable (R100) and its filename must be version-unique. **inferred.**
+
+### The update signal is the resolved version, not the digest
+
+- **The cache path is keyed on the resolved version**, and **`claude plugin update` skips a plugin
+  whose resolved version already matches**. **measured.**
+- **Therefore: changing the zip and its `sha256` without bumping the declared version leaves every
+  installed user silently on the cached copy.** Nothing errors – the digest they hold still verifies,
+  because it is the digest of the copy they already have – and the only symptom is that the change
+  never arrives. **inferred**, directly from the measured cache-key and skip behaviour.
+- **Where no version is declared anywhere, the digest becomes the resolved version** and this failure
+  mode cannot occur. **measured.** It does not apply here: this plan declares a version in
+  `plugin.json` deliberately (Q13: explicit versions make updates release-gated), so R98's
+  content-change-implies-version-bump is a hard CI-enforced release rule (AE81).
+
+### Publishing the zip: `[[dist.extra-artifacts]]`
+
+- **`dist`'s `[[dist.extra-artifacts]]` builds and uploads an arbitrary file as a standalone release
+  asset with zero change to the generated `release.yml`** – verified by regenerating in a scratch copy
+  of the repository and diffing the output. **measured.**
+- **The earlier build-ordering concern blocks only checksum generation, not publishing.** The asset
+  rides the existing `gh release create` call. **measured.**
+- **`dist` never emits a `.sha256` sibling for an extra artifact and never lists it in `sha256.sum`.**
+  Both are hardcoded to the per-target archives plus the source tarball, so an extra artifact is
+  outside that set by construction rather than by configuration. **measured.** This is exactly why the
+  plugin's pin lives in `marketplace.json` rather than beside the asset: there is no published digest
+  file for the harness to consult.
+
+### The reproducible zip recipe (R96, R97)
+
+The recipe is a **specification** derived from measured platform differences, not itself a probe
+result. Each clause removes one input that varies by machine:
+
+- Sorted entries explicitly, never directory-iteration order.
+- A fixed **1980-01-01** timestamp on every entry – never an mtime, never a clock.
+- Modes normalised to **0644**, or **0755** under `bin/` and for `*.sh`.
+- ZIP `create_system` forced to **unix**.
+- **Stored, not deflated**, so no zlib version difference can reach the bytes.
+- `.DS_Store` excluded.
+- A **loud refusal** on a symlink or a non-ASCII filename: macOS normalises filenames to **NFD** and
+  Linux to **NFC**, and the two hash differently, so a non-ASCII name would make the digest a
+  function of who built it. **measured** (the NFD/NFC divergence); **inferred** (refusing is the
+  correct response).
+- `.gitattributes` (R97) pins the plugin tree's line endings, so a checkout with `core.autocrlf`
+  enabled yields the same file bytes – and therefore the same digest – as the Linux CI runner.
+  **inferred**, from the measured fact that `core.autocrlf` rewrites checked-out bytes.
+
+**`git archive` is not usable for this and must not be substituted in.** Its tree-ish form
+(`HEAD:plugin`) stamps the **current time** into every entry, and its commit-ish form
+(`HEAD plugin`) binds the entries to the **committer time** – reintroducing the self-pinning problem,
+since the committer time is not known before the commit exists. **measured.**
+
+**Explicitly assumed, not measured: that this recipe produces an identical digest on Linux.** The
+argument is **structural** – the builder reads none of the inputs that differ across platforms: no
+clock, no mtime, no `umask`, no directory-iteration order, and no compressor – and every
+platform-dependent input that remains (filename normalisation, line endings, symlinks) is either
+refused outright or pinned by `.gitattributes`. But **no Linux execution was performed**, because no
+container runtime was available on the machine this was validated on. AE79 exists precisely to close
+this gap, and it is the one claim in this section that the plan is taking on faith. If it is wrong,
+CI's re-derivation (AE82) fails the release loudly rather than shipping a pin nobody can reproduce –
+the failure mode is a blocked release, not a bad install.
+
+### Forge-side protections, verified live on the real repository
+
+- **A tag ruleset must cover `~ALL` tags, not `refs/tags/v*`.** The release workflow triggers on
+  `**[0-9]+.[0-9]+.[0-9]+*` (`.github/workflows/release.yml:45`), so a tag like `0.9.1` would cut a
+  real release while sitting outside a `v*` pattern. **measured.**
+- **Rules `deletion`, `non_fast_forward` and `update`, with no bypass actors, block force-moving and
+  deleting a released tag – for the repository owner too.** Both operations were refused with
+  **HTTP 422** against a real tag. **measured.**
+- **`creation` is deliberately omitted.** With it, tag creation is blocked for the owner as well,
+  which would break the release pipeline, since a maintainer pushing the tag is what triggers it.
+  Verified: with `creation` absent, tag **creation still succeeds** while move and delete stay
+  refused. **measured.**
+- **Release immutability is a separate control**, enabled with
+  `PUT /repos/{owner}/{repo}/immutable-releases`. It freezes assets after publication. **measured.**
+- **Without it, a published release asset can be replaced under a fixed name with the tag
+  untouched** – demonstrated, not theorised. This is the attack the tag ruleset alone does not cover,
+  and the reason both controls are needed. **measured.**
+- **Immutability is compatible with the pipeline as it stands**, because assets are attached by the
+  same `gh release create` call that creates the release and no later job touches it. **measured.**
+- **Two limits, stated rather than papered over.** Neither control applies **retroactively** – a
+  release published before enablement stays mutable and is not a trust root (AE84) – and neither is
+  **self-protecting on a personal account**: the owner, or any token with classic `repo` scope, can
+  delete the ruleset or disable immutability. **measured.**
+
+### Considered and declined: `github-attestations-phase = "host"` (KTD21)
+
+Recorded so it is not rediscovered as a new idea.
+
+- **What it would buy.** The plugin zip, the installer script and `sha256.sum` are all currently
+  **unattested**. Setting the phase to `host` would attest every uploaded asset, because the default
+  filter is `["*"]` and the attest step then runs on `artifacts/*` in the same job that uploads them.
+  It is one config key and it survives `dist init`. **measured.**
+- **Why it is not adopted.** It is an **enum, not an addition**. Moving attestation to the host phase
+  moves it *out* of `build-local-artifacts`, which (a) loses the bare extracted binary as an attested
+  subject, and (b) signs artifacts **after** they transit Actions artifact storage rather than before
+  – converting an injection that is currently detectable as an unattested file into one that is
+  **cryptographically endorsed**. **inferred**, from the measured phase semantics.
+- **The plugin does not need it.** R67's digest pin is the plugin's integrity control and R71's
+  checksum verification is the binary's. Revisit only as a deliberate decision, never as a default.
+
+### Correction to Q14's `git-subdir` record
+
+Q14 stated that "the CLI refuses to install when a pinned commit does not match the ref", and
+[plugin-assets.md](./plugin-assets.md) repeated it. **That claim was imprecise.** The property that
+was actually established is narrower: **`sha` overrides `ref` as the effective pin** when both are
+set. No refusal-on-mismatch behaviour was exercised. The correction is recorded rather than quietly
+dropped because it was one of the reasons `git-subdir` looked stronger than it was – and because the
+`archive` digest check, which *was* exercised end to end with its verbatim error message, is the
+property that claim was reaching for.
+
+Confidence: **measured** throughout, except the items marked **inferred** inline and the one
+**assumed** item called out in its own paragraph – that the reproducible-zip recipe yields an
+identical digest on Linux.
 
 ---
 

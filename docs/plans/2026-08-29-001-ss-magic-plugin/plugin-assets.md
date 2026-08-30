@@ -1,9 +1,10 @@
 # Plugin assets – every file the plugin ships, verbatim
 
 Companion to [the plan](../2026-08-29-001-feat-ss-magic-claude-plugin-plan.md). These are **committed
-bytes**, not bytes any code renders. The plugin is a subdirectory of this repository that the
-marketplace serves; `ss-magic` writes none of it, reads none of it at runtime, and has no `install`
-verb (R66). The embed-and-render pipeline that once produced this tree is retired with KTD15.
+bytes**, not bytes any code renders. The plugin is a subdirectory of this repository that a
+deterministic builder zips into a release asset the marketplace pins by content digest (R67, R96,
+KTD16); `ss-magic` writes none of it, reads none of it at runtime, and has no `install` verb (R66).
+The embed-and-render pipeline that once produced this tree is retired with KTD15.
 
 The tree is JSON, Markdown and two small shell scripts. The behavior is the `ss-magic` binary, which
 a `SessionStart` bootstrap installs into `${CLAUDE_PLUGIN_DATA}` at a pinned version (R70-R73).
@@ -13,8 +14,11 @@ a `SessionStart` bootstrap installs into `${CLAUDE_PLUGIN_DATA}` at a pinned ver
 ```plaintext
 <repo root>/
 ├── .claude-plugin/
-│   └── marketplace.json          # the distribution manifest; one git-subdir entry
-└── plugin/                       # everything the harness installs, verbatim
+│   └── marketplace.json          # the distribution manifest; one archive entry, pinned by sha256
+├── .gitattributes                # pins plugin-tree line endings; keeps the digest host-independent (R97)
+├── scripts/
+│   └── build-plugin-zip.py       # the deterministic zip builder (R96); humans and CI run this one
+└── plugin/                       # everything the builder zips and the harness installs, verbatim
     ├── .claude-plugin/
     │   └── plugin.json
     ├── ss-magic.version          # the binary pin – one version literal, no newline noise
@@ -29,6 +33,11 @@ a `SessionStart` bootstrap installs into `${CLAUDE_PLUGIN_DATA}` at a pinned ver
         └── setup-github-ci/SKILL.md
 ```
 
+The builder packages `plugin/` and nothing else. `.claude-plugin/marketplace.json`, `.gitattributes`
+and `scripts/build-plugin-zip.py` all sit **outside** the packaged subtree, which is precisely what
+makes the digest self-consistent: the manifest that carries the digest is not part of the bytes being
+digested (see [the marketplace section](#claude-pluginmarketplacejson--at-the-repository-root)).
+
 Only `plugin.json` goes inside `plugin/.claude-plugin/`. The docs call the alternative out
 explicitly: *"Common mistake: Don't put `commands/`, `agents/`, `skills/`, or `hooks/` inside the
 `.claude-plugin/` directory."* `skills/<name>/SKILL.md` is always scanned; `hooks/hooks.json` and
@@ -37,9 +46,9 @@ explicitly: *"Common mistake: Don't put `commands/`, `agents/`, `skills/`, or `h
 Two roots are easy to confuse and mean different things:
 
 - `.claude-plugin/marketplace.json` sits at the **repository** root. It is the catalogue, never
-  installed.
-- `plugin/` is what the marketplace entry's `path` names, and is what lands on a user's machine as
-  `${CLAUDE_PLUGIN_ROOT}`.
+  installed and never packaged.
+- `plugin/` is what `scripts/build-plugin-zip.py` packages into the release asset the marketplace
+  entry's `url` names, and is what lands on a user's machine as `${CLAUDE_PLUGIN_ROOT}`.
 
 Skill names are deliberately **unprefixed** – the manifest `name` already becomes the invocation
 prefix, so they read `/ss-magic:scratchpad`, `/ss-magic:operator-checklist` and
@@ -63,9 +72,15 @@ Only `name` is required – confirmed against the real minimal manifest shipped 
 
 `version` tracks the crate version, and R95 makes that agreement a CI gate rather than a convention:
 one release moves `Cargo.toml`, this manifest, `plugin/ss-magic.version`, the marketplace entry's
-`ref`/`sha`, and the workflow pin together. The field carries **no** install semantics of its own:
-*"Changing `version` in plugin.json doesn't flip existing user installations."* What actually decides
-which binary runs is the pin file below, not this key.
+`url` and `sha256`, and the workflow pin together. The field carries **no** install semantics of its
+own: *"Changing `version` in plugin.json doesn't flip existing user installations."* What actually
+decides which binary runs is the pin file below, not this key.
+
+**But bumping it is mandatory on every content change, because the resolved version – not the digest –
+is the update signal (R98).** The two statements are not in tension: bumping `version` does not
+retroactively flip anyone's installation, and *not* bumping it means `claude plugin update` skips the
+plugin entirely. See [the version trap](#the-version-is-the-update-signal-not-the-digest) below,
+which is the single most expensive mistake available in this packaging.
 
 `author` is an **object**, not a string – every plugin installed on this machine uses the object form
 (`compound-engineering`, `cloudflare`, and the rest all carry `{"name": …}`), and the structure
@@ -359,6 +374,9 @@ Three decisions in that file are load-bearing:
 
 ## `.claude-plugin/marketplace.json` – at the repository root
 
+The source is `archive`, pinned by the plugin zip's SHA-256 (R67, KTD16). It replaced `git-subdir` on
+2026-08-30; [the reason is below](#why-not-git-subdir-a-commit-cannot-pin-itself).
+
 ```json
 {
   "name": "ss-magic",
@@ -367,11 +385,9 @@ Three decisions in that file are load-bearing:
     {
       "name": "ss-magic",
       "source": {
-        "source": "git-subdir",
-        "url": "https://github.com/ViktorStiskala/superset-magic.git",
-        "path": "plugin",
-        "ref": "v0.10.0",
-        "sha": "0000000000000000000000000000000000000000"
+        "source": "archive",
+        "url": "https://github.com/ViktorStiskala/superset-magic/releases/download/v0.10.0/ss-magic-plugin-v0.10.0.zip",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "description": "Session scratchpad, context page-fault gate, operator checklist, and cost ledger for the Superset workspace contract"
     }
@@ -379,34 +395,151 @@ Three decisions in that file are load-bearing:
 }
 ```
 
-- **`path` resolves from the repository root**, not from `.claude-plugin/`. `"plugin"` is correct;
-  `"../plugin"` is not.
-- **`sha` must be lowercase hex**, 40 characters. Uppercase is rejected at validation (AE55), which is
-  what keeps a malformed pin out of a release.
-- **`sha` is the effective pin when both are set**, and the CLI refuses to install when the pinned
-  commit does not match the ref. `ref` stays for readability and for the case where the sha is being
-  advanced.
-- **The `sha` is a placeholder in this document only.** R95 makes the release commit fill it, and
-  fills it *after* the named release's assets are published.
+- **The schema is exactly two fields.** `url` is required; `sha256` is optional but is the entire
+  point of choosing this source. 64 hex characters, **case-insensitive** – unlike `git-subdir`'s
+  `sha`, which had to be lowercase.
+- **The digest is enforced client-side.** A deliberate mismatch produces, verbatim:
+
+  ```plaintext
+  Plugin archive integrity check failed for <plugin>: expected sha256 <x>, got <y>. The archive was not installed.
+  ```
+
+  Nothing is extracted, and the same check runs again on `claude plugin update` – so a swapped asset
+  is refused on the update path too, not only at first install (AE55).
+- **The `sha256` is a placeholder in this document only.** R95 makes the release commit fill it with
+  the digest `scripts/build-plugin-zip.py` produces from the tree being released, and R96's
+  reproducibility is what lets that happen *before* the tag exists.
+- **Two pins, two orderings – do not conflate them.** The *marketplace digest* is committed **before**
+  the tag, because the builder can produce it from the working tree; between that commit and the
+  release publishing, the entry's `url` names an asset that does not exist yet, which is expected and
+  self-correcting. The *binary pin* in `plugin/ss-magic.version` is the opposite: R95 forbids
+  advancing it before the named release's assets are published, because a pin naming an unpublished
+  release 404s and the bootstrap silently installs nothing.
+- **The URL should name a release asset versioned in its own filename.** With release immutability on
+  (R100) an asset cannot be replaced after publication, and a per-version filename means a later
+  release never has an opportunity to overwrite an earlier pin's target.
 - No ss-magic code path reads this file at runtime. It is repository content, served to the harness.
 
-### The cost of `git-subdir`: an object source is "external"
+### Archive constraints, measured on 2.1.251
 
-Measured in the 2.1.251 loader, and it is the reason this choice needed a ruling rather than a
-default. **The loader branches on whether a source is a string or an object.** A relative-path string
-source (`"./plugin"`) is resolved inside the already-cloned marketplace and is *not* treated as
-external. **Every object source, `git-subdir` included, takes the external branch.**
+- **ZIP only.** A `.tar.gz` behind an `archive` URL is rejected with `invalid zip data`. The
+  container format is what decides it, not the extension.
+- **Two accepted layouts, and no third.** `.claude-plugin/` must sit either at the **zip root** or
+  inside a **single top-level wrapper directory**. Anything deeper is not found. The builder emits
+  the zip-root form.
+- **URL restrictions.** https only. The host must not resolve to a loopback, link-local or
+  cloud-metadata address – an SSRF guard, which also means a localhost-served archive is not a usable
+  local testing shortcut.
+- **Limits.** Body capped at 256 MiB, fetch at 120 s, redirects at 5. A GitHub Release asset URL on a
+  public repo works unauthenticated, including its redirect to `objects.githubusercontent.com`, well
+  inside the redirect budget.
+- **No client dependencies.** Fetching and extracting the plugin archive needs **no `git`** – where
+  `git-subdir` requires `git` >= 2.25 for sparse-checkout cone mode – and **no external `unzip`**;
+  the CLI unpacks it itself. (Adding the marketplace by `owner/repo` shorthand still clones the
+  marketplace repository the usual way; what disappears is the dependency on the *plugin payload*
+  path.)
+
+### Why not `git-subdir`: a commit cannot pin itself
+
+`git-subdir` was this plan's choice until 2026-08-30, and it carries an **irreducible circularity**.
+The commit hash covers `.claude-plugin/marketplace.json`, so writing a `sha` into that file changes
+the commit the `sha` would have to name. The pin can therefore only ever name an **ancestor** commit,
+and the released tag's own plugin content is never the content being pinned.
+
+The obvious workaround – tag, build, commit the digest, move the tag – is **forbidden outright** once
+release immutability and the tag ruleset are on (R99, R100); GitHub's own documentation is blunt
+about it: *"Git tags cannot be moved."*
+
+`archive` has no such circularity, because `plugin/` and `.claude-plugin/marketplace.json` are
+**disjoint subtrees**. Verified directly: rewriting the digest in `marketplace.json` to a dummy value
+and re-zipping `plugin/` produced an **identical** hash. The manifest can name the digest of bytes it
+is not part of.
+
+### An object source is "external" – the cost, unchanged
+
+Measured in the 2.1.251 loader, and it survives the source change intact because it is a property of
+*object* sources, not of `git-subdir` specifically. **The loader branches on whether a source is a
+string or an object.** A relative-path string source (`"./plugin"`) is resolved inside the
+already-cloned marketplace and is *not* treated as external. **Every object source, `archive`
+included, takes the external branch.**
 
 The consequence: a plugin that only a project's `.claude/settings.json` enables is reported as **not
-installed** until each user runs `claude plugin install` themselves. `git-subdir` therefore forgoes
-collaborator auto-install. That is an acceptable price here – nothing in this plan depends on
-zero-touch install for collaborators, and R66 already makes the install an explicit user action – but
-it is a real capability the string form would have kept.
+installed** until each user runs `claude plugin install` themselves. Collaborator auto-install is
+forgone – as it was under `git-subdir`. That is an acceptable price here: nothing in this plan
+depends on zero-touch install for collaborators, and R66 already makes the install an explicit user
+action.
 
-It also requires **`git` >= 2.25** on the client, for sparse-checkout cone mode.
+What `archive` buys for the same price: a pin the client verifies **by content** rather than by
+provenance, no `git` on the client, and no self-pinning circularity.
 
-What it buys, and why the trade was taken: explicit release pinning that survives being added by
-direct URL to `marketplace.json`, with a commit-level `sha` the CLI enforces.
+### The version is the update signal, not the digest
+
+**This is the operational trap of `archive` packaging, and it is silent (R98).** The resolved version
+– from `plugin.json`, then the marketplace entry, then the source – keys the cache path, and
+**`claude plugin update` skips a plugin whose resolved version already matches**. The digest is an
+integrity check, never a freshness check.
+
+So: **publishing a new zip with a new `sha256` but the same declared version leaves every installed
+user silently on the cached copy.** Nothing errors. The digest they hold still verifies, because it
+is the digest of the copy they already have. The only signal is that the change never arrives.
+
+Where *no* version is declared anywhere, the digest itself becomes the resolved version and this
+failure mode cannot occur – but this plan declares a version in `plugin.json`, deliberately (Q13:
+explicit versions make updates release-gated). The coupling is therefore a hard release rule enforced
+in CI (R95, R98, AE81): **content change ⇒ version bump**, in the same commit.
+
+### Building the zip: `scripts/build-plugin-zip.py` (R96)
+
+The pin is only as good as the builder's determinism, so the builder specifies its output byte by
+byte rather than inheriting anything from the machine it runs on:
+
+- **Sorted entries**, explicitly – never directory-iteration order, which varies by filesystem.
+- **A fixed `1980-01-01` timestamp** on every entry – never an mtime, never a clock. (1980-01-01 is
+  the ZIP epoch, so it is the one timestamp that needs no further normalisation.)
+- **Modes normalised to `0644`**, or `0755` under `bin/` and for `*.sh` – so a stray `chmod` or a
+  different `umask` cannot reach the bytes.
+- **`create_system` forced to unix**, so the field does not record which OS built the archive.
+- **Stored, not deflated.** No zlib version difference can then reach the output; compression is the
+  classic source of "same input, different bytes, different compressor build".
+- **`.DS_Store` excluded.**
+- **A loud refusal** – not a best-effort archive – on a **symlink** or a **non-ASCII filename**.
+  macOS normalises filenames to NFD and Linux to NFC, and the two hash differently, so a non-ASCII
+  name would make the digest a function of who built it. Failing is the only correct response
+  (AE80).
+
+**`git archive` is not used, and must not be.** Its tree-ish form (`git archive HEAD:plugin`) stamps
+the *current* time into every entry, and its commit-ish form (`git archive HEAD plugin`) binds the
+entries to the *committer* time – which reintroduces exactly the self-pinning problem `archive` was
+adopted to escape, since the committer time is not known before the commit exists.
+
+`.gitattributes` (R97) pins the plugin tree's line endings, so a checkout on a machine with
+`core.autocrlf` enabled produces the same file bytes – and therefore the same digest – as the Linux
+CI runner. Without it the digest is a function of who ran the builder, and the builder's own care is
+wasted a layer down.
+
+### Publishing it: `[[dist.extra-artifacts]]`
+
+`dist` builds and uploads an arbitrary file as a standalone release asset with **zero change to the
+generated `release.yml`** – verified by regenerating in a scratch copy of the repo and diffing.
+
+```toml
+[[dist.extra-artifacts]]
+artifacts = ["ss-magic-plugin-v0.10.0.zip"]
+build = ["python3", "scripts/build-plugin-zip.py", "--out", "ss-magic-plugin-v0.10.0.zip"]
+```
+
+The earlier concern about build ordering turned out to block only **checksum generation**, not
+publishing – the asset rides the existing `gh release create` call.
+
+**`dist` gives an extra artifact no `.sha256` sibling and no line in `sha256.sum`.** Both are
+hardcoded to the per-target archives plus the source tarball, so an extra artifact is outside that
+set by construction rather than by configuration. That is precisely why the plugin's pin lives in
+`marketplace.json` instead of beside the asset – there is no published digest file for the harness to
+consult, so the manifest carries it.
+
+Note the asymmetry with the *binary* bootstrap: R71 verifies the platform archive against its
+published `.sha256`, which exists because the platform archives are exactly the set `dist` does
+checksum. The plugin zip is not in that set, and the marketplace digest fills the same role for it.
 
 ## Installing it
 
@@ -420,9 +553,14 @@ claude plugin install ss-magic@ss-magic
 - `install` defaults to **`--scope user`** – machine-global, which is precisely why `plugin.enabled`
   survives as the per-repository gate (R5-R7, R65). An install made for one repository must not act
   in every other one on the machine.
+- `install` fetches the `archive` URL and verifies its `sha256` before extracting anything; a
+  mismatch installs nothing and reports the integrity error quoted above.
 - **Nothing hot-reloads.** Run `/reload-plugins` or restart the session; see below.
 - The plugin loads from its local cache and needs no network at session start. Marketplace refresh
   happens in the background afterwards, and a failed refresh keeps the cached version.
+- `claude plugin update` re-verifies the digest – but only reaches the fetch when the resolved
+  version differs. Bumping the zip without bumping the version is the silent no-op described in
+  [the version trap](#the-version-is-the-update-signal-not-the-digest).
 
 Migration removes any pre-existing `~/.claude/skills/ss-magic/` (R66). It is not a fallback: the
 loader resolves by plugin **name**, a marketplace install outranks a `@skills-dir` copy, and the
@@ -463,8 +601,17 @@ claude plugin validate ./plugin   # the plugin subdirectory
 ```
 
 **Validation is non-strict about source objects.** An unknown key inside a source object is silently
-ignored rather than flagged – so a typo like `"subdir"` for `"path"` passes validation and fails at
-install. CI must assert the source object's keys itself; `claude plugin validate` will not.
+ignored rather than flagged. Under `archive` this is sharper than it was under `git-subdir`: writing
+`"sha"` instead of `"sha256"` passes validation, and the install then **succeeds with no integrity
+check at all**, because `sha256` is an optional field and an absent one simply means "unpinned". The
+failure is silent in both directions – nothing warns, and nothing verifies. CI must assert the source
+object's keys itself; `claude plugin validate` will not.
+
+**A plugin name may be declared only once per marketplace, and there is no fallback source field.**
+`claude plugin validate` errors with `Duplicate plugin name`, and at runtime the first matching entry
+silently wins. So a second entry cannot be used as an alternate or backup source for the same plugin:
+the `archive` URL is a single point of availability by design, which is one more reason the asset it
+names must be immutable (R100).
 
 ## Nothing hot-reloads
 
