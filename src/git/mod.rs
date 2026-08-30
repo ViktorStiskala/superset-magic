@@ -307,69 +307,6 @@ pub fn tracked_files(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<PathBuf
     Ok(parse_ls_files_z(&git(&args, Some(repo_root))?))
 }
 
-/// Resolve the `.gitignore` rule that COVERS `rel` in the working tree rooted
-/// at `repo_root`, via `git check-ignore -v --no-index -- <rel>`.
-///
-/// Returns `Ok(Some(pattern))` when a rule matches (the bare pattern text,
-/// e.g. `**/.dev.vars`), `Ok(None)` when no rule covers the path.
-///
-/// `-v` prints `<source>:<line>:<pattern>\t<pathname>`. We parse the pattern
-/// out of the colon-delimited prefix before the tab. `--no-index` makes the
-/// check independent of whether the path is tracked, so a covering rule is
-/// found even for a path that git would otherwise consider already tracked.
-///
-/// A leading `!` (negation) pattern means the path is explicitly *un*-ignored;
-/// such a match is reported as `None` so the caller falls back to the literal
-/// path rather than copying a negation rule into main.
-// consumed by U11 (gitignore::find_covering_rule)
-pub fn check_ignore_pattern(repo_root: &Path, rel: &Path) -> Result<Option<String>> {
-    let rel_str = rel
-        .to_str()
-        .with_context(|| format!("non-UTF-8 path: {}", rel.display()))?;
-    let out = git_raw(
-        &["check-ignore", "-v", "--no-index", "--", rel_str],
-        Some(repo_root),
-    )?;
-    match out.status.code() {
-        // 0 → matched; parse the pattern. 1 → no match. Other → error.
-        Some(1) => return Ok(None),
-        Some(0) => {}
-        _ => {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            bail!("`git check-ignore -v --no-index -- {rel_str}` failed: {stderr}");
-        }
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout.lines().next().unwrap_or("").trim_end();
-    Ok(parse_check_ignore_line(line))
-}
-
-/// Parse one `git check-ignore -v` line into its bare pattern.
-///
-/// Format: `<source>:<line>:<pattern>\t<pathname>`. The source path may itself
-/// contain colons, so we split off the trailing `\t<pathname>` first, then
-/// take everything AFTER the second colon as the pattern (so a pattern that
-/// contains colons survives). A blank pattern (no matching gitignore source —
-/// e.g. a command-line `-e` exclude renders as `::pattern`) still parses. A
-/// negation pattern (`!…`) is reported as `None`.
-fn parse_check_ignore_line(line: &str) -> Option<String> {
-    if line.is_empty() {
-        return None;
-    }
-    // Strip the trailing `\t<pathname>` if present.
-    let prefix = line.split('\t').next().unwrap_or(line);
-    // `<source>:<line>:<pattern>` — find the first two colons. The pattern is
-    // everything after the second colon (it may contain further colons).
-    let first = prefix.find(':')?;
-    let rest = &prefix[first + 1..];
-    let second = rest.find(':')?;
-    let pattern = rest[second + 1..].trim();
-    if pattern.is_empty() || pattern.starts_with('!') {
-        return None;
-    }
-    Some(pattern.to_string())
-}
-
 /// Shell out to `date +%Y%m%d-%H%M%S` for the feature-branch suffix.
 /// Local timezone — matches what a developer would type by hand.
 pub fn timestamp_branch_suffix() -> Result<String> {
