@@ -661,3 +661,116 @@ fn file_scheme_origin_uses_only_the_final_segment() {
         "local hierarchy must not leak into the name"
     );
 }
+
+// ── Excluded state trees (whole-tree enumeration filter) ────────────────
+
+/// AE53. A bare `.superset` DIRECTORY match is the ancestor shape the flat
+/// match-list filter cannot catch: `under_excluded_tree(".superset")` is false,
+/// so the rel survives into `write_archive` and the recursive walk is the only
+/// place left to prune. Both state trees under it — `.magic` (plugin state) and
+/// `backups` (recovered secrets) — must be pruned while the contract files are
+/// still archived.
+#[test]
+fn bare_superset_directory_match_prunes_both_state_trees() {
+    let repo = init_repo();
+    write_magic(repo.path(), &[".superset"]);
+    write_file(repo.path(), ".superset/config.json", "{}\n");
+    write_file(repo.path(), ".superset/magic.sh", "#!/bin/sh\n");
+    write_file(repo.path(), ".superset/.magic/state.json", "{\"token\":\"s3cret\"}\n");
+    write_file(
+        repo.path(),
+        ".superset/backups/20260101-000000/main/.env",
+        "RECOVERED=1\n",
+    );
+
+    let code = pack_core(repo.path(), |_| {}).unwrap();
+    assert!(exit_ok(code));
+    let entries = archive_entries(repo.path());
+    for want in [
+        ".superset/config.json",
+        ".superset/magic.sh",
+        ".superset/magic.json",
+    ] {
+        assert!(entries.contains(want), "{want} must still pack: {entries:?}");
+    }
+    assert!(
+        !entries.iter().any(|e| e.contains(".superset/.magic/")),
+        "the plugin state tree must be pruned from a directory match: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| e.contains(".superset/backups/")),
+        "the backups tree must be pruned from a directory match: {entries:?}"
+    );
+}
+
+/// AE14. A `**` pattern sweeps the whole repo: every excluded tree must stay
+/// out of the archive, the contract files must stay in, and the reported count
+/// must be the number of UNIQUE archived paths (a `**` match list carries both
+/// `.superset` the directory and `.superset/config.json` the file, so counting
+/// tar entries or match roots would both be wrong).
+#[test]
+fn broad_glob_excludes_every_state_tree_and_counts_unique_paths() {
+    let repo = init_repo();
+    write_magic(repo.path(), &["**"]);
+    write_file(repo.path(), ".superset/config.json", "{}\n");
+    write_file(repo.path(), ".scratchpad/notes.md", "scratch\n");
+    write_file(repo.path(), ".superset/.magic/state.json", "{\"token\":\"s3cret\"}\n");
+    write_file(
+        repo.path(),
+        ".superset/backups/20260101-000000/main/.env",
+        "RECOVERED=1\n",
+    );
+
+    let mut done: Vec<usize> = Vec::new();
+    let code = pack_core(repo.path(), |ev| {
+        if let PackEvent::Done { count, .. } = ev {
+            done.push(*count);
+        }
+    })
+    .unwrap();
+    assert!(exit_ok(code));
+
+    let entries = archive_entries(repo.path());
+    for want in [".superset/config.json", ".superset/magic.json"] {
+        assert!(entries.contains(want), "{want} must pack: {entries:?}");
+    }
+    for forbidden in [".git/", ".scratchpad/", ".superset/.magic/", ".superset/backups/"] {
+        assert!(
+            !entries.iter().any(|e| e.contains(forbidden)),
+            "{forbidden} must be absent from the archive: {entries:?}"
+        );
+    }
+    assert_eq!(done.len(), 1, "exactly one Done event");
+    assert_eq!(
+        done[0],
+        entries.len(),
+        "the reported count must equal the number of unique archived paths: {entries:?}"
+    );
+}
+
+/// The exclusion is on the EXACT component path, never a string prefix and
+/// never a bare component name: a sibling directory `.superset/.magicked`, a
+/// sibling `.superset/backupsfoo/`, a root-level file called `.magic` (the
+/// rule needs the `.superset` parent), and `.superset` itself all stay
+/// packable. Widening the rule would silently drop the contract files.
+#[test]
+fn exclusion_matches_exact_components_not_prefixes() {
+    let repo = init_repo();
+    write_magic(repo.path(), &[".superset", ".magic"]);
+    write_file(repo.path(), ".superset/config.json", "{}\n");
+    write_file(repo.path(), ".superset/.magicked/keep.txt", "keep\n");
+    write_file(repo.path(), ".superset/backupsfoo/keep.txt", "keep\n");
+    write_file(repo.path(), ".magic", "a root-level file, not the state tree\n");
+
+    let code = pack_core(repo.path(), |_| {}).unwrap();
+    assert!(exit_ok(code));
+    let entries = archive_entries(repo.path());
+    for want in [
+        ".superset/config.json",
+        ".superset/.magicked/keep.txt",
+        ".superset/backupsfoo/keep.txt",
+        ".magic",
+    ] {
+        assert!(entries.contains(want), "{want} must pack: {entries:?}");
+    }
+}

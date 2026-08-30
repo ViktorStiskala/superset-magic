@@ -1978,3 +1978,109 @@ fn run_bulk_noop_when_no_untracked_candidates() {
         "a no-op appends no gitignore rule"
     );
 }
+
+// ── Excluded state trees (whole-tree enumeration filter) ────────────────
+
+/// Every file path under `root`, relative to it, sorted.
+fn files_under(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in walkdir::WalkDir::new(root).into_iter().flatten() {
+        if entry.file_type().is_file() {
+            if let Ok(rel) = entry.path().strip_prefix(root) {
+                out.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// AE13 (enumeration half). A broad pattern must never OFFER a file that lives
+/// in an excluded tree — the plugin's `.superset/.magic/` state, the
+/// third-party `.scratchpad/` ss-magic does not own, or the tool's own backups
+/// of previously overwritten secrets.
+#[test]
+fn broad_pattern_never_offers_files_from_excluded_trees() {
+    let main = init_main_repo();
+    let (_wt_dir, wt) = make_worktree(main.path());
+    write_magic(&wt, &["**"]);
+    write(&wt, "apps/api/.dev.vars", "REAL=1\n");
+    write(&wt, ".scratchpad/notes.md", "scratch\n");
+    write(&wt, ".superset/.magic/state.json", "{\"token\":\"s3cret\"}\n");
+    write(
+        &wt,
+        ".superset/backups/20260101-000000/worktree/.env",
+        "RECOVERED=1\n",
+    );
+
+    let forbidden = [".scratchpad/", ".superset/.magic/", ".superset/backups/"];
+
+    let offered = rels(&compute_candidates(&wt).unwrap());
+    assert!(
+        offered.iter().any(|r| r == "apps/api/.dev.vars"),
+        "a real untracked secret is still offered: {offered:?}"
+    );
+    for tree in forbidden {
+        assert!(
+            !offered.iter().any(|r| r.starts_with(tree)),
+            "{tree} must never be a reverse-sync candidate: {offered:?}"
+        );
+    }
+
+    let unified: Vec<String> = compute_reconcile_set(&wt, main.path())
+        .unwrap()
+        .iter()
+        .map(|c| c.rel.to_string_lossy().to_string())
+        .collect();
+    assert!(
+        unified.iter().any(|r| r == "apps/api/.dev.vars"),
+        "a real untracked secret is still reconciled: {unified:?}"
+    );
+    for tree in forbidden {
+        assert!(
+            !unified.iter().any(|r| r.starts_with(tree)),
+            "{tree} must never enter the reconcile set: {unified:?}"
+        );
+    }
+}
+
+/// AE86 (backup half). The pre-copy backup pass re-walks the worktree from the
+/// matched path, so a bare `.superset` literal hands it the same ancestor
+/// directory the forward copy gets. It must back up the contract files without
+/// capturing either state tree — capturing `.superset/.magic/` copies plugin
+/// state, and capturing `.superset/backups/` copies recovered secrets into the
+/// very tree being written (which also recurses into itself).
+#[test]
+fn forward_backup_pass_skips_excluded_trees_under_a_bare_superset_literal() {
+    let main = init_main_repo();
+    let (_wt_dir, wt) = make_worktree(main.path());
+    // main holds what the forward sync is about to copy over the worktree...
+    write(main.path(), ".superset/config.json", "{\"setup\":[]}\n");
+    // ...and the worktree holds the copies to be overwritten, plus both trees
+    // the backup pass must leave alone.
+    write(&wt, ".superset/config.json", "stale\n");
+    write(&wt, ".superset/.magic/state.json", "{\"token\":\"s3cret\"}\n");
+    write(
+        &wt,
+        ".superset/backups/20260101-000000/worktree/.env",
+        "RECOVERED=1\n",
+    );
+
+    backup_forward_targets(main.path(), &wt, &[".superset".to_string()]).unwrap();
+
+    let captured = files_under(&wt.join(".superset/backups"));
+    assert!(
+        captured
+            .iter()
+            .any(|p| p.ends_with("worktree/.superset/config.json")),
+        "the overwritten contract file must be backed up: {captured:?}"
+    );
+    assert!(
+        !captured.iter().any(|p| p.contains(".magic")),
+        "the plugin state tree must never be captured by a backup: {captured:?}"
+    );
+    assert!(
+        !captured.iter().any(|p| p.contains(".superset/backups")),
+        "the backups tree must never be copied into itself: {captured:?}"
+    );
+}

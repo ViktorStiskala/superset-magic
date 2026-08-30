@@ -44,7 +44,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -135,8 +135,9 @@ pub fn compute_candidates(worktree_root: &Path) -> Result<Vec<PathBuf>> {
         .into_iter()
         .filter(|rel| matched_set.contains(rel.as_path()))
         .filter(|rel| is_safe_rel(rel))
-        // Never re-offer a backed-up secret copy under the tool's own tree.
-        .filter(|rel| !under_backups_dir(rel))
+        // Never offer anything living in an excluded tree: a backed-up
+        // secret copy, the plugin's `.magic` state, `.scratchpad`, or `.git`.
+        .filter(|rel| !crate::sync::under_excluded_tree(rel))
         .collect();
 
     out.sort();
@@ -198,7 +199,7 @@ pub fn compute_reconcile_set(worktree_root: &Path, main_root: &Path) -> Result<V
     let mut rels: Vec<PathBuf> = wt_matched
         .into_iter()
         .chain(main_matched)
-        .filter(|rel| is_safe_rel(rel) && !under_backups_dir(rel))
+        .filter(|rel| is_safe_rel(rel) && !crate::sync::under_excluded_tree(rel))
         .collect();
     rels.sort();
     rels.dedup();
@@ -222,16 +223,6 @@ pub fn compute_reconcile_set(worktree_root: &Path, main_root: &Path) -> Result<V
         });
     }
     Ok(out)
-}
-
-/// True when `rel` lives under the tool's own `.superset/backups/…` tree, so a
-/// broad user pattern (`**/.env`) can never re-offer or pack a backed-up secret
-/// copy. Shared with `pack` so an archive never captures a recovered secret.
-pub(crate) fn under_backups_dir(rel: &Path) -> bool {
-    use std::ffi::OsStr;
-    let mut c = rel.components();
-    matches!(c.next(), Some(Component::Normal(a)) if a == OsStr::new(".superset"))
-        && matches!(c.next(), Some(Component::Normal(b)) if b == OsStr::new("backups"))
 }
 
 /// Classify one candidate `rel` against both trees for the unified cockpit (R24).
@@ -594,15 +585,17 @@ pub fn run_bulk(worktree_root: &Path, main_root: &Path, no_backup: bool) -> Resu
 
 /// Back up a file OR directory `target` to `dest` before it is overwritten,
 /// returning the backup path (`Ok(None)` when `target` is absent — a fresh
-/// create has nothing to lose). A directory is copied recursively.
-fn backup_if_exists(target: &Path, dest: &Path) -> Result<Option<PathBuf>> {
+/// create has nothing to lose). A directory is copied recursively, with `root`
+/// (the tree `target` sits under) passed through so the recursive copy can key
+/// its excluded-tree pruning on root-relative paths.
+fn backup_if_exists(root: &Path, target: &Path, dest: &Path) -> Result<Option<PathBuf>> {
     if !target.exists() {
         return Ok(None);
     }
     if target.is_dir() {
         // `copy_dir_recursive`'s first step is `create_dir_all(dest)`, which
         // creates `dest` and its parents.
-        apply::copy_dir_recursive(target, dest)?;
+        apply::copy_dir_recursive(root, target, dest)?;
         Ok(Some(dest.to_path_buf()))
     } else {
         // `backup` does the parent mkdir + `fs::copy` (the file-overwrite site's
@@ -628,7 +621,10 @@ pub fn backup_forward_targets(main_root: &Path, cwd_root: &Path, patterns: &[Str
     let backups_root = backups_root_for(cwd_root, true)?;
     let mut backed_up = Vec::new();
     for rel in &matches {
-        if under_backups_dir(rel) {
+        // Skip every excluded tree. Backing one up is the same leak as syncing
+        // it, one step earlier — and for `.superset/backups` the copy would
+        // additionally walk into the backup destination it is creating.
+        if crate::sync::under_excluded_tree(rel) {
             continue;
         }
         // Forward sync overwrites the WORKTREE side, so back up under the shared
@@ -636,7 +632,7 @@ pub fn backup_forward_targets(main_root: &Path, cwd_root: &Path, patterns: &[Str
         // reverse-sync bulk path use — one consistent layout, and no collision if
         // a forward and an interactive/bulk run ever share a timestamp directory.
         let dest = backups_root.join(backup_rel_path(&ts, BackupSide::Worktree, rel));
-        if let Some(p) = backup_if_exists(&cwd_root.join(rel), &dest)? {
+        if let Some(p) = backup_if_exists(cwd_root, &cwd_root.join(rel), &dest)? {
             backed_up.push(p);
         }
     }

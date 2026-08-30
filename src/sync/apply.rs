@@ -125,7 +125,7 @@ where
             }
         }
         let outcome: Result<()> = if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dest_path)
+            copy_dir_recursive(src, &src_path, &dest_path)
         } else if src_path.is_file() {
             fs::copy(&src_path, &dest_path).map(|_| ()).map_err(|e| {
                 anyhow::Error::from(e).context(format!(
@@ -264,9 +264,24 @@ where
 
 /// Walk `src` once and return every file/dir's path relative to `src`,
 /// including directories so a pattern like `apps/*/config` can match them.
+///
+/// The excluded trees (`crate::sync::EXCLUDED_TREES` — the backups tree, the
+/// plugin's `.magic` state, `.scratchpad`, `.git`) are PRUNED here rather than
+/// filtered out of the result: `filter_entry` returning `false` for a directory
+/// stops the walk from descending, so no pattern — however broad — can ever see
+/// a path inside one of them.
 fn walk_source(src: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for entry in WalkDir::new(src).follow_links(false).into_iter().flatten() {
+    let walker = WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| match e.path().strip_prefix(src) {
+            Ok(rel) => !crate::sync::under_excluded_tree(rel),
+            // Not under `src` at all (can't happen for a plain walk) — keep it
+            // rather than silently dropping an entry we can't classify.
+            Err(_) => true,
+        });
+    for entry in walker.flatten() {
         if entry.depth() == 0 {
             continue;
         }
@@ -283,7 +298,16 @@ fn build_matcher(pattern: &str) -> Result<GlobMatcher> {
         .compile_matcher())
 }
 
+/// Whether a match must be dropped, for either of the two independent reasons:
+/// the legacy `DEFAULT_EXCLUDES` directory NAMES at any depth, or a whole
+/// excluded tree (`crate::sync::EXCLUDED_TREES`) matched on its exact leading
+/// components. Glob matches already arrive pre-pruned from [`walk_source`]; a
+/// LITERAL pattern never passes through that walk, so this is where a literal
+/// naming a file inside an excluded tree gets stopped.
 fn is_excluded(rel: &Path) -> bool {
+    if crate::sync::under_excluded_tree(rel) {
+        return true;
+    }
     rel.components().any(|c| match c {
         std::path::Component::Normal(name) => DEFAULT_EXCLUDES
             .iter()
@@ -294,9 +318,28 @@ fn is_excluded(rel: &Path) -> bool {
 
 /// Recursively copy `src` into `dst`. Crate-visible so the reverse-sync backup
 /// pass can back up a directory target before a forward sync overwrites it.
-pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+///
+/// `root` is the tree `src` lives under — the sync root, NOT `src` itself. This
+/// walk re-enumerates the live filesystem from a directory that was already
+/// chosen as a match, so it is its own enforcement point for the excluded trees
+/// and cannot rely on any filter applied to the match list: a literal
+/// `.superset` pattern is appended to the match set without ever passing through
+/// [`walk_source`], and would otherwise copy `backups/` and `.magic/` wholesale.
+/// The exclusion rules are written relative to the root (`.superset/.magic`), so
+/// an entry's path is stripped against `root` — stripping against `src` would
+/// yield `.magic/…` and match nothing. Excluded directories are pruned, so the
+/// walk never descends into them.
+pub(crate) fn copy_dir_recursive(root: &Path, src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst).with_context(|| format!("mkdir -p {}", dst.display()))?;
-    for entry in WalkDir::new(src).follow_links(false) {
+    let walker = WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| match e.path().strip_prefix(root) {
+            Ok(rel) => !crate::sync::under_excluded_tree(rel),
+            // Outside `root` entirely — keep it; the caller chose this source.
+            Err(_) => true,
+        });
+    for entry in walker {
         let entry = entry?;
         let rel = entry.path().strip_prefix(src)?;
         let target = dst.join(rel);

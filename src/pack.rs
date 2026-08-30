@@ -17,6 +17,7 @@
 //! The control flow deliberately mirrors `main::sync_core`: resolve root →
 //! probe `magic.json` → load overlaid config → empty-guard → do work.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitCode, Stdio};
@@ -164,7 +165,10 @@ pub fn copy_to_clipboard(text: &str) -> bool {
 pub enum PackEvent {
     /// A file or directory was added to the archive at `rel`.
     Add { rel: PathBuf },
-    /// The archive was written and persisted: `count` entries at `out_path`.
+    /// The archive was written and persisted: `count` UNIQUE file paths at
+    /// `out_path`. Not the number of tar entries and not the number of matches:
+    /// a directory match contributes every file beneath it, and two overlapping
+    /// matches that name the same file count once.
     /// The rendering layer owns the summary line, the `tar` extraction hint,
     /// and the clipboard copy of the archive's real path.
     Done { out_path: PathBuf, count: usize },
@@ -236,17 +240,17 @@ where
     //    drop any match that resolves to the repo root itself (a `.` pattern):
     //    `append_dir_all(".", root)` would walk the whole tree live — including
     //    the in-progress temp archive and `.git` — corrupting the archive and
-    //    bypassing the self-exclusion guard. And drop any LEAF match under the
-    //    tool's own `.superset/backups/` tree so a recovered secret copy is
-    //    never packed. (An ancestor DIRECTORY match — e.g. a bare `.superset`
-    //    pattern — is handled separately in `write_archive`, whose directory
-    //    walk prunes the backups subtree; `under_backups_dir` needs both the
-    //    `.superset` and `backups` components, so it cannot catch the ancestor.)
+    //    bypassing the self-exclusion guard. And drop any LEAF match inside an
+    //    excluded tree (`crate::sync::EXCLUDED_TREES` — recovered secrets under
+    //    `.superset/backups/`, the plugin's `.superset/.magic/` state,
+    //    `.scratchpad`, `.git`) so none of them is ever packed. (An ancestor
+    //    DIRECTORY match — e.g. a bare `.superset` pattern — is handled
+    //    separately in `write_archive`, whose directory walk prunes the excluded
+    //    subtrees; the rules match on full component paths, so `.superset`
+    //    itself passes this filter and cannot be caught here.)
     let file_name = archive_file_name(&root);
     rels.retain(|r| {
-        !is_pack_archive_rel(r)
-            && !is_repo_root_rel(r)
-            && !crate::sync::reverse_sync::under_backups_dir(r)
+        !is_pack_archive_rel(r) && !is_repo_root_rel(r) && !crate::sync::under_excluded_tree(r)
     });
 
     // 7. Nothing left to archive after filtering → success, no archive written.
@@ -312,10 +316,12 @@ fn is_repo_root_rel(rel: &Path) -> bool {
 /// (KTD3). Real directories are added recursively; a matched symlink is stored
 /// as a single symlink entry (never followed); special files (sockets/fifos)
 /// and entries that vanished after expansion are skipped. Returns the number of
-/// entries added. When nothing was added (every match was special/vanished),
-/// the temp file is discarded and `out_path` is left untouched — see the
-/// `count == 0` guard — so a prior good archive is never replaced by an empty
-/// one, and the caller gets `0`.
+/// UNIQUE file paths added — a directory match expands to every file beneath it,
+/// and overlapping matches naming the same file count once, so this is neither
+/// the number of matches nor the number of tar entries (which also include bare
+/// directory headers). When no file was added, the temp file is discarded and
+/// `out_path` is left untouched — see the `count == 0` guard — so a prior good
+/// archive is never replaced by an empty one, and the caller gets `0`.
 fn write_archive<F>(
     root: &Path,
     rels: &[PathBuf],
@@ -328,7 +334,9 @@ where
     let tmp = NamedTempFile::new_in(root)
         .with_context(|| format!("creating temp archive in {}", root.display()))?;
 
-    let mut count = 0usize;
+    // Unique repo-relative paths of the content entries actually archived.
+    // A set, because a directory match and a leaf match can name the same file.
+    let mut added: HashSet<PathBuf> = HashSet::new();
     {
         // Default level (6) is the crate's documented speed/size balance —
         // right for a quick ad-hoc snapshot over what are usually small config
@@ -361,27 +369,29 @@ where
                 builder
                     .append_path_with_name(&abs, rel)
                     .with_context(|| format!("adding symlink {} to archive", rel.display()))?;
+                added.insert(rel.clone());
             } else if file_type.is_dir() {
                 // NOT a blind `append_dir_all`: a directory match that is an
-                // ANCESTOR of `.superset/backups` (a literal `.superset`
-                // pattern, or a broad glob like `**` that matches the bare
-                // `.superset` component) would otherwise walk the live tree and
-                // pack every recovered secret under `.superset/backups/…`. The
-                // guarded walk prunes that subtree no matter how the dir match
-                // reached `rels` — the flat `under_backups_dir` retain filter
-                // (step 6) only catches leaf matches, not ancestor dirs.
-                append_dir_excluding_backups(&mut builder, root, rel, &abs)
+                // ANCESTOR of an excluded tree (a literal `.superset` pattern,
+                // or a broad glob like `**` that matches the bare `.superset`
+                // component) would otherwise walk the live tree and pack every
+                // recovered secret under `.superset/backups/…` and the plugin
+                // state under `.superset/.magic/`. The guarded walk prunes those
+                // subtrees no matter how the dir match reached `rels` — the flat
+                // retain filter (step 6) only catches leaf matches, not the
+                // ancestor dirs that sit above them.
+                append_dir_excluding_trees(&mut builder, root, rel, &abs, &mut added)
                     .with_context(|| format!("adding directory {} to archive", rel.display()))?;
             } else if file_type.is_file() {
                 builder
                     .append_path_with_name(&abs, rel)
                     .with_context(|| format!("adding file {} to archive", rel.display()))?;
+                added.insert(rel.clone());
             } else {
                 // Socket / fifo / other special file — skip.
                 continue;
             }
             on_event(&PackEvent::Add { rel: rel.clone() });
-            count += 1;
         }
 
         // Finalize both layers: tar footer, then flush the bzip2 stream.
@@ -389,10 +399,11 @@ where
         enc.finish().context("finalizing bzip2 stream")?;
     }
 
-    // Nothing was actually archived (every match was a special/vanished
-    // entry): drop the temp file and leave any existing archive untouched,
-    // rather than replacing a prior good backup with an empty tarball.
-    if count == 0 {
+    // No file was actually archived (every match was special, vanished, or a
+    // directory that held nothing but excluded/empty subtrees): drop the temp
+    // file and leave any existing archive untouched, rather than replacing a
+    // prior good backup with an empty tarball.
+    if added.is_empty() {
         return Ok(0);
     }
 
@@ -401,29 +412,37 @@ where
     tmp.persist(out_path)
         .with_context(|| format!("persisting archive to {}", out_path.display()))?;
 
-    Ok(count)
+    Ok(added.len())
 }
 
 /// Recursively add the directory match `rel` (rooted at `abs`) to `builder`,
-/// EXCLUDING any descendant under the tool's own `.superset/backups/` tree so a
-/// recovered secret is never packed. Mirrors `append_dir_all`'s recursive walk
-/// but prunes the backups subtree (keyed on each entry's `root`-relative path,
-/// via [`crate::sync::reverse_sync::under_backups_dir`]) and never follows
-/// symlinks (a symlink is stored as a single symlink entry, matching the
-/// top-level classification and `apply.rs`). Entry names are `root`-relative so
-/// the archive keeps the same layout `append_dir_all` produced.
-fn append_dir_excluding_backups<W: Write>(
+/// EXCLUDING every descendant that falls in one of `crate::sync::EXCLUDED_TREES`
+/// — recovered secrets under `.superset/backups/`, the plugin's
+/// `.superset/.magic/` state, `.scratchpad`, and `.git`. A single directory
+/// match can sit above several of them at once (a bare `.superset` is the
+/// ancestor of both `.magic` and `backups`), which the per-entry filter handles
+/// naturally: each is pruned as the walk reaches it.
+///
+/// Mirrors `append_dir_all`'s recursive walk but prunes those subtrees (keyed on
+/// each entry's `root`-relative path, via [`crate::sync::under_excluded_tree`])
+/// and never follows symlinks (a symlink is stored as a single symlink entry,
+/// matching the top-level classification and `apply.rs`). Entry names are
+/// `root`-relative so the archive keeps the same layout `append_dir_all`
+/// produced. Every file/symlink actually written is recorded in `added`, which
+/// is what `write_archive` reports as the pack's unique-path count.
+fn append_dir_excluding_trees<W: Write>(
     builder: &mut tar::Builder<W>,
     root: &Path,
     rel: &Path,
     abs: &Path,
+    added: &mut HashSet<PathBuf>,
 ) -> Result<()> {
     let walker = WalkDir::new(abs)
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| match e.path().strip_prefix(root) {
-            // Prune the backups subtree wherever it appears under the match.
-            Ok(r) => !crate::sync::reverse_sync::under_backups_dir(r),
+            // Prune each excluded subtree wherever it appears under the match.
+            Ok(r) => !crate::sync::under_excluded_tree(r),
             Err(_) => true,
         });
     for entry in walker {
@@ -441,6 +460,7 @@ fn append_dir_excluding_backups<W: Write>(
             builder
                 .append_path_with_name(path, name)
                 .with_context(|| format!("adding {} to archive", name.display()))?;
+            added.insert(name.to_path_buf());
         }
         // Special files (socket / fifo) are skipped, as at the top level.
     }
