@@ -347,3 +347,35 @@ fn version_drift_notice_is_silent_when_the_pin_file_is_absent() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(version_drift_notice(Some(dir.path().to_path_buf())), None);
 }
+
+/// The injected guidance must name the wrapper, `ss-magic-plugin`, and never a
+/// bare `ss-magic`.
+///
+/// The model runs these commands through the Bash tool, where
+/// `${CLAUDE_PLUGIN_DATA}` is not exported -- so the bootstrapped binary cannot
+/// be named directly, and the wrapper is what resolves it. A bare `ss-magic`
+/// would also resolve against whatever the user has on PATH, which is the
+/// reason R75 gives the wrapper a distinct name in the first place. Guidance
+/// naming a command the model cannot reliably run is worse than no guidance,
+/// and it ships on every session start, so it is worth a test of its own.
+#[test]
+fn the_injected_guidance_names_the_wrapper_not_a_bare_ss_magic() {
+    for line in CHECKLIST_VERBS.lines() {
+        let cmd = line.trim();
+        if cmd.is_empty() {
+            continue;
+        }
+        assert!(
+            cmd.starts_with("ss-magic-plugin checklist "),
+            "every verb line must invoke the wrapper; got: {cmd}"
+        );
+    }
+    // Belt and braces: no line may start with the bare binary name, which is
+    // what a careless edit would reintroduce.
+    assert!(
+        !CHECKLIST_VERBS
+            .lines()
+            .any(|l| l.trim().starts_with("ss-magic plugin")),
+        "the guidance must not name a bare `ss-magic`"
+    );
+}

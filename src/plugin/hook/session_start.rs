@@ -20,19 +20,27 @@ use crate::plugin::hook::event::{Payload, Response};
 use crate::plugin::hook::{HookContext, Outcome};
 use crate::plugin::scratchpad::{self, Report};
 
-/// The `ss-magic plugin checklist` verb family (R89, R90), spelled out here
-/// only so the injected guidance can name them. The schema and the verbs
-/// themselves belong to U27; this module never reads, writes, or even checks
-/// for `checklist.json`'s existence — it states where the pointer will
-/// resolve and how to reach it, nothing more.
+/// The checklist verb family (R89, R90), spelled out here only so the injected
+/// guidance can name them. The schema and the verbs themselves belong to
+/// `checklist`; this module never reads, writes, or even checks for
+/// `checklist.json`'s existence — it states where the pointer will resolve and
+/// how to reach it, nothing more.
+///
+/// These are spelled `ss-magic-plugin`, the wrapper on the Bash tool's PATH —
+/// **not** a bare `ss-magic`. The model runs these through the Bash tool, where
+/// `${CLAUDE_PLUGIN_DATA}` is not exported and so the bootstrapped binary
+/// cannot be named directly; the wrapper resolves it and injects the `plugin`
+/// verb. A bare `ss-magic` would also resolve against whatever the user happens
+/// to have on PATH, which is exactly why R75 gives the wrapper a distinct name.
 const CHECKLIST_VERBS: &str = "\
-    ss-magic plugin checklist init <slug>
-    ss-magic plugin checklist add-item <section> <id>
-    ss-magic plugin checklist add-entry <id>
-    ss-magic plugin checklist set <id> <dotted-key> <value>
-    ss-magic plugin checklist done <id>
-    ss-magic plugin checklist list
-    ss-magic plugin checklist verify";
+    ss-magic-plugin checklist init <slug>
+    ss-magic-plugin checklist add-item <section> <id>
+    ss-magic-plugin checklist add-entry <id>
+    ss-magic-plugin checklist set <id> <dotted-key> <value>
+    ss-magic-plugin checklist done <id>
+    ss-magic-plugin checklist list
+    ss-magic-plugin checklist verify
+    ss-magic-plugin checklist render-md";
 
 /// The pointer's file name inside the state root (R89) — not yet written by
 /// anything in this codebase (U27 owns that write path). Named here only so
