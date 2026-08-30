@@ -41,8 +41,9 @@
 //! `heartbeat.rs` (the machine-level `hooks.jsonl` row every hook leaves
 //! behind), `cache.rs` (the hash-keyed conclusion cache behind `conclude` /
 //! `conclusions` / `gc`), `ledger.rs` (the machine-level cost ledger
-//! `SessionEnd` appends to, and the `cost` verb that reports it) and, added by
-//! later units, `status.rs` and `checklist/`.
+//! `SessionEnd` appends to, and the `cost` verb that reports it), `checklist/`
+//! (the typed checklist document, its canonical ordering and its validator,
+//! which knows nothing about hooks) and, added by later units, `status.rs`.
 
 use std::process::ExitCode;
 
@@ -52,6 +53,7 @@ use crate::tui::style;
 
 pub(crate) mod bypass;
 pub(crate) mod cache;
+pub(crate) mod checklist;
 pub(crate) mod claim;
 pub(crate) mod config;
 pub(crate) mod expect_artifact;
