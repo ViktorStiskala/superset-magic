@@ -55,6 +55,7 @@ use globset::Glob;
 
 use crate::plugin::bypass;
 use crate::plugin::cache;
+use crate::plugin::checklist;
 use crate::plugin::hook::event::{
     Payload, PermissionDecision, PreToolUse, PreToolUseResponse, Response,
 };
@@ -97,15 +98,15 @@ const MAX_WALK_DEPTH: usize = 64;
 /// answer "which worktree is this" without asking git.
 const ROOT_MARKER: &str = ".superset/magic.json";
 
-// ── The checklist seam (R88) — U28 plugs in here ─────────────────────────────
+// ── The checklist deny (R88) ─────────────────────────────────────────────────
 
 /// What the checklist classifier decided about a tool's target path.
 ///
-/// This is U28's seam, and its position in [`gate`] is load-bearing: the
-/// classification runs FIRST, ahead of every exemption below it. The reason is
-/// specific. A checklist file is meant to be reached through the
-/// `ss-magic plugin checklist` verbs, which render it through the binary's own
-/// renderer inside an untrusted-data envelope. If the exemptions ran first, an
+/// Its position in [`gate`] is load-bearing: the classification runs FIRST,
+/// ahead of every exemption below it. The reason is specific. A checklist file
+/// is meant to be reached through the `ss-magic-plugin checklist` verbs, which
+/// render it through the binary's own renderer inside an untrusted-data
+/// envelope. If the exemptions ran first, an
 /// agent dispatched to "go read the checklist" would be waved through by the
 /// subagent exemption and pull the raw document into its context, and from
 /// there into its report — precisely the leak the verbs exist to prevent. The
@@ -123,20 +124,150 @@ pub(crate) enum Classification {
     /// even for a checklist large enough to trip the size threshold too. The
     /// two denials lead to different places and the model must get the right
     /// one.
-    #[allow(dead_code)] // Constructed by U28; the ordering tests build it today.
     Checklist { reason: String },
 }
 
 /// How [`gate`] asks whether a path is a checklist file. A function pointer
-/// rather than a direct call so the ordering can be tested: a test supplies a
-/// classifier that says "checklist" for everything and asserts the deny still
-/// wins over a subagent read, a state-tree path, a `.png` and an `Edit`.
+/// rather than a direct call so the ordering can be tested independently of
+/// what counts as a checklist: a test supplies a classifier that says
+/// "checklist" for everything and asserts the deny still wins over a subagent
+/// read, a state-tree path, a `.png` and an `Edit`.
 type Classifier = fn(&HookContext<'_>, &Path) -> Classification;
 
-/// The stub U28 replaces. Until then nothing is ever classified as a checklist
-/// and the gate behaves exactly as the size machinery below describes.
-fn classify_checklist(_ctx: &HookContext<'_>, _realpath: &Path) -> Classification {
-    Classification::Ordinary
+/// The shipped classifier: is this path the operator checklist?
+///
+/// Two routes count, because there are two ways to arrive at the document.
+/// The pointer at `.superset/.magic/checklist.json` names the active
+/// checklist, and the committed naming convention
+/// (`docs/actions/<stem>.checklist.json`) identifies one in a repository that
+/// has no pointer yet. Either is enough — a repository can have both, and a
+/// checklist reached by the pointer and the same checklist reached by its path
+/// are the same file and get the same answer.
+fn classify_checklist(ctx: &HookContext<'_>, realpath: &Path) -> Classification {
+    let root = classification_root(ctx);
+    let resolved = absolutize(ctx.cwd(), realpath);
+    if !is_checklist_path(&root, &resolved) {
+        return Classification::Ordinary;
+    }
+    Classification::Checklist {
+        reason: checklist_reason(tool_label(ctx), &display_path(&root, &resolved)),
+    }
+}
+
+/// The worktree the checklist is looked for in.
+///
+/// The same root the rest of the gate uses, resolved the same way. The walk
+/// canonicalizes as it goes, so its answer already matches the realpath the
+/// gate hands the classifier; only the last-resort fallback has been through
+/// no such walk and needs resolving here.
+fn classification_root(ctx: &HookContext<'_>) -> PathBuf {
+    worktree_root(ctx.cwd()).unwrap_or_else(|| {
+        ctx.config_root
+            .canonicalize()
+            .unwrap_or_else(|_| ctx.config_root.clone())
+    })
+}
+
+/// The tool's target as an absolute path, without touching the filesystem.
+///
+/// [`gate`] canonicalizes the target, which resolves it fully — but only when
+/// the file is there. A `Write` creating a checklist that does not exist yet
+/// leaves the path exactly as the tool spelled it, and the harness's tools take
+/// absolute paths, so that is normally already absolute. A relative one is
+/// joined onto the envelope's `cwd` rather than left to fail the comparison:
+/// otherwise an agent could reach the file simply by spelling the path
+/// differently. Stat'ing here would defeat the point, since the file this
+/// branch exists for is precisely the one that is not there.
+fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    cwd.canonicalize()
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .join(path)
+}
+
+/// Whether `path` is the checklist, by either route.
+fn is_checklist_path(root: &Path, path: &Path) -> bool {
+    // Purely lexical and free, so it goes first — and it is the only one of the
+    // two that answers at all before `checklist init` has ever run.
+    if checklist::matches_convention(root, path) {
+        return true;
+    }
+
+    let Some(target) = checklist::pointer_target(root) else {
+        return false;
+    };
+
+    // The pointer records the intended path and is deliberately never stat'd,
+    // so a checklist that has not been written yet still compares equal here.
+    // That matters: without it an agent could read (or create) the document by
+    // getting to it before `init` does.
+    if target == path {
+        return true;
+    }
+
+    // Only worth resolving once the cheap comparison has failed: the pointer
+    // may spell the path through a symlinked directory, in which case the two
+    // agree only after both sides are resolved. A target that is not there
+    // fails this, which is exactly right — the lexical comparison above is the
+    // answer for that case.
+    target.canonicalize().is_ok_and(|resolved| resolved == path)
+}
+
+/// The tool's own name, for the first line of the denial. Reads it back out of
+/// the envelope so the sentence says `Read`, `Edit` or `Write` rather than
+/// something generic; the fallback is unreachable through [`gate`], which has
+/// already matched the variant.
+fn tool_label<'a>(ctx: &'a HookContext<'_>) -> &'a str {
+    match &ctx.envelope.payload {
+        Payload::PreToolUse(payload) => payload.tool_name.as_str(),
+        _ => "tool call",
+    }
+}
+
+/// The checklist denial (R88): what to run instead of reading or writing the
+/// file.
+///
+/// It deliberately says nothing about Explore agents. The page-fault denials
+/// further down route an oversized read to a subagent, and a model handed that
+/// instruction for a checklist would dispatch an agent that pulls the raw
+/// document into ITS window and repeats it in a report — the leak the verbs
+/// exist to prevent by rendering the document through the binary instead. Size
+/// never enters into it either: a checklist is machine-written bookkeeping
+/// whose useful form is what `list` and `render-md` print, so there is nothing
+/// a summary of the raw bytes would add.
+///
+/// The commands are spelled `ss-magic-plugin`, the wrapper on the Bash tool's
+/// PATH, and not a bare `ss-magic`: the model runs these through Bash, where
+/// `${CLAUDE_PLUGIN_DATA}` is not exported and the bootstrapped binary cannot
+/// be named directly. `session_start.rs` spells the same family the same way,
+/// for the same reason.
+fn checklist_reason(tool: &str, shown: &str) -> String {
+    format!(
+        "ss-magic blocked this {tool}: {shown} is the operator checklist, which is \
+         reached through its own commands rather than by reading or writing the file \
+         directly.\n\
+         \n\
+         The file is machine-written JSON. Reading it raw spends your context on \
+         bookkeeping you do not need, and hand-editing it loses the canonical ordering \
+         and the validation every write goes through. Run these instead:\n\
+         \n\
+         \x20 to see what it says\n\
+         \x20      ss-magic-plugin checklist list        the checklist, rendered\n\
+         \x20      ss-magic-plugin checklist render-md   the full Markdown rendering\n\
+         \x20      ss-magic-plugin checklist verify      what is missing or inconsistent\n\
+         \n\
+         \x20 to change it\n\
+         \x20      ss-magic-plugin checklist init <slug>\n\
+         \x20      ss-magic-plugin checklist add-item <section> <id> [TITLE]\n\
+         \x20      ss-magic-plugin checklist add-entry <id> [SUMMARY]\n\
+         \x20      ss-magic-plugin checklist set <id> <dotted-key> <value>\n\
+         \x20      ss-magic-plugin checklist done <id>\n\
+         \n\
+         Start with `ss-magic-plugin checklist list`. It tells you what this file says \
+         without putting the file in your window.\n"
+    )
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
@@ -181,7 +312,7 @@ impl GateTool {
 /// 1. **config** — the gate's tunables, already resolved for the envelope's
 ///    `cwd` by the wrapper (R53). The wrapper also ran R55's enablement gate,
 ///    so a repository with the plugin off never reaches this function at all.
-/// 2. **checklist** (R88) — U28's seam, ahead of every exemption.
+/// 2. **checklist** (R88) — denied outright, ahead of every exemption.
 /// 3. **tool** — only `Read` reaches the size machinery.
 /// 4. **state tree** (R43) — `.superset/.magic/`, unconditionally.
 /// 5. **subagent** (R52) — the agent the gate routes to must be able to read.
@@ -205,7 +336,10 @@ fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
 
     // ── 2. Checklist classification (R88) ────────────────────────────────────
     // Before every exemption, and before the tool branch, because it is the one
-    // decision that applies to writes as well as reads.
+    // decision that applies to writes as well as reads. The target is resolved
+    // first so reaching the file through a symlink, or through the pointer, is
+    // the same case as naming it outright; a target that is not there yet keeps
+    // the path as spelled, which the classifier compares lexically.
     if let Some(target) = &target {
         let realpath = target.canonicalize().unwrap_or_else(|_| target.clone());
         if let Classification::Checklist { reason } = classify(ctx, &realpath) {

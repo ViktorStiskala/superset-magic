@@ -1076,19 +1076,266 @@ fn a_checklist_deny_consumes_no_bypass_claim() {
     assert!(claim.exists());
 }
 
-/// The shipped classifier is the stub U28 replaces: nothing is a checklist
-/// path yet, so today's behavior is exactly the size machinery below it.
+// ── The shipped classifier: what counts as a checklist (R88) ─────────────────
+
+impl Repo {
+    /// Record `rel` as the active checklist, the way `checklist init` does.
+    /// The file itself is not created — the pointer is written whether or not
+    /// the document exists.
+    fn point_at(&self, rel: &str) {
+        let pointer = checklist::Pointer {
+            path: rel.to_string(),
+            slug: "2026-08-demo".to_string(),
+            recorded_at: "2026-08-30T12:00:00Z".to_string(),
+        };
+        self.write_pointer(&serde_json::to_string(&pointer).unwrap());
+    }
+
+    /// Put arbitrary bytes where the pointer belongs, for the malformed case.
+    fn write_pointer(&self, body: &str) {
+        let path = checklist::pointer_path(&self.root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+}
+
+/// A deny that is the checklist deny: it names the wrapper's verb family and
+/// carries none of the page-fault routing. Returns the reason for further
+/// assertions.
+fn checklist_denial(outcome: &Outcome) -> &str {
+    let reason = denial(outcome);
+    assert!(
+        reason.contains("ss-magic-plugin checklist list"),
+        "the deny must name the checklist verb: {reason}"
+    );
+    assert!(
+        !reason.contains("Explore"),
+        "the deny must never route to an Explore agent: {reason}"
+    );
+    assert_eq!(outcome.detail.as_deref(), Some("deny: checklist path"));
+    reason
+}
+
+/// AE74. A `Read` from inside a dispatched agent and an `Edit` from the main
+/// thread are both denied, and both denials name the checklist verb.
+///
+/// These are the two exemptions that would otherwise hand the raw document
+/// over: R52 waves a subagent's read through, and the tool branch waves every
+/// write through because there is no context to save on one. Neither waives
+/// this. The fixture has no pointer, so the naming convention alone is doing
+/// the work — a repository that has never run `checklist init` is still
+/// covered.
 #[test]
-fn the_shipped_classifier_classifies_nothing_yet() {
+fn a_checklist_is_denied_from_a_subagent_and_denied_for_an_edit() {
     let repo = repo();
     let file = repo.file_of_size("docs/actions/2026-08-x.checklist.json", 100);
-    let event = HookEvent::PreToolUse;
-    let env = read_of(&repo.root, &file);
-    let config = default_config();
-    let ctx = ctx_for(&event, &env, &repo.root, &config);
-    assert!(matches!(
-        classify_checklist(&ctx, &file),
-        Classification::Ordinary
+    assert!(!checklist::pointer_path(&repo.root).exists());
+
+    let read = run(
+        &from_subagent(read_of(&repo.root, &file)),
+        &repo.root,
+        &default_config(),
+    );
+    assert!(checklist_denial(&read).starts_with("ss-magic blocked this Read"));
+
+    let edit = run(
+        &envelope(&repo.root, "Edit", serde_json::json!({ "file_path": &file })),
+        &repo.root,
+        &default_config(),
+    );
+    assert!(checklist_denial(&edit).starts_with("ss-magic blocked this Edit"));
+}
+
+/// A notebook edit spells its target `notebook_path`, and the deny has to see
+/// it there too — otherwise the one tool whose key differs is the way past it.
+#[test]
+fn a_notebook_edit_of_a_checklist_is_denied() {
+    let repo = repo();
+    let file = repo.file_of_size("docs/actions/2026-08-x.checklist.json", 100);
+    let env = envelope(
+        &repo.root,
+        "NotebookEdit",
+        serde_json::json!({ "notebook_path": &file }),
+    );
+    checklist_denial(&run(&env, &repo.root, &default_config()));
+}
+
+/// The pointer's target is denied wherever it points — including inside
+/// `.superset/.magic/`, which R43 otherwise exempts unconditionally. The
+/// exemption exists so a session can re-read its own scratchpad notes; it is
+/// not a way to stage a checklist somewhere the deny does not look.
+#[test]
+fn a_checklist_the_pointer_names_inside_the_state_tree_is_still_denied() {
+    let repo = repo();
+    let file = repo.file_of_size(".superset/.magic/hidden.checklist.json", 100);
+    repo.point_at(".superset/.magic/hidden.checklist.json");
+
+    checklist_denial(&run(&read_of(&repo.root, &file), &repo.root, &default_config()));
+}
+
+/// The convention is the exact directory, not a suffix match: a file with the
+/// same name somewhere else is an ordinary file, and gating it would deny
+/// reads the deny has no business in.
+#[test]
+fn a_same_named_file_outside_docs_actions_is_not_a_checklist() {
+    let repo = repo();
+    for rel in [
+        "notes/2026-08-x.checklist.json",
+        "docs/2026-08-x.checklist.json",
+        // Nested one level deeper than the convention allows. The verbs never
+        // write here; a checklist that genuinely lived here would be reached
+        // through the pointer instead.
+        "docs/actions/archive/2026-08-x.checklist.json",
+    ] {
+        let file = repo.file_of_size(rel, 100);
+        let outcome = run(&read_of(&repo.root, &file), &repo.root, &default_config());
+        assert!(
+            allowed(&outcome).starts_with("allow: under the gate"),
+            "{rel} should not be a checklist"
+        );
+    }
+}
+
+/// And a file that IS in `docs/actions/` but is not a checklist document —
+/// the notes and diagrams that live beside one — reads normally.
+#[test]
+fn a_docs_actions_file_that_is_not_a_checklist_reads_normally() {
+    let repo = repo();
+    for rel in [
+        "docs/actions/README.md",
+        "docs/actions/2026-08-x.json",
+        // The suffix with nothing in front of it is not a stem.
+        "docs/actions/.checklist.json",
+    ] {
+        let file = repo.file_of_size(rel, 100);
+        let outcome = run(&read_of(&repo.root, &file), &repo.root, &default_config());
+        assert!(
+            allowed(&outcome).starts_with("allow: under the gate"),
+            "{rel} should not be a checklist"
+        );
+    }
+}
+
+/// A checklist past the size gate gets the checklist deny, not the page-fault
+/// one, even with a conclusion cached for it. The two denials lead to
+/// different places: one says "run the verb", the other says "send an agent to
+/// read the file", and the second is exactly what must never be said about a
+/// checklist.
+#[test]
+fn an_oversized_checklist_gets_the_checklist_deny_not_the_page_fault_text() {
+    let repo = repo();
+    let file = repo.file_of_size("docs/actions/2026-08-big.checklist.json", 400_000);
+    repo.conclude(&file, "CONCLUSION-BODY");
+
+    let outcome = run(&read_of(&repo.root, &file), &repo.root, &default_config());
+    let reason = checklist_denial(&outcome);
+    assert!(!reason.contains("CONCLUSION-BODY"));
+    assert!(!reason.contains("ss-magic plugin bypass"));
+}
+
+/// R88 matches the RESOLVED target, so a symlink to a checklist is the same
+/// case as naming the checklist. Otherwise one `ln -s` defeats the deny.
+#[test]
+fn a_checklist_reached_through_a_symlink_is_denied() {
+    let repo = repo();
+    let file = repo.file_of_size("docs/actions/2026-08-x.checklist.json", 100);
+    let link = repo.root.join("shortcut.json");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+
+    checklist_denial(&run(&read_of(&repo.root, &link), &repo.root, &default_config()));
+}
+
+/// A checklist that does not exist yet is still a checklist path. The pointer
+/// is written before the document is (`init` records the intended path first),
+/// and the classifier never stats — so an agent cannot get at the file by
+/// creating it, or read one by racing whoever is about to.
+#[test]
+fn a_write_of_a_checklist_that_does_not_exist_yet_is_denied() {
+    let repo = repo();
+
+    // By the naming convention, with nothing on disk at all.
+    let by_convention = repo.root.join("docs/actions/2026-08-new.checklist.json");
+    assert!(!by_convention.exists());
+    let env = envelope(
+        &repo.root,
+        "Write",
+        serde_json::json!({ "file_path": &by_convention }),
+    );
+    assert!(checklist_denial(&run(&env, &repo.root, &default_config()))
+        .starts_with("ss-magic blocked this Write"));
+
+    // And by a pointer whose target has not been written, at a path the
+    // convention would not recognise on its own.
+    repo.point_at("state/tracker.json");
+    let by_pointer = repo.root.join("state/tracker.json");
+    assert!(!by_pointer.exists());
+    let env = envelope(
+        &repo.root,
+        "Write",
+        serde_json::json!({ "file_path": &by_pointer }),
+    );
+    checklist_denial(&run(&env, &repo.root, &default_config()));
+}
+
+/// A pointer that cannot be parsed leaves the naming convention as the only
+/// route, rather than failing the classification open or shut for everything.
+#[test]
+fn a_malformed_pointer_leaves_the_convention_as_the_only_route() {
+    let repo = repo();
+    repo.write_pointer("{ this is not json");
+
+    let unrelated = repo.file_of_size("state/tracker.json", 100);
+    assert!(
+        allowed(&run(&read_of(&repo.root, &unrelated), &repo.root, &default_config()))
+            .starts_with("allow: under the gate")
+    );
+
+    let conventional = repo.file_of_size("docs/actions/2026-08-x.checklist.json", 100);
+    checklist_denial(&run(
+        &read_of(&repo.root, &conventional),
+        &repo.root,
+        &default_config(),
     ));
 }
 
+/// The pointer is a file on disk and its contents are not automatically
+/// trustworthy: a path that could leave the repository is refused rather than
+/// followed, so a hand-edited pointer cannot turn the deny into a way to block
+/// reads anywhere on the filesystem.
+#[test]
+fn a_pointer_that_escapes_the_repository_is_not_followed() {
+    let repo = repo();
+    let file = repo.file_of_size("state/tracker.json", 100);
+    repo.point_at(&file.to_string_lossy());
+
+    assert!(
+        allowed(&run(&read_of(&repo.root, &file), &repo.root, &default_config()))
+            .starts_with("allow: under the gate")
+    );
+}
+
+/// The whole deny text, checked once: it names every verb the model needs and
+/// carries nothing that would send it back to the raw file.
+#[test]
+fn the_deny_names_the_checklist_verbs_and_the_wrapper_spelling() {
+    let repo = repo();
+    let file = repo.file_of_size("docs/actions/2026-08-x.checklist.json", 100);
+    let outcome = run(&read_of(&repo.root, &file), &repo.root, &default_config());
+    let reason = checklist_denial(&outcome);
+
+    assert!(reason.contains("docs/actions/2026-08-x.checklist.json"));
+    for verb in [
+        "list", "render-md", "verify", "init", "add-item", "add-entry", "set", "done",
+    ] {
+        assert!(
+            reason.contains(&format!("ss-magic-plugin checklist {verb}")),
+            "the deny should name `{verb}`: {reason}"
+        );
+    }
+    // The wrapper, never a bare `ss-magic`: the model runs these through Bash,
+    // where the bootstrapped binary cannot be named directly.
+    assert!(
+        !reason.contains("ss-magic plugin checklist"),
+        "the deny must use the wrapper spelling: {reason}"
+    );
+}

@@ -13,8 +13,8 @@
 //! U26) a renderer. It knows nothing about hooks, tool envelopes or permission
 //! decisions — the same dependency direction [`crate::plugin::cache`] follows.
 //! The `PreToolUse` gate that denies a direct `Read` or `Edit` of a checklist
-//! is a *caller*: it asks whether a resolved path is a checklist file and acts
-//! on the answer. Inverting that, by teaching the schema about tool payloads,
+//! is a *caller*: it asks [`pointer_target`] and [`matches_convention`]
+//! whether a resolved path is a checklist file and acts on the answer. Inverting that, by teaching the schema about tool payloads,
 //! would make the format untestable without a harness envelope.
 //!
 //! ## The pieces
@@ -37,13 +37,13 @@
 //! business, but the write, the verb dispatch and the pointer belong to the
 //! verb layer.
 
-// The verbs (U27) are wired, so the document model now has a production
-// caller. What is still unused is the surface the Read/Edit deny (U28) will
-// consume — `verbs`' pointer and naming-convention helpers, which exist for
-// exactly that caller — plus a handful of model accessors the verbs happen
-// not to need. One pair of module-wide allows rather than a dozen individual
-// attributes; drop them once U28 lands, and anything still unused then is
-// genuinely dead.
+// Both production callers are now wired: the verbs are the write path, and the
+// `PreToolUse` deny consumes `pointer_target` and `matches_convention`. What
+// remains unreferenced outside this family's own tests is the rest of the
+// re-exported surface — the constants and `Pointer` that let a caller name a
+// checklist path, and a handful of model accessors the verbs happen not to
+// need. They are the format's vocabulary rather than leftovers, so one pair of
+// module-wide allows keeps them without a dozen individual attributes.
 #![allow(dead_code, unused_imports)]
 
 mod order;
