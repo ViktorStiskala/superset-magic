@@ -749,6 +749,18 @@ blocked. Flag a nudge that sets a decision, that widens the `gh pr` match beyond
   `ss-magic` would resolve non-deterministically against a user's own install).
   A missing binary is a normal state – it exits 0 with one stderr line. No skill
   body may name `${CLAUDE_PLUGIN_DATA}` or a bare `ss-magic`; CI asserts this.
+- **The wrapper spelling is required in ALL model-facing text, not just skill
+  bodies.** Any command a hook response tells the model to run – every deny
+  reason, nudge, and `additionalContext` – is executed through the Bash tool,
+  where `${CLAUDE_PLUGIN_DATA}` is NOT exported, so only `ss-magic-plugin`
+  resolves. A bare `ss-magic` there reaches nothing on a marketplace-only
+  install (the only delivery path), so a conclusion can never be recorded and a
+  bypass never consumed – the same oversized Read stays a miss forever. This
+  already bit once: the checklist deny carried the wrapper from the start while
+  the size-gate deny quietly did not. Flag a bare `ss-magic` in any string that
+  reaches the model. **The human verbs' own `Usage:` strings are the deliberate
+  exception** – a person runs those in a terminal, where the bare name is
+  correct – so check where the string is printed, not just its text.
 
 ### `ss-magic plugin` never self-updates and never opens the TUI
 

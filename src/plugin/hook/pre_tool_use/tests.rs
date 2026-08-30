@@ -748,7 +748,7 @@ fn concurrent_gated_reads_race_for_one_claim_and_exactly_one_wins() {
 fn every_deny_reason_names_the_bypass_invocation_verbatim() {
     let repo = repo();
     let file = repo.file_of_size("docs/big.md", 200_000);
-    let expected = "ss-magic plugin bypass docs/big.md";
+    let expected = "ss-magic-plugin bypass docs/big.md";
 
     let miss = run(&read_of(&repo.root, &file), &repo.root, &default_config());
     assert!(denial(&miss).contains(expected), "{}", denial(&miss));
@@ -756,6 +756,52 @@ fn every_deny_reason_names_the_bypass_invocation_verbatim() {
     repo.conclude(&file, "a conclusion");
     let hit = run(&read_of(&repo.root, &file), &repo.root, &default_config());
     assert!(denial(&hit).contains(expected), "{}", denial(&hit));
+}
+
+/// No model-facing deny text may name a BARE `ss-magic`.
+///
+/// Every command in a hook response is run by the model through the Bash tool,
+/// and `${CLAUDE_PLUGIN_DATA}` is not exported there — so only the
+/// `ss-magic-plugin` wrapper on the PATH resolves. A bare `ss-magic` reaches
+/// either nothing or whatever the user happens to have installed, which on a
+/// marketplace-only install means a conclusion can never be recorded and a
+/// bypass can never be consumed: the same oversized Read stays a miss forever.
+///
+/// This is asserted over EVERY deny reason rather than per-spelling, because
+/// the checklist deny had carried the wrapper from the start while the size
+/// gate quietly did not. Patching the four strings without this test would fix
+/// the instance and leave the next one free to appear.
+///
+/// The human verbs' own usage strings are deliberately NOT covered: a person
+/// runs those in a terminal, where the bare name is the right one.
+#[test]
+fn no_model_facing_deny_text_names_a_bare_ss_magic() {
+    let repo = repo();
+
+    let big = repo.file_of_size("docs/big.md", 200_000);
+    let checklist = repo.file_of_size("docs/actions/2026-08-x.checklist.json", 400_000);
+
+    let miss_outcome = run(&read_of(&repo.root, &big), &repo.root, &default_config());
+    let miss = denial(&miss_outcome);
+    repo.conclude(&big, "a conclusion");
+    let hit_outcome = run(&read_of(&repo.root, &big), &repo.root, &default_config());
+    let hit = denial(&hit_outcome);
+    let deny_outcome = run(
+        &read_of(&repo.root, &checklist),
+        &repo.root,
+        &default_config(),
+    );
+    let deny = checklist_denial(&deny_outcome);
+
+    for (label, text) in [("miss", &miss), ("hit", &hit), ("checklist", &deny)] {
+        // `ss-magic-plugin` legitimately starts with `ss-magic`, so the bare
+        // form is only the one followed by a space.
+        assert!(
+            !text.contains("ss-magic plugin "),
+            "{label} deny names a bare `ss-magic`, which does not resolve in the \
+             Bash tool — use the `ss-magic-plugin` wrapper:\n{text}"
+        );
+    }
 }
 
 // ── The cache (R21–R24, R64) ─────────────────────────────────────────────────
@@ -772,7 +818,7 @@ fn two_misses_both_route_and_neither_returns_content() {
         let reason = denial(&outcome);
         assert!(reason.contains("Explore agent"), "attempt {attempt}: {reason}");
         assert!(
-            reason.contains("ss-magic plugin conclude big.rs"),
+            reason.contains("ss-magic-plugin conclude big.rs"),
             "attempt {attempt}: {reason}"
         );
         assert!(
@@ -1253,7 +1299,7 @@ fn an_oversized_checklist_gets_the_checklist_deny_not_the_page_fault_text() {
     let outcome = run(&read_of(&repo.root, &file), &repo.root, &default_config());
     let reason = checklist_denial(&outcome);
     assert!(!reason.contains("CONCLUSION-BODY"));
-    assert!(!reason.contains("ss-magic plugin bypass"));
+    assert!(!reason.contains("ss-magic-plugin bypass"));
 }
 
 /// R88 matches the RESOLVED target, so a symlink to a checklist is the same

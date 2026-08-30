@@ -664,6 +664,14 @@ the tree:
   model to update the checklist, but ONLY when `git::status_porcelain` shows a
   candidate checklist untracked or edited-but-unstaged. It never sets a decision;
   the command is never blocked, and the text says so.
+  Every command these three jobs put in front of the model is spelled
+  `ss-magic-plugin`, the wrapper on the Bash tool's PATH, and NEVER a bare
+  `ss-magic`: the model runs them through Bash, where `${CLAUDE_PLUGIN_DATA}` is
+  not exported and the bootstrapped binary cannot be named directly. The human
+  verbs' own `Usage:` strings keep the bare spelling deliberately, since a person
+  runs those in a terminal. `no_model_facing_deny_text_names_a_bare_ss_magic`
+  asserts the rule over every deny reason rather than per-string, because the
+  checklist deny carried the wrapper from the start while the size gate did not.
 - `hook/pre_compact.rs` – appends one timestamped entry to a tool-owned
   `PRE-COMPACT.md` in the session dir and returns silence. That file is
   deliberately NOT one of `STATE_FILES`: those are model-owned and never

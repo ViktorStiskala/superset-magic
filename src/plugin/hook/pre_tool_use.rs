@@ -1105,14 +1105,21 @@ fn hit_preamble(shown: &str, size: u64, threshold_lines: u32) -> String {
 
 /// The text following a cached conclusion: what to do if it did not answer the
 /// question, including the bypass invocation verbatim (R42).
+/// Like [`checklist_reason`], every command here is spelled `ss-magic-plugin` —
+/// the wrapper on the Bash tool's PATH — and never a bare `ss-magic`. This text
+/// is read by the model, which runs the command through Bash, where
+/// `${CLAUDE_PLUGIN_DATA}` is not exported and the bootstrapped binary cannot be
+/// named directly. A bare `ss-magic` would also resolve against whatever the
+/// user happens to have installed. The human verbs' own usage strings keep the
+/// bare spelling on purpose: a person runs those in a terminal.
 fn hit_epilogue(shown: &str) -> String {
     format!(
         "\nIf that does not answer your question, dispatch an Explore agent to read \
          {shown} — the gate does not apply inside a subagent — and have it record what \
-         it finds with `ss-magic plugin conclude {shown}`, replacing the entry above.\n\
+         it finds with `ss-magic-plugin conclude {shown}`, replacing the entry above.\n\
          \n\
          To read the raw bytes in THIS window instead, run exactly:\n\
-         \n    ss-magic plugin bypass {shown}\n\n\
+         \n    ss-magic-plugin bypass {shown}\n\n\
          and read the file again. That lets exactly the next Read of this file through, \
          once; the one after it is gated again.\n"
     )
@@ -1121,6 +1128,13 @@ fn hit_epilogue(shown: &str) -> String {
 /// The miss branch: no conclusion exists, so the denial has to explain how one
 /// gets made. It names the cache path and routes the work to an Explore agent
 /// (R21), and ends with the bypass invocation verbatim (R42).
+/// Like [`checklist_reason`], every command here is spelled `ss-magic-plugin` —
+/// the wrapper on the Bash tool's PATH — and never a bare `ss-magic`. This text
+/// is read by the model, which runs the command through Bash, where
+/// `${CLAUDE_PLUGIN_DATA}` is not exported and the bootstrapped binary cannot be
+/// named directly. A bare `ss-magic` would also resolve against whatever the
+/// user happens to have installed. The human verbs' own usage strings keep the
+/// bare spelling on purpose: a person runs those in a terminal.
 fn miss_reason(shown: &str, size: u64, threshold_lines: u32, entry: &str) -> String {
     format!(
         "ss-magic blocked this Read to keep it out of your context window.\n\
@@ -1137,7 +1151,7 @@ fn miss_reason(shown: &str, size: u64, threshold_lines: u32, entry: &str) -> Str
          read the whole file.\n\
          2. Have that agent record what it found, so the file is never read twice:\n\
          \n\
-         \x20      ss-magic plugin conclude {shown} <<'EOF'\n\
+         \x20      ss-magic-plugin conclude {shown} <<'EOF'\n\
          \x20      <what it found>\n\
          \x20      EOF\n\
          \n\
@@ -1149,7 +1163,7 @@ fn miss_reason(shown: &str, size: u64, threshold_lines: u32, entry: &str) -> Str
          {threshold_lines} lines goes through untouched.\n\
          \n\
          If you truly need the raw bytes in THIS window, run exactly:\n\
-         \n    ss-magic plugin bypass {shown}\n\n\
+         \n    ss-magic-plugin bypass {shown}\n\n\
          and read the file again. That lets exactly the next Read of this file through, \
          once; the one after it is gated again.\n",
         size_kb = kb(size),
