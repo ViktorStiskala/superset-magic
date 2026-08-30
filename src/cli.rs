@@ -2,10 +2,10 @@
 //!
 //! A handful of entry points don't justify pulling in `clap`, so this is a tiny
 //! parser over `std::env::args`: the first non-flag token selects `sync`,
-//! `pack`, `update`, or `init`; its absence falls through to the interactive
-//! (bare) mode. `--help`/`-h` short-circuits to a help request, and any
-//! unrecognized subcommand is an error carrying the same usage text the help
-//! path prints.
+//! `pack`, `update`, `init`, or `plugin`; its absence falls through to the
+//! interactive (bare) mode. `--version`/`-V` and `--help`/`-h` short-circuit to
+//! terminal signals, and any unrecognized subcommand is an error carrying the
+//! same usage text the help path prints.
 //!
 //! The parser is split from `main.rs` so it's unit-testable without spawning
 //! the process: `parse(&[String]) -> Parsed` takes argv (sans program name)
@@ -46,6 +46,17 @@ pub enum Parsed {
     /// given file patterns without the TUI. Carried separately from `Command`
     /// (which stays `Copy`) and handled before the update gate.
     Init(Vec<String>),
+    /// `plugin [ARGS...]`: the Claude Code plugin entry point. The remaining
+    /// argv is carried verbatim (flags included, unlike [`Parsed::Init`]) for
+    /// `plugin::parse` to split into a hook event or a human verb. Kept apart
+    /// from `Command` — which stays `Copy` — for the same reason `Init` is, and
+    /// handled before the auto-update gate so no plugin invocation can trigger
+    /// a self-update or the TUI.
+    Plugin(Vec<String>),
+    /// `--version`/`-V` was requested; print the version and exit 0. Terminal:
+    /// it is decided before any subcommand is selected, so a `--version` inside
+    /// a hook can never fall through to the bare menu.
+    Version,
     /// `--help`/`-h` was requested; print usage and exit 0.
     Help,
     /// An unrecognized subcommand; the string is the offending token. The
@@ -67,12 +78,17 @@ Commands:
   update         Force a self-update to the latest release
   init           Initialize .superset (magic.json layout) non-interactively;
                  optional file-pattern args become magic.json `files`
+  plugin         Claude Code plugin entry point: `plugin hook <event>` for the
+                 harness, or a named verb (`status`, `checklist`, …) for humans.
+                 Never self-updates and never opens the menu
 
 Options:
   -n, --no-backup   Skip the pre-overwrite backup on `sync`/`reverse-sync`.
                     WARNING: overwriting or deleting an untracked secret then
                     leaves NO recovery path (no git history, no backup).
-  -h, --help        Print this help (recognized before the subcommand)";
+  -h, --help        Print this help (recognized before the subcommand)
+  -V, --version     Print the version and exit (recognized anywhere before the
+                    `plugin` token)";
 
 /// Render the usage text. Kept as a function (not just the `const`) so the
 /// help path and the error path share one source of truth and a trailing
@@ -84,11 +100,15 @@ pub fn usage() -> &'static str {
 /// Parse argv with the program name already stripped (i.e. pass
 /// `std::env::args().skip(1)` collected into a slice).
 ///
-/// The first non-flag token decides the command. A leading `--help`/`-h`
-/// anywhere before a subcommand short-circuits to [`Parsed::Help`]. Other
-/// flags are skipped while scanning for the subcommand (none are defined
-/// today, but this keeps `ss-magic --foo sync` from mis-selecting `--foo`).
+/// `--version`/`-V` wins over everything (see [`version_requested`]). After
+/// that the first non-flag token decides the command, and a `--help`/`-h`
+/// anywhere before that token short-circuits to [`Parsed::Help`]. Other flags
+/// are skipped while scanning for the subcommand (none are defined today, but
+/// this keeps `ss-magic --foo sync` from mis-selecting `--foo`).
 pub fn parse(args: &[String]) -> Parsed {
+    if version_requested(args) {
+        return Parsed::Version;
+    }
     for (i, arg) in args.iter().enumerate() {
         if arg == "-h" || arg == "--help" {
             return Parsed::Help;
@@ -114,6 +134,10 @@ pub fn parse(args: &[String]) -> Parsed {
                     .cloned()
                     .collect(),
             ),
+            // Everything after `plugin` belongs to the plugin verb tree and is
+            // handed over untouched — flags included, because the verbs take
+            // their own (`--json`, `--local`, …).
+            PLUGIN_TOKEN => Parsed::Plugin(args[i + 1..].to_vec()),
             other => Parsed::Error(other.to_string()),
         };
     }
@@ -128,6 +152,29 @@ pub fn parse(args: &[String]) -> Parsed {
 /// maintainer should NOT "fix" one to match the other.
 fn has_no_backup(args: &[String]) -> bool {
     args.iter().any(|a| a == "--no-backup" || a == "-n")
+}
+
+/// The `plugin` subcommand token. Named because both [`parse`] and
+/// [`version_requested`] have to agree on where the plugin's own argv begins.
+const PLUGIN_TOKEN: &str = "plugin";
+
+/// True when `--version`/`-V` appears anywhere BEFORE the `plugin` token.
+///
+/// Two deliberate asymmetries with `-h`/`--help`, which is only recognized
+/// before the subcommand:
+///
+/// - The scan runs past a subcommand token, so `ss-magic sync --version` still
+///   prints the version. Without that, an unrecognized `--version` would be
+///   skipped as an unknown flag and fall through to `Command::Bare`, which is
+///   gated for auto-update and opens the interactive menu — exactly the wrong
+///   thing when a hook shells out to check which binary it got.
+/// - The scan STOPS at `plugin`, because everything after it is the plugin verb
+///   tree's own argv and a `-V` there may well be a verb's flag or value, not a
+///   request for the crate version.
+fn version_requested(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|a| a.as_str() != PLUGIN_TOKEN)
+        .any(|a| a == "--version" || a == "-V")
 }
 
 #[cfg(test)]
