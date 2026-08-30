@@ -416,6 +416,7 @@ fn run_human(verb: HumanVerb, args: &[String]) -> Result<ExitCode> {
         HumanVerb::Conclusions => cache::run_conclusions(args),
         HumanVerb::Gc => cache::run_gc(args),
         HumanVerb::Cost => ledger::run(args),
+        HumanVerb::Checklist => checklist::run(args),
         _ => {
             eprintln!(
                 "{}",
