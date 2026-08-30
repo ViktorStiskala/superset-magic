@@ -33,3 +33,21 @@ github-attestations = true
 install-path = "CARGO_HOME"
 
 # Plain vX.Y.Z tag trigger — standalone single-package repo, no tag namespace needed.
+
+# Publish the Claude Code plugin zip as a standalone release asset. It rides the
+# existing `gh release create` call, so the generated release.yml is unchanged.
+#
+# `artifacts` must name a literal filename (cargo-dist does not template it), so
+# this one string is the only hand-copied version in the release path – CI's
+# version-surface assertion (R95) is what stops it from drifting. The build
+# command takes no --out: scripts/build-plugin-zip.py derives the filename from
+# the crate version in Cargo.toml, so the value is copied here rather than
+# invented twice.
+#
+# dist gives an extra artifact no .sha256 sibling and no line in sha256.sum –
+# both are hardcoded to the per-target archives plus the source tarball. That is
+# why the plugin's integrity pin lives in .claude-plugin/marketplace.json, which
+# the Claude Code client verifies before extracting anything.
+[[dist.extra-artifacts]]
+artifacts = ["ss-magic-plugin-v0.10.0.zip"]
+build = ["python3", "scripts/build-plugin-zip.py"]

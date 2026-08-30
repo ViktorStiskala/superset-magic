@@ -1,10 +1,16 @@
-# Test suite CI.
+# Test suite CI, plus the plugin packaging assertions.
 #
 # Runs on every PR commit and on pushes to main. Also callable as a reusable
 # workflow: dist-workspace.toml registers it via `plan-jobs = ["./ci"]`, so the
 # cargo-dist release workflow (release.yml) invokes it as a `custom-ci` job and
 # artifact builds are gated on the suite passing (see docs/plans/
 # 2026-07-14-001-feat-ci-and-src-restructure-plan.md, KTD1).
+#
+# The `plugin` job guards the marketplace delivery path: the plugin zip's SHA-256
+# is committed into .claude-plugin/marketplace.json before the tag exists, and a
+# pin that does not match the tree it names installs nothing (or, worse, installs
+# unpinned). Because this workflow is a plan-phase job, those assertions run
+# before any release asset is built or published.
 #
 # The GITHUB_TOKEN stays read-only even when called from release.yml (which
 # grants contents: write): cargo test executes third-party build scripts, so
@@ -48,3 +54,104 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run test suite
         run: cargo test --locked
+
+  plugin:
+    name: plugin package
+    runs-on: ubuntu-latest
+    # Same reasoning as the test job: this gates releases, so a wedged run must
+    # fail fast rather than stall a tag for GitHub's 360-minute default.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The R98 check compares the plugin tree against the previous release
+          # tag, so the tags and the history reaching them must both be present.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The builder is the one artifact both a human and CI run. If they can
+      # ever disagree the pin is meaningless, so its own reproducibility and
+      # refusal tests run here rather than being trusted.
+      - name: Builder selftest (AE79 reproducibility, AE80 refusals)
+        run: python3 scripts/build-plugin-zip.py --selftest
+
+      # Three assertions, and the third is not implied by the second: a
+      # misspelled or absent `sha256` key makes the marketplace entry validate
+      # cleanly and install the plugin unpinned, which removes the only
+      # integrity control on it.
+      - name: Release assertions (R95 versions, R96 digest pin, R101 sha256 key)
+        run: python3 scripts/build-plugin-zip.py --check
+
+      # R98: the resolved version, not the digest, is the update signal.
+      # `claude plugin update` skips a plugin whose version already matches, so
+      # new bytes under an unchanged version reach nobody and nothing errors.
+      - name: Content change requires a version bump (R98)
+        run: |
+          set -euo pipefail
+          head_commit=$(git rev-parse 'HEAD^{commit}')
+          base=""
+          for tag in $(git tag --list --sort=-v:refname --merged HEAD); do
+            case "$tag" in
+              v[0-9]*.[0-9]*.[0-9]*|[0-9]*.[0-9]*.[0-9]*) ;;
+              *) continue ;;
+            esac
+            # On a tag build HEAD *is* the release tag; compare against the
+            # previous one, not against itself.
+            if [ "$(git rev-parse "$tag^{commit}")" != "$head_commit" ]; then
+              base="$tag"
+              break
+            fi
+          done
+          if [ -z "$base" ]; then
+            echo "no earlier release tag is reachable from HEAD; nothing to compare against."
+            exit 0
+          fi
+          echo "baseline: $base"
+          python3 scripts/build-plugin-zip.py --check-bump "$base"
+
+      # A skill body runs through the Bash tool, where ${CLAUDE_PLUGIN_DATA} is
+      # NOT exported - it reaches hook and MCP/LSP processes only. Naming it in a
+      # skill would expand to nothing and produce a path at the filesystem root,
+      # with no error. Skills reach the pinned binary through the bin/ wrapper
+      # instead, which is on the Bash tool's PATH while the plugin is enabled.
+      - name: No skill body names CLAUDE_PLUGIN_DATA
+        run: |
+          set -euo pipefail
+          if grep -rn 'CLAUDE_PLUGIN_DATA' plugin/skills/; then
+            echo "the paths above expand to nothing in the Bash tool; use ss-magic-plugin" >&2
+            exit 1
+          fi
+          echo "ok: no skill body names CLAUDE_PLUGIN_DATA"
+
+      # Run the exact command dist-workspace.toml registers as the extra
+      # artifact's build, and confirm it produces the filename `artifacts`
+      # declares. A mismatch there publishes no plugin asset at all, and the
+      # marketplace url would then 404 for every user.
+      - name: Build the asset cargo-dist will publish
+        run: |
+          set -euo pipefail
+          artifact=$(grep -oE 'ss-magic-plugin-v[0-9]+\.[0-9]+\.[0-9]+\.zip' dist-workspace.toml | head -1)
+          python3 scripts/build-plugin-zip.py
+          if [ ! -f "$artifact" ]; then
+            echo "builder produced no $artifact; dist would publish nothing and the" >&2
+            echo "marketplace url would 404 for every user. The builder derives its" >&2
+            echo "filename from Cargo.toml's version, so this means dist-workspace.toml" >&2
+            echo "and Cargo.toml disagree." >&2
+            exit 1
+          fi
+          python3 - "$artifact" <<'PY'
+          import hashlib, json, pathlib, sys, zipfile
+
+          path = pathlib.Path(sys.argv[1])
+          with zipfile.ZipFile(path) as zf:
+              stored = [i.filename for i in zf.infolist() if i.compress_type != zipfile.ZIP_STORED]
+              assert not stored, f"deflated entries in the archive: {stored}"
+              assert any(
+                  n == ".claude-plugin/plugin.json" for n in zf.namelist()
+              ), "the manifest is not at the zip root; the loader would not find it"
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          manifest = json.loads(pathlib.Path(".claude-plugin/marketplace.json").read_text())
+          pinned = manifest["plugins"][0]["source"]["sha256"].lower()
+          assert digest == pinned, f"built {digest} but the manifest pins {pinned}"
+          print(f"{path.name}: {digest} (matches the committed pin)")
+          PY

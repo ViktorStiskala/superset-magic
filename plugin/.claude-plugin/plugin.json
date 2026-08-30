@@ -1,0 +1,8 @@
+{
+  "name": "ss-magic",
+  "version": "0.10.0",
+  "description": "Session scratchpad, context page-fault gate, operator checklist, and cost ledger for the Superset workspace contract",
+  "repository": "https://github.com/ViktorStiskala/superset-magic",
+  "license": "MIT",
+  "author": { "name": "Viktor Stiskala" }
+}

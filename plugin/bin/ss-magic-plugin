@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Shipped at ${CLAUDE_PLUGIN_ROOT}/bin/, which is on the Bash tool's PATH while the plugin
+# is enabled. ${CLAUDE_PLUGIN_DATA} is NOT exported to the Bash tool, so re-derive the data
+# directory from the documented layout: <config dir>/plugins/data/<plugin>-<marketplace>/,
+# where every character outside [a-zA-Z0-9_-] is replaced (so "ss-magic@ss-magic" is
+# "ss-magic-ss-magic"). Prefer the real variable when one is set, for hook/MCP callers.
+set -u
+data="${CLAUDE_PLUGIN_DATA:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/data/ss-magic-ss-magic}"
+bin="$data/bin/ss-magic"
+if [ ! -x "$bin" ]; then
+  echo "ss-magic: pinned plugin binary not installed at $bin" >&2
+  echo "It installs on the next fresh session (SessionStart bootstrap); start a new session." >&2
+  exit 127
+fi
+exec "$bin" plugin "$@"
