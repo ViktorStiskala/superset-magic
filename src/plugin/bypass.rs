@@ -21,20 +21,12 @@
 //! syscall [`consume`] is built on.
 //!
 //! The obvious choice, "delete the file and treat a successful delete as the
-//! claim", does not work. It was tried, and it fails on macOS: with eight
-//! threads unlinking one path behind a barrier, **six to eight of them get
-//! `Ok`** and only the stragglers see `ENOENT`. Sequentially the second
-//! `unlink` correctly reports `ENOENT`, so the bug is invisible to any test
-//! that does not actually race — which is exactly how a one-shot bypass would
-//! have shipped letting a whole burst of reads through.
-//!
-//! `rename` measured clean on the same machine, in the same shape: exactly one
-//! winner, every trial. So the claim is a rename. Each consumer creates a
-//! private landing file in the claim directory and renames the claim onto it;
-//! the rename requires the source to exist, so exactly one consumer's rename
-//! finds it there. The landing file deletes itself when it drops, which is what
-//! takes the claim out of circulation. No lock is needed — this is one atomic
-//! syscall, not a read-modify-write.
+//! claim", does not work — see [`crate::plugin::claim`], which owns the
+//! rename-based mechanism that replaced it and the measurement that ruled the
+//! `unlink` version out. Everything this module does with a claim file goes
+//! through [`claim::take`]; the subagent-output declarations of
+//! [`crate::plugin::expect_artifact`] use the same helper, so the two one-shot
+//! stores cannot drift apart on the one property that matters.
 //!
 //! ## Why claims expire
 //!
@@ -55,6 +47,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::hashing;
+use crate::plugin::claim;
 use crate::plugin::scratchpad::{self, STATE_REL};
 use crate::tui::style;
 
@@ -161,31 +154,18 @@ pub fn record(dir: &Path, realpath: &Path, now: u64) -> Result<PathBuf> {
 pub fn consume(dir: &Path, realpath: &Path, now: u64) -> bool {
     let path = claim_path(dir, realpath);
 
-    // The landing spot. It is in the claim directory itself so the rename never
-    // crosses a filesystem, it has a name no `claim_path` can ever produce, and
-    // dropping it unlinks whatever ended up at that path — the claim, once the
-    // rename below has moved it there.
-    let Ok(landing) = tempfile::Builder::new()
-        .prefix(".taken-")
-        .suffix(".tmp")
-        .tempfile_in(dir)
-    else {
-        // No claim directory at all, so there is nothing to claim.
+    // Either there was no claim, or a concurrent read took it first. Both mean
+    // the same thing here: this read is not the one that gets through.
+    let Some(claimed) = claim::take(dir, &path) else {
         return false;
     };
-
-    if fs::rename(&path, landing.path()).is_err() {
-        // Either there was no claim, or a concurrent read took it first. Both
-        // mean the same thing here: this read is not the one that gets through.
-        return false;
-    }
 
     // Read the claim only now that it is ours, so nothing can change under us
     // between deciding and reading. A body we cannot parse is still a claim
     // somebody deliberately recorded, so it is honored rather than discarded on
     // a technicality.
-    let recorded = fs::read_to_string(landing.path())
-        .ok()
+    let recorded = claimed
+        .text()
         .and_then(|text| serde_json::from_str::<Claim>(&text).ok())
         .map(|claim| claim.recorded_epoch);
 

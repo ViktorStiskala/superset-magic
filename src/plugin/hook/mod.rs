@@ -71,6 +71,7 @@ pub mod event;
 mod pre_compact;
 mod pre_tool_use;
 mod session_start;
+mod subagent_stop;
 
 use event::{DecodeError, Envelope, Response};
 
@@ -245,8 +246,7 @@ pub fn route(event: &HookEvent) -> Option<Route> {
         // commit nudge) plug into the same handler.
         HookEvent::PreToolUse => ("pre_tool_use", pre_tool_use::handle, true),
         HookEvent::PreCompact => ("pre_compact", pre_compact::handle, true),
-        // U16.
-        HookEvent::SubagentStop => ("subagent_stop", not_implemented, true),
+        HookEvent::SubagentStop => ("subagent_stop", subagent_stop::handle, true),
         // U17.
         HookEvent::SessionEnd => ("session_end", not_implemented, false),
         // U30.

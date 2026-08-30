@@ -32,7 +32,10 @@
 //! work lives in siblings: `config.rs` (the typed `plugin` key and its
 //! overlay resolution), `identity.rs` (the `<repo>-<branch>` slug),
 //! `scratchpad.rs` (the `.superset/.magic/` state tree), `bypass.rs` (the
-//! one-shot Read-gate claims behind `bypass`), `tmproot.rs` (the
+//! one-shot Read-gate claims behind `bypass`), `expect_artifact.rs` (the
+//! pending subagent-output declarations behind `expect-artifact`, which
+//! `SubagentStop` enforces), `claim.rs` (the rename-based exactly-once file
+//! claim both of those one-shot stores are built on), `tmproot.rs` (the
 //! private per-machine temporary root and its fd-lock helper), `hook/` (the
 //! stdin decode, event routing, JSON envelope and fail-open wrapper),
 //! `heartbeat.rs` (the machine-level `hooks.jsonl` row every hook leaves
@@ -48,7 +51,9 @@ use crate::tui::style;
 
 pub(crate) mod bypass;
 pub(crate) mod cache;
+pub(crate) mod claim;
 pub(crate) mod config;
+pub(crate) mod expect_artifact;
 pub(crate) mod heartbeat;
 pub(crate) mod hook;
 pub(crate) mod identity;
@@ -402,6 +407,7 @@ fn run_human(verb: HumanVerb, args: &[String]) -> Result<ExitCode> {
     match verb {
         HumanVerb::Scratchpad => scratchpad::run(args),
         HumanVerb::Bypass => bypass::run(args),
+        HumanVerb::ExpectArtifact => expect_artifact::run(args),
         HumanVerb::Conclude => cache::run_conclude(args),
         HumanVerb::Conclusions => cache::run_conclusions(args),
         HumanVerb::Gc => cache::run_gc(args),

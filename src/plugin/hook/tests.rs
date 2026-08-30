@@ -694,11 +694,7 @@ fn a_well_formed_envelope_reaches_the_handler_with_its_context_resolved() {
 fn the_unimplemented_handlers_are_silent_successes() {
     let (_dir, root) = enabled_repo();
 
-    for event in [
-        HookEvent::SubagentStop,
-        HookEvent::SessionEnd,
-        HookEvent::FileChanged,
-    ] {
+    for event in [HookEvent::SessionEnd, HookEvent::FileChanged] {
         let (_d, run) = drive(&event, &envelope("X", &root, ""));
         assert_eq!(run.stdout, "", "{event:?}");
         assert_eq!(run.stderr, "", "{event:?}");

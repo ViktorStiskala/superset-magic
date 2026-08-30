@@ -43,13 +43,15 @@
 //! - Imperative text survives summarization. A file that says "run this
 //!   command" can be summarized into a cache entry that still says it, and the
 //!   gate then injects that entry straight into a denial the model is primed to
-//!   read as guidance. So the header is not enough: [`render`] wraps the whole
+//!   read as guidance. So the header is not enough: [`envelope`] wraps the whole
 //!   entry in an untrusted-data envelope whose instruction to treat the
 //!   contents as evidence comes *first*, before any of the quoted text (R64).
 //!   Text read before its framing has already been read as instruction.
 //!
-//! [`render`] is the one place that wrapping happens, so the `conclusions` verb
-//! and the gate's denial cannot drift apart.
+//! [`envelope`] is the one place that wrapping happens, so the `conclusions`
+//! verb and the gate's denial cannot drift apart — nor can the salvaged
+//! subagent transcripts of `hook/subagent_stop.rs`, which are the same class of
+//! ss-magic-generated text and go through the same call.
 //!
 //! ## Lifecycle (KTD14)
 //!
@@ -478,6 +480,9 @@ fn close_marker(nonce: &str) -> String {
 /// 2. the stamped header naming the original file (R54);
 /// 3. the agent's body, verbatim;
 /// 4. the closing marker.
+///
+/// Steps 1, 3 and 4 are [`envelope`]'s doing; this function's own job is
+/// step 2, deciding which header the entry gets.
 pub fn render(entry: &Entry, budget: Budget) -> String {
     // A hand-written or truncated entry has no header of its own. Synthesize
     // one rather than rendering a bare body: provenance is not optional, and an
@@ -496,16 +501,32 @@ pub fn render(entry: &Entry, budget: Budget) -> String {
         entry.header.clone()
     };
 
+    envelope(&head, &entry.body, &entry.path, budget)
+}
+
+/// Wrap `head` and `body` in the untrusted-data envelope (R54, R64).
+///
+/// Split out of [`render`] because a salvaged subagent transcript is the same
+/// class of content as a cached conclusion — repository-influenced text this
+/// tool generated, which some later session will read back with nothing else
+/// around to explain where it came from. Both go through this one function so
+/// the framing, the nonce and the truncation rule cannot drift into two
+/// slightly different versions of "quoted safely".
+///
+/// `whole` is where the reader is sent when the body does not fit the budget:
+/// the cache entry itself for a conclusion, the original transcript for a
+/// salvage.
+pub fn envelope(head: &str, body: &str, whole: &Path, budget: Budget) -> String {
     let notice = format!(
-        "\n[ss-magic: body truncated to the inline byte budget. The whole entry is at {}]\n",
-        entry.path.display()
+        "\n[ss-magic: body truncated to the inline byte budget. The whole text is at {}]\n",
+        whole.display()
     );
 
     // The nonce is not known yet, but every nonce is the same length, so the
     // fixed part's size is.
     // Trimmed so the blank line between the header and the body is exactly one,
     // whether the header came off disk (no trailing newline, the separator ate
-    // it) or was synthesized above (one).
+    // it) or was synthesized by a caller (one).
     let head = head.trim_end();
 
     let placeholder = "0".repeat(NONCE_HEX_LEN);
@@ -520,8 +541,8 @@ pub fn render(entry: &Entry, budget: Budget) -> String {
         + 1;
 
     let (body, truncated) = match budget {
-        Budget::Unbounded => (entry.body.as_str(), false),
-        Budget::Bytes(limit) => bound(&entry.body, limit.saturating_sub(fixed + notice.len())),
+        Budget::Unbounded => (body, false),
+        Budget::Bytes(limit) => bound(body, limit.saturating_sub(fixed + notice.len())),
     };
 
     let mut inner = String::with_capacity(head.len() + body.len() + notice.len() + 2);
