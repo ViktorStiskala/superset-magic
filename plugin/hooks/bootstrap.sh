@@ -400,7 +400,7 @@ if [ ! -f "$disclosed_marker" ]; then
         printf '  from %s/v%s (archive verified against its published SHA-256).\n' \
             "$RELEASE_PAGE_BASE" "$pin"
         printf '  It registers hooks that run for every session while the plugin is enabled:\n'
-        printf '  SessionStart, PreToolUse, PreCompact, SubagentStop, SessionEnd, FileChanged.\n'
+        printf '  SessionStart, PreToolUse, PreCompact, SubagentStop, SessionEnd.\n'
         printf '  This notice appears once per machine; later sessions are silent.\n'
     } >&2
     write_line "$disclosed_marker" "$pin"

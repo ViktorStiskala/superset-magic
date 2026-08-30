@@ -348,6 +348,31 @@ ss-magic already owns the per-worktree contract, already runs on every worktree,
 
 ### Scope Boundaries
 
+**Retired 2026-08-30 by R92's own probe gate: the `file-changed` direnv export (R92, AE77, U30).**\
+R92 reversed an earlier ruling (Q12) that refused a `FileChanged` hook, and made the reversal
+conditional: the event had to be shown to fire on a `.envrc` write and report the expected `cwd`
+with two worktrees of one repository open. **That evidence does not exist and the probe failed**,
+so the export does not ship.
+
+Two findings settle it. `validation-evidence.md`'s Q12 still lists `FileChanged` under refused –
+"the direnv workstream is out of scope, and its cross-worktree reliability was an open question in
+the source plan itself" – with no measurement of the event firing, its payload, its `cwd`, or the
+two-worktree case. And a static read of the pinned 2.1.251 binary found that a `FileChanged`
+entry's `matcher` **is** its watch-path list, with the harness skipping any entry that has none:
+the shipped entry had no matcher, so it registered zero watch paths and could never have fired.
+`plugin-assets.md`'s design note – "ships without a matcher, and filters inside the handler" – is
+therefore wrong, and the entry has been removed rather than left as a hook that silently does
+nothing.
+
+One measurement went the other way and is worth keeping: `CLAUDE_ENV_FILE` **is** present in the
+hook environment for `FileChanged`, contradicting the evidence record's claim that it exists only
+on `SessionStart`. So the export is blocked on reliability, not on the channel being absent.
+
+The handler itself is implemented and tested, and is inert because nothing routes to it. Shipping
+it needs a live probe on a real session with two worktrees open; until then, exporting secrets on
+an unverified assumption is the failure the amendment exists to prevent.
+
+
 **Deferred for later**
 
 - Effort tiering, and any change to session or subagent effort settings.

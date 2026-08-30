@@ -72,18 +72,6 @@
           }
         ]
       }
-    ],
-    "FileChanged": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_DATA}/bin/ss-magic",
-            "args": ["plugin", "hook", "file-changed"],
-            "timeout": 10
-          }
-        ]
-      }
     ]
   }
 }

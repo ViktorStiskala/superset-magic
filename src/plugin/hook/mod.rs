@@ -68,6 +68,7 @@ use crate::plugin::heartbeat::{self, Outcome as RowOutcome, Row};
 use crate::plugin::HookEvent;
 
 pub mod event;
+mod file_changed;
 mod pre_compact;
 mod pre_tool_use;
 mod session_end;
@@ -249,8 +250,11 @@ pub fn route(event: &HookEvent) -> Option<Route> {
         HookEvent::PreCompact => ("pre_compact", pre_compact::handle, true),
         HookEvent::SubagentStop => ("subagent_stop", subagent_stop::handle, true),
         HookEvent::SessionEnd => ("session_end", session_end::handle, false),
-        // U30.
-        HookEvent::FileChanged => ("file_changed", not_implemented, false),
+        // U30. Routed, but unreachable in a real session: the plugin ships no
+        // `FileChanged` manifest entry, because R92's probe was not satisfied
+        // (see `file_changed.rs`). Wiring it here keeps the handler exercised
+        // and makes enabling it later a manifest change alone.
+        HookEvent::FileChanged => ("file_changed", file_changed::handle, false),
         HookEvent::Unknown(_) | HookEvent::Missing => return None,
     };
     Some(Route {
@@ -260,15 +264,8 @@ pub fn route(event: &HookEvent) -> Option<Route> {
     })
 }
 
-/// Stand-in for every per-event handler until its own unit lands.
-///
-/// Silent and successful on purpose: an unimplemented event must be
-/// indistinguishable, from the harness's side, from an event whose handler
-/// decided there was nothing to do. The heartbeat note is what tells the
-/// difference, and it is the only place the difference shows.
-fn not_implemented(_ctx: &HookContext<'_>) -> Result<Outcome> {
-    Ok(Outcome::silent().with_detail("handler not implemented yet"))
-}
+// The stand-in handler that stood here until U30 is gone: every one of the six
+// routed events now reaches a real module.
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 

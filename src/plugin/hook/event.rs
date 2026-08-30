@@ -166,11 +166,16 @@ pub struct SessionEnd {
 
 /// `file-changed` — fires on a watched file write.
 ///
-/// The payload shape here is provisional: unlike the other five, it was not
-/// captured from a live session, and R92 makes U30 probe it on the pinned
-/// harness version before the direnv export ships. Both spellings are typed
-/// because either is plausible, and a handler that needs certainty should read
-/// [`Envelope::raw`] rather than trusting these two fields to be populated.
+/// U30 probed the shape against the pinned 2.1.251 bundle, which declares it
+/// as the common envelope plus `file_path` (one absolute path, singular) and
+/// `event` (one of `change`, `add`, `unlink`). `file_paths` is kept only
+/// because U11 typed it before that was known and a batch spelling costs
+/// nothing to tolerate; the harness does not send it. A handler wanting a
+/// field none of these cover should still read [`Envelope::raw`].
+///
+/// What the probe did *not* establish is that the event ever reaches a
+/// handler: registering a watch path is what makes it fire, and the plugin
+/// ships no `FileChanged` entry today. See `file_changed.rs` for why.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct FileChanged {
     /// The changed file, if the harness reports a single one.
@@ -179,6 +184,11 @@ pub struct FileChanged {
     /// The changed files, if the harness reports a batch.
     #[serde(default)]
     pub file_paths: Vec<String>,
+    /// What happened to it — `change`, `add` or `unlink`. Typed as a free
+    /// string rather than an enum so an unrecognized verb decodes into a
+    /// handler decision instead of failing the whole envelope.
+    #[serde(default)]
+    pub event: Option<String>,
 }
 
 /// The per-event half of a decoded envelope. Which variant is built is decided

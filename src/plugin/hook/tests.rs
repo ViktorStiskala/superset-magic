@@ -683,15 +683,17 @@ fn a_well_formed_envelope_reaches_the_handler_with_its_context_resolved() {
     assert_eq!(run.row.outcome, heartbeat::Outcome::Ok);
 }
 
-/// `file-changed` is the last event still on the stand-in handler (U30 owns
-/// it). Reaching it must be indistinguishable, from the harness's side, from
-/// reaching a handler that decided it had nothing to do — the heartbeat note
-/// is the only place the difference shows. Every other event now has a real
-/// handler and is covered by its own module's tests: `SessionStart` (U12),
-/// `PreToolUse` (U14), `PreCompact` (U15), `SubagentStop` (U16) and
-/// `SessionEnd` (U17).
+/// Every routed event now reaches a real module — `SessionStart` (U12),
+/// `PreToolUse` (U14), `PreCompact` (U15), `SubagentStop` (U16), `SessionEnd`
+/// (U17) and `file-changed` (U30) — each covered by its own module's tests.
+///
+/// What is still worth asserting here is the shape `file-changed` presents to
+/// the harness through the whole pipeline. It carries no payload in this
+/// envelope, so it finds no rc file and does nothing; that has to look exactly
+/// like every other quiet path — empty stdout, empty stderr, one `Ok` row —
+/// rather than like a hook that failed or blocked.
 #[test]
-fn the_unimplemented_handler_is_a_silent_success() {
+fn a_file_changed_event_with_nothing_to_do_is_a_silent_success() {
     let (_dir, root) = enabled_repo();
     let event = HookEvent::FileChanged;
 
@@ -702,7 +704,7 @@ fn the_unimplemented_handler_is_a_silent_success() {
     assert_eq!(run.row.event, event.as_str());
     assert_eq!(
         run.row.detail.as_deref(),
-        Some("handler not implemented yet")
+        Some("no .env or .envrc among the changed paths")
     );
 }
 
