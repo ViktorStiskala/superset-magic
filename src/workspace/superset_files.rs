@@ -147,6 +147,23 @@ pub fn write_magic_json(root: &Path, cfg: &MagicConfig) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite `.superset/magic.local.json` from `cfg` (including whatever it
+/// carries in `extras`), pretty-printed with a trailing newline.
+///
+/// The gitignored counterpart to [`write_magic_json`], and equally a plain
+/// writer: it serializes exactly what `cfg` holds and preserves nothing on
+/// its own. A caller changing one key on top of an existing local file (the
+/// `--local` half of `enable`/`disable`/`config set`, R7) must first load
+/// that file with [`load_magic_local_json`] and carry its `extras` forward,
+/// same as every other writer in this module.
+pub fn write_magic_local_json(root: &Path, cfg: &MagicConfig) -> Result<()> {
+    ensure_superset_dir(root)?;
+    let path = superset_dir(root).join(MAGIC_LOCAL_JSON);
+    let body = format!("{}\n", serde_json::to_string_pretty(cfg)?);
+    fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 /// Build a fresh `MagicConfig` with `new_files`, carrying forward the
 /// unknown top-level keys (KTD8) from `existing`, if any. Mirrors
 /// `merge_setup_into_config`'s preservation discipline for `config.json`:
@@ -223,6 +240,19 @@ pub fn load_magic_json(root: &Path) -> Result<Option<MagicConfig>> {
         format!(
             "reading {}",
             superset_dir(root).join(MAGIC_JSON).display()
+        )
+    })
+}
+
+/// Load just `magic.local.json` (the gitignored per-machine overlay) from
+/// `root/.superset/`. `Ok(None)` when the file is absent; error when it
+/// exists but cannot be parsed. Does NOT read or merge `magic.json` — use
+/// [`load_overlaid`] when you want the full union.
+pub fn load_magic_local_json(root: &Path) -> Result<Option<MagicConfig>> {
+    read_json::<MagicConfig>(&superset_dir(root).join(MAGIC_LOCAL_JSON)).with_context(|| {
+        format!(
+            "reading {}",
+            superset_dir(root).join(MAGIC_LOCAL_JSON).display()
         )
     })
 }

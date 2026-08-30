@@ -623,6 +623,86 @@ fn load_magic_json_malformed_returns_clean_error_before_merge() {
     assert!(msg.contains("malformed JSON"), "msg: {msg}");
 }
 
+/// `load_magic_local_json` mirrors `load_magic_json` exactly, but reads
+/// `magic.local.json` and does NOT merge it with the base file — that is
+/// `load_overlaid`'s job, not this one's.
+#[test]
+fn load_magic_local_json_reads_only_the_local_file_unmerged() {
+    let dir = fresh();
+    let root = dir.path();
+    write_magic_json(root, &magic_cfg(&["**/.env"])).unwrap();
+    write_magic_local_json(root, &magic_cfg(&["**/.dev.vars"])).unwrap();
+
+    let local = load_magic_local_json(root).unwrap().unwrap();
+    assert_eq!(
+        local.files,
+        vec!["**/.dev.vars".to_string()],
+        "must read the local file's own files, not the base's, and not the union"
+    );
+}
+
+/// A missing `magic.local.json` is `Ok(None)`, the same as a missing
+/// `magic.json` — not an error, even when the base file is present.
+#[test]
+fn load_magic_local_json_absent_is_none() {
+    let dir = fresh();
+    let root = dir.path();
+    write_magic_json(root, &magic_cfg(&["**/.env"])).unwrap();
+
+    assert!(load_magic_local_json(root).unwrap().is_none());
+}
+
+/// `write_magic_local_json` produces pretty-printed JSON with a trailing
+/// newline, round-tripping through `load_magic_local_json` — the same shape
+/// `write_magic_json` produces for the base file.
+#[test]
+fn write_magic_local_json_is_pretty_with_trailing_newline_and_round_trips() {
+    let dir = fresh();
+    let root = dir.path();
+    write_magic_local_json(root, &magic_cfg(&["**/.dev.vars"])).unwrap();
+
+    let raw = fs::read_to_string(root.join(".superset/magic.local.json")).unwrap();
+    assert!(raw.contains('\n'), "expected pretty-printed JSON");
+    assert!(raw.ends_with('\n'), "expected trailing newline");
+
+    let result = load_magic_local_json(root).unwrap().unwrap();
+    assert_eq!(result.files, vec!["**/.dev.vars".to_string()]);
+}
+
+/// `write_magic_local_json` round-trips `extras` the same way the base
+/// writer does — it is a plain writer with no preservation of its own, so a
+/// caller supplying `extras` gets them back unchanged.
+#[test]
+fn write_magic_local_json_round_trips_extras() {
+    let dir = fresh();
+    let root = dir.path();
+    let mut extras = serde_json::Map::new();
+    extras.insert("plugin".to_string(), serde_json::json!({"enabled": true}));
+    let cfg = MagicConfig {
+        files: vec![],
+        extras,
+    };
+    write_magic_local_json(root, &cfg).unwrap();
+
+    let local = load_magic_local_json(root).unwrap().unwrap();
+    assert_eq!(local.extras["plugin"]["enabled"], serde_json::json!(true));
+}
+
+/// A malformed `magic.local.json` is a hard error, same as the base file —
+/// no silent fallback to "as if absent".
+#[test]
+fn load_magic_local_json_malformed_returns_clean_error() {
+    let dir = fresh();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".superset")).unwrap();
+    fs::write(root.join(".superset/magic.local.json"), "{not json").unwrap();
+
+    let err = load_magic_local_json(root).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("magic.local.json"), "msg: {msg}");
+    assert!(msg.contains("malformed JSON"), "msg: {msg}");
+}
+
 /// empty magic.json files array + non-empty local → local entries appended.
 #[test]
 fn overlay_empty_base_files_plus_local() {

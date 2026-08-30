@@ -29,8 +29,11 @@
 //! ## Layout
 //!
 //! This module owns only the second-level parse and the dispatch table. The
-//! work lives in siblings: `config.rs` (the typed `plugin` key and its
-//! overlay resolution), `identity.rs` (the `<repo>-<branch>` slug),
+//! work lives in siblings: `config.rs` (the typed `plugin` key, its overlay
+//! resolution, and the `enable`/`disable`/`config get`/`config set` write
+//! path behind it), `compact_window.rs` (the opt-in `autoCompactWindow`
+//! write behind `compact-window`), `identity.rs` (the `<repo>-<branch>`
+//! slug),
 //! `scratchpad.rs` (the `.superset/.magic/` state tree), `bypass.rs` (the
 //! one-shot Read-gate claims behind `bypass`), `expect_artifact.rs` (the
 //! pending subagent-output declarations behind `expect-artifact`, which
@@ -60,6 +63,7 @@ pub(crate) mod bypass;
 pub(crate) mod cache;
 pub(crate) mod checklist;
 pub(crate) mod claim;
+pub(crate) mod compact_window;
 pub(crate) mod config;
 pub(crate) mod expect_artifact;
 pub(crate) mod heartbeat;
@@ -204,6 +208,13 @@ impl HumanVerb {
     }
 
     /// The token that selects this verb.
+    // No production caller now that every verb dispatches to a real handler —
+    // `run_human`'s old "not implemented yet" fallback was the last one, and
+    // it is gone now that the fallback arm has nothing left to catch. Kept
+    // for round-trip completeness (tests assert `as_str` reverses
+    // `from_token` for every verb) and for a future caller that wants to
+    // name a verb back to the user.
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Status => "status",
@@ -412,9 +423,8 @@ fn run_hook(event: &HookEvent) -> Result<ExitCode> {
     hook::run(event)
 }
 
-/// Route a human verb to its handler. Verbs later units own still land on the
-/// not-implemented arm, which reports on stderr and exits non-zero — the
-/// posture every human verb keeps.
+/// Route a human verb to its handler. Every verb here reports problems on
+/// stderr and exits non-zero — the posture every human verb keeps.
 fn run_human(verb: HumanVerb, args: &[String]) -> Result<ExitCode> {
     match verb {
         HumanVerb::Scratchpad => scratchpad::run(args),
@@ -428,16 +438,10 @@ fn run_human(verb: HumanVerb, args: &[String]) -> Result<ExitCode> {
         HumanVerb::Checklist => checklist::run(args),
         HumanVerb::Status => status::run(args),
         HumanVerb::SpillIndex => spill_index::run(args),
-        _ => {
-            eprintln!(
-                "{}",
-                style::err(format!(
-                    "error: `ss-magic plugin {}` is not implemented yet",
-                    verb.as_str()
-                ))
-            );
-            Ok(ExitCode::from(2))
-        }
+        HumanVerb::Enable => config::run_enable(args),
+        HumanVerb::Disable => config::run_disable(args),
+        HumanVerb::Config => config::run_config(args),
+        HumanVerb::CompactWindow => compact_window::run(args),
     }
 }
 

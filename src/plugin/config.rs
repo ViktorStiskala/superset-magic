@@ -29,12 +29,16 @@
 //! dropped rather than kept, so a bad entry can only shrink the exemption
 //! list (make the gate fire MORE often), never widen it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
-use serde_json::Value;
+use anyhow::{Context, Result};
+use serde_json::{Map, Value};
 
 use crate::git;
-use crate::workspace::superset_files;
+use crate::plugin::scratchpad;
+use crate::tui::style;
+use crate::workspace::superset_files::{self, MagicConfig};
 
 // ── Bounds and defaults (R53) ───────────────────────────────────────────────
 
@@ -136,9 +140,6 @@ impl Default for GateConfig {
 /// `magic.local.json`, a `plugin` value that is not a JSON object) degrades
 /// to the corresponding half of [`PluginConfig::default`] rather than
 /// propagating an error to the caller.
-// consumed by U14 (the page-fault gate), U19 (`config`/`enable`/`disable`)
-// and U28 (`status`)
-#[allow(dead_code)]
 pub fn resolve(cwd_root: &Path) -> PluginConfig {
     PluginConfig {
         enabled: resolve_enabled(cwd_root),
@@ -152,8 +153,15 @@ pub fn resolve(cwd_root: &Path) -> PluginConfig {
 /// repository, or the `git` invocation otherwise fails) — still the safest
 /// available answer, and strictly better than refusing to resolve.
 fn resolve_enabled(cwd_root: &Path) -> bool {
-    let root = git::main_checkout_root(cwd_root).unwrap_or_else(|_| cwd_root.to_path_buf());
-    enabled_from_value(plugin_value(&root).as_ref())
+    enabled_from_value(plugin_value(&main_checkout_or_self(cwd_root)).as_ref())
+}
+
+/// The main checkout's root, or `cwd_root` itself when none can be found
+/// (outside any git repository, or the `git` invocation otherwise fails) —
+/// the same fallback [`resolve_enabled`] uses, shared here because the
+/// `--local` write path (R7) needs exactly the same root.
+fn main_checkout_or_self(cwd_root: &Path) -> PathBuf {
+    git::main_checkout_root(cwd_root).unwrap_or_else(|_| cwd_root.to_path_buf())
 }
 
 /// The merged `plugin` value at `root` (base `magic.json` overlaid with that
@@ -227,6 +235,367 @@ fn gate_from_value(value: Option<&Value>) -> GateConfig {
             })
             .unwrap_or_default(),
     }
+}
+
+// ── Write path: `enable` / `disable` / `config get` / `config set` (U19, R37) ──
+//
+// Everything above this line only READS the overlaid `plugin` value. What
+// follows WRITES it, from four human verbs sharing one discipline:
+//
+// - Every write is a load-modify-write over the ONE file being targeted
+//   (never the merged/overlaid view — that would bake local's already-applied
+//   values back into base, or vice versa). It changes exactly the key it was
+//   asked to change and carries every other key on the file forward
+//   untouched, including keys this build has never heard of (KTD8) — the
+//   same discipline [`superset_files::merge_files_into_magic_config`]
+//   documents for `files`, applied here to `plugin`.
+// - `--local` (R7) redirects the target from the caller's own repository root
+//   to the MAIN CHECKOUT's `magic.local.json`, resolved with the same
+//   `git::main_checkout_root` fallback [`resolve_enabled`] uses, because a
+//   worktree's own local overlay is itself a forward-sync target and cannot
+//   be trusted to hold the per-machine enable toggle.
+// - `get` always answers from the OVERLAID value (base plus the caller's own
+//   local overlay) — never base alone — since that is what a person actually
+//   wants to know: what the plugin will do, not what one file happens to say.
+// - Whenever a write turns `plugin.enabled` on, it also gitignores
+//   `.superset/.magic/` at the CALLER's OWN root (via
+//   [`scratchpad::ensure_state_ignored`]) — R40's lazy half of the ignore
+//   rule. This runs at the repository the invocation is ACTUALLY standing in,
+//   not at `--local`'s redirected target: hooks fire, and the ignored-tree
+//   gate is checked, wherever the session's cwd is, so that is the tree that
+//   has to be protected right now regardless of which file recorded the
+//   toggle. Turning the plugin off never removes the rule — R40 is explicit
+//   that nothing here ever edits `.gitignore` except to add this one line.
+// - `config` is scoped to keys rooted at `"plugin"` only. `files` and any
+//   other top-level key already have their own editors (the bootstrap
+//   picker, the edit-config menu); this verb is "the plugin configuration
+//   from the command line" (R37), not a general JSON editor for the file.
+
+/// The one top-level key `config get`/`config set` may address. Also the
+/// first segment `write_plugin_key` expects in every path it is handed.
+const PLUGIN_KEY: &str = "plugin";
+
+const ENABLE_USAGE: &str = "\
+Usage: ss-magic plugin enable [--local]
+
+Turn the plugin's hooks on for this repository by setting `plugin.enabled`
+to `true`.
+
+Without --local, writes .superset/magic.json (committed — affects every
+worktree once the change is committed and synced). With --local, writes the
+main checkout's .superset/magic.local.json instead (R7: a worktree's own
+local overlay is itself a forward-sync target, so the per-machine toggle
+always lands in the main checkout's).
+
+Also gitignores .superset/.magic/ in THIS repository if it is not already,
+so a repository initialized before this shipped is not silenced the moment
+it is turned on.";
+
+const DISABLE_USAGE: &str = "\
+Usage: ss-magic plugin disable [--local]
+
+Stop the plugin's hooks from acting on this repository by setting
+`plugin.enabled` to `false`. The installed tree (binary, hooks, skills) is
+left in place — this only flips the switch.
+
+Without --local, writes .superset/magic.json (committed). With --local,
+writes the main checkout's .superset/magic.local.json instead (R7).
+
+Never removes the .superset/.magic/ gitignore rule `enable` may have added.";
+
+const CONFIG_USAGE: &str = "\
+Usage: ss-magic plugin config get <plugin.DOTTED.KEY>
+       ss-magic plugin config set <plugin.DOTTED.KEY> <VALUE> [--local]
+
+Read or write one key under the plugin configuration block (magic.json's
+`plugin` object) — not `files`, and not any other top-level key.
+
+`get` always reads the OVERLAID, resolved value (magic.json plus this
+repository's own magic.local.json), never just the committed base.
+
+`set` parses VALUE as JSON when it parses (true, 3000, [\"docs/**\"], null,
+...), otherwise takes it as a plain string. Without --local it edits
+.superset/magic.json; with --local it edits the main checkout's
+.superset/magic.local.json instead (R7), resolved from any worktree.
+
+Setting plugin.enabled to true also gitignores .superset/.magic/ in this
+repository if it is not already (R40); nothing here ever removes that rule.";
+
+/// `plugin enable` — a human verb; problems report on stderr and exit
+/// non-zero.
+pub fn run_enable(args: &[String]) -> Result<ExitCode> {
+    run_toggle(args, ENABLE_USAGE, true)
+}
+
+/// `plugin disable` — the mirror of [`run_enable`].
+pub fn run_disable(args: &[String]) -> Result<ExitCode> {
+    run_toggle(args, DISABLE_USAGE, false)
+}
+
+/// Shared body for `enable`/`disable`: both are "set `plugin.enabled` to a
+/// fixed literal, optionally at the `--local` target", differing only in
+/// which literal and which usage text. Parses argv and reads the real
+/// current directory, then hands off to [`run_toggle_core`], which takes an
+/// explicit `cwd` so the actual filesystem work is testable without a
+/// process or a real working directory.
+fn run_toggle(args: &[String], usage: &str, enabled: bool) -> Result<ExitCode> {
+    let local = match args {
+        [] => false,
+        [flag] if flag == "-h" || flag == "--help" => {
+            println!("{usage}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        [flag] if flag == "--local" => true,
+        _ => return Ok(usage_error(usage, "pass no arguments, or exactly `--local`")),
+    };
+
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    run_toggle_core(&cwd, local, enabled)
+}
+
+fn run_toggle_core(cwd: &Path, local: bool, enabled: bool) -> Result<ExitCode> {
+    let cwd_root = git::cwd_repo_root(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let target_root = if local {
+        main_checkout_or_self(&cwd_root)
+    } else {
+        cwd_root.clone()
+    };
+
+    write_plugin_key(&target_root, local, &[PLUGIN_KEY, "enabled"], Value::Bool(enabled))?;
+
+    if enabled {
+        scratchpad::ensure_state_ignored(&cwd_root).context("gitignoring .superset/.magic/")?;
+    }
+
+    println!(
+        "{}",
+        style::ok(format!(
+            "Set `plugin.enabled` to `{enabled}` in {}",
+            magic_file_label(local)
+        ))
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `plugin config get|set …` — dispatches to the two sub-verbs.
+pub fn run_config(args: &[String]) -> Result<ExitCode> {
+    let Some((sub, rest)) = args.split_first() else {
+        return Ok(usage_error(CONFIG_USAGE, "needs a `get` or `set` subcommand"));
+    };
+    match sub.as_str() {
+        "-h" | "--help" => {
+            println!("{CONFIG_USAGE}");
+            Ok(ExitCode::SUCCESS)
+        }
+        "get" => run_config_get(rest),
+        "set" => run_config_set(rest),
+        other => Ok(usage_error(
+            CONFIG_USAGE,
+            &format!("unknown `config` subcommand `{other}`"),
+        )),
+    }
+}
+
+/// `plugin config get <dotted-key>`.
+fn run_config_get(args: &[String]) -> Result<ExitCode> {
+    let [key] = args else {
+        return Ok(usage_error(CONFIG_USAGE, "`get` takes exactly one dotted key"));
+    };
+    let segments = match validate_plugin_key(key) {
+        Ok(segments) => segments,
+        Err(message) => return Ok(usage_error(CONFIG_USAGE, &message)),
+    };
+
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    let value = run_config_get_core(&cwd, &segments)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The read half of `config get`, split out from printing so it is testable
+/// against a plain `Value` rather than captured stdout — mirroring
+/// `status.rs`'s split between computing a report and printing it.
+fn run_config_get_core(cwd: &Path, segments: &[&str]) -> Result<Value> {
+    let cwd_root = git::cwd_repo_root(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let cfg = superset_files::load_overlaid(&cwd_root)
+        .context("reading the overlaid magic.json")?
+        .unwrap_or_default();
+
+    Ok(navigate(cfg.extras.get(PLUGIN_KEY), &segments[1..])
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+/// `plugin config set <dotted-key> <value> [--local]`.
+fn run_config_set(args: &[String]) -> Result<ExitCode> {
+    let (key, raw_value, local) = match args {
+        [key, value] => (key, value, false),
+        [key, value, flag] if flag == "--local" => (key, value, true),
+        _ => {
+            return Ok(usage_error(
+                CONFIG_USAGE,
+                "`set` takes a dotted key, a value, and an optional `--local`",
+            ))
+        }
+    };
+    let segments = match validate_plugin_key(key) {
+        Ok(segments) => segments,
+        Err(message) => return Ok(usage_error(CONFIG_USAGE, &message)),
+    };
+
+    let value = parse_value(raw_value);
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    let outcome = run_config_set_core(&cwd, key, &segments, value, local)?;
+    println!("{}", style::ok(outcome));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_config_set_core(
+    cwd: &Path,
+    key: &str,
+    segments: &[&str],
+    value: Value,
+    local: bool,
+) -> Result<String> {
+    let turns_on = turns_plugin_on(segments, &value);
+    let cwd_root = git::cwd_repo_root(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let target_root = if local {
+        main_checkout_or_self(&cwd_root)
+    } else {
+        cwd_root.clone()
+    };
+
+    write_plugin_key(&target_root, local, segments, value)?;
+
+    if turns_on {
+        scratchpad::ensure_state_ignored(&cwd_root).context("gitignoring .superset/.magic/")?;
+    }
+
+    Ok(format!("Set `{key}` in {}", magic_file_label(local)))
+}
+
+/// Split a dotted key into segments and check it is one `config` may touch:
+/// rooted at `"plugin"`, with no empty segment (a stray leading, trailing or
+/// doubled dot).
+fn validate_plugin_key(key: &str) -> Result<Vec<&str>, String> {
+    let segments: Vec<&str> = key.split('.').collect();
+    if segments.first() != Some(&PLUGIN_KEY) || segments.iter().any(|s| s.is_empty()) {
+        return Err(format!(
+            "`{key}` is not a plugin configuration key; `config` only reads and writes keys \
+             rooted at `plugin` (e.g. `plugin.enabled`, `plugin.gate.threshold_lines`)"
+        ));
+    }
+    Ok(segments)
+}
+
+/// Walk `path` (dotted-key segments AFTER the leading `"plugin"`) into
+/// `value`, returning `None` as soon as a segment is missing or the current
+/// value is not an object to index into. An empty `path` returns `value`
+/// itself unchanged — the "get/set the whole plugin block" case.
+fn navigate<'a>(value: Option<&'a Value>, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value?;
+    for seg in path {
+        current = current.as_object()?.get(*seg)?;
+    }
+    Some(current)
+}
+
+/// Parse a CLI-supplied value as JSON when it parses as one (`true`, `3000`,
+/// `["docs/**"]`, the literal `null`, ...); anything that fails to parse —
+/// ordinary unquoted text like `docs/**` — is taken as a plain JSON string
+/// instead, so a caller never has to hand-quote everyday values.
+fn parse_value(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+/// Whether writing `value` at `segments` (a [`validate_plugin_key`]-checked,
+/// plugin-rooted dotted key) turns the plugin ON — the trigger for R40's lazy
+/// ignore-rule write. Recognizes both the ordinary `plugin.enabled` spelling
+/// and a whole-block replacement (`plugin` set to an object carrying
+/// `"enabled": true`), since both mean "the plugin is now enabled" from the
+/// ignore rule's point of view.
+fn turns_plugin_on(segments: &[&str], value: &Value) -> bool {
+    match segments {
+        [PLUGIN_KEY, "enabled"] => value.as_bool() == Some(true),
+        [PLUGIN_KEY] => value.get("enabled").and_then(Value::as_bool) == Some(true),
+        _ => false,
+    }
+}
+
+/// Load-modify-write one key on the plugin configuration file at
+/// `target_root` (`magic.local.json` when `local`, else `magic.json`).
+/// `path` is the FULL key path INCLUDING the leading `"plugin"` segment
+/// (e.g. `&["plugin", "enabled"]`, or just `&["plugin"]` for the whole
+/// block); `value` replaces whatever was there. Every other key on the file —
+/// every other top-level key, and every other key under `plugin` — survives
+/// unchanged (KTD8): this loads the file, walks/creates just the requested
+/// path inside `extras`, and writes the whole `MagicConfig` back. A malformed
+/// existing file is a hard error (propagated, not swallowed) rather than
+/// being silently rebuilt from nothing.
+fn write_plugin_key(target_root: &Path, local: bool, path: &[&str], value: Value) -> Result<()> {
+    debug_assert_eq!(path.first(), Some(&PLUGIN_KEY), "path must be plugin-rooted");
+
+    let existing = if local {
+        superset_files::load_magic_local_json(target_root)
+    } else {
+        superset_files::load_magic_json(target_root)
+    }
+    .with_context(|| format!("reading the existing {}", magic_file_label(local)))?;
+
+    let mut cfg: MagicConfig = existing.unwrap_or_default();
+    set_nested(&mut cfg.extras, path, value);
+
+    if local {
+        superset_files::write_magic_local_json(target_root, &cfg)
+    } else {
+        superset_files::write_magic_json(target_root, &cfg)
+    }
+    .with_context(|| format!("writing {}", magic_file_label(local)))
+}
+
+/// Set the value at `path` (a non-empty list of dotted-key segments, e.g.
+/// `["plugin", "gate", "threshold_lines"]`) inside `extras`, creating any
+/// missing intermediate object along the way. An intermediate value that
+/// exists but is not itself an object (e.g. a stray `"plugin": "oops"` left
+/// by hand-editing) is replaced with a fresh empty object rather than
+/// rejected — the same fail-safe posture `gate_from_value`/`enabled_from_value`
+/// already take on the READ side, applied here to writing: `set` always
+/// succeeds instead of erroring over a malformed value it is about to fix.
+fn set_nested(extras: &mut Map<String, Value>, path: &[&str], value: Value) {
+    let Some((last, parents)) = path.split_last() else {
+        return; // an empty path has nothing to set; every caller here passes
+                 // at least `["plugin"]`
+    };
+    let mut current = extras;
+    for seg in parents {
+        let entry = current
+            .entry((*seg).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(Map::new());
+        }
+        current = entry.as_object_mut().expect("just ensured this is an object");
+    }
+    current.insert((*last).to_string(), value);
+}
+
+/// The relative path a message names for the file a write just touched.
+fn magic_file_label(local: bool) -> &'static str {
+    if local {
+        ".superset/magic.local.json"
+    } else {
+        ".superset/magic.json"
+    }
+}
+
+/// Report a usage mistake and hand back the exit code for one: the message,
+/// then `usage`. `2` matches the rest of the crate's convention for "the
+/// command as typed cannot be carried out" (see e.g.
+/// `checklist::verbs::refused`).
+fn usage_error(usage: &str, message: &str) -> ExitCode {
+    eprintln!("{}", style::err(format!("error: {message}")));
+    eprintln!("{usage}");
+    ExitCode::from(2)
 }
 
 #[cfg(test)]
