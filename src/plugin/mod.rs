@@ -35,8 +35,9 @@
 //! private per-machine temporary root and its fd-lock helper), `hook/` (the
 //! stdin decode, event routing, JSON envelope and fail-open wrapper),
 //! `heartbeat.rs` (the machine-level `hooks.jsonl` row every hook leaves
-//! behind) and, added by later units, `status.rs`, `checklist/`, `ledger.rs`
-//! and `cache.rs`.
+//! behind), `cache.rs` (the hash-keyed conclusion cache behind `conclude` /
+//! `conclusions` / `gc`) and, added by later units, `status.rs`, `checklist/`
+//! and `ledger.rs`.
 
 use std::process::ExitCode;
 
@@ -44,6 +45,7 @@ use anyhow::Result;
 
 use crate::tui::style;
 
+pub(crate) mod cache;
 pub(crate) mod config;
 pub(crate) mod heartbeat;
 pub(crate) mod hook;
@@ -397,6 +399,9 @@ fn run_hook(event: &HookEvent) -> Result<ExitCode> {
 fn run_human(verb: HumanVerb, args: &[String]) -> Result<ExitCode> {
     match verb {
         HumanVerb::Scratchpad => scratchpad::run(args),
+        HumanVerb::Conclude => cache::run_conclude(args),
+        HumanVerb::Conclusions => cache::run_conclusions(args),
+        HumanVerb::Gc => cache::run_gc(args),
         _ => {
             eprintln!(
                 "{}",
