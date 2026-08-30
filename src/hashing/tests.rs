@@ -69,3 +69,42 @@ fn hash_file_missing_path_errors() {
         "error should name the unreadable path"
     );
 }
+
+// ── sha256 (R80's cross-language identifier hash) ─────────────────────────────
+
+/// FIPS 180-4's canonical example vector. If this ever goes red, the
+/// implementation has diverged from the standard — and, more concretely,
+/// from whatever `shasum -a 256` on the shell side of R80 would compute for
+/// the same bytes.
+#[test]
+fn sha256_matches_known_vector_abc() {
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+/// The empty input is its own well-known vector (there is no message block
+/// with real content, only the padding) — exercised on its own because R80's
+/// identifier must be well-defined even when `$HOME` is unset or empty (see
+/// `tmproot::tests`), which hashes exactly this input.
+#[test]
+fn sha256_matches_known_vector_empty() {
+    assert_eq!(
+        sha256_hex(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+}
+
+/// A input spanning more than one 64-byte block exercises the message
+/// schedule's cross-block carry (`h` folded forward into the next block's
+/// compression), not just the single-block padding path the two vectors
+/// above take.
+#[test]
+fn sha256_matches_known_vector_two_blocks() {
+    let input = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    assert_eq!(
+        sha256_hex(input),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+    );
+}

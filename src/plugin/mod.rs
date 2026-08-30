@@ -31,10 +31,10 @@
 //! This module owns only the second-level parse and the dispatch table. The
 //! work lives in siblings: `config.rs` (the typed `plugin` key and its
 //! overlay resolution), `identity.rs` (the `<repo>-<branch>` slug),
-//! `scratchpad.rs` (the `.superset/.magic/` state tree) and, added by later
-//! units, `hook/` (the stdin decode, event routing, JSON envelope and
-//! fail-open wrapper), `status.rs`, `checklist/`, `ledger.rs`, `cache.rs`
-//! and `tmproot.rs`.
+//! `scratchpad.rs` (the `.superset/.magic/` state tree), `tmproot.rs` (the
+//! private per-machine temporary root and its fd-lock helper) and, added by
+//! later units, `hook/` (the stdin decode, event routing, JSON envelope and
+//! fail-open wrapper), `status.rs`, `checklist/`, `ledger.rs` and `cache.rs`.
 
 use std::process::ExitCode;
 
@@ -45,6 +45,7 @@ use crate::tui::style;
 pub(crate) mod config;
 pub(crate) mod identity;
 pub(crate) mod scratchpad;
+pub(crate) mod tmproot;
 
 // ── Hook events ───────────────────────────────────────────────────────────────
 
