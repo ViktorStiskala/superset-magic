@@ -61,6 +61,16 @@ opt-out (`--no-backup`/`-n` on the direct subcommands) and, when skipped,
 leaves an overwritten or deleted file with no recovery path. Retention keeps
 the 10 newest batches; older ones are pruned after each apply.
 
+### Excluded trees
+The four directory trees no ss-magic operation may ever enumerate, whatever the
+sync patterns say: `.superset/backups` (pre-write backups, which hold recovered
+secrets), `.superset/.magic` (the Claude Code plugin's machine-local state),
+`.scratchpad` (a tree ss-magic does not own but must never push into the shared
+main checkout), and `.git`. Each is matched as an exact path rather than a name
+or a prefix, so `.superset` itself stays includable and the contract files still
+travel. The exclusion is applied during each directory walk, not to the match
+list, so a pattern that matches an *ancestor* of one of them cannot re-admit it.
+
 ### Pack
 Bundling the files matching the sync patterns from the current git repo root
 into a single `ss-magic-<repo>.tar.bz2` archive at that root, preserving each
@@ -121,6 +131,30 @@ the work to an agent that reads the file in its own context and writes back a
 conclusion; a later read of the same file is denied again, but that denial
 carries the conclusion inline. This is what keeps the gate from blocking the
 model permanently.
+
+### Operator checklist
+The committed record of the operational steps a change needs before it is safe
+to ship – verification, rollout, decisions still open, and follow-ups that
+outlive the code change – as one typed JSON document per action under
+`docs/actions/`. The plugin's own verbs are its only write path; direct reads and
+edits of the file are denied, which is what keeps every write canonically
+ordered, validated, and renderable to byte-identical Markdown wherever it
+appears (the CLI, a commit-time nudge, or a pull-request comment).
+
+### One-shot claim
+A record whose consumption is its own exactly-once flag, used for the bypass
+token that admits a single gated read and for the artifact a subagent is
+required to produce. Claiming renames the record onto a private name rather than
+deleting it, so exactly one of several concurrent callers can win – a deleting
+claim is not exclusive under a real race, even though it looks like it.
+
+### Version pin
+The plugin's declared version, which fixes both the binary its hooks run and the
+skills and Markdown shipped beside it. A `SessionStart` bootstrap installs the
+pinned binary and does nothing when it already matches, so updating the plugin is
+what updates the binary; no plugin invocation ever self-updates, because a
+mid-session swap would leave the binary and the shipped assets describing
+different behavior.
 
 ### Cost ledger
 The append-only record of what each ended session cost, written once per

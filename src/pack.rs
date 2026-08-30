@@ -283,7 +283,7 @@ where
     };
 
     // Every match was a special/vanished entry — write_archive wrote nothing
-    // and left any existing archive untouched. Don't claim "Packed 0 entries".
+    // and left any existing archive untouched. Don't claim "Packed 0 files".
     if count == 0 {
         println!(
             "{}",

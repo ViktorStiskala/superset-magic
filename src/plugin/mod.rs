@@ -289,7 +289,8 @@ Usage: ss-magic plugin <VERB> [ARGS...]
 
 Hook entry point (driven by a JSON envelope on stdin, for the harness):
   hook <event>          One of: session-start, pre-tool-use, pre-compact,
-                        subagent-stop, session-end, file-changed
+                        subagent-stop, session-end. (`file-changed` still routes,
+                        but no shipped manifest declares it - see Scope Boundaries.)
 
 Verbs (driven by argv, for humans and skills):
   status                What the plugin sees, and why it is or is not acting

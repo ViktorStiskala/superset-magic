@@ -259,7 +259,7 @@ fn print_pack_event(ev: &pack::PackEvent) {
             println!();
             println!(
                 "{}",
-                tui::style::ok(format!("Packed {count} entries → {}", real.display()))
+                tui::style::ok(format!("Packed {count} files → {}", real.display()))
             );
             println!(
                 "{}",
