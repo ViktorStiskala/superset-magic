@@ -307,6 +307,33 @@ pub fn tracked_files(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<PathBuf
     Ok(parse_ls_files_z(&git(&args, Some(repo_root))?))
 }
 
+// ---------------------------------------------------------------------------
+// Read-only probes used by the plugin identity slug (U7).
+// ---------------------------------------------------------------------------
+
+/// `git symbolic-ref --quiet --short HEAD`: the short name of the branch HEAD
+/// currently points at, or `None` when HEAD is detached (the command exits 1
+/// rather than erroring — `--quiet` suppresses the stderr message for that
+/// case). `--short` returns e.g. `feature/x` rather than the full
+/// `refs/heads/feature/x`. Deliberately NOT `git rev-parse --abbrev-ref HEAD`,
+/// which returns the literal string `HEAD` under detached HEAD instead of
+/// failing — a value indistinguishable from an actual branch named `HEAD`,
+/// which `symbolic-ref`'s exit code sidesteps entirely.
+pub fn symbolic_ref_head(cwd_root: &Path) -> Result<Option<String>> {
+    git_optional(
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        Some(cwd_root),
+    )
+}
+
+/// `git rev-parse --short HEAD`: the abbreviated commit hash HEAD resolves to,
+/// or `None` when there is no commit to resolve yet (an unborn HEAD in a
+/// brand-new repository). Used to build the `detached-<short-sha>` identity
+/// fallback.
+pub fn short_head_sha(cwd_root: &Path) -> Result<Option<String>> {
+    git_optional(&["rev-parse", "--short", "HEAD"], Some(cwd_root))
+}
+
 /// Shell out to `date +%Y%m%d-%H%M%S` for the feature-branch suffix.
 /// Local timezone — matches what a developer would type by hand.
 pub fn timestamp_branch_suffix() -> Result<String> {

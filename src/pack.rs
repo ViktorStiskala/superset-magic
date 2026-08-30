@@ -34,15 +34,27 @@ use crate::tui::style;
 
 /// Archive file name for `root`: `ss-magic-<stem>.tar.bz2`.
 ///
-/// The stem is derived from the `origin` remote when one is configured
-/// (normalized so every URL form of the same repo yields the same name), and
-/// falls back to the primary (main) worktree directory's basename otherwise —
-/// e.g. `ss-magic-viktorstiskala_upx-cz.tar.bz2` for any origin form of
+/// The stem is [`repo_name_stem`], with a last-resort `files` stem preserving
+/// the legacy name shape when neither of ITS sources yields usable characters
+/// — e.g. `ss-magic-viktorstiskala_upx-cz.tar.bz2` for any origin form of
 /// `github.com/ViktorStiskala/upx.cz`, or `ss-magic-upx-cz.tar.bz2` for an
-/// origin-less checkout at `.../upx.cz`. A last-resort `files` stem preserves
-/// the legacy name shape when neither source yields usable characters.
+/// origin-less checkout at `.../upx.cz`.
 pub fn archive_file_name(root: &Path) -> String {
-    let stem = git::origin_url(root)
+    let stem = repo_name_stem(root).unwrap_or_else(|| "files".to_string());
+    format!("ss-magic-{stem}.tar.bz2")
+}
+
+/// Derive a repo-name stem for `root`: the `origin` remote when one is
+/// configured (normalized so every URL form of the same repo yields the same
+/// name — see [`stem_from_origin`]), falling back to the primary (main)
+/// worktree directory's basename, sanitized the same way, otherwise. Returns
+/// `None` when neither source yields usable characters (no origin AND a
+/// basename that itself sanitizes to empty), leaving the choice of last-resort
+/// fallback to the caller — `archive_file_name` falls back further to the
+/// literal `files` stem; [`crate::plugin::identity`] (KTD12) falls back to its
+/// next identity source instead.
+pub(crate) fn repo_name_stem(root: &Path) -> Option<String> {
+    git::origin_url(root)
         .ok()
         .flatten()
         .and_then(|url| stem_from_origin(&url))
@@ -53,8 +65,6 @@ pub fn archive_file_name(root: &Path) -> String {
                 .map(|n| sanitize_segment(&n.to_string_lossy()))
                 .filter(|s| !s.is_empty())
         })
-        .unwrap_or_else(|| "files".to_string());
-    format!("ss-magic-{stem}.tar.bz2")
 }
 
 /// Normalize a git remote URL into a filename stem.

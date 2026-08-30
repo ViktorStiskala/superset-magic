@@ -42,6 +42,7 @@ use anyhow::Result;
 use crate::tui::style;
 
 pub(crate) mod config;
+pub(crate) mod identity;
 
 // ── Hook events ───────────────────────────────────────────────────────────────
 
