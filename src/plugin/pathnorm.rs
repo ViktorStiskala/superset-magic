@@ -1,21 +1,24 @@
 //! Lexical path normalization, shared by every gate that decides from a path.
 //!
-//! Six separate bypasses of the checklist deny (R88) came from the same
-//! mistake: the classifier reduced a path one way and the filesystem reduced it
+//! Nine separate bypasses of the checklist deny (R88) came from the same
+//! mistake: the classifier reduced a path one way and the harness reduced it
 //! another, so two spellings of one file compared unequal and the deny did not
 //! fire. A symlinked ancestor, a case difference, a relative target, a `..`
-//! component, a `/proc/self/cwd` prefix and a leading `..` were each found and
-//! fixed one at a time.
+//! component, a `/proc/self/cwd` prefix, a leading `..`, every other
+//! per-process `/proc` view, a target rooted in a sibling worktree and a
+//! leading `~` were each found and fixed one at a time.
 //!
 //! Patching spellings individually is what produced that sequence. The
 //! invariant a path gate actually needs is that **both sides are reduced to one
-//! basis before they are compared, and no resolution whose answer depends on
-//! which process performs it is ever trusted**. This module owns the lexical
-//! half of that: [`normalize`] does the reduction `canonicalize` cannot do
-//! (because it requires the file to exist, and the interesting case is
-//! precisely a file that does not exist yet), and [`process_view`] answers
-//! whether resolving the path here would even mean the same thing as resolving
-//! it there.
+//! basis before they are compared: every expansion the harness performs is
+//! performed here too, and no resolution whose answer depends on which process
+//! performs it is ever trusted**. This module owns the lexical half of that:
+//! [`normalize`] does the reduction `canonicalize` cannot do (because it
+//! requires the file to exist, and the interesting case is precisely a file
+//! that does not exist yet), [`home_relative`] spots the one expansion the
+//! harness performs that a path gate would otherwise not perform at all, and
+//! [`process_view`] answers whether resolving the path here would even mean the
+//! same thing as resolving it there.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -73,6 +76,74 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
     }
     prefixed.push(out);
     prefixed
+}
+
+/// Whether a path opens with a shell-style `~`, and whether this process can
+/// expand it faithfully.
+///
+/// The harness expands a leading `~` before it opens the file. That is
+/// measured rather than assumed: a probe file read back through `~/<name>`
+/// returned its contents while the recorded tool input still spelled the `~`,
+/// so a hook is handed the unexpanded form of a path the harness will open
+/// expanded. A gate that skips the expansion is deciding about a path with a
+/// literal `~` directory component in it, which is not a file anyone will
+/// touch.
+///
+/// This is a different failure from the one [`ProcessView`] describes. There,
+/// both sides perform a resolution and reach different files because they are
+/// different processes. Here, one side performs an expansion the other does not
+/// perform at all — an asymmetry of STAGE rather than of process. The remedy is
+/// the same either way: perform it too, or refuse to root the path.
+///
+/// Only the FIRST component counts, exactly as a shell treats it, so `./~/x`
+/// and `a/~/x` name a real directory called `~` and are left alone. That is
+/// also why this has to run on the RAW spelling, ahead of [`normalize`]: to the
+/// normalizer the `~` in `~/../x` is an ordinary segment, which the `..` pops,
+/// leaving a working-directory-relative `x` where the harness reaches `$HOME`'s
+/// parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HomeRelative {
+    /// No leading `~`. The path means what it spells.
+    No,
+    /// `~` or `~/<rest>`: the current user's home with `rest` below it. The
+    /// caller re-roots `rest` on the `HOME` it inherited from the harness,
+    /// which is the same value the harness expanded against — so unlike
+    /// `/proc/self`, this expansion means the same thing in both processes and
+    /// is safe to perform here.
+    Own(PathBuf),
+    /// `~name/...`: some other account's home. Nothing in the environment
+    /// records where that is, and guessing `/home/<name>` or `/Users/<name>`
+    /// would be inventing a resolution the harness never performed — the exact
+    /// move that produced the sequence of bypasses above. So it is reported as
+    /// unexpandable and the caller decides about it without a root, in
+    /// whichever direction is safe.
+    Other,
+}
+
+/// Classify `path`'s leading `~`, per [`HomeRelative`].
+///
+/// Purely lexical — no environment is read and no user database is consulted —
+/// so the answer does not depend on where or as whom this runs.
+pub(crate) fn home_relative(path: &Path) -> HomeRelative {
+    let Some(Component::Normal(first)) = path.components().next() else {
+        return HomeRelative::No;
+    };
+    // `to_string_lossy` rather than `to_str`, so a name that is not valid UTF-8
+    // is still tested for its leading byte: the lossy conversion substitutes
+    // only the invalid sequences, and a leading ASCII `~` survives it intact.
+    // Missing one would leave the component unexpanded, which is the unsafe
+    // direction.
+    if !first.to_string_lossy().starts_with('~') {
+        return HomeRelative::No;
+    }
+    if first != "~" {
+        return HomeRelative::Other;
+    }
+    let mut rest = PathBuf::new();
+    for component in path.components().skip(1) {
+        rest.push(component.as_os_str());
+    }
+    HomeRelative::Own(rest)
 }
 
 /// How much of a path's meaning depends on **which process resolves it**.

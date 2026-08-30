@@ -1349,15 +1349,17 @@ fn repo_behind_a_symlink() -> (Repo, PathBuf) {
 /// rather than the shape of the response.
 ///
 /// `denial` alone would panic with "expected a denial, got Silent", which
-/// reads like a plumbing mismatch. What actually happened is that a write to
-/// the operator checklist was waved through, so say that.
+/// reads like a plumbing mismatch. What actually happened is that the operator
+/// checklist was reached outside its verbs, so say that. Both directions are
+/// named because both are the failure: a `Write` puts the document on disk
+/// unvalidated, and a `Read` pulls the raw bytes into a context window.
 fn assert_denied_as_checklist(outcome: &Outcome, tool: &str, what: &str) {
     assert_eq!(
         outcome.detail.as_deref(),
         Some("deny: checklist path"),
         "R88 did not fire: {what} was allowed ({:?}). \
-         `{tool}` can then write the operator checklist directly, bypassing \
-         the `ss-magic-plugin checklist` verbs entirely.",
+         `{tool}` can then read or write the operator checklist directly, \
+         bypassing the `ss-magic-plugin checklist` verbs entirely.",
         outcome.detail
     );
     assert!(
@@ -2130,6 +2132,292 @@ fn the_deny_names_the_checklist_verbs_and_the_wrapper_spelling() {
     assert!(
         !reason.contains("ss-magic plugin checklist"),
         "the deny must use the wrapper spelling: {reason}"
+    );
+}
+
+// ── A leading `~` (regression) ───────────────────────────────────────────────
+//
+// The ninth way through the same deny, and the first that needed no `/proc`
+// spelling, no symlink and no second worktree — just the shorthand a model
+// writes without being asked.
+//
+// The harness expands a leading `~` before it opens the file. The hook expanded
+// it not at all: `target_path` read `tool_input["file_path"]` straight into a
+// `PathBuf`, so `resolve_target` was handed a path whose first component was a
+// literal `~`. That fails `is_absolute`, so it took
+// `absolute_cwd(cwd).join(lexical)` and became `<cwd>/~/docs/actions/…`, whose
+// parent is not `docs/actions` — and the pointer route missed for the same
+// reason. Both routes said Ordinary while the harness wrote the checklist.
+//
+// This is a divergence of STAGE rather than of process, which is the notch the
+// invariant was missing: `/proc` is a resolution both sides perform and disagree
+// about, while `~` is an expansion only one side performs at all. The expansion
+// surface is now bounded by measurement — a probe file read back through
+// `~/<name>` returned its contents while the recorded tool input still spelled
+// the `~`, and the same probe through `$HOME/<name>` was reported missing, so
+// the tilde is the only expansion that diverges.
+//
+// These fixtures have to move `HOME`, since the expansion is against the value
+// this process inherited. `HOME` is process-global, so they serialize on
+// `ENV_LOCK` and restore through a `Drop` guard rather than at the end of the
+// body: a failing assertion must not leave the rest of the suite running under
+// a temporary `HOME`.
+
+/// Serializes the tests that move `HOME`, which is process-global while Rust
+/// runs tests multithreaded.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// `HOME` set for the lifetime of the guard and put back on drop, panics
+/// included.
+struct HomeGuard {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl HomeGuard {
+    fn set(home: &Path) -> Self {
+        // A poisoned lock means an earlier test panicked while holding it — and
+        // its own guard already put `HOME` back on the way out, so there is no
+        // broken state to protect. Recovering beats failing every later test
+        // with a message about the wrong thing.
+        let lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", home);
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+/// A worktree sitting directly under a `HOME` this test controls, plus the
+/// `~/<name>` prefix that reaches it. Returns the guard so the caller keeps the
+/// override alive for the length of the test.
+fn repo_under_home() -> (Repo, String, HomeGuard) {
+    let repo = repo();
+    let home = repo.root.parent().unwrap().to_path_buf();
+    let name = repo.root.file_name().unwrap().to_string_lossy().into_owned();
+    let guard = HomeGuard::set(&home);
+    (repo, format!("~/{name}"), guard)
+}
+
+/// A `~`-spelled checklist is denied, by either route.
+///
+/// A failure here means `~/<repo>/docs/actions/<stem>.checklist.json` — a
+/// spelling that works on macOS and Linux, needs no Bash step and no adversary
+/// — writes the operator checklist straight past R88.
+#[test]
+fn a_tilde_checklist_target_is_denied() {
+    let (repo, prefix, _home) = repo_under_home();
+    // Not a conventional name, so the pointer route is the only thing that can
+    // catch the second spelling below.
+    repo.point_at("state/tracker.json");
+
+    for (rel, route) in [
+        ("docs/actions/2026-08-new.checklist.json", "the convention"),
+        ("state/tracker.json", "the pointer"),
+    ] {
+        let spelling = format!("{prefix}/{rel}");
+        // The precondition the bug needs, asserted rather than assumed: the
+        // spelling is NOT absolute, so a gate that only expands what fails
+        // `is_absolute` by joining it onto the cwd carries the literal `~`
+        // into the comparison and can never match either route.
+        assert!(
+            !Path::new(&spelling).is_absolute(),
+            "{spelling} has to be non-absolute to exercise the cwd join"
+        );
+
+        let env = envelope(
+            &repo.root,
+            "Write",
+            serde_json::json!({ "file_path": &spelling }),
+        );
+        let outcome = run(&env, &repo.root, &default_config());
+        assert_denied_as_checklist(
+            &outcome,
+            "Write",
+            &format!(
+                "a Write of `{spelling}`, a checklist by {route} reached through the \
+                 leading `~` the harness expands and the hook did not"
+            ),
+        );
+    }
+}
+
+/// Expanding the `~` must not turn into denying everything spelled with one: an
+/// ordinary `~`-relative read is still an ordinary read.
+#[test]
+fn a_tilde_read_that_is_not_a_checklist_is_allowed() {
+    let (repo, prefix, _home) = repo_under_home();
+    repo.point_at("state/tracker.json");
+
+    for rel in [
+        "src/main.rs",
+        // Under `docs/actions/` but not checklist-named, and named like the
+        // pointer's file but not under its directory — the two near misses.
+        "docs/actions/notes.md",
+        "tracker.json",
+    ] {
+        let spelling = format!("{prefix}/{rel}");
+        let env = envelope(&repo.root, "Read", serde_json::json!({ "file_path": &spelling }));
+        let outcome = run(&env, &repo.root, &default_config());
+        assert!(
+            allowed(&outcome).starts_with("allow:"),
+            "{spelling} is not a checklist and must go through: {:?}",
+            outcome.detail
+        );
+    }
+}
+
+/// The expansion has to happen on the RAW spelling, before the `..`s are
+/// cancelled — the one ordering claim `resolve_target` makes about it.
+///
+/// `~/../docs/actions/<stem>.checklist.json` is `$HOME`'s parent with the
+/// checklist below it, so with `HOME` inside the worktree it IS the worktree's
+/// checklist. Reduce first and the normalizer pops the `~` like any other
+/// segment, leaving a relative `docs/actions/…` that gets joined onto the
+/// envelope's cwd — a different directory, and no checklist at all. The cwd is
+/// deliberately a SUBDIRECTORY of the worktree here, because that is what makes
+/// the two orders reach different files rather than the same one by luck.
+#[test]
+fn the_tilde_is_expanded_before_the_parent_components_are_cancelled() {
+    let repo = repo();
+    let cwd = repo.root.join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let home = repo.root.join("sub");
+    fs::create_dir_all(&home).unwrap();
+    let _home = HomeGuard::set(&home);
+
+    let spelling = "~/../docs/actions/2026-08-new.checklist.json";
+    let env = envelope(&cwd, "Write", serde_json::json!({ "file_path": spelling }));
+    let outcome = run(&env, &repo.root, &default_config());
+    assert_denied_as_checklist(
+        &outcome,
+        "Write",
+        &format!(
+            "a Write of `{spelling}`, which is the worktree's checklist only if the \
+             `~` is expanded before the `..` cancels it"
+        ),
+    );
+}
+
+/// `~name` is another account's home, and nothing here knows where that is.
+/// Guessing `/home/<name>` would be inventing a resolution the harness never
+/// performed, so the path takes the unrootable route instead — which still
+/// denies a checklist-SHAPED path and still lets an ordinary one through.
+///
+/// No `HOME` override: reaching the guess would mean `own_home` was consulted
+/// at all, and it must not be for this shape.
+#[test]
+fn a_named_home_target_is_judged_without_a_root_never_guessed() {
+    let repo = repo();
+    repo.point_at("state/tracker.json");
+
+    for (spelling, route) in [
+        (
+            "~alice/repo/docs/actions/2026-08-new.checklist.json",
+            "the convention",
+        ),
+        ("~alice/repo/state/tracker.json", "the pointer"),
+    ] {
+        let env = envelope(&repo.root, "Write", serde_json::json!({ "file_path": spelling }));
+        let outcome = run(&env, &repo.root, &default_config());
+        assert_denied_as_checklist(
+            &outcome,
+            "Write",
+            &format!(
+                "a Write of `{spelling}`, a checklist by {route} under a `~name` no \
+                 process here can expand"
+            ),
+        );
+    }
+
+    let env = envelope(
+        &repo.root,
+        "Read",
+        serde_json::json!({ "file_path": "~alice/repo/src/main.rs" }),
+    );
+    let outcome = run(&env, &repo.root, &default_config());
+    assert!(
+        allowed(&outcome).starts_with("allow:"),
+        "an ordinary file under an unexpandable `~name` must go through: {:?}",
+        outcome.detail
+    );
+}
+
+// ── An unrootable path whose indirection is in its tail (regression) ─────────
+//
+// `is_checklist_under_any_root` tested only what the path SPELLS, and the
+// spelling is not where an unrootable path has to hide its indirection. A decoy
+// symlink named `notes.txt`, reached through a per-process `/proc` view, is
+// checklist-shaped by neither route and was allowed — despite that branch's
+// docstring promising it errs toward the deny.
+//
+// The fix resolves the path as well, and ONLY to ADD a denial. That does not
+// reintroduce the cross-process trust problem move 2 of the invariant forbids:
+// canonicalizing here still answers a question about the hook's process, but a
+// wrong answer used additively can only over-deny.
+//
+// The fixture builds a `proc/self/root` directory inside the worktree rather
+// than using the real `/proc`, so the same assertion runs on Linux and on
+// macOS, where `/proc` does not exist at all. `process_view` looks for the
+// selector anywhere in the sequence, so the two are classified identically.
+
+/// A decoy symlink under an unrootable path, resolving to the checklist, is
+/// denied — and the same shape resolving to an ordinary file is not.
+#[test]
+fn an_unrootable_path_whose_tail_is_a_decoy_symlink_is_denied() {
+    let repo = repo();
+    // A checklist that exists: `canonicalize` resolves a symlink only when its
+    // target is really there.
+    let checklist = repo.write("docs/actions/2026-08-live.checklist.json", "{}");
+    let ordinary = repo.write("src/main.rs", "fn main() {}");
+
+    let opaque_dir = repo.root.join("proc/self/root");
+    fs::create_dir_all(&opaque_dir).unwrap();
+    let decoy = opaque_dir.join("notes.txt");
+    let harmless = opaque_dir.join("other.txt");
+    std::os::unix::fs::symlink(&checklist, &decoy).unwrap();
+    std::os::unix::fs::symlink(&ordinary, &harmless).unwrap();
+
+    // The precondition, asserted rather than assumed: without the Opaque
+    // classification this exercises the ordinary rooted branch, which already
+    // canonicalizes and would pass for the wrong reason.
+    assert_eq!(
+        pathnorm::process_view(&decoy),
+        pathnorm::ProcessView::Opaque,
+        "the fixture has to be an unrootable per-process view to exercise the branch"
+    );
+    // And the shape alone says nothing: the deny can only come from resolving.
+    assert!(
+        !decoy.to_string_lossy().contains("checklist"),
+        "the decoy must not be checklist-shaped, or the shape test answers it"
+    );
+
+    let env = envelope(&repo.root, "Read", serde_json::json!({ "file_path": &decoy }));
+    let outcome = run(&env, &repo.root, &default_config());
+    assert_denied_as_checklist(
+        &outcome,
+        "Read",
+        "a Read of a decoy symlink, under an unrootable per-process view, resolving \
+         to the checklist",
+    );
+
+    let env = envelope(&repo.root, "Read", serde_json::json!({ "file_path": &harmless }));
+    let outcome = run(&env, &repo.root, &default_config());
+    assert!(
+        allowed(&outcome).starts_with("allow:"),
+        "resolving an unrootable path may ADD denials, not manufacture them: {:?}",
+        outcome.detail
     );
 }
 

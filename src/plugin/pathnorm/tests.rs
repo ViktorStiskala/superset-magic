@@ -159,3 +159,96 @@ fn a_bare_proc_cwd_re_roots_with_an_empty_remainder() {
         ProcessView::Cwd(PathBuf::new()),
     );
 }
+
+// ── A leading `~` (the expansion the harness performs and a gate would not) ──
+//
+// The ninth bypass of the R88 deny, and the first that needed no `/proc`
+// spelling, no symlink and no second worktree. `~/repo/docs/actions/…` is
+// shorthand a model emits unprompted; the harness expands it before opening the
+// file, the hook expanded nothing, and the two ended up looking at different
+// paths. `home_relative` is the lexical half of the fix — it says what kind of
+// `~` this is, and the caller supplies the `HOME` to expand against.
+
+/// `~` and `~/rest` name the current user's home. The remainder comes back
+/// unexpanded, for the caller to re-root on the `HOME` it inherited.
+#[test]
+fn a_leading_tilde_is_the_callers_own_home() {
+    assert_eq!(
+        home_relative(Path::new("~/docs/actions/x.checklist.json")),
+        HomeRelative::Own(PathBuf::from("docs/actions/x.checklist.json"))
+    );
+    assert_eq!(
+        home_relative(Path::new("~")),
+        HomeRelative::Own(PathBuf::new()),
+        "a bare `~` is the home directory itself, with nothing below it"
+    );
+}
+
+/// The remainder keeps its `..`, because the expansion has to happen BEFORE the
+/// cancellation. `$HOME/../x` is a file beside the home directory; cancelling
+/// first pops the `~` itself, like any other segment, and yields a
+/// working-directory-relative `x` somewhere else entirely.
+#[test]
+fn the_remainder_keeps_a_parent_component_for_the_caller_to_cancel() {
+    assert_eq!(
+        home_relative(Path::new("~/../x")),
+        HomeRelative::Own(PathBuf::from("../x"))
+    );
+    // What reducing first would have produced instead — the wrong file, which
+    // is why `resolve_target` asks this question before it normalizes.
+    assert_eq!(
+        normalize(Path::new("~/../x")),
+        Path::new("x"),
+        "the normalizer pops `~` like an ordinary segment; that is the trap"
+    );
+}
+
+/// `~name` is some other account's home. Nothing here knows where that is, and
+/// a guessed `/home/<name>` would be a resolution the harness never performed —
+/// the move that produced the whole sequence of bypasses. So it is reported as
+/// unexpandable and the caller decides without a root.
+#[test]
+fn a_named_home_is_reported_unexpandable_never_guessed() {
+    for path in ["~alice/x", "~root", "~alice/repo/docs/actions/x.checklist.json"] {
+        assert_eq!(
+            home_relative(Path::new(path)),
+            HomeRelative::Other,
+            "{path} names an account whose home only a user database knows"
+        );
+    }
+}
+
+/// A name that is not valid UTF-8 is still tested for its leading byte. Missing
+/// one would leave the component unexpanded, which is the unsafe direction.
+#[test]
+fn a_non_utf8_named_home_is_still_recognized() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::OsStr::from_bytes(b"~ali\xffce/x");
+    assert_eq!(home_relative(Path::new(name)), HomeRelative::Other);
+}
+
+/// Only the FIRST component is special, exactly as a shell treats it. Anywhere
+/// else a `~` is an ordinary directory name, and expanding it would send the
+/// gate to a file the harness never touches.
+#[test]
+fn a_tilde_that_is_not_the_first_component_is_an_ordinary_name() {
+    for path in ["./~/x", "a/~/x", "/~/x", "/home/me/~/x"] {
+        assert_eq!(
+            home_relative(Path::new(path)),
+            HomeRelative::No,
+            "{path} names a real directory called `~`"
+        );
+    }
+}
+
+#[test]
+fn an_ordinary_path_has_no_leading_tilde() {
+    for path in ["docs/actions/x.json", "/r/docs", "", "../x"] {
+        assert_eq!(
+            home_relative(Path::new(path)),
+            HomeRelative::No,
+            "{path} has nothing to expand"
+        );
+    }
+}

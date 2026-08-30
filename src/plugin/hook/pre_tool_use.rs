@@ -176,34 +176,69 @@ fn classify_checklist(ctx: &HookContext<'_>, target: &Path) -> Classification {
 
 // ── The invariant this gate is built on ──────────────────────────────────────
 //
-// **The gate classifies from the TARGET, and never trusts a resolution whose
+// **The gate classifies from the TARGET; it performs every expansion the
+// harness performs before opening a file, and never trusts a resolution whose
 // result depends on which process performs it.**
 //
-// Six bypasses of the R88 deny were found and fixed one at a time — a
+// Eight bypasses of the R88 deny were found and fixed one at a time — a
 // symlinked ancestor, a case difference, a relative target, a `..` component, a
-// `/proc/self/cwd` prefix, a leading `..` — and each fix was followed by
+// `/proc/self/cwd` prefix, a leading `..`, every other per-process `/proc` view
+// and a target rooted in a sibling worktree — and each fix was followed by
 // another hole. They share one generator: the gate kept choosing its
 // comparison basis from the ACTOR (the hook's own process, the envelope's cwd)
 // rather than from the target, and kept recognizing individual SPELLINGS
 // rather than the property that made them dangerous.
 //
+// A ninth then escaped the invariant as it was first written, which is why the
+// sentence above now has a middle clause. That first statement closed only
+// resolutions whose answer depends on WHICH PROCESS performs them; a leading
+// `~` is an expansion the harness performs and the hook did not perform AT ALL
+// — an asymmetry of stage, not of process. So `~/repo/docs/actions/x` failed
+// `is_absolute`, was joined onto the envelope's cwd with a literal `~`
+// component still in it, and matched neither route while the harness opened the
+// expanded path.
+//
 // So the invariant is satisfied in three moves, in this order, and the order is
 // load-bearing:
 //
-//   1. Reduce lexically FIRST, before anything else looks at the path
-//      ([`resolve_target`]). `..` is an ordinary component, so a spelling only
-//      shows what it is once its `..`s have been cancelled — and the reduction
-//      used to run AFTER the `/proc` test, which is how the fix for `..` came
-//      to defeat the fix for `/proc`. Where this earns its place now is the
-//      unrootable branch below: a path that is never canonicalized is judged
-//      purely by its shape, and an uncancelled `docs/actions/foo/../x` reads as
-//      a file in `docs/actions/foo` while the filesystem writes the checklist.
-//      (The reported `/tmp/../proc/self/cwd/x` shape is closed twice over, since
-//      move 2's scan finds the selector wherever it ends up sitting.)
+//   1. Perform every expansion the harness performs — or refuse to root the
+//      path — and reduce lexically, both before anything else looks at the
+//      path ([`resolve_target`]).
+//
+//      The expansion goes first because it acts on the RAW spelling: `~/../x`
+//      has to become `$HOME/../x` before the `..` is cancelled, or the `~` is
+//      popped like an ordinary segment and the path quietly becomes a
+//      different one. The reduction then goes before everything else because
+//      `..` is an ordinary component, so a spelling only shows what it is once
+//      its `..`s have been cancelled — and the reduction used to run AFTER the
+//      `/proc` test, which is how the fix for `..` came to defeat the fix for
+//      `/proc`. Where that earns its place now is the unrootable branch below:
+//      a path that is never canonicalized for a verdict that could CLEAR it is
+//      judged largely by its shape, and an uncancelled `docs/actions/foo/../x`
+//      reads as a file in `docs/actions/foo` while the filesystem writes the
+//      checklist. (The reported `/tmp/../proc/self/cwd/x` shape is closed twice
+//      over, since move 2's scan finds the selector wherever it ends up
+//      sitting.)
+//
+//      The set of expansions to perform is bounded by MEASUREMENT, not by
+//      imagination, so it is a short list rather than an open-ended one. A
+//      probe file in the real home read back as `~/<name>` returned its
+//      contents while the recorded tool input still spelled the `~`, so the
+//      harness expands the tilde and the hook must too. The same probe spelled
+//      `$HOME/<name>` was reported missing, so both sides treat shell-variable
+//      syntax as a literal and it cannot diverge. `/proc` is move 2's business.
+//      Tilde is the only divergence there is: do not add speculative handling
+//      for other syntaxes, and if a new one is ever suspected, probe it before
+//      writing code for it.
 //   2. Decide process-relativeness as a PROPERTY of the component sequence
 //      ([`pathnorm::process_view`]), never as a recognized prefix — and for a
 //      form that cannot be faithfully re-rooted, refuse to `canonicalize` it
-//      here at all and decide lexically, toward the deny.
+//      here for any verdict that would CLEAR it, and decide lexically, toward
+//      the deny. Resolving such a path to ADD a denial is still allowed
+//      ([`is_checklist_under_any_root`] does exactly that, since an unrootable
+//      path can carry its indirection in its tail): a resolution performed in
+//      the wrong process can be wrong there too, but wrong in that direction
+//      only ever over-denies.
 //   3. Derive the candidate roots from the TARGET as well as from the actor
 //      ([`classification_roots`]). A worktree and its main checkout are one
 //      ordinary deployment, so an absolute path into a sibling tree's
@@ -211,7 +246,7 @@ fn classify_checklist(ctx: &HookContext<'_>, target: &Path) -> Classification {
 //      root-relative comparison against the actor's own root alone can never
 //      see it.
 //
-// If a seventh bypass turns up, the question to ask is which of these three the
+// If a tenth bypass turns up, the question to ask is which of these three the
 // path escaped — not which spelling to add to a list. Adding the spelling is
 // the move that produced the sequence.
 
@@ -220,20 +255,43 @@ enum Target {
     /// A path that means the same thing in every process, resolved against the
     /// filesystem and directly comparable with a worktree root.
     Rooted(PathBuf),
-    /// A process-relative path with no faithful re-rooting (`…/proc/<pid>/root`,
-    /// `…/proc/self/fd/<n>`, …), reduced lexically and deliberately never
-    /// handed to `canonicalize`: doing that here would answer a question about
-    /// the HOOK's process, which is not the one that will perform the write.
-    /// There is no root to compare it against, so the classifier asks the
-    /// root-independent question instead.
+    /// A path this process cannot root faithfully. Two shapes arrive here: a
+    /// per-process view with no re-rooting (`…/proc/<pid>/root`,
+    /// `…/proc/self/fd/<n>`, …), and a `~name` — or a `~` with no usable `HOME`
+    /// — whose expansion only a user database knows. Both are reduced lexically
+    /// and deliberately never handed to `canonicalize` for a verdict that could
+    /// CLEAR them: doing that here would answer a question about the HOOK's
+    /// process, which is not the one that will perform the write. There is no
+    /// root to compare against, so the classifier asks the root-independent
+    /// question instead, which may only ADD denials.
     Unrootable(PathBuf),
 }
 
 /// Reduce the tool's target to one basis, per steps 1 and 2 of the invariant
 /// above.
 fn resolve_target(cwd: &Path, raw: &Path) -> Target {
-    // 1. Lexical reduction first, unconditionally.
-    let lexical = pathnorm::normalize(raw);
+    // 1a. Expansion first, on the RAW spelling. The harness expands a leading
+    //     `~` before it opens the file and nothing here used to expand it at
+    //     all, so the gate was judging a path with a literal `~` component in
+    //     it — a file no one will ever touch. It has to run ahead of the
+    //     reduction because the normalizer treats `~` as an ordinary segment,
+    //     so `~/../x` would have its `~` popped and come out as a
+    //     working-directory-relative `x`.
+    let expanded = match pathnorm::home_relative(raw) {
+        pathnorm::HomeRelative::No => raw.to_path_buf(),
+        pathnorm::HomeRelative::Own(rest) => match own_home() {
+            Some(home) => home.join(rest),
+            // No `HOME` to expand against, so there is no faithful expansion to
+            // perform. The path is judged without a root rather than rooted on
+            // a guess.
+            None => return Target::Unrootable(pathnorm::normalize(raw)),
+        },
+        // `~name` is another account's home, which only a user database knows.
+        pathnorm::HomeRelative::Other => return Target::Unrootable(pathnorm::normalize(raw)),
+    };
+
+    // 1b. Lexical reduction, unconditionally.
+    let lexical = pathnorm::normalize(&expanded);
 
     match pathnorm::process_view(&lexical) {
         // 2a. Re-rootable: `…/proc/<selector>/cwd/<rest>` means "<the resolving
@@ -269,6 +327,21 @@ fn resolve_target(cwd: &Path, raw: &Path) -> Target {
 /// off than it was.
 fn absolute_cwd(cwd: &Path) -> PathBuf {
     cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
+}
+
+/// The home directory a leading `~` expands to, or `None` when there is none
+/// this process can faithfully use.
+///
+/// `HOME` is safe to trust here in a way `/proc/self` is not. The hook is a
+/// subprocess of the harness and inherits its environment, so both sides expand
+/// against the same value and the expansion means the same thing in either
+/// process — which is precisely the property move 2 of the invariant denies to
+/// `/proc`. An unset, empty or relative `HOME` yields `None`: there is then no
+/// value to reproduce, and the caller judges the path without a root instead of
+/// inventing one.
+fn own_home() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    home.is_absolute().then_some(home)
 }
 
 /// Every worktree root `target` could be a checklist under — step 3 of the
@@ -414,18 +487,44 @@ fn is_checklist_path(root: &Path, path: &Path) -> bool {
 /// Whether `path` is the checklist under **some** root, when which root it
 /// really sits under cannot be established.
 ///
-/// This is what step 2 of the invariant leaves the gate holding: a
-/// process-relative path with no faithful re-rooting is never `canonicalize`d
-/// here, so it has no root and neither root-relative route in
+/// This is what steps 1 and 2 of the invariant leave the gate holding: a path
+/// with no faithful rooting — a per-process `/proc` view, or a `~` this process
+/// cannot expand — is never `canonicalize`d here for a verdict that could CLEAR
+/// it, so it has no root and neither root-relative route in
 /// [`is_checklist_path`] can be asked about it. The root-independent question
 /// is asked instead, and it errs toward the deny — which is the safe direction
 /// for this gate, where one path too many costs a redirect to the CLI and one
 /// too few costs the operator checklist written unlocked and unvalidated.
 ///
-/// Erring toward the deny is not the same as denying everything. Both tests
-/// below are about the SHAPE of the path, so an ordinary process-relative read
-/// — `/proc/self/status`, say — matches neither and goes through untouched.
+/// Erring toward the deny is not the same as denying everything. The shape
+/// tests are about what the path SPELLS, so an ordinary process-relative read
+/// — `/proc/self/status`, say — matches none of them and goes through
+/// untouched.
 fn is_checklist_under_any_root(pointer_root: &Path, path: &Path) -> bool {
+    if has_checklist_shape(pointer_root, path) {
+        return true;
+    }
+
+    // The shape test sees only what the path spells, and an unrootable path can
+    // carry its indirection in its TAIL rather than its prefix: a decoy symlink
+    // at `…/proc/self/root/<repo>/docs/actions/notes.txt` pointing at the
+    // checklist spells nothing checklist-shaped at all. So resolve it and ask
+    // again — but ONLY to add a denial, never to remove one.
+    //
+    // That is what keeps move 2 of the invariant intact rather than quietly
+    // undoing it. Canonicalizing here still answers a question about the HOOK's
+    // process, so the answer may well be about a different file; the difference
+    // is the direction it can be wrong in. Used additively, a wrong answer
+    // costs a redirect to the CLI. Used to CLEAR a path, it would cost the deny
+    // itself. A path that does not resolve at all — every `/proc` spelling on
+    // macOS — simply keeps the shape verdict.
+    path.canonicalize()
+        .is_ok_and(|resolved| has_checklist_shape(pointer_root, &resolved))
+}
+
+/// The root-independent half of [`is_checklist_under_any_root`]: does `path`
+/// SPELL a checklist, under any root at all?
+fn has_checklist_shape(pointer_root: &Path, path: &Path) -> bool {
     // The convention is a fixed three-component tail
     // (`docs/actions/<stem>.checklist.json`), so asking `matches_convention`
     // about every ancestor in turn asks "is this a conventionally-named
