@@ -29,8 +29,9 @@
 //! ## Layout
 //!
 //! This module owns only the second-level parse and the dispatch table. The
-//! work lives in siblings added by later units: `hook/` (the stdin decode,
-//! event routing, JSON envelope and fail-open wrapper), `config.rs`,
+//! work lives in siblings: `config.rs` (this unit — the typed `plugin` key
+//! and its overlay resolution) and, added by later units, `hook/` (the
+//! stdin decode, event routing, JSON envelope and fail-open wrapper),
 //! `identity.rs`, `scratchpad.rs`, `status.rs`, `checklist/`, `ledger.rs`,
 //! `cache.rs` and `tmproot.rs`.
 
@@ -39,6 +40,8 @@ use std::process::ExitCode;
 use anyhow::Result;
 
 use crate::tui::style;
+
+pub(crate) mod config;
 
 // ── Hook events ───────────────────────────────────────────────────────────────
 

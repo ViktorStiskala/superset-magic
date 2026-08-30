@@ -437,6 +437,60 @@ fn overlay_malformed_local_returns_error_with_path() {
     assert!(msg.contains("malformed JSON"), "msg: {msg}");
 }
 
+/// R6 — a non-`files` key absent from magic.local.json inherits the base
+/// value unchanged (the merge loop only ever touches keys local actually
+/// mentions).
+#[test]
+fn overlay_non_files_key_absent_in_local_inherits_base() {
+    let dir = fresh();
+    let root = dir.path();
+    write_magic_json_raw(root, r#"{"files":[],"plugin":{"enabled":true}}"#);
+    write_magic_local_raw(root, r#"{"files":[]}"#);
+
+    let result = load_overlaid(root).unwrap().unwrap();
+    assert_eq!(
+        result.extras.get("plugin"),
+        Some(&serde_json::json!({"enabled": true}))
+    );
+}
+
+/// R6 — an explicit `null` in magic.local.json for a non-`files` key means
+/// "off": it overrides the base value with `null` rather than being treated
+/// as absent.
+#[test]
+fn overlay_non_files_key_explicit_null_in_local_means_off() {
+    let dir = fresh();
+    let root = dir.path();
+    write_magic_json_raw(root, r#"{"files":[],"plugin":{"enabled":true}}"#);
+    write_magic_local_raw(root, r#"{"files":[],"plugin":null}"#);
+
+    let result = load_overlaid(root).unwrap().unwrap();
+    assert_eq!(result.extras.get("plugin"), Some(&serde_json::Value::Null));
+}
+
+/// R6 — local's value replaces base's WHOLE; this is not a deep merge. A
+/// local `plugin` object that omits a sub-key the base had does not carry
+/// that sub-key forward — the whole base `plugin` value is discarded, not
+/// merged key-by-key underneath it.
+#[test]
+fn overlay_non_files_key_local_value_replaces_base_whole_not_deep_merged() {
+    let dir = fresh();
+    let root = dir.path();
+    write_magic_json_raw(
+        root,
+        r#"{"files":[],"plugin":{"enabled":true,"gate":{"threshold_lines":5000}}}"#,
+    );
+    write_magic_local_raw(root, r#"{"files":[],"plugin":{"enabled":false}}"#);
+
+    let result = load_overlaid(root).unwrap().unwrap();
+    assert_eq!(
+        result.extras.get("plugin"),
+        Some(&serde_json::json!({"enabled": false})),
+        "local's plugin value must replace base's whole, dropping base's `gate` \
+         rather than inheriting it underneath local's `enabled`"
+    );
+}
+
 /// write_magic_json produces pretty-printed JSON with a trailing newline
 /// that round-trips through load_overlaid.
 #[test]
