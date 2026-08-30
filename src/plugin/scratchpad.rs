@@ -618,10 +618,11 @@ fn now_rfc3339() -> String {
 ///
 /// Pure and dependency-free, using Howard Hinnant's civil-from-days algorithm
 /// — the same technique as `sync::reverse_sync`'s backup-directory timestamp,
-/// reproduced here rather than shared because the two produce different
-/// formats for different audiences (a directory name there, a machine-readable
-/// instant here) and neither module is the natural home for the other's.
-fn format_rfc3339(secs: u64) -> String {
+/// which is NOT shared with it because the two produce different formats for
+/// different audiences (a directory name there, a machine-readable instant
+/// here). `plugin::heartbeat` wants exactly this format for the same audience,
+/// so it calls this rather than growing a third copy of the date arithmetic.
+pub(crate) fn format_rfc3339(secs: u64) -> String {
     let days = secs / 86_400;
     let rem = secs % 86_400;
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);

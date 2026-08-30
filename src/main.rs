@@ -61,13 +61,25 @@ pub fn should_run_update_gate(cmd: Command, guard_active: bool) -> bool {
 }
 
 fn run() -> Result<ExitCode> {
-    tui::style::init();
-    // Composition order: tui::style::init (above) → parse argv → [help check] →
-    // [auto-update gate for Bare/Sync] → dispatch (menu / sync / update).
-    // Parsing and the help response happen before the gate so `--help`
-    // answers instantly without a network call.
+    // Composition order: parse argv → style init → [help check] → [auto-update
+    // gate for Bare/Sync] → dispatch (menu / sync / update). Parsing and the
+    // help response happen before the gate so `--help` answers instantly
+    // without a network call.
+    //
+    // Style is initialized AFTER the parse, and skipped entirely for the plugin
+    // verb tree. The color decision lives in a `OnceLock`, so whichever call
+    // makes it first wins for the whole process — and a `plugin hook` verb must
+    // force color off, because it answers the harness with JSON on stdout and
+    // an ANSI escape would make that unparseable. `plugin::run` therefore makes
+    // the choice itself, once it knows whether it is serving the harness or a
+    // person. Nothing between the parse and that point prints anything.
     let args: Vec<String> = env::args().skip(1).collect();
-    match cli::parse(&args) {
+    let parsed = cli::parse(&args);
+    if !matches!(parsed, Parsed::Plugin(_)) {
+        tui::style::init();
+    }
+
+    match parsed {
         // `--version`/`-V`: answer and stop. No network call, no dispatch —
         // a hook shelling out to identify the binary must not trip an update
         // or a menu.
@@ -92,7 +104,8 @@ fn run() -> Result<ExitCode> {
         Parsed::Init(patterns) => init_noninteractive(&patterns),
         // The plugin verb tree. Handled here, in a sibling arm of the update
         // gate rather than inside it, so no plugin invocation ever self-updates
-        // or opens the TUI.
+        // or opens the TUI. It is also the one arm that reaches this match with
+        // style still uninitialized, per the note above.
         Parsed::Plugin(plugin_args) => plugin::run(&plugin_args),
         Parsed::Command(cmd) => {
             // U8: run the daily-cache auto-update gate before any work for

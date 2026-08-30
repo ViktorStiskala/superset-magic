@@ -250,3 +250,29 @@ fn config_writing_verbs_are_reachable_only_as_human_verbs() {
         }
     }
 }
+
+// ── R47: the color posture is decided by which caller is being served ─────────
+
+/// A hook verb answers the harness with JSON on stdout and plain text on
+/// stderr, so it forces color off — for every event, including one this binary
+/// cannot route and one with no event token at all.
+#[test]
+fn every_hook_invocation_forces_color_off() {
+    for (token, _) in EVENTS {
+        assert!(forces_no_color(&parse(&argv(&["hook", token]))), "{token}");
+    }
+    assert!(forces_no_color(&parse(&argv(&["hook", "notification"]))));
+    assert!(forces_no_color(&parse(&argv(&["hook"]))));
+}
+
+/// A human verb is a person at a terminal, so it keeps the ordinary detection.
+/// So do the help and error paths, which print styled text of their own.
+#[test]
+fn human_verbs_and_the_error_paths_keep_normal_color_detection() {
+    for (token, _) in VERBS {
+        assert!(!forces_no_color(&parse(&argv(&[token]))), "{token}");
+    }
+    for args in [vec!["--help"], vec![], vec!["nonsense"]] {
+        assert!(!forces_no_color(&parse(&argv(&args))), "{args:?}");
+    }
+}

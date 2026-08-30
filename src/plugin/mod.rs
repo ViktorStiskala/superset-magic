@@ -32,9 +32,11 @@
 //! work lives in siblings: `config.rs` (the typed `plugin` key and its
 //! overlay resolution), `identity.rs` (the `<repo>-<branch>` slug),
 //! `scratchpad.rs` (the `.superset/.magic/` state tree), `tmproot.rs` (the
-//! private per-machine temporary root and its fd-lock helper) and, added by
-//! later units, `hook/` (the stdin decode, event routing, JSON envelope and
-//! fail-open wrapper), `status.rs`, `checklist/`, `ledger.rs` and `cache.rs`.
+//! private per-machine temporary root and its fd-lock helper), `hook/` (the
+//! stdin decode, event routing, JSON envelope and fail-open wrapper),
+//! `heartbeat.rs` (the machine-level `hooks.jsonl` row every hook leaves
+//! behind) and, added by later units, `status.rs`, `checklist/`, `ledger.rs`
+//! and `cache.rs`.
 
 use std::process::ExitCode;
 
@@ -43,6 +45,8 @@ use anyhow::Result;
 use crate::tui::style;
 
 pub(crate) mod config;
+pub(crate) mod heartbeat;
+pub(crate) mod hook;
 pub(crate) mod identity;
 pub(crate) mod scratchpad;
 pub(crate) mod tmproot;
@@ -319,7 +323,15 @@ pub fn parse(args: &[String]) -> Parsed {
 /// Entry point for `ss-magic plugin …`, called from `main.rs` outside the
 /// auto-update gate. Parses the argv and routes it.
 pub fn run(args: &[String]) -> Result<ExitCode> {
-    match parse(args) {
+    let parsed = parse(args);
+
+    if forces_no_color(&parsed) {
+        style::init_no_color();
+    } else {
+        style::init();
+    }
+
+    match parsed {
         Parsed::Invocation(inv) => dispatch(inv),
         Parsed::Help => {
             println!("{}", usage());
@@ -344,6 +356,21 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
     }
 }
 
+/// Whether this invocation must force color off.
+///
+/// A hook verb owns stdout for its JSON envelope and stderr for plain-text
+/// diagnostics; an ANSI escape would make the first unparseable and the second
+/// harder to read in a transcript. Every other invocation — including a hook
+/// event this binary cannot route, which prints nothing anyway — makes the
+/// ordinary terminal-detection decision.
+///
+/// `main.rs` deliberately leaves the choice to us rather than initializing
+/// style before the parse: the decision lives in a `OnceLock`, so whichever
+/// call makes it first wins for the whole process.
+fn forces_no_color(parsed: &Parsed) -> bool {
+    matches!(parsed, Parsed::Invocation(Invocation::Hook { .. }))
+}
+
 /// Route a resolved invocation to its handler.
 fn dispatch(inv: Invocation) -> Result<ExitCode> {
     match inv {
@@ -352,16 +379,16 @@ fn dispatch(inv: Invocation) -> Result<ExitCode> {
     }
 }
 
-/// Placeholder for the hook wrapper that U11 adds in `plugin/hook/mod.rs`,
-/// which will own the stdin decode, the per-event modules, the JSON envelope
-/// and the heartbeat row.
+/// Hand the invocation to the hook pipeline, which owns the stdin decode, the
+/// enablement and ignored-tree gates, the per-event dispatch, the JSON
+/// envelope on stdout and the heartbeat row.
 ///
-/// Until then it holds the posture the wrapper must keep: nothing on stdout,
-/// nothing on stderr, exit 0. An unimplemented hook has to look to the harness
-/// exactly like a hook that decided to do nothing, or an in-flight session
-/// would break on a tool that is only ever advisory.
-fn run_hook(_event: &HookEvent) -> Result<ExitCode> {
-    Ok(ExitCode::SUCCESS)
+/// It always exits 0 — including for an event this binary cannot route, and
+/// including when a handler fails outright. An unimplemented or broken hook
+/// has to look to the harness exactly like a hook that decided to do nothing,
+/// or an in-flight session would break on a tool that is only ever advisory.
+fn run_hook(event: &HookEvent) -> Result<ExitCode> {
+    hook::run(event)
 }
 
 /// Route a human verb to its handler. Verbs later units own still land on the

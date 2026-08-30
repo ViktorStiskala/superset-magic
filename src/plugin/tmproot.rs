@@ -79,8 +79,10 @@ use crate::hashing;
 /// directly under a machine temp base. Fixed cross-language contract text —
 /// see the module docs' "identifier is a cross-language contract" section.
 // Not yet referenced outside this module and its tests: U23's bootstrap.sh
-// matches this contract in shell rather than calling into Rust, and U30 is
-// the first in-crate caller of the lock helpers below.
+// matches this contract in shell rather than calling into Rust. The lock
+// helpers below DO have an in-crate caller — `plugin::heartbeat` locks its
+// own store with `with_lock` — but nothing outside this module needs the
+// namespace name itself yet.
 #[allow(dead_code)]
 pub const NAMESPACE_DIR: &str = "ss-magic-plugin";
 
@@ -251,7 +253,10 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
 /// don't actually provide. `root` should be [`resolve_root`]'s result (or
 /// another already-validated root); this function does not itself validate
 /// anything about `root`; it just opens/creates the one file inside it.
-#[allow(dead_code)]
+///
+/// Also used off the temporary root: `plugin::heartbeat` locks its own
+/// machine-level store with this rather than introducing a second locking
+/// scheme (KTD5 allows exactly one).
 pub fn with_lock<T>(root: &Path, name: &str, f: impl FnOnce() -> T) -> io::Result<T> {
     let file = open_lock_file(&root.join(name))?;
     let mut lock = fd_lock::RwLock::new(file);

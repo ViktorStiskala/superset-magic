@@ -63,6 +63,25 @@ pub fn init() {
     inquire::set_global_render_config(render_config(on));
 }
 
+/// Initialize the global color decision as OFF, skipping terminal detection
+/// entirely, and install the matching (empty) inquire `RenderConfig`.
+///
+/// This is what a `ss-magic plugin hook` verb calls instead of [`init`]. Such a
+/// verb answers the harness with a single JSON object on stdout and puts every
+/// diagnostic on stderr; an ANSI escape would make the first unparseable and
+/// the second harder to read in a transcript. Detection would usually reach the
+/// same answer — a hook's streams are pipes, not a terminal — but "usually" is
+/// not a contract, and `FORCE_COLOR` in the environment would flip it.
+///
+/// Like [`init`] this is a no-op once the decision has already been made, since
+/// both write through the same `OnceLock`. That is why `main.rs` does not
+/// initialize style before parsing argv: whichever of the two runs first wins,
+/// so the choice has to be made after the verb is known.
+pub fn init_no_color() {
+    let on = *COLOR_ENABLED.get_or_init(|| false);
+    inquire::set_global_render_config(render_config(on));
+}
+
 /// Whether color output is enabled in this process.
 pub fn enabled() -> bool {
     *COLOR_ENABLED.get_or_init(detect)
