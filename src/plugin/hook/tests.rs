@@ -684,17 +684,17 @@ fn a_well_formed_envelope_reaches_the_handler_with_its_context_resolved() {
 }
 
 /// The remaining shipped events all reach their (still unimplemented)
-/// handlers and leave a successful row saying so. `SessionStart` (U12) and
-/// `PreToolUse` (U14) have real handlers now and are deliberately left out of
-/// this list — see `session_start/tests.rs` and `pre_tool_use/tests.rs`. Until
-/// each remaining unit lands, "no handler yet" must be indistinguishable from
-/// "the handler had nothing to do" everywhere except the heartbeat note.
+/// handlers and leave a successful row saying so. `SessionStart` (U12),
+/// `PreToolUse` (U14) and `PreCompact` (U15) have real handlers now and are
+/// deliberately left out of this list — see `session_start/tests.rs`,
+/// `pre_tool_use/tests.rs` and `pre_compact/tests.rs`. Until each remaining
+/// unit lands, "no handler yet" must be indistinguishable from "the handler
+/// had nothing to do" everywhere except the heartbeat note.
 #[test]
 fn the_unimplemented_handlers_are_silent_successes() {
     let (_dir, root) = enabled_repo();
 
     for event in [
-        HookEvent::PreCompact,
         HookEvent::SubagentStop,
         HookEvent::SessionEnd,
         HookEvent::FileChanged,

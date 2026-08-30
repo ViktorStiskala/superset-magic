@@ -68,6 +68,7 @@ use crate::plugin::heartbeat::{self, Outcome as RowOutcome, Row};
 use crate::plugin::HookEvent;
 
 pub mod event;
+mod pre_compact;
 mod pre_tool_use;
 mod session_start;
 
@@ -243,8 +244,7 @@ pub fn route(event: &HookEvent) -> Option<Route> {
         // U14's Read gate is wired; U28 (the checklist deny) and U29 (the
         // commit nudge) plug into the same handler.
         HookEvent::PreToolUse => ("pre_tool_use", pre_tool_use::handle, true),
-        // U15.
-        HookEvent::PreCompact => ("pre_compact", not_implemented, true),
+        HookEvent::PreCompact => ("pre_compact", pre_compact::handle, true),
         // U16.
         HookEvent::SubagentStop => ("subagent_stop", not_implemented, true),
         // U17.
