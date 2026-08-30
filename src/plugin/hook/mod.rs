@@ -68,6 +68,7 @@ use crate::plugin::heartbeat::{self, Outcome as RowOutcome, Row};
 use crate::plugin::HookEvent;
 
 pub mod event;
+mod session_start;
 
 use event::{DecodeError, Envelope, Response};
 
@@ -237,8 +238,7 @@ pub struct Route {
 /// route, which must look to the harness like a hook that did nothing.
 pub fn route(event: &HookEvent) -> Option<Route> {
     let (module, handler, writes_state): (_, Handler, _) = match event {
-        // U12 replaces the handler with `session_start::handle`.
-        HookEvent::SessionStart => ("session_start", not_implemented, true),
+        HookEvent::SessionStart => ("session_start", session_start::handle, true),
         // U14 (the Read gate), U28 (the checklist deny) and U29 (the commit
         // nudge) all land in `pre_tool_use::handle`.
         HookEvent::PreToolUse => ("pre_tool_use", not_implemented, true),

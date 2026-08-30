@@ -683,8 +683,10 @@ fn a_well_formed_envelope_reaches_the_handler_with_its_context_resolved() {
     assert_eq!(run.row.outcome, heartbeat::Outcome::Ok);
 }
 
-/// The six shipped events all reach their (still unimplemented) handlers and
-/// leave a successful row saying so. Until U12 onward land, "no handler yet"
+/// The remaining shipped events all reach their (still unimplemented)
+/// handlers and leave a successful row saying so. `SessionStart` has its own
+/// real handler as of U12 (see `session_start/tests.rs`) and is deliberately
+/// left out of this list; until each remaining unit lands, "no handler yet"
 /// must be indistinguishable from "the handler had nothing to do" everywhere
 /// except the heartbeat note.
 #[test]
@@ -692,7 +694,6 @@ fn the_unimplemented_handlers_are_silent_successes() {
     let (_dir, root) = enabled_repo();
 
     for event in [
-        HookEvent::SessionStart,
         HookEvent::PreToolUse,
         HookEvent::PreCompact,
         HookEvent::SubagentStop,
