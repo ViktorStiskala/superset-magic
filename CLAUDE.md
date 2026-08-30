@@ -517,6 +517,32 @@ the tree:
   `compact_window.rs`, `setup_ci.rs` (the CI workflow writer), and
   `checklist/verbs.rs` (the document and pointer writers) all call this one
   copy now; nothing here changed what any of them actually wrote.
+- `plugin/pathnorm.rs` – the lexical path reduction every gate that decides from
+  a path shares, and the reason the R88 checklist deny stopped growing new
+  bypasses. `normalize` removes `.` and cancels `..` TEXTUALLY (the caller
+  canonicalizes afterwards, which is what handles symlinks – and the order is not
+  interchangeable, because the filesystem cancels a `..` AFTER resolving a
+  symlink); a leading `..` that cannot be cancelled is COUNTED rather than
+  pushed, since a pushed one is poppable by the next `..` and `../../x` would
+  collapse to `x` – a path escaping its tree quietly becoming one inside it, the
+  exact failure a containment check exists to catch. Do NOT reimplement it by
+  walking `parent()`/`file_name()`: `file_name()` is `None` for a `..`
+  component, so such a walk SKIPS the hop instead of cancelling it.
+  `process_view` answers whether resolving a path here would even mean the same
+  thing as resolving it there, as a property of the COMPONENT SEQUENCE rather
+  than a list of recognized prefixes – `…/proc/<selector>/cwd/<rest>` is the one
+  re-rootable form (`Cwd(rest)`), everything else below a process selector
+  (`root`, `fd/<n>`, `task/<tid>`, `ns/…`) is `Opaque`, and the FIRST selector
+  wins so `/proc/self/root/proc/self/cwd/…` cannot be re-rooted on another
+  process's mount namespace. The scan runs over the whole sequence because
+  procfs is mountable anywhere. `home_relative` classifies a LEADING `~`:
+  `Own(rest)` for the current user's home – safe to expand here because the hook
+  inherits the harness's `HOME`, so unlike `/proc/self` the expansion is
+  process-INDEPENDENT – and `Other` for `~name`, whose location only a user
+  database knows, so it is reported unexpandable rather than guessed at
+  `/home/<name>`. It tests the leading byte through `to_string_lossy`, so a
+  non-UTF-8 `~name` is still caught (missing one would leave it unexpanded,
+  which is the unsafe direction).
 - `plugin/tmproot.rs` – the private, per-machine, cross-session temporary root
   for coordination that predates any repository or session context.
   `resolve_root()` is `/tmp/ss-magic-plugin/<identifier>/`, falling back to
@@ -615,7 +641,15 @@ the tree:
   pointer's recorded target) is denied with instructions to use the checklist
   verbs. It deliberately does NOT suggest an Explore agent, unlike the size
   gate – dispatching an agent to read the checklist would leak it into that
-  agent's context just the same. (2) The **Read gate**: a `Read` past the
+  agent's context just the same. `resolve_target` is the load-bearing part and
+  runs in a FIXED order: expand a leading `~` on the RAW spelling (ahead of the
+  reduction – the normalizer treats `~` as an ordinary segment, so `~/../x`
+  would otherwise have its `~` popped and come out cwd-relative), reduce
+  lexically, then ask `pathnorm::process_view`. A `Cwd` view re-roots on the
+  ENVELOPE's cwd (the agent's, not this process's); an `Opaque` view is judged
+  WITHOUT a root by the shape test, which then canonicalizes and re-asks only to
+  ADD a denial, never to remove one – so a wrong answer costs a redirect to the
+  CLI rather than the deny itself. (2) The **Read gate**: a `Read` past the
   configured byte threshold (`threshold_lines * BYTES_PER_LINE`) is denied and
   routed to an Explore agent, or answered with the cached conclusion when one
   exists. It never emits an allow – only `Silent` or `Deny` – so it can never
@@ -927,7 +961,8 @@ the real incident this run fixed.
 ## Plugin constraints (hard rules)
 
 The plugin adds three surfaces with their own failure modes. Each rule below is
-backed by a `docs/solutions/` write-up of the real incident behind it.
+backed by a `docs/solutions/` write-up of the real incident behind it, except the
+last, which is backed by the eight-bypass sequence recorded in this file.
 
 - **Never build "consume exactly once" on `unlink`'s error, and never validate
   an exclusivity property sequentially.** Measured here: 8 threads racing to
@@ -952,6 +987,30 @@ backed by a `docs/solutions/` write-up of the real incident behind it.
   path, and a handler panic is caught), while the scratchpad's ignore gate, the
   tracked-path check and the tmproot ownership check all refuse on "could not
   ask" as well as on "no". Do not "simplify" either half toward the other.
+
+- **A path gate must perform every expansion the harness performs before it
+  roots a path – or refuse to root it.** Eight bypasses of the R88 checklist deny
+  came from one habit: classifying from the ACTOR (the hook's process, the
+  envelope's cwd) rather than from the TARGET, and recognizing SPELLINGS rather
+  than the property behind them. A symlinked ancestor, a case difference, a
+  relative target, a `..` component, a `/proc/self/cwd` prefix, a leading `..`, a
+  decoy symlink in an opaque path's TAIL and a leading `~` were each found and
+  patched one at a time; each patch produced the next hole. The rule has three
+  moves, in order: (1) perform every expansion the harness performs – or refuse
+  to root the path – and reduce lexically, both before anything else looks at the
+  path; (2) decide process-relativeness as a PROPERTY (`pathnorm::process_view`),
+  never a prefix list, and never trust a resolution whose result depends on which
+  process performs it – canonicalization may be used to ADD a denial but never to
+  CLEAR one; (3) derive comparison roots from the target as well as the actor.
+  Note move 1's phrasing: an earlier form said only "never trust a
+  process-dependent resolution", which quantifies over resolutions the code
+  PERFORMS and so cannot catch one it OMITS – which is exactly what the tilde
+  was. The expansion surface is bounded BY MEASUREMENT, not assumption: `~`
+  diverges (handled), `$HOME` syntax was probed and provably does not (both sides
+  treat it as a literal, deliberately unhandled), `/proc` is move 2. **Do not add
+  speculative expansions – probe first.** Adding spellings on suspicion is what
+  produced the sequence. If a ninth bypass turns up, ask which of the three moves
+  it escaped, not which spelling to add.
 
 ## Documented Solutions
 

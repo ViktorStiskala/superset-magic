@@ -632,6 +632,58 @@ is what keeps every stored document canonically ordered and valid.
   the framing text placed BEFORE the quoted body. Flag a second rendering path,
   unescaped prose, a locale/local-time date, or a bypassed envelope.
 
+### A path gate classifies from the TARGET, in three fixed moves
+
+The checklist deny above is only as good as its answer to "is this path that
+file". Eight separate bypasses of it came from one habit: deciding from the
+ACTOR (the hook's own process, the envelope's cwd) rather than from the TARGET,
+and recognizing SPELLINGS rather than the property behind them. A symlinked
+ancestor, a case difference, a relative target, a `..` component, a
+`/proc/self/cwd` prefix, a leading `..`, a decoy symlink in an opaque path's
+TAIL, and a leading `~` were each patched one at a time, and each patch produced
+the next hole. Review any change to path classification against these three
+moves, in this order.
+
+- **Move 1 – expand, then reduce, before anything else looks at the path.**
+  Perform every expansion the harness performs before it opens a file, or refuse
+  to root the path. A leading `~` must be expanded against `HOME` on the RAW
+  spelling, AHEAD of the lexical reduction: the normalizer treats `~` as an
+  ordinary segment, so `~/../x` would otherwise have its `~` popped and come out
+  working-directory-relative. `~name` (another account's home, known only to a
+  user database) and an unset or non-absolute `HOME` must make the path
+  unrootable, NEVER a guess at `/home/<name>`. Flag a reduction that runs before
+  expansion, a guessed home directory, or a new expansion added on suspicion
+  rather than measurement – the surface is bounded by probing (`~` diverges
+  between harness and hook; `$HOME`-style syntax was probed and provably does
+  not, so it is deliberately unhandled).
+- **Move 2 – decide process-relativeness as a property, not a prefix list.** A
+  path is process-relative when a `proc` component is followed by a process
+  selector (`self`, `thread-self`, or all-digits) ANYWHERE in the component
+  sequence – procfs is mountable anywhere, so a fixed `/proc/...` prefix match is
+  wrong. Only `…/proc/<selector>/cwd/<rest>` is re-rootable; `root`, `fd/<n>`,
+  `task/<tid>` and `ns/…` name what only the selected process sees. The FIRST
+  selector must win, or `/proc/self/root/proc/self/cwd/…` re-roots on another
+  process's mount namespace. Never trust a resolution whose result depends on
+  which process performs it: `canonicalize` may be used to ADD a denial but
+  NEVER to CLEAR one, because it answers about the hook's process and a wrong
+  answer must cost a redirect rather than the deny itself. Flag a prefix match, a
+  last-match scan, or a canonicalize that clears a path.
+- **Move 3 – derive comparison roots from the target as well as the actor,** and
+  compare fold-case where the naming convention does. Flag a comparison whose
+  both sides come from one source: a fixture built that way cannot fail a basis
+  bug, which is what hid three of the eight.
+
+Lexical reduction itself must count leading `..` rather than push them – a
+pushed one is poppable by the next `..`, so `../../x` collapses to `x`, turning a
+path that escapes its tree into a valid-looking one inside it. And it must not be
+reimplemented by walking `parent()`/`file_name()`: `file_name()` returns `None`
+for a `..` component, so such a walk SKIPS the hop instead of cancelling it.
+
+Test both levels. A unit test of the reduction helper is NOT a test of the gate –
+during one of these fixes the helper's own `..` test passed throughout a revert of
+the gate's call to it. Flag a new path-classification behavior covered only by a
+helper unit test.
+
 ### The commit nudge is advisory and narrowly scoped
 
 The `PreToolUse[Bash]` nudge matches only a command whose trailing words are
