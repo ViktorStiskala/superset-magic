@@ -282,7 +282,33 @@ pub fn is_ignored(repo_root: &Path, rel: &Path) -> Result<bool> {
 /// (no slash, dir absent) is treated as a file and MISSES it. Exit 0 → ignored,
 /// exit 1 → not ignored, any other exit is a real error.
 pub fn is_ignored_str(repo_root: &Path, rel_str: &str) -> Result<bool> {
-    let out = git_raw(&["check-ignore", "-q", "--", rel_str], Some(repo_root))?;
+    check_ignore(repo_root, rel_str, false)
+}
+
+/// Like [`is_ignored_str`], but asking ONLY what the `.gitignore` rules say —
+/// `--no-index` makes git skip its "is this already in the index?" shortcut.
+///
+/// The difference is not academic. By default `git check-ignore` reports a path
+/// as NOT ignored once anything at or under it is tracked, whatever the rules
+/// say, so a repository that committed one file inside an otherwise-ignored
+/// directory makes the whole directory read as unignored. The plugin's state
+/// tree asks the rules-only question ("would a file created here be invisible
+/// to git?") because it answers the tracked question separately and positively,
+/// via [`tracked_files`].
+pub fn is_ignored_no_index_str(repo_root: &Path, rel_str: &str) -> Result<bool> {
+    check_ignore(repo_root, rel_str, true)
+}
+
+/// Shared body of the two ignore probes: exit 0 → ignored, exit 1 → not
+/// ignored, anything else (an unreadable repo, a pathspec that crosses a
+/// symlink) is a real error carrying git's own message.
+fn check_ignore(repo_root: &Path, rel_str: &str, no_index: bool) -> Result<bool> {
+    let mut args: Vec<&str> = vec!["check-ignore", "-q"];
+    if no_index {
+        args.push("--no-index");
+    }
+    args.extend_from_slice(&["--", rel_str]);
+    let out = git_raw(&args, Some(repo_root))?;
     match out.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),

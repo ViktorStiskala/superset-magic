@@ -28,6 +28,7 @@
 //! pure, UI-free helpers ([`migrated_setup`], [`stage_migration`]) so they are
 //! unit-testable without driving the interactive prompt.
 
+use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -35,6 +36,7 @@ use anyhow::{Context, Result};
 
 use crate::git;
 use crate::git::gitignore;
+use crate::plugin::scratchpad;
 use crate::sync::reverse_sync;
 use crate::workspace::superset_files::{self, Config};
 use crate::tui::style;
@@ -64,16 +66,24 @@ const MAGIC_LOCAL_REL: &str = ".superset/magic.local.json";
 
 /// Ensure the workspace's bootstrap gitignore rules exist under `repo_root` —
 /// the step shared verbatim by `run_migrate`, `run_init`, and
-/// `run_init_noninteractive`. Two rules, each idempotent (a no-op when git
+/// `run_init_noninteractive`. Three rules, each idempotent (a no-op when git
 /// already ignores it):
 ///
 /// - `.superset/magic.local.json` — the per-machine overlay, unrecoverable if
-///   committed; and
+///   committed;
 /// - `.superset/backups/` — the tool's pre-overwrite backup tree, which can hold
 ///   recovered secret bytes. Ignored eagerly (via
 ///   [`reverse_sync::ensure_backups_ignored`]) so a fresh `ss-magic init` gets
 ///   the same rule the FIRST sync would otherwise add lazily — the backups tree
-///   is protected before any secret bytes are ever backed up.
+///   is protected before any secret bytes are ever backed up; and
+/// - `.superset/.magic/` — the Claude plugin's per-worktree state tree (via
+///   [`scratchpad::ensure_state_ignored`]). Eager for the same reason, and with
+///   more riding on it: the plugin's hooks refuse to write ANY state while git
+///   does not report that tree ignored, so a repository that never gets this
+///   rule gets no plugin state at all. `ss-magic sync` deliberately runs no
+///   plugin step, so `init`/`migrate` here and the explicit
+///   `ss-magic plugin enable` are the only two paths that ever write it — never
+///   a hook.
 fn ensure_bootstrap_gitignores(repo_root: &Path) -> Result<()> {
     gitignore::ensure_path_ignored(
         repo_root,
@@ -82,8 +92,70 @@ fn ensure_bootstrap_gitignores(repo_root: &Path) -> Result<()> {
         gitignore::PathKind::File,
     )?;
     reverse_sync::ensure_backups_ignored(repo_root)?;
+    scratchpad::ensure_state_ignored(repo_root)?;
     Ok(())
 }
+
+/// Path of the pre-marketplace skills-directory copy of the plugin, relative to
+/// the user's home directory.
+const LEGACY_SKILLS_REL: &str = ".claude/skills/ss-magic";
+
+/// Remove a pre-marketplace `~/.claude/skills/ss-magic/` left by an earlier
+/// revision of this tool, if one is there.
+///
+/// The plugin now reaches a machine only through the Claude Code marketplace,
+/// and a marketplace install outranks a skills-directory copy of the same
+/// name. Left in place, the shadowed copy does no work but is permanently
+/// reported as a conflict in the harness's plugin-errors view, so `init` and
+/// `migrate` clear it out. Nothing outside that exact path is touched, and a
+/// symlink at that path has the LINK removed rather than whatever it points
+/// at. Returns whether anything was removed.
+fn remove_legacy_skills_dir(home: &Path) -> Result<bool> {
+    let path = home.join(LEGACY_SKILLS_REL);
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        return Ok(false);
+    };
+    if meta.is_symlink() || meta.is_file() {
+        fs::remove_file(&path)
+            .with_context(|| format!("removing {}", path.display()))?;
+    } else {
+        fs::remove_dir_all(&path)
+            .with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(true)
+}
+
+/// [`remove_legacy_skills_dir`] against the real home directory, best-effort:
+/// a failure warns and lets init/migrate finish, since a stale skills copy is
+/// a cosmetic conflict in the plugin-errors view rather than a reason to
+/// abandon a workspace bootstrap. A machine with no discoverable home
+/// directory has nowhere for the legacy copy to be, so it is a no-op.
+#[cfg(not(test))]
+fn clear_legacy_skills_install() {
+    let Some(dirs) = directories::BaseDirs::new() else {
+        return;
+    };
+    match remove_legacy_skills_dir(dirs.home_dir()) {
+        Ok(true) => println!(
+            "{}",
+            style::ok(format!("Removed legacy ~/{LEGACY_SKILLS_REL}/"))
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!(
+            "{}",
+            style::warn(format!("Could not remove ~/{LEGACY_SKILLS_REL}/: {e:#}"))
+        ),
+    }
+}
+
+/// The real home directory is deliberately unreachable from the test binary:
+/// the unit suite runs on a developer's own machine, and `run_init` /
+/// `run_init_noninteractive` are called directly by several tests. A test that
+/// can delete something under someone's `~` is not one anyone should have to
+/// trust, however narrow the path. The removal logic itself is covered by
+/// driving [`remove_legacy_skills_dir`] against a temporary home instead.
+#[cfg(test)]
+fn clear_legacy_skills_install() {}
 
 /// Which branch the main-checkout bare invocation should take, decided from
 /// the parsed `config.json` `setup` array (KTD8).
@@ -285,6 +357,7 @@ and must be recreated."
     superset_files::copy_into_repo(staging.path(), repo_root, &[SETUP_SH_REL])?;
     rename_setup_config(repo_root)?;
     ensure_bootstrap_gitignores(repo_root)?;
+    clear_legacy_skills_install();
 
     println!();
     println!("{}", style::ok("Wrote .superset/magic.json"));
@@ -293,6 +366,7 @@ and must be recreated."
     println!("{}", style::ok("Removed .superset/setup.sh"));
     println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
     println!("{}", style::ok("Gitignored .superset/backups/"));
+    println!("{}", style::ok("Gitignored .superset/.magic/"));
 
     execute_final_action(repo_root, action, MIGRATE_COMMIT_MESSAGE, "chore/ss-magic-migrate-")
 }
@@ -449,6 +523,7 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
     // ---- Materialize. ----
     superset_files::copy_into_repo(stage_root, repo_root, &[])?;
     ensure_bootstrap_gitignores(repo_root)?;
+    clear_legacy_skills_install();
 
     println!();
     println!("{}", style::ok("Wrote .superset/magic.json"));
@@ -460,6 +535,7 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
         println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
     }
     println!("{}", style::ok("Gitignored .superset/backups/"));
+    println!("{}", style::ok("Gitignored .superset/.magic/"));
 
     execute_final_action(repo_root, action, INIT_COMMIT_MESSAGE, "chore/ss-magic-init-")
 }
@@ -496,6 +572,7 @@ pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<
 
     superset_files::copy_into_repo(stage_root, repo_root, &[])?;
     ensure_bootstrap_gitignores(repo_root)?;
+    clear_legacy_skills_install();
 
     println!("{}", style::ok("Wrote .superset/magic.json"));
     println!("{}", style::ok("Wrote .superset/magic.sh"));
@@ -504,6 +581,7 @@ pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<
         println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
     }
     println!("{}", style::ok("Gitignored .superset/backups/"));
+    println!("{}", style::ok("Gitignored .superset/.magic/"));
     println!(
         "{}",
         style::info("Done. Changes are on disk; run `git status` to review.")

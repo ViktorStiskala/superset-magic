@@ -836,3 +836,58 @@ fn build_pattern_options_combined_fs_hit_and_existing() {
     );
     assert!(preselected.contains(&opts_len), "custom must be preselected");
 }
+
+// ── R66: clearing the pre-marketplace skills-directory copy ─────────────────
+
+/// An earlier revision of this tool copied the plugin into
+/// `~/.claude/skills/ss-magic/`. A marketplace install outranks that copy, so
+/// the leftover does no work and only shows up as a conflict in the harness's
+/// plugin-errors view — `init` and `migrate` remove it.
+#[test]
+fn removes_a_legacy_skills_directory() {
+    let home = fresh();
+    let legacy = home.path().join(LEGACY_SKILLS_REL);
+    fs::create_dir_all(legacy.join("nested")).unwrap();
+    fs::write(legacy.join("SKILL.md"), "old copy").unwrap();
+    // A sibling skill from some other tool, which is none of our business.
+    let sibling = home.path().join(".claude/skills/other");
+    fs::create_dir_all(&sibling).unwrap();
+    fs::write(sibling.join("SKILL.md"), "not ours").unwrap();
+
+    assert!(remove_legacy_skills_dir(home.path()).unwrap());
+
+    assert!(!legacy.exists());
+    assert_eq!(fs::read_to_string(sibling.join("SKILL.md")).unwrap(), "not ours");
+    assert!(home.path().join(".claude/skills").is_dir());
+}
+
+/// The ordinary case on any machine that never ran the old revision: nothing
+/// to remove, and nothing reported.
+#[test]
+fn removing_an_absent_legacy_skills_directory_is_a_no_op() {
+    let home = fresh();
+    assert!(!remove_legacy_skills_dir(home.path()).unwrap());
+
+    // Not even the parent directories are created on the way to looking.
+    assert!(!home.path().join(".claude").exists());
+}
+
+/// A symlink at that path has the LINK removed, never the tree it points at —
+/// deleting someone's checked-out plugin source because they symlinked it into
+/// place would be an unrecoverable surprise.
+#[test]
+fn a_symlinked_legacy_skills_path_loses_only_the_link() {
+    let home = fresh();
+    let target = fresh();
+    fs::write(target.path().join("SKILL.md"), "the real thing").unwrap();
+    fs::create_dir_all(home.path().join(".claude/skills")).unwrap();
+    std::os::unix::fs::symlink(target.path(), home.path().join(LEGACY_SKILLS_REL)).unwrap();
+
+    assert!(remove_legacy_skills_dir(home.path()).unwrap());
+
+    assert!(!home.path().join(LEGACY_SKILLS_REL).exists());
+    assert_eq!(
+        fs::read_to_string(target.path().join("SKILL.md")).unwrap(),
+        "the real thing"
+    );
+}

@@ -29,11 +29,12 @@
 //! ## Layout
 //!
 //! This module owns only the second-level parse and the dispatch table. The
-//! work lives in siblings: `config.rs` (this unit — the typed `plugin` key
-//! and its overlay resolution) and, added by later units, `hook/` (the
-//! stdin decode, event routing, JSON envelope and fail-open wrapper),
-//! `identity.rs`, `scratchpad.rs`, `status.rs`, `checklist/`, `ledger.rs`,
-//! `cache.rs` and `tmproot.rs`.
+//! work lives in siblings: `config.rs` (the typed `plugin` key and its
+//! overlay resolution), `identity.rs` (the `<repo>-<branch>` slug),
+//! `scratchpad.rs` (the `.superset/.magic/` state tree) and, added by later
+//! units, `hook/` (the stdin decode, event routing, JSON envelope and
+//! fail-open wrapper), `status.rs`, `checklist/`, `ledger.rs`, `cache.rs`
+//! and `tmproot.rs`.
 
 use std::process::ExitCode;
 
@@ -43,6 +44,7 @@ use crate::tui::style;
 
 pub(crate) mod config;
 pub(crate) mod identity;
+pub(crate) mod scratchpad;
 
 // ── Hook events ───────────────────────────────────────────────────────────────
 
@@ -345,7 +347,7 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
 fn dispatch(inv: Invocation) -> Result<ExitCode> {
     match inv {
         Invocation::Hook { event, .. } => run_hook(&event),
-        Invocation::Human { verb, .. } => run_human(verb),
+        Invocation::Human { verb, args } => run_human(verb, &args),
     }
 }
 
@@ -361,17 +363,23 @@ fn run_hook(_event: &HookEvent) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Placeholder for the human verbs that later units add. Reports on stderr and
-/// exits non-zero, the posture every human verb keeps.
-fn run_human(verb: HumanVerb) -> Result<ExitCode> {
-    eprintln!(
-        "{}",
-        style::err(format!(
-            "error: `ss-magic plugin {}` is not implemented yet",
-            verb.as_str()
-        ))
-    );
-    Ok(ExitCode::from(2))
+/// Route a human verb to its handler. Verbs later units own still land on the
+/// not-implemented arm, which reports on stderr and exits non-zero — the
+/// posture every human verb keeps.
+fn run_human(verb: HumanVerb, args: &[String]) -> Result<ExitCode> {
+    match verb {
+        HumanVerb::Scratchpad => scratchpad::run(args),
+        _ => {
+            eprintln!(
+                "{}",
+                style::err(format!(
+                    "error: `ss-magic plugin {}` is not implemented yet",
+                    verb.as_str()
+                ))
+            );
+            Ok(ExitCode::from(2))
+        }
+    }
 }
 
 #[cfg(test)]
