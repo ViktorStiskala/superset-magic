@@ -55,6 +55,15 @@ jobs:
       - name: Run test suite
         run: cargo test --locked
 
+      # The bootstrap and the wrapper are shell, and macOS ships bash 3.2 - no
+      # associative arrays, no `${var^^}`, no `mapfile`. The plugin job below
+      # runs the same harness on Linux; this is the only place that proves the
+      # scripts work on the older shell half the users have. Uses a fake curl
+      # on PATH, so it never touches the network.
+      - name: Plugin bootstrap failure-path tests (bash 3.2)
+        if: runner.os == 'macOS'
+        run: /bin/bash scripts/test-bootstrap.sh
+
   plugin:
     name: plugin package
     runs-on: ubuntu-latest
@@ -122,6 +131,16 @@ jobs:
             exit 1
           fi
           echo "ok: no skill body names CLAUDE_PLUGIN_DATA"
+
+      # The bootstrap runs at every fresh session on every machine with the
+      # plugin enabled, so its failure paths matter more than its success path:
+      # offline, a corrupted download, a hostile version pin, an unwritable data
+      # directory, an unsupported platform, and four sessions racing to install
+      # at once. Each asserts exit 0, empty stdout (a hook's stdout enters the
+      # model's context) and an untouched existing binary. A curl shim on PATH
+      # serves a locally built fake release, so no network is involved.
+      - name: Plugin bootstrap failure-path tests (AE57-AE67)
+        run: bash scripts/test-bootstrap.sh
 
       # Run the exact command dist-workspace.toml registers as the extra
       # artifact's build, and confirm it produces the filename `artifacts`

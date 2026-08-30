@@ -1,15 +1,76 @@
 #!/usr/bin/env bash
-# Shipped at ${CLAUDE_PLUGIN_ROOT}/bin/, which is on the Bash tool's PATH while the plugin
-# is enabled. ${CLAUDE_PLUGIN_DATA} is NOT exported to the Bash tool, so re-derive the data
-# directory from the documented layout: <config dir>/plugins/data/<plugin>-<marketplace>/,
-# where every character outside [a-zA-Z0-9_-] is replaced (so "ss-magic@ss-magic" is
-# "ss-magic-ss-magic"). Prefer the real variable when one is set, for hook/MCP callers.
+#
+# The bridge between a skill body and the pinned binary.
+#
+# A skill body runs through the Bash tool. ${CLAUDE_PLUGIN_DATA} - the directory
+# the SessionStart bootstrap installs into - is exported to hook and MCP/LSP
+# processes only, and is NOT in the Bash tool's environment, so a skill cannot
+# name that path: it would expand to nothing and produce a path at the
+# filesystem root, with no error. The plugin's own bin/ directory IS on the Bash
+# tool's PATH while the plugin is enabled, so this wrapper is what every skill
+# invokes.
+#
+# Two things about it are load-bearing:
+#
+#   * The name is `ss-magic-plugin`, not `ss-magic`. A wrapper called `ss-magic`
+#     would collide on PATH with a user's own installed ss-magic, and the
+#     resolution order between the plugin's bin/ and that install is not
+#     something this plugin controls. Non-deterministic resolution is exactly
+#     what pinning a version exists to prevent, so the wrapper takes a name
+#     nothing else claims.
+#   * It injects the `plugin` verb, so a skill reads `ss-magic-plugin checklist
+#     list` rather than stuttering, and consequently cannot reach bare
+#     `ss-magic` at all - no update gate, no TUI. That posture is enforced by
+#     shape here rather than by care at every call site.
+#
+# A missing binary is a normal, expected state, not an error: the first session
+# after an install or a pin bump runs with the binary still arriving, because
+# hooks on one event fire concurrently and the bootstrap cannot be relied on to
+# finish before a skill runs. So this exits 0 with one line of explanation
+# rather than failing the skill mid-run.
+
 set -u
-data="${CLAUDE_PLUGIN_DATA:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/data/ss-magic-ss-magic}"
-bin="$data/bin/ss-magic"
-if [ ! -x "$bin" ]; then
-  echo "ss-magic: pinned plugin binary not installed at $bin" >&2
-  echo "It installs on the next fresh session (SessionStart bootstrap); start a new session." >&2
-  exit 127
+
+explain() {
+    printf 'ss-magic: %s\n' "$1" >&2
+    exit 0
+}
+
+self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) ||
+    explain "cannot locate the plugin directory; no ss-magic command was run."
+
+# $BIN is resolved through a durable, Bash-visible handoff rather than an
+# environment variable, because no variable naming the data directory reaches
+# this process. The bootstrap writes the resolved data directory into
+# <R80 root>/data-root, and both sides recompute that R80 root from $HOME - the
+# one input a hook process and a Bash-tool process are guaranteed to share.
+# lib/tmproot.sh is the single implementation of that path, sourced by both, so
+# the writer and the reader cannot drift apart.
+lib="$self_dir/../lib/tmproot.sh"
+[ -r "$lib" ] || explain "the plugin tree is incomplete ($lib is missing); no ss-magic command was run."
+# shellcheck source=../lib/tmproot.sh
+. "$lib" || explain "the plugin tree is unreadable; no ss-magic command was run."
+
+# The variable is preferred when it happens to be set - a hook or MCP process
+# invoking this wrapper already has the authoritative value and need not go
+# through the handoff at all.
+data=${CLAUDE_PLUGIN_DATA:-}
+if [ -z "$data" ]; then
+    # Read-only: this is a pure consumer of a file the bootstrap wrote. It never
+    # creates the root, because a root it had to create would by definition hold
+    # no handoff to read.
+    root=$(ss_magic_resolve_root) ||
+        explain "the plugin has not run its session-start bootstrap yet; no ss-magic command was run."
+    handoff="$root/$SS_MAGIC_DATA_ROOT_FILE"
+    [ -r "$handoff" ] ||
+        explain "the pinned binary has not been installed yet; start a new session to install it."
+    IFS= read -r data <"$handoff" 2>/dev/null
+    [ -n "${data:-}" ] ||
+        explain "the pinned binary has not been installed yet; start a new session to install it."
 fi
+
+bin="$data/bin/ss-magic"
+[ -x "$bin" ] ||
+    explain "the pinned binary is not installed at $bin yet; start a new session to install it."
+
 exec "$bin" plugin "$@"
