@@ -45,7 +45,10 @@
 //! (the typed checklist document, its canonical ordering and its validator,
 //! which knows nothing about hooks), `setup_ci.rs` (the pinned GitHub
 //! Actions workflow behind `setup-github-ci`, whose bytes are an embedded
-//! asset) and, added by later units, `status.rs`.
+//! asset), `status.rs` (the one place that answers "why is the plugin not
+//! doing anything", across both enablement layers, the ignored-tree gate and
+//! the bootstrap) and `spill_index.rs` (a read-only listing of the harness's
+//! own oversized-tool-output files for this worktree).
 
 use std::process::ExitCode;
 
@@ -65,6 +68,8 @@ pub(crate) mod identity;
 pub(crate) mod ledger;
 pub(crate) mod scratchpad;
 pub(crate) mod setup_ci;
+pub(crate) mod spill_index;
+pub(crate) mod status;
 pub(crate) mod tmproot;
 
 // ── Hook events ───────────────────────────────────────────────────────────────
@@ -421,6 +426,8 @@ fn run_human(verb: HumanVerb, args: &[String]) -> Result<ExitCode> {
         HumanVerb::Cost => ledger::run(args),
         HumanVerb::SetupGithubCi => setup_ci::run(args),
         HumanVerb::Checklist => checklist::run(args),
+        HumanVerb::Status => status::run(args),
+        HumanVerb::SpillIndex => spill_index::run(args),
         _ => {
             eprintln!(
                 "{}",
