@@ -333,6 +333,47 @@ pub fn tracked_files(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<PathBuf
     Ok(parse_ls_files_z(&git(&args, Some(repo_root))?))
 }
 
+/// `git status --porcelain -- <pathspecs>`, parsed into `(status, path)` pairs.
+///
+/// Porcelain v1's short format is two status letters — index state, then
+/// worktree state — followed by a space and the path; stable across git
+/// versions and plain enough to read without a diff parser. Used by the
+/// `PreToolUse[Bash]` commit nudge (R91) to tell a checklist that is staged
+/// from one that only has local, unstaged edits, or none at all. An empty
+/// `pathspecs` would list the whole repository rather than nothing, which no
+/// caller here wants, so it short-circuits to an empty result instead.
+pub fn status_porcelain(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<(String, PathBuf)>> {
+    if pathspecs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args: Vec<&str> = vec!["status", "--porcelain", "--"];
+    args.extend_from_slice(pathspecs);
+    // NOT the shared `git` helper: its blanket `.trim()` is meant for a single
+    // trimmed value and would eat the leading space of the FIRST line here —
+    // porcelain's index column is a literal space when a file is modified
+    // only in the worktree, so trimming it shifts every field on that line by
+    // one and corrupts both the code and the path. `git_raw` keeps the output
+    // untouched; only the surrounding whole-output whitespace (a trailing
+    // newline) is stripped, never a line's own leading column.
+    let out = git_raw(&args, Some(repo_root))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        bail!("`git {}` failed: {stderr}", args.join(" "));
+    }
+    // `str::lines()` only splits on line boundaries (stripping a trailing
+    // `\r` before an `\n`, same as `.trim()` would, but nothing else) — it
+    // never touches a line's own leading or trailing content the way `.trim()`
+    // on the whole string would.
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let code = line.get(0..2)?.to_string();
+            let path = line.get(3..)?;
+            (!path.is_empty()).then(|| (code, PathBuf::from(path)))
+        })
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Read-only probes used by the plugin identity slug (U7).
 // ---------------------------------------------------------------------------

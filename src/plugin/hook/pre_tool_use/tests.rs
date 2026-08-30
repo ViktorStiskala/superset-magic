@@ -268,16 +268,29 @@ fn the_worktree_is_resolved_by_a_filesystem_walk_not_by_git() {
 }
 
 /// The structural half of the same claim: nothing in this module can reach a
-/// subprocess, so no future edit can quietly put git back on the hot path.
-/// `PreToolUse` is the most frequent hook there is — one `git rev-parse` per
-/// tool call is a cost paid on every step of every session.
+/// subprocess ahead of a match, so no future edit can quietly put git back on
+/// the hot path. `PreToolUse` is the most frequent hook there is — one `git
+/// rev-parse` per tool call is a cost paid on every step of every session.
+///
+/// This used to assert that claim about the WHOLE file. U29 adds one
+/// deliberate exception: the R91 commit nudge, reached only once its own
+/// string scan already found a shipping action in a `Bash` command, is
+/// allowed to ask git about the checklist. So the scan below stops at the
+/// marker that introduces that code — everything before it, the Read gate's
+/// decision order AND the nudge's own matcher, must still cost nothing but a
+/// string scan or a stat; only what comes after may spawn git.
 #[test]
-fn the_gate_never_reaches_for_git_or_any_subprocess() {
+fn git_and_subprocess_are_confined_to_the_post_match_nudge_code() {
     let body = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/plugin/hook/pre_tool_use.rs"),
     )
     .unwrap();
     let code = body.split("#[cfg(test)]").next().unwrap();
+
+    const ALLOWED_FROM: &str = "// ── Only reached after a match: checklist + git status ──";
+    let (before, _after) = code
+        .split_once(ALLOWED_FROM)
+        .expect("the post-match marker must be present in pre_tool_use.rs");
 
     for forbidden in [
         "git::",
@@ -287,8 +300,10 @@ fn the_gate_never_reaches_for_git_or_any_subprocess() {
         "scratchpad::ensure",
     ] {
         assert!(
-            !code.contains(forbidden),
-            "the gate must not use `{forbidden}`: the decision order is filesystem-only"
+            !before.contains(forbidden),
+            "`{forbidden}` must not appear before the post-match marker: everything up to \
+             it — the Read gate's decision order and the R91 matcher alike — must cost \
+             nothing but a string scan or a stat"
         );
     }
 }
@@ -928,7 +943,9 @@ fn a_conclusion_does_not_survive_the_file_changing() {
 
 /// The size machinery is `Read`-only: there is no context to save on a write,
 /// and `Grep`/`Glob` are matched for forward compatibility but inert (neither
-/// tool exists in this environment, so their behavior is unverified).
+/// tool exists in this environment, so their behavior is unverified). `Bash`
+/// is deliberately NOT in this list — U29 gives it its own decision (the R91
+/// commit nudge), covered in its own section below.
 #[test]
 fn no_other_tool_reaches_the_size_machinery() {
     let repo = repo();
@@ -941,7 +958,6 @@ fn no_other_tool_reaches_the_size_machinery() {
         ("NotebookEdit", "allow: not a Read (nothing to save on a write)"),
         ("Grep", "allow: Grep/Glob matcher is inert"),
         ("Glob", "allow: Grep/Glob matcher is inert"),
-        ("Bash", "allow: tool is not gated"),
     ] {
         let env = envelope(
             &repo.root,
@@ -1338,4 +1354,299 @@ fn the_deny_names_the_checklist_verbs_and_the_wrapper_spelling() {
         !reason.contains("ss-magic plugin checklist"),
         "the deny must use the wrapper spelling: {reason}"
     );
+}
+
+// ── The commit-time nudge (R91) ───────────────────────────────────────────────
+//
+// Every fixture above is deliberately git-free (see the module docs). This
+// section is the one exception: the nudge is the one branch in this file
+// allowed to ask git anything, so its tests need a real repository.
+// `init_main_repo`/`git_run` are the crate's shared isolated-git test
+// helpers (identity set via env vars, so they work with no global git
+// config) — the same ones `subagent_stop`, `session_start` and the other
+// hook suites already use.
+
+use crate::tests::support::{git_run, init_main_repo};
+
+/// A real git repository with the `.superset/magic.json` marker the same
+/// filesystem walk the Read gate uses needs to recognize it as a worktree
+/// root.
+fn nudge_repo() -> (TempDir, PathBuf) {
+    let dir = init_main_repo("main");
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".superset")).unwrap();
+    fs::write(root.join(".superset/magic.json"), r#"{"files":[]}"#).unwrap();
+    (dir, root)
+}
+
+/// A `Bash` envelope carrying `command`.
+fn bash(cwd: &Path, command: &str) -> Envelope {
+    envelope(cwd, "Bash", serde_json::json!({ "command": command }))
+}
+
+/// Write a placeholder checklist file at `root/rel`. Its content is never
+/// parsed by the nudge (only its git status matters), so a placeholder is
+/// enough.
+fn write_checklist(root: &Path, rel: &str) -> PathBuf {
+    let path = root.join(rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "{}\n").unwrap();
+    path
+}
+
+/// Record `rel` as the active checklist, the way `checklist init` does,
+/// without writing the file itself — for the "pointer names a file that was
+/// never created" case.
+fn record_pointer(root: &Path, rel: &str) {
+    let pointer = checklist::Pointer {
+        path: rel.to_string(),
+        slug: "test".to_string(),
+        recorded_at: "2026-08-30T00:00:00Z".to_string(),
+    };
+    let path = checklist::pointer_path(root);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, serde_json::to_string(&pointer).unwrap()).unwrap();
+}
+
+/// The `additionalContext` text, or a panic naming what came back instead.
+/// Also asserts the nudge never denies — R91/R20 forbid it.
+fn nudged(outcome: &Outcome) -> &str {
+    match &outcome.response {
+        Response::PreToolUse(inner) => {
+            assert_eq!(inner.decision, None, "the nudge must never deny");
+            inner
+                .additional_context
+                .as_deref()
+                .expect("expected additionalContext, got none")
+        }
+        other => panic!("expected a PreToolUse response, got {other:?} ({:?})", outcome.detail),
+    }
+}
+
+const NOT_A_SHIPPING_ACTION: &str =
+    "allow: command does not mention git commit/push or gh pr create";
+
+/// AE76 and the base case together: a wrapper prefix must not change the
+/// advice at all, only tolerate it.
+#[test]
+fn bare_and_rtk_wrapped_git_commit_fire_the_same_nudge() {
+    let (_dir, root) = nudge_repo();
+    write_checklist(&root, "docs/actions/2026-08-demo.checklist.json");
+
+    let bare = run(&bash(&root, "git commit -m 'wip'"), &root, &default_config());
+    let wrapped = run(&bash(&root, "rtk git commit -m 'wip'"), &root, &default_config());
+
+    let bare_ctx = nudged(&bare);
+    let wrapped_ctx = nudged(&wrapped);
+    assert!(bare_ctx.contains("docs/actions/2026-08-demo.checklist.json"));
+    assert_eq!(
+        bare_ctx, wrapped_ctx,
+        "the wrapper prefix must not change the advice"
+    );
+}
+
+/// A chained command, on either side of `&&` or `;`, still matches.
+#[test]
+fn a_chained_command_still_matches() {
+    let (_dir, root) = nudge_repo();
+    write_checklist(&root, "docs/actions/2026-08-demo.checklist.json");
+
+    for command in ["cargo build && git push", "cargo build; git push"] {
+        let outcome = run(&bash(&root, command), &root, &default_config());
+        nudged(&outcome);
+    }
+}
+
+/// Inside a `$( … )` command substitution, the invocation is real and must
+/// still match.
+#[test]
+fn a_command_inside_a_substitution_still_matches() {
+    let (_dir, root) = nudge_repo();
+    write_checklist(&root, "docs/actions/2026-08-demo.checklist.json");
+
+    let outcome = run(
+        &bash(&root, "OUT=$(git commit -m 'x'); echo \"$OUT\""),
+        &root,
+        &default_config(),
+    );
+    nudged(&outcome);
+}
+
+/// A heredoc BODY mentioning the words is data, not a command, and must not
+/// false-positive the matcher into a lookup on every call that merely quotes
+/// one. No checklist exists in this fixture at all, so the only way this
+/// passes for the right reason is the "does not mention" detail below —
+/// `checklist_candidates` would also return `None` for an unrelated reason,
+/// which is why the assertion pins the exact allow reason rather than just
+/// "was allowed".
+#[test]
+fn a_heredoc_body_mentioning_the_words_does_not_match() {
+    let (_dir, root) = nudge_repo();
+    let command = "cat <<'EOF'\ngit commit\nEOF\n";
+    let outcome = run(&bash(&root, command), &root, &default_config());
+    assert_eq!(allowed(&outcome), NOT_A_SHIPPING_ACTION);
+}
+
+/// The words inside a quoted string that is not a command at all — an
+/// argument to `echo`, say — must not match.
+#[test]
+fn a_quoted_non_command_string_does_not_match() {
+    let (_dir, root) = nudge_repo();
+    let outcome = run(&bash(&root, r#"echo "git commit""#), &root, &default_config());
+    assert_eq!(allowed(&outcome), NOT_A_SHIPPING_ACTION);
+}
+
+/// `git-commit` and `gitcommit` are single tokens, never the two words `git`
+/// and `commit`; `gh pr-create` is likewise not `gh`, `pr`, `create`.
+#[test]
+fn hyphenated_lookalikes_do_not_match() {
+    let (_dir, root) = nudge_repo();
+    for command in ["git-commit -m x", "gitcommit", "gh pr-create"] {
+        let outcome = run(&bash(&root, command), &root, &default_config());
+        assert_eq!(allowed(&outcome), NOT_A_SHIPPING_ACTION, "{command} must not match");
+    }
+}
+
+/// `gh pr create` is the one PR subcommand that ships something; the
+/// read-only ones must not nudge.
+#[test]
+fn gh_pr_create_matches_but_read_only_gh_pr_does_not() {
+    let (_dir, root) = nudge_repo();
+    write_checklist(&root, "docs/actions/2026-08-demo.checklist.json");
+
+    nudged(&run(&bash(&root, "gh pr create --fill"), &root, &default_config()));
+
+    for read_only in ["gh pr view", "gh pr list", "gh pr diff"] {
+        let outcome = run(&bash(&root, read_only), &root, &default_config());
+        assert_eq!(
+            allowed(&outcome),
+            NOT_A_SHIPPING_ACTION,
+            "{read_only} is read-only and must not nudge"
+        );
+    }
+}
+
+/// A repository that has never adopted the checklist is never nudged, no
+/// matter what the command does.
+#[test]
+fn a_repository_with_no_checklist_at_all_is_never_nudged() {
+    let (_dir, root) = nudge_repo();
+    let outcome = run(&bash(&root, "git commit -m 'wip'"), &root, &default_config());
+    assert_eq!(allowed(&outcome), "allow: no checklist exists in this repository");
+}
+
+/// A checklist that IS staged is part of the commit; no nudge.
+#[test]
+fn a_staged_checklist_does_not_nudge() {
+    let (dir, root) = nudge_repo();
+    write_checklist(&root, "docs/actions/2026-08-demo.checklist.json");
+    git_run(&["add", "docs/actions/2026-08-demo.checklist.json"], dir.path());
+
+    let outcome = run(&bash(&root, "git commit -m 'wip'"), &root, &default_config());
+    assert_eq!(allowed(&outcome), "allow: checklist is staged (or has no pending edits)");
+}
+
+/// A checklist already committed and untouched since must not nudge on every
+/// later, unrelated commit — that reading would fire on every commit in a
+/// repository that adopted the checklist once, which is exactly the noise
+/// R91 asks the design to avoid.
+#[test]
+fn a_checklist_untouched_since_its_last_commit_does_not_nudge() {
+    let (dir, root) = nudge_repo();
+    write_checklist(&root, "docs/actions/2026-08-demo.checklist.json");
+    git_run(&["add", "docs/actions/2026-08-demo.checklist.json"], dir.path());
+    git_run(&["commit", "-q", "-m", "checklist"], dir.path());
+
+    let outcome = run(&bash(&root, "git commit -m 'unrelated change'"), &root, &default_config());
+    assert_eq!(allowed(&outcome), "allow: checklist is staged (or has no pending edits)");
+}
+
+/// The one mistake this nudge exists to catch: a real edit to the checklist
+/// that was never staged.
+#[test]
+fn a_checklist_edited_but_not_staged_is_nudged() {
+    let (dir, root) = nudge_repo();
+    let path = write_checklist(&root, "docs/actions/2026-08-demo.checklist.json");
+    git_run(&["add", "docs/actions/2026-08-demo.checklist.json"], dir.path());
+    git_run(&["commit", "-q", "-m", "checklist"], dir.path());
+
+    fs::write(&path, "{\"changed\": true}\n").unwrap();
+
+    let outcome = run(&bash(&root, "git commit -m 'more work'"), &root, &default_config());
+    assert!(nudged(&outcome).contains("docs/actions/2026-08-demo.checklist.json"));
+}
+
+/// A pointer naming a checklist that was never written is the strongest case
+/// of "absent" — it is caught by a plain `fs::metadata` check, before the
+/// git call `staleness` would otherwise make.
+#[test]
+fn a_pointer_naming_an_uncreated_checklist_is_nudged() {
+    let (_dir, root) = nudge_repo();
+    record_pointer(&root, "docs/actions/2026-08-ghost.checklist.json");
+    assert!(!root.join("docs/actions/2026-08-ghost.checklist.json").exists());
+
+    let outcome = run(&bash(&root, "git push"), &root, &default_config());
+    assert!(nudged(&outcome).contains("docs/actions/2026-08-ghost.checklist.json"));
+}
+
+/// A `Bash` call with no `command` key at all — should not happen, but must
+/// not panic.
+#[test]
+fn a_bash_call_with_no_command_string_is_allowed() {
+    let (_dir, root) = nudge_repo();
+    let env = envelope(&root, "Bash", serde_json::json!({}));
+    let outcome = run(&env, &root, &default_config());
+    assert_eq!(allowed(&outcome), "allow: Bash call carries no command string");
+}
+
+/// The response is `additionalContext` only: no `permissionDecision`, no
+/// `updatedInput` anywhere on the wire.
+#[test]
+fn the_nudge_never_denies_and_never_carries_a_rewrite() {
+    let (_dir, root) = nudge_repo();
+    write_checklist(&root, "docs/actions/2026-08-demo.checklist.json");
+    let outcome = run(&bash(&root, "git commit -m 'wip'"), &root, &default_config());
+
+    let line = event::encode(&outcome.response).unwrap().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let specific = &value["hookSpecificOutput"];
+
+    assert!(specific.get("permissionDecision").is_none());
+    assert!(specific.get("updatedInput").is_none());
+    assert!(value.get("updatedInput").is_none());
+    assert!(specific.get("additionalContext").is_some());
+}
+
+/// The heartbeat row's `detail` is a short internal note, never the command
+/// line itself — on the matching path or the non-matching one.
+#[test]
+fn the_heartbeat_detail_never_carries_the_raw_command() {
+    let (_dir, root) = nudge_repo();
+    write_checklist(&root, "docs/actions/2026-08-demo.checklist.json");
+    let marker = "SENTINEL-COMMAND-TEXT-DO-NOT-LEAK";
+
+    let matching = run(
+        &bash(&root, &format!("git commit -m '{marker}'")),
+        &root,
+        &default_config(),
+    );
+    let detail = matching.detail.unwrap_or_default();
+    assert!(!detail.contains(marker), "the heartbeat detail leaked the command: {detail}");
+
+    let non_matching = run(&bash(&root, &format!("echo {marker}")), &root, &default_config());
+    let quiet_detail = non_matching.detail.unwrap_or_default();
+    assert!(!quiet_detail.contains(marker), "leaked on the non-matching path too: {quiet_detail}");
+}
+
+/// Stateless by design: the same command, run twice, nudges both times. There
+/// is no "already nudged" memory to suppress the second one.
+#[test]
+fn the_same_command_nudges_every_time_it_runs() {
+    let (_dir, root) = nudge_repo();
+    write_checklist(&root, "docs/actions/2026-08-demo.checklist.json");
+
+    for _ in 0..2 {
+        let outcome = run(&bash(&root, "git commit -m 'wip'"), &root, &default_config());
+        nudged(&outcome);
+    }
 }

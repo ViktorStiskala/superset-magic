@@ -292,7 +292,9 @@ enum GateTool {
     /// `Bash grep`), so their behavior could not be exercised and nothing here
     /// acts on them.
     Search,
-    /// Anything else, `Bash` included.
+    /// `Bash` — the only tool the R91 commit nudge looks at.
+    Bash,
+    /// Anything else.
     Other,
 }
 
@@ -302,6 +304,7 @@ impl GateTool {
             "Read" => Self::Read,
             "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => Self::Mutating,
             "Grep" | "Glob" => Self::Search,
+            "Bash" => Self::Bash,
             _ => Self::Other,
         }
     }
@@ -313,16 +316,19 @@ impl GateTool {
 ///    `cwd` by the wrapper (R53). The wrapper also ran R55's enablement gate,
 ///    so a repository with the plugin off never reaches this function at all.
 /// 2. **checklist** (R88) — denied outright, ahead of every exemption.
-/// 3. **tool** — only `Read` reaches the size machinery.
-/// 4. **state tree** (R43) — `.superset/.magic/`, unconditionally.
-/// 5. **subagent** (R52) — the agent the gate routes to must be able to read.
-/// 6. **non-text** (R43) — the binary-owned extension list.
-/// 7. **configured exemptions** (R53) — patterns this repository added.
-/// 8. **one stat** — the only filesystem call on the under-threshold path.
-/// 9. **threshold** — under it, the read goes through untouched.
-/// 10. **window** (R41) — a bounded `offset`/`limit` goes through too.
-/// 11. **bypass** (R42) — a one-shot claim, consumed here.
-/// 12. **cache** — hit serves the conclusion, miss routes to an Explore agent.
+/// 3. **Bash** (R91) — the commit-time checklist nudge, on its own branch:
+///    every other tool falls through to the size machinery below, `Bash`
+///    never does.
+/// 4. **tool** — only `Read` reaches the size machinery.
+/// 5. **state tree** (R43) — `.superset/.magic/`, unconditionally.
+/// 6. **subagent** (R52) — the agent the gate routes to must be able to read.
+/// 7. **non-text** (R43) — the binary-owned extension list.
+/// 8. **configured exemptions** (R53) — patterns this repository added.
+/// 9. **one stat** — the only filesystem call on the under-threshold path.
+/// 10. **threshold** — under it, the read goes through untouched.
+/// 11. **window** (R41) — a bounded `offset`/`limit` goes through too.
+/// 12. **bypass** (R42) — a one-shot claim, consumed here.
+/// 13. **cache** — hit serves the conclusion, miss routes to an Explore agent.
 fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
     let Payload::PreToolUse(payload) = &ctx.envelope.payload else {
         // Unreachable through `hook::route`, which builds the variant from the
@@ -347,7 +353,15 @@ fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
         }
     }
 
-    // ── 3. Only `Read` reaches the size machinery ────────────────────────────
+    // ── 3. Bash: the commit-time checklist nudge (R91) ───────────────────────
+    // Its own branch, ahead of the "only Read matters" cutoff below — every
+    // other tool falls through that cutoff into an unconditional allow, and
+    // Bash needs its own decision instead.
+    if tool == GateTool::Bash {
+        return Ok(commit_nudge(ctx, payload));
+    }
+
+    // ── 4. Only `Read` reaches the size machinery ────────────────────────────
     if tool != GateTool::Read {
         return Ok(allow(match tool {
             GateTool::Mutating => "allow: not a Read (nothing to save on a write)",
@@ -360,7 +374,7 @@ fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
         return Ok(allow("allow: the Read carries no file_path"));
     };
 
-    // ── 4. The state tree (R43) ──────────────────────────────────────────────
+    // ── 5. The state tree (R43) ──────────────────────────────────────────────
     // The scratchpad's own STATUS.md was measured at 594 lines / 88.7 KB, and
     // the shipped skill tells the model to read it first on resume. Gating it
     // would deny the read the scratchpad exists to serve — a session that just
@@ -370,7 +384,7 @@ fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
         return Ok(allow("allow: inside the .superset/.magic state tree"));
     }
 
-    // ── 5. A subagent's own read (R52) ───────────────────────────────────────
+    // ── 6. A subagent's own read (R52) ───────────────────────────────────────
     // Without this the routing eats itself: the Explore agent the miss branch
     // dispatches reads the same file, is denied, and is told to dispatch
     // another Explore agent, forever.
@@ -378,7 +392,7 @@ fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
         return Ok(allow(format!("allow: issued inside a subagent ({agent})")));
     }
 
-    // ── 6. Non-text extensions (KTD11, R43) ──────────────────────────────────
+    // ── 7. Non-text extensions (KTD11, R43) ──────────────────────────────────
     if let Some(ext) = non_text_extension(&target) {
         return Ok(allow(format!("allow: non-text extension .{ext}")));
     }
@@ -387,12 +401,12 @@ fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
     // for the state directories the last two steps read.
     let root = worktree_root(ctx.cwd()).unwrap_or_else(|| ctx.config_root.clone());
 
-    // ── 7. Configured exemptions (R53) ───────────────────────────────────────
+    // ── 8. Configured exemptions (R53) ───────────────────────────────────────
     if let Some(pattern) = configured_exemption(&ctx.config.gate.exemptions, &root, &target) {
         return Ok(allow(format!("allow: exemption pattern `{pattern}`")));
     }
 
-    // ── 8. One stat ──────────────────────────────────────────────────────────
+    // ── 9. One stat ──────────────────────────────────────────────────────────
     // A file that is not there, or is a directory, is not ours to refuse: the
     // Read fails (or succeeds) on its own terms and says something useful,
     // which a deny reason about context economy would only obscure.
@@ -404,7 +418,7 @@ fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
     }
     let size = meta.len();
 
-    // ── 9. The threshold ─────────────────────────────────────────────────────
+    // ── 10. The threshold ─────────────────────────────────────────────────────
     let threshold_lines = ctx.config.gate.threshold_lines;
     let limit_bytes = threshold_bytes(threshold_lines);
     if size <= limit_bytes {
@@ -413,7 +427,7 @@ fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
         )));
     }
 
-    // ── 10. A bounded window (R41) ───────────────────────────────────────────
+    // ── 11. A bounded window (R41) ───────────────────────────────────────────
     // Asking for 200 lines of a 400 KB file costs 200 lines of context, so
     // there is nothing to save by blocking it. The cache key is unaffected:
     // it fingerprints the file, never the window (R24), so a windowed read and
@@ -433,12 +447,12 @@ fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
         return Ok(allow("allow: the target vanished before it could be keyed"));
     };
 
-    // ── 11. The one-shot bypass (R42) ────────────────────────────────────────
+    // ── 12. The one-shot bypass (R42) ────────────────────────────────────────
     if bypass::consume(&bypass::dir_for_root(&root), &identity.realpath, ctx.now) {
         return Ok(allow("allow: consumed a one-shot bypass claim"));
     }
 
-    // ── 12. The conclusion cache ─────────────────────────────────────────────
+    // ── 13. The conclusion cache ─────────────────────────────────────────────
     let shown = display_path(&root, &target);
     let key = identity.key();
     let cache_dir = cache::dir_for_root(&root);
@@ -759,6 +773,399 @@ fn miss_reason(shown: &str, size: u64, threshold_lines: u32, entry: &str) -> Str
         // page-fault.md's measured rule of thumb: roughly one token per four
         // bytes of text.
         tokens = grouped(size / 4),
+    )
+}
+
+// ── The commit-time nudge (R91) ──────────────────────────────────────────────
+//
+// A `Bash` invocation that looks like it is about to ship something —
+// `git commit`, `git push`, `gh pr create` — gets an advisory note on
+// `additionalContext` when the operator checklist looks left behind. Nothing
+// here ever denies: `additionalContext` is delivered whether or not the call
+// goes ahead (`hook/event.rs`), and this section never sets `decision` at
+// all, so the Bash call itself is untouched either way.
+//
+// ## Cost discipline (KTD4)
+//
+// `PreToolUse[Bash]` fires on every Bash call the session makes, which is the
+// overwhelming majority of tool calls in most sessions. [`commit_nudge`]
+// therefore does exactly one thing before touching the filesystem or a
+// subprocess: it scans the raw command string with [`shipping_action`], and
+// returns immediately if that scan found nothing. Everything past that
+// point — finding the checklist, asking git about it — is reached only on the
+// rare call that already matched, which is what the marker below fences: the
+// functions between it and here may use git and the filesystem; nothing
+// before it may, and a test scans the source text of this file to hold that
+// line.
+//
+// ## What "absent from the commit" means here
+//
+// [`staleness`] reads it narrowly: a checklist counts as absent when it has
+// not been written yet (a pointer named it, `checklist init` never followed
+// through), or when it carries a git-visible EDIT that has not been staged —
+// untracked, or modified/deleted in the worktree relative to the index. A
+// checklist that IS staged is not absent, and neither is one that simply has
+// not changed since it was last committed. That last case is deliberate: the
+// alternative reading — nudge whenever the checklist is not part of THIS
+// commit's staged diff — fires on every unrelated commit a repository makes
+// after it first commits its checklist, which is exactly the noise this
+// design avoids. This reading instead catches the one mistake worth
+// catching: a real edit to the checklist that is about to be silently left
+// out of the commit, push, or PR being made.
+//
+// The check is stateless and re-runs from scratch on every matching Bash
+// call, including the same command run twice in a row — there is no cache
+// here, unlike the Read gate's conclusion cache, because the underlying git
+// state can genuinely change between one Bash call and the next and a stale
+// "already nudged" memory would just be a second bug.
+//
+// A repository that has never adopted the checklist (no pointer, and nothing
+// under `docs/actions/` matching the convention) is never nudged, whatever
+// the command does — see [`checklist_candidates`].
+
+// ── The matcher: one string scan, no subprocess (KTD4) ───────────────────────
+
+/// Whether `command` — the raw string a `Bash` tool call carries — mentions a
+/// shipping action: `git commit`, `git push`, or `gh pr create`.
+///
+/// This is the pre-filter R91 asks for: everything below is plain string
+/// scanning, with no filesystem access and no subprocess, so the cost on the
+/// overwhelming majority of Bash calls that do not match is one pass over the
+/// command string.
+///
+/// Heredoc bodies are stripped first — a heredoc's data is not a command, and
+/// scanning it would false-positive on the words appearing in prose or a
+/// planted test fixture rather than an actual invocation. What is left is
+/// then read word by word, skipping single- and double-quoted spans (so
+/// `echo "git commit"` does not match) while still looking inside a
+/// `$( … )` command substitution (so `x=$(git commit -m y)` does match). A
+/// wrapper prefix like `rtk` needs no special handling: only the LAST two (or
+/// three, for `gh pr create`) words matter, whatever comes before them.
+fn shipping_action(command: &str) -> bool {
+    shipping_action_words(&strip_heredocs(command))
+}
+
+/// The word-level scan behind [`shipping_action`], run on text that has
+/// already had its heredoc bodies removed.
+///
+/// This is a single left-to-right pass. It tracks three pieces of state: the
+/// current quote (`'`, `"`, or none), how many `$( … )` levels deep the scan
+/// is, and the last up-to-three bare words seen — checked for a match every
+/// time a new word completes, so the scan can return the moment it finds
+/// one rather than building a list of every word in the command.
+///
+/// Two simplifications are deliberate, given this is advisory-only and the
+/// codebase's fail-open convention (an uncertain answer costs nothing but a
+/// missed nudge, never a wrong block): a `$( … )` opened while already inside
+/// a double-quoted string is not specially unwrapped (real `bash` does
+/// evaluate it there; this scan treats the quote as still literal), and
+/// backslash escapes are not interpreted at all. Neither case appears in any
+/// scenario this nudge is meant to catch — an actual `git commit`/`git
+/// push`/`gh pr create` invocation is essentially never written that way —
+/// and getting either wrong only means a rare missed nudge, not a rewritten
+/// or blocked command.
+fn shipping_action_words(command: &str) -> bool {
+    let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut depth: u32 = 0;
+    let mut word = String::new();
+    let mut w0: Option<String> = None;
+    let mut w1: Option<String> = None;
+    let mut w2: Option<String> = None;
+
+    while let Some(c) = chars.next() {
+        // Inside a real quote (not one reset by being nested in a `$( … )`),
+        // every character is literal except the one that closes it.
+        if depth == 0 && quote.is_some() {
+            if Some(c) == quote {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' if depth == 0 => {
+                if flush_word(&mut word, &mut w0, &mut w1, &mut w2) {
+                    return true;
+                }
+                quote = Some('\'');
+            }
+            '"' => {
+                if flush_word(&mut word, &mut w0, &mut w1, &mut w2) {
+                    return true;
+                }
+                quote = Some('"');
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                chars.next();
+                if flush_word(&mut word, &mut w0, &mut w1, &mut w2) {
+                    return true;
+                }
+                depth += 1;
+            }
+            '(' if depth > 0 => depth += 1,
+            ')' if depth > 0 => {
+                depth -= 1;
+                if flush_word(&mut word, &mut w0, &mut w1, &mut w2) {
+                    return true;
+                }
+            }
+            c if is_word_char(c) => word.push(c),
+            _ => {
+                if flush_word(&mut word, &mut w0, &mut w1, &mut w2) {
+                    return true;
+                }
+            }
+        }
+    }
+    flush_word(&mut word, &mut w0, &mut w1, &mut w2)
+}
+
+/// End the current word (a no-op if nothing has been accumulated), shift it
+/// into the trailing three-word window, and report whether that window now
+/// matches a shipping action.
+fn flush_word(
+    word: &mut String,
+    w0: &mut Option<String>,
+    w1: &mut Option<String>,
+    w2: &mut Option<String>,
+) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    *w0 = w1.take();
+    *w1 = w2.take();
+    *w2 = Some(std::mem::take(word));
+    matches_shipping_action(w0, w1, w2)
+}
+
+/// `git commit`, `git push` (the last two words), or `gh pr create` (the last
+/// three) — checked against a trailing window rather than the start of the
+/// command, which is what lets a wrapper prefix (`rtk git commit`), a
+/// preceding chained command (`a && git push`), or anything else earlier in
+/// the string pass through unnoticed. `gh pr` alone is deliberately NOT
+/// enough: `gh pr view`, `gh pr list` and `gh pr diff` are read-only and
+/// nudging on them would fire on ordinary PR inspection, which is exactly the
+/// noise this design avoids — only `create`, the one that actually opens a
+/// PR, counts.
+fn matches_shipping_action(w0: &Option<String>, w1: &Option<String>, w2: &Option<String>) -> bool {
+    let pair = |a: &str, b: &str| w1.as_deref() == Some(a) && w2.as_deref() == Some(b);
+    if pair("git", "commit") || pair("git", "push") {
+        return true;
+    }
+    w0.as_deref() == Some("gh") && w1.as_deref() == Some("pr") && w2.as_deref() == Some("create")
+}
+
+/// The bare-word character set used to split `command` into tokens: ASCII
+/// alphanumerics plus the handful of characters that routinely appear inside
+/// one shell word without ending it (`-`, `_`, `.`, `/`). Everything else —
+/// whitespace, `;`, `&`, `|`, parens outside a substitution, and so on — is a
+/// word boundary. This is also why `git-commit` and `gitcommit` never match
+/// `git`/`commit` as two words: the hyphen is a word character, so both are
+/// one token, and a token is compared to a whole word, never as a substring.
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')
+}
+
+/// Remove every heredoc BODY from `command`, keeping the redirect line that
+/// introduced it (which can itself be a real command, e.g. `cat <<EOF`).
+///
+/// A heredoc's body is data, not a command, so the words this scan looks for
+/// must not count when they only appear inside one — a fixture, a commit
+/// message template, or any other planted text between the markers. This is
+/// a line-based approximation of bash's own heredoc handling: it finds each
+/// `<<[-]DELIM` redirect (a `<<<` here-string is left alone; it carries no
+/// body), then drops every following line up to and including the line that,
+/// once its leading tabs are stripped for `<<-`, equals `DELIM` exactly.
+/// Quoting around `DELIM` (`<<'EOF'`, `<<"EOF"`) only changes whether bash
+/// expands the body, not where it ends, so it is stripped for the comparison
+/// and otherwise ignored.
+fn strip_heredocs(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut lines = command.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        out.push_str(line);
+        out.push('\n');
+        for (delim, strip_tabs) in heredoc_delimiters(line) {
+            for body_line in lines.by_ref() {
+                let candidate = if strip_tabs {
+                    body_line.trim_start_matches('\t')
+                } else {
+                    body_line
+                };
+                if candidate == delim {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every heredoc `<<[-]DELIM` redirect named on `line`, in the order they
+/// appear — a line can carry more than one (`cmd <<A <<B`), and their bodies
+/// follow in that same order on the lines after it.
+fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != b'<' || bytes[i + 1] != b'<' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 2;
+        if bytes.get(j) == Some(&b'<') {
+            i = j + 1; // `<<<`, a here-string: no body follows.
+            continue;
+        }
+        let strip_tabs = bytes.get(j) == Some(&b'-');
+        if strip_tabs {
+            j += 1;
+        }
+        while matches!(bytes.get(j), Some(b' ') | Some(b'\t')) {
+            j += 1;
+        }
+        if matches!(bytes.get(j), Some(b'\'') | Some(b'"')) {
+            j += 1;
+        }
+        let word_start = j;
+        while bytes
+            .get(j)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+        {
+            j += 1;
+        }
+        if word_start < j {
+            out.push((line[word_start..j].to_string(), strip_tabs));
+        }
+        i = j.max(i + 2);
+    }
+    out
+}
+
+// ── Only reached after a match: checklist + git status ──────────────────────
+
+/// The R91 advisory itself, reached only once [`shipping_action`] has already
+/// found a shipping action in the raw command string.
+fn commit_nudge(ctx: &HookContext<'_>, payload: &PreToolUse) -> Outcome {
+    let Some(command) = payload.tool_input.get("command").and_then(|v| v.as_str()) else {
+        return allow("allow: Bash call carries no command string");
+    };
+
+    if !shipping_action(command) {
+        return allow("allow: command does not mention git commit/push or gh pr create");
+    }
+
+    // The match is confirmed, so the cost discipline above no longer applies:
+    // everything from here touches the filesystem and, in `staleness`, git.
+    let root = worktree_root(ctx.cwd()).unwrap_or_else(|| ctx.config_root.clone());
+    let Some(candidates) = checklist_candidates(&root) else {
+        return allow("allow: no checklist exists in this repository");
+    };
+
+    match staleness(&root, &candidates) {
+        Some(path) => {
+            let shown = display_path(&root, &path);
+            Outcome::new(Response::PreToolUse(PreToolUseResponse {
+                additional_context: Some(nudge_text(&shown)),
+                ..PreToolUseResponse::default()
+            }))
+            .with_detail(format!("nudge: checklist {shown} looks absent from this commit"))
+        }
+        None => allow("allow: checklist is staged (or has no pending edits)"),
+    }
+}
+
+/// The checklist path(s) this repository has, whether or not any file has
+/// been written to one yet. `None` means there is no checklist here at all —
+/// the pointer is unset and `docs/actions/` holds nothing matching the naming
+/// convention — which is the one case the nudge must stay silent on
+/// regardless of what the Bash command does: a repository that has never
+/// adopted the checklist should not be nagged into starting one from a commit
+/// hook.
+///
+/// Mirrors the two routes [`is_checklist_path`] recognizes, but does not
+/// bail out on an ambiguous "several files, no pointer" repository the way
+/// the `checklist` verb's own resolver does — an advisory nudge has nothing
+/// useful to say about which one is active, so it just checks all of them.
+fn checklist_candidates(root: &Path) -> Option<Vec<PathBuf>> {
+    if let Some(target) = checklist::pointer_target(root) {
+        return Some(vec![target]);
+    }
+    let dir = root.join(checklist::ACTIONS_REL);
+    let mut found: Vec<PathBuf> = fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| checklist::matches_convention(root, path))
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    found.sort();
+    Some(found)
+}
+
+/// The first of `candidates` that looks left out of what is about to be
+/// committed, or `None` when every one of them is already accounted for. See
+/// the section doc above for what "absent" means and why it is read this
+/// narrowly.
+fn staleness(root: &Path, candidates: &[PathBuf]) -> Option<PathBuf> {
+    let mut existing: Vec<(&Path, &str)> = Vec::new();
+    for path in candidates {
+        if !path.is_file() {
+            // Named (by the pointer) but never written — the strongest case
+            // of "absent", and cheaper to answer than any of the others: no
+            // git call needed at all.
+            return Some(path.clone());
+        }
+        match path.strip_prefix(root).ok().and_then(|rel| rel.to_str()) {
+            Some(rel) => existing.push((path.as_path(), rel)),
+            // Not expressible as a UTF-8 path relative to its own root —
+            // should not happen for a path this repository's own convention
+            // or pointer produced. Nothing useful to check; move on.
+            None => continue,
+        }
+    }
+    if existing.is_empty() {
+        return None;
+    }
+
+    let rels: Vec<&str> = existing.iter().map(|(_, rel)| *rel).collect();
+    // Fully qualified rather than a top-level `use crate::git;`, deliberately:
+    // this file's structural test scans the source text for exactly that
+    // import, and it must appear nowhere before the marker above it.
+    let status = crate::git::status_porcelain(root, &rels).ok()?;
+
+    for (code, reported) in &status {
+        let untracked = code == "??";
+        // Porcelain's second column is the worktree state: `M`odified or
+        // `D`eleted there means there is an edit git has not been told to
+        // stage, whatever the first column (the index state) says.
+        let worktree_dirty = matches!(code.as_bytes().get(1), Some(b'M') | Some(b'D'));
+        if !untracked && !worktree_dirty {
+            continue;
+        }
+        if let Some((path, _)) = existing.iter().find(|(_, rel)| Path::new(rel) == reported) {
+            return Some(path.to_path_buf());
+        }
+    }
+    None
+}
+
+/// The advisory text placed on `additionalContext`. Well under the channel's
+/// 10,000-character cliff (`hook/event.rs`), so unlike the Read gate's cached
+/// conclusions there is no byte budget to compute here.
+fn nudge_text(shown: &str) -> String {
+    format!(
+        "ss-magic notice: {shown} looks left out of this commit — it either has not been \
+         written yet, or it has local edits that are not staged. If this change belongs to \
+         that action, update the checklist and stage it before committing:\n\
+         \n\
+         \x20      ss-magic-plugin checklist add-entry <id> [SUMMARY]\n\
+         \x20      ss-magic-plugin checklist done <id>\n\
+         \n\
+         This is advisory only — the command you ran was not blocked.\n"
     )
 }
 
