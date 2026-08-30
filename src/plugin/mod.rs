@@ -43,7 +43,9 @@
 //! `conclusions` / `gc`), `ledger.rs` (the machine-level cost ledger
 //! `SessionEnd` appends to, and the `cost` verb that reports it), `checklist/`
 //! (the typed checklist document, its canonical ordering and its validator,
-//! which knows nothing about hooks) and, added by later units, `status.rs`.
+//! which knows nothing about hooks), `setup_ci.rs` (the pinned GitHub
+//! Actions workflow behind `setup-github-ci`, whose bytes are an embedded
+//! asset) and, added by later units, `status.rs`.
 
 use std::process::ExitCode;
 
@@ -62,6 +64,7 @@ pub(crate) mod hook;
 pub(crate) mod identity;
 pub(crate) mod ledger;
 pub(crate) mod scratchpad;
+pub(crate) mod setup_ci;
 pub(crate) mod tmproot;
 
 // ── Hook events ───────────────────────────────────────────────────────────────
@@ -416,6 +419,7 @@ fn run_human(verb: HumanVerb, args: &[String]) -> Result<ExitCode> {
         HumanVerb::Conclusions => cache::run_conclusions(args),
         HumanVerb::Gc => cache::run_gc(args),
         HumanVerb::Cost => ledger::run(args),
+        HumanVerb::SetupGithubCi => setup_ci::run(args),
         HumanVerb::Checklist => checklist::run(args),
         _ => {
             eprintln!(
