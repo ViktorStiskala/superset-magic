@@ -133,6 +133,10 @@ pub(crate) enum Classification {
 /// what counts as a checklist: a test supplies a classifier that says
 /// "checklist" for everything and asserts the deny still wins over a subagent
 /// read, a state-tree path, a `.png` and an `Edit`.
+///
+/// The path it receives is the tool's target **as spelled**, unreduced: the
+/// shipped classifier owns the reduction so that it happens in exactly one
+/// place (see the invariant above [`resolve_target`]).
 type Classifier = fn(&HookContext<'_>, &Path) -> Classification;
 
 /// The shipped classifier: is this path the operator checklist?
@@ -144,24 +148,163 @@ type Classifier = fn(&HookContext<'_>, &Path) -> Classification;
 /// has no pointer yet. Either is enough — a repository can have both, and a
 /// checklist reached by the pointer and the same checklist reached by its path
 /// are the same file and get the same answer.
-fn classify_checklist(ctx: &HookContext<'_>, realpath: &Path) -> Classification {
-    let root = classification_root(ctx);
-    let resolved = absolutize(ctx.cwd(), realpath);
-    if !is_checklist_path(&root, &resolved) {
-        return Classification::Ordinary;
-    }
-    Classification::Checklist {
-        reason: checklist_reason(tool_label(ctx), &display_path(&root, &resolved)),
+///
+/// `target` is the path exactly as the tool spelled it. Reducing it is this
+/// function's own job and happens in exactly one place ([`resolve_target`]),
+/// which is what the invariant documented there depends on.
+fn classify_checklist(ctx: &HookContext<'_>, target: &Path) -> Classification {
+    let denied = |shown: String| Classification::Checklist {
+        reason: checklist_reason(tool_label(ctx), &shown),
+    };
+    match resolve_target(ctx.cwd(), target) {
+        Target::Rooted(path) => {
+            for root in classification_roots(ctx, &path) {
+                if is_checklist_path(&root, &path) {
+                    return denied(display_path(&root, &path));
+                }
+            }
+            Classification::Ordinary
+        }
+        Target::Unrootable(path) => {
+            if is_checklist_under_any_root(&actor_root(ctx), &path) {
+                return denied(path.to_string_lossy().into_owned());
+            }
+            Classification::Ordinary
+        }
     }
 }
 
-/// The worktree the checklist is looked for in.
+// ── The invariant this gate is built on ──────────────────────────────────────
+//
+// **The gate classifies from the TARGET, and never trusts a resolution whose
+// result depends on which process performs it.**
+//
+// Six bypasses of the R88 deny were found and fixed one at a time — a
+// symlinked ancestor, a case difference, a relative target, a `..` component, a
+// `/proc/self/cwd` prefix, a leading `..` — and each fix was followed by
+// another hole. They share one generator: the gate kept choosing its
+// comparison basis from the ACTOR (the hook's own process, the envelope's cwd)
+// rather than from the target, and kept recognizing individual SPELLINGS
+// rather than the property that made them dangerous.
+//
+// So the invariant is satisfied in three moves, in this order, and the order is
+// load-bearing:
+//
+//   1. Reduce lexically FIRST, before anything else looks at the path
+//      ([`resolve_target`]). `..` is an ordinary component, so a spelling only
+//      shows what it is once its `..`s have been cancelled — and the reduction
+//      used to run AFTER the `/proc` test, which is how the fix for `..` came
+//      to defeat the fix for `/proc`. Where this earns its place now is the
+//      unrootable branch below: a path that is never canonicalized is judged
+//      purely by its shape, and an uncancelled `docs/actions/foo/../x` reads as
+//      a file in `docs/actions/foo` while the filesystem writes the checklist.
+//      (The reported `/tmp/../proc/self/cwd/x` shape is closed twice over, since
+//      move 2's scan finds the selector wherever it ends up sitting.)
+//   2. Decide process-relativeness as a PROPERTY of the component sequence
+//      ([`pathnorm::process_view`]), never as a recognized prefix — and for a
+//      form that cannot be faithfully re-rooted, refuse to `canonicalize` it
+//      here at all and decide lexically, toward the deny.
+//   3. Derive the candidate roots from the TARGET as well as from the actor
+//      ([`classification_roots`]). A worktree and its main checkout are one
+//      ordinary deployment, so an absolute path into a sibling tree's
+//      `docs/actions/` is an ordinary thing for an agent to write — and a
+//      root-relative comparison against the actor's own root alone can never
+//      see it.
+//
+// If a seventh bypass turns up, the question to ask is which of these three the
+// path escaped — not which spelling to add to a list. Adding the spelling is
+// the move that produced the sequence.
+
+/// The target, reduced to the basis the checklist comparisons run on.
+enum Target {
+    /// A path that means the same thing in every process, resolved against the
+    /// filesystem and directly comparable with a worktree root.
+    Rooted(PathBuf),
+    /// A process-relative path with no faithful re-rooting (`…/proc/<pid>/root`,
+    /// `…/proc/self/fd/<n>`, …), reduced lexically and deliberately never
+    /// handed to `canonicalize`: doing that here would answer a question about
+    /// the HOOK's process, which is not the one that will perform the write.
+    /// There is no root to compare it against, so the classifier asks the
+    /// root-independent question instead.
+    Unrootable(PathBuf),
+}
+
+/// Reduce the tool's target to one basis, per steps 1 and 2 of the invariant
+/// above.
+fn resolve_target(cwd: &Path, raw: &Path) -> Target {
+    // 1. Lexical reduction first, unconditionally.
+    let lexical = pathnorm::normalize(raw);
+
+    match pathnorm::process_view(&lexical) {
+        // 2a. Re-rootable: `…/proc/<selector>/cwd/<rest>` means "<the resolving
+        //     process's working directory>/<rest>". The process that will
+        //     actually perform the write is the agent's, and the envelope
+        //     records its cwd, so joining `rest` there reproduces exactly what
+        //     the harness's own resolution will reach.
+        pathnorm::ProcessView::Cwd(rest) => {
+            Target::Rooted(resolve_for_classification(&absolute_cwd(cwd).join(rest)))
+        }
+        // 2b. Not re-rootable. Canonicalizing would resolve the selected
+        //     process's private view through THIS process, which is a different
+        //     file — so the path keeps its lexical form and is judged by the
+        //     root-independent test, which errs toward the deny.
+        pathnorm::ProcessView::Opaque => Target::Unrootable(lexical),
+        // An ordinary path. A relative one is joined onto the ENVELOPE's cwd —
+        // the agent's working directory — because a bare `canonicalize` would
+        // resolve it against the hook process's own, and the harness invokes
+        // this binary from somewhere else entirely.
+        pathnorm::ProcessView::Independent => {
+            let absolute = if lexical.is_absolute() {
+                lexical
+            } else {
+                absolute_cwd(cwd).join(lexical)
+            };
+            Target::Rooted(resolve_for_classification(&absolute))
+        }
+    }
+}
+
+/// The envelope's cwd on the same basis the worktree roots use. A cwd that
+/// cannot be resolved keeps its spelling, which leaves the comparison no worse
+/// off than it was.
+fn absolute_cwd(cwd: &Path) -> PathBuf {
+    cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
+}
+
+/// Every worktree root `target` could be a checklist under — step 3 of the
+/// invariant above.
+///
+/// The actor's root comes first because it is the common case and is already
+/// memoized. The target's own root is then walked for independently: both
+/// routes in [`is_checklist_path`] are root-relative (`matches_convention`
+/// opens with a `strip_prefix` and returns false when it fails; the pointer is
+/// read from the root), so a target legitimately rooted in a DIFFERENT tree —
+/// a sibling worktree, or the main checkout this worktree hangs off — matches
+/// neither route when the only root on offer is the one the agent happens to
+/// be sitting in. That shape is this repository's own deployment, not an
+/// adversarial curiosity.
+///
+/// [`walk_for_root`] rather than the memoized [`worktree_root`] on purpose:
+/// the memo exists because the several callers below all ask about the one
+/// unchanging cwd, whereas a target differs on every tool call and would only
+/// fill the map with single-use entries.
+fn classification_roots(ctx: &HookContext<'_>, target: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![actor_root(ctx)];
+    if let Some(root) = target.parent().and_then(walk_for_root) {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// The worktree the ACTOR is working in.
 ///
 /// The same root the rest of the gate uses, resolved the same way. The walk
-/// canonicalizes as it goes, so its answer already matches the realpath the
-/// gate hands the classifier; only the last-resort fallback has been through
-/// no such walk and needs resolving here.
-fn classification_root(ctx: &HookContext<'_>) -> PathBuf {
+/// canonicalizes as it goes, so its answer already matches the resolved target
+/// the classifier compares against; only the last-resort fallback has been
+/// through no such walk and needs resolving here.
+fn actor_root(ctx: &HookContext<'_>) -> PathBuf {
     worktree_root(ctx.cwd()).unwrap_or_else(|| {
         ctx.config_root
             .canonicalize()
@@ -169,43 +312,16 @@ fn classification_root(ctx: &HookContext<'_>) -> PathBuf {
     })
 }
 
-/// The tool's target as an absolute path, without touching the filesystem.
-///
-/// [`gate`] canonicalizes the target, which resolves it fully — but only when
-/// the file is there. A `Write` creating a checklist that does not exist yet
-/// leaves the path exactly as the tool spelled it, and the harness's tools take
-/// absolute paths, so that is normally already absolute. A relative one is
-/// joined onto the envelope's `cwd` rather than left to fail the comparison:
-/// otherwise an agent could reach the file simply by spelling the path
-/// differently. Stat'ing here would defeat the point, since the file this
-/// branch exists for is precisely the one that is not there.
-fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
-    // `/proc/self/cwd/x` passes `is_absolute` and is still process-relative:
-    // the kernel resolves `self` against whoever asks, and the hook is not the
-    // process that will perform the write. Treat the remainder as relative so
-    // it lands on the envelope's cwd, the way the harness will resolve it.
-    if let Some(rel) = pathnorm::strip_proc_cwd(path) {
-        return cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()).join(rel);
-    }
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    cwd.canonicalize()
-        .unwrap_or_else(|_| cwd.to_path_buf())
-        .join(path)
-}
-
-/// The target resolved to the same basis the classification root uses.
+/// The target resolved to the same basis the classification roots use.
 ///
 /// `canonicalize` only works on a path that exists, and the interesting case
 /// here is precisely the one that does not: a `Write` creating a checklist, or
 /// an `Edit` recreating a deleted one. Falling back to the raw spelling looks
-/// harmless but is not, because [`classification_root`] canonicalizes
-/// unconditionally — so on any machine where an ancestor is a symlink (macOS
-/// resolves `/tmp` to `/private/tmp`, and a symlinked home or checkout is
-/// ordinary), the root is canonical while the target is not, every prefix
-/// comparison in [`is_checklist_path`] misses, and the R88 deny silently does
-/// not fire.
+/// harmless but is not, because [`actor_root`] canonicalizes unconditionally —
+/// so on any machine where an ancestor is a symlink (macOS resolves `/tmp` to
+/// `/private/tmp`, and a symlinked home or checkout is ordinary), the root is
+/// canonical while the target is not, every prefix comparison in
+/// [`is_checklist_path`] misses, and the R88 deny silently does not fire.
 ///
 /// So resolve the deepest ancestor that does exist and re-attach the tail that
 /// does not. That yields a canonical path for a file that was never created,
@@ -214,11 +330,13 @@ fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
 /// nothing to resolve against, and the lexical comparison is then no worse off
 /// than before.
 fn resolve_for_classification(target: &Path) -> PathBuf {
-    // Cancel `.` and `..` first. `canonicalize` would do it, but only for a
-    // path that exists, and the whole point of this function is the one that
-    // does not — so the ancestor walk below would otherwise reconstruct a
-    // *different* path than the filesystem will reach. Reducing lexically here
-    // means both halves agree before anything is compared.
+    // Cancel `.` and `..` before the ancestor walk. `canonicalize` would do it,
+    // but only for a path that exists, and the whole point of this function is
+    // the one that does not — so the walk below would otherwise reconstruct a
+    // *different* path than the filesystem will reach. `resolve_target` has
+    // normally normalized already and this repeats it, which is free:
+    // `normalize` is idempotent, and repeating it keeps this function correct
+    // for a caller that hands it a raw spelling.
     let normalized = pathnorm::normalize(target);
     let target = normalized.as_path();
     if let Ok(real) = target.canonicalize() {
@@ -291,6 +409,77 @@ fn is_checklist_path(root: &Path, path: &Path) -> bool {
     target
         .canonicalize()
         .is_ok_and(|resolved| paths_equal_ignoring_case(&resolved, path))
+}
+
+/// Whether `path` is the checklist under **some** root, when which root it
+/// really sits under cannot be established.
+///
+/// This is what step 2 of the invariant leaves the gate holding: a
+/// process-relative path with no faithful re-rooting is never `canonicalize`d
+/// here, so it has no root and neither root-relative route in
+/// [`is_checklist_path`] can be asked about it. The root-independent question
+/// is asked instead, and it errs toward the deny — which is the safe direction
+/// for this gate, where one path too many costs a redirect to the CLI and one
+/// too few costs the operator checklist written unlocked and unvalidated.
+///
+/// Erring toward the deny is not the same as denying everything. Both tests
+/// below are about the SHAPE of the path, so an ordinary process-relative read
+/// — `/proc/self/status`, say — matches neither and goes through untouched.
+fn is_checklist_under_any_root(pointer_root: &Path, path: &Path) -> bool {
+    // The convention is a fixed three-component tail
+    // (`docs/actions/<stem>.checklist.json`), so asking `matches_convention`
+    // about every ancestor in turn asks "is this a conventionally-named
+    // checklist under any root at all". Asking through the real predicate
+    // rather than restating the naming rule here is deliberate: a second copy
+    // of the rule is a copy that drifts, and the fold-case behaviour comes
+    // along for free.
+    if path
+        .ancestors()
+        .any(|root| checklist::matches_convention(root, path))
+    {
+        return true;
+    }
+
+    // The pointer records a repository-relative path, so the root-independent
+    // form of that route is "do the target's trailing components spell what the
+    // pointer named". The pointer is read from the actor's root because it is
+    // the only one in reach — and a path wearing this repository's pointed-at
+    // spelling is worth denying wherever it claims to live.
+    let Some(target) = checklist::pointer_target(pointer_root) else {
+        return false;
+    };
+    // `pointer_target` returns the recorded relative path joined onto the root
+    // it was read from, so stripping that root back off recovers the relative
+    // spelling to compare as a suffix.
+    let Ok(rel) = target.strip_prefix(pointer_root) else {
+        return false;
+    };
+    ends_with_ignoring_case(path, rel)
+}
+
+/// Whether `path`'s trailing components are exactly `tail`, folding ASCII case.
+///
+/// Component-wise rather than string-wise, so `notes.json` does not match a
+/// pointer at `mynotes.json`; case-folded for the same reason
+/// [`paths_equal_ignoring_case`] folds, since the filesystems this runs on
+/// treat the two spellings as one file. An empty `tail` matches nothing: the
+/// pointer always names a file, and "every path ends with nothing" would deny
+/// the world.
+fn ends_with_ignoring_case(path: &Path, tail: &Path) -> bool {
+    let path: Vec<_> = path.components().collect();
+    let tail: Vec<_> = tail.components().collect();
+    if tail.is_empty() || tail.len() > path.len() {
+        return false;
+    }
+    path[path.len() - tail.len()..]
+        .iter()
+        .zip(&tail)
+        .all(|(a, b)| match (a.as_os_str().to_str(), b.as_os_str().to_str()) {
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            // A non-UTF-8 component cannot be folded; compare it exactly rather
+            // than declaring two undecidable components equal.
+            _ => a == b,
+        })
 }
 
 /// The tool's own name, for the first line of the denial. Reads it back out of
@@ -420,22 +609,13 @@ fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
 
     // ── 2. Checklist classification (R88) ────────────────────────────────────
     // Before every exemption, and before the tool branch, because it is the one
-    // decision that applies to writes as well as reads. The target is resolved
-    // first so reaching the file through a symlink, or through the pointer, is
-    // the same case as naming it outright; a target that is not there yet keeps
-    // the path as spelled, which the classifier compares lexically.
+    // decision that applies to writes as well as reads. The target goes in
+    // exactly as the tool spelled it: reducing it is the classifier's own job,
+    // and doing it in one place is what the invariant above [`resolve_target`]
+    // rests on. Splitting the reduction between here and there is how a `..`
+    // came to be cancelled after a `/proc` prefix had already been looked for.
     if let Some(target) = &target {
-        // Absolutize against the ENVELOPE's cwd before resolving. A bare
-        // `canonicalize` on a relative path resolves against the hook process's
-        // own working directory, which is not the agent's: the harness invokes
-        // the binary directly, so a relative `docs/actions/x.checklist.json`
-        // would resolve against whatever directory the process happens to be
-        // in - the main checkout, say, while the agent is in a worktree - and
-        // the classification root would not match. The harness meanwhile
-        // resolves the same spelling against the agent's real cwd and touches
-        // the real file.
-        let realpath = resolve_for_classification(&absolutize(ctx.cwd(), target));
-        if let Classification::Checklist { reason } = classify(ctx, &realpath) {
+        if let Classification::Checklist { reason } = classify(ctx, target) {
             return Ok(deny(reason, "deny: checklist path"));
         }
     }

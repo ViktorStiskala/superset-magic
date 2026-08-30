@@ -1,5 +1,5 @@
 use super::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The bug this module exists to prevent, stated as a test.
 ///
@@ -64,40 +64,98 @@ fn a_normal_path_is_unchanged() {
 /// without a leading slash. The hook resolves `self` against its own process;
 /// the harness resolves the same string against the agent's.
 #[test]
-fn a_proc_cwd_prefix_is_recognized_and_stripped() {
+fn a_proc_cwd_path_is_recognized_as_re_rootable() {
     for prefix in ["/proc/self/cwd", "/proc/thread-self/cwd", "/proc/4321/cwd"] {
         let path = format!("{prefix}/docs/actions/x.checklist.json");
         assert_eq!(
-            strip_proc_cwd(Path::new(&path)).as_deref(),
-            Some(Path::new("docs/actions/x.checklist.json")),
-            "{prefix} names a process's cwd and must be treated as relative"
+            process_view(Path::new(&path)),
+            ProcessView::Cwd(PathBuf::from("docs/actions/x.checklist.json")),
+            "{prefix} names a process's cwd and its remainder must be re-rooted"
         );
     }
 }
 
+/// The sibling `/proc` forms that a fixed four-component prefix match walked
+/// straight past. Each names something only the selected process can see, so
+/// none of them can be re-rooted — and `canonicalize`ing one in the hook's own
+/// process answers a question about the wrong process, which is exactly the
+/// resolution the invariant forbids.
+///
+/// `/proc/self/root/proc/self/cwd/…` is the sharpest of them: it *contains* the
+/// re-rootable spelling, and a scan that took the LAST match would hand back a
+/// remainder rooted in another process's mount namespace. The first selector
+/// wins for that reason.
 #[test]
-fn an_ordinary_path_is_not_mistaken_for_a_proc_cwd() {
+fn other_per_process_views_are_opaque_not_re_rootable() {
     for path in [
-        "/docs/actions/x.json",
-        "/proc/self/environ",
-        "/proc/self/cwdish/x",
-        "/proc/notaprocess/cwd/x",
-        "/procyon/self/cwd/x",
-        "proc/self/cwd/x", // relative: absolutize already joins it
+        "/proc/self/root/proc/self/cwd/docs/actions/x.checklist.json",
+        "/proc/self/task/991/cwd/docs/actions/x.checklist.json",
+        "/proc/self/fd/3/docs/actions/x.checklist.json",
+        "/proc/1234/root/etc/passwd",
+        "/proc/self/ns/mnt",
+        // The bare selector directory: still that process's view, nothing to
+        // re-root.
+        "/proc/self",
     ] {
         assert_eq!(
-            strip_proc_cwd(Path::new(path)),
-            None,
-            "{path} is not a /proc cwd reference"
+            process_view(Path::new(path)),
+            ProcessView::Opaque,
+            "{path} is a per-process view with no faithful re-rooting"
         );
     }
 }
 
-/// The bare `/proc/self/cwd` with nothing after it names the directory itself.
+/// Procfs is mountable anywhere, and a `..` can put the selector where a
+/// prefix match would never look — so the property is tested for over the whole
+/// component sequence, and the caller normalizes before asking.
 #[test]
-fn a_bare_proc_cwd_strips_to_an_empty_remainder() {
+fn the_selector_is_found_wherever_it_sits_in_the_sequence() {
+    // A bind mount somewhere other than `/proc`.
     assert_eq!(
-        strip_proc_cwd(Path::new("/proc/self/cwd")).as_deref(),
-        Some(Path::new("")),
+        process_view(Path::new("/mnt/proc/self/cwd/x")),
+        ProcessView::Cwd(PathBuf::from("x"))
+    );
+    // The ordering bug, as the caller hands it over: `normalize` first, then
+    // ask. Asking first — which is what the previous shape did — sees `/tmp`
+    // and answers `Independent`.
+    assert_eq!(
+        process_view(&normalize(Path::new("/tmp/../proc/self/cwd/x"))),
+        ProcessView::Cwd(PathBuf::from("x")),
+        "a `..` that lexically produces the prefix has to be cancelled first"
+    );
+    // A `proc` whose next component is not a process selector does not stop the
+    // scan; a later one that is still counts.
+    assert_eq!(
+        process_view(Path::new("/a/proc/notaprocess/proc/self/cwd/x")),
+        ProcessView::Cwd(PathBuf::from("x"))
+    );
+}
+
+#[test]
+fn an_ordinary_path_names_no_process() {
+    for path in [
+        "/docs/actions/x.json",
+        // The `/proc` files that mean the same thing to every reader.
+        "/proc/mounts",
+        "/proc/cpuinfo",
+        "/procyon/self/cwd/x",
+        "/proc/notaprocess/cwd/x",
+        "docs/actions/x.checklist.json",
+    ] {
+        assert_eq!(
+            process_view(Path::new(path)),
+            ProcessView::Independent,
+            "{path} resolves the same way in every process"
+        );
+    }
+}
+
+/// The bare `/proc/self/cwd` with nothing after it names the directory itself,
+/// which re-roots onto the caller's cwd with an empty remainder.
+#[test]
+fn a_bare_proc_cwd_re_roots_with_an_empty_remainder() {
+    assert_eq!(
+        process_view(Path::new("/proc/self/cwd")),
+        ProcessView::Cwd(PathBuf::new()),
     );
 }

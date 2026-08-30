@@ -1307,7 +1307,7 @@ fn a_write_of_a_checklist_that_does_not_exist_yet_is_denied() {
 // touching either of them, because the obvious version of both passes while
 // the bug is present.
 //
-// The gate compares two paths: the worktree root from `classification_root`,
+// The gate compares two paths: the worktree root from `actor_root`,
 // and the tool's target. The root is canonicalized UNCONDITIONALLY — the walk
 // in `walk_for_root` starts from `cwd.canonicalize()`. The target used to be
 // resolved with `canonicalize().unwrap_or_else(|_| target.clone())`, and
@@ -1558,11 +1558,10 @@ fn a_relative_checklist_target_is_resolved_against_the_envelopes_cwd() {
         // working directory, the crate root under `cargo test` — the spelling
         // has to land on an absolute path OUTSIDE the fixture for the miss to
         // happen at all. A relative path that resolves nowhere keeps its
-        // spelling instead, and `classify_checklist`'s own `absolutize` then
-        // joins it onto the envelope's cwd after all, so a test built on one
-        // would pass with the bug present and prove nothing. Both spellings
-        // here start at the crate's own `docs/`, which is what makes them
-        // resolve.
+        // spelling instead, and `resolve_target` joins it onto the envelope's
+        // cwd after all, so a test built on one would pass with the bug present
+        // and prove nothing. Both spellings here start at the crate's own
+        // `docs/`, which is what makes them resolve.
         let as_the_process_would = resolve_for_classification(Path::new(rel));
         assert!(
             as_the_process_would.is_absolute() && !as_the_process_would.starts_with(&repo.root),
@@ -1708,10 +1707,12 @@ fn a_parent_component_in_a_pointer_target_is_cancelled() {
 // real file. The same divergence as a bare relative path, wearing a leading
 // slash.
 //
-// `absolutize` now strips the prefix and treats the remainder as relative to
-// the envelope's cwd, which is what the harness will do with it.
+// `resolve_target` now re-roots the remainder on the envelope's cwd, which is
+// what the harness will do with it. (The recognition itself was later widened
+// from this fixed prefix to a property of the whole component sequence — see
+// the block below, which is the bypass that widening closed.)
 //
-// The fix is purely lexical — `strip_proc_cwd` never stats `/proc` — so this
+// The fix is purely lexical — `pathnorm::process_view` never stats `/proc` — so this
 // test asserts the same decision on Linux, where the spelling resolves, and on
 // macOS, where `/proc` does not exist at all. That is deliberate rather than
 // incidental: gating it behind `#[cfg(target_os = "linux")]` would make it
@@ -1741,9 +1742,10 @@ fn a_proc_cwd_checklist_target_is_denied() {
         ] {
             let spelling = format!("{prefix}/{rel}");
             // The precondition the bug needs, asserted rather than assumed:
-            // the spelling is absolute, so `absolutize`'s `is_absolute`
-            // short-circuit would return it untouched and the classification
-            // would be decided about a path in some other process's tree.
+            // the spelling is absolute, so a gate that only re-roots paths
+            // failing `is_absolute` would return it untouched and the
+            // classification would be decided about a path in some other
+            // process's tree.
             assert!(
                 Path::new(&spelling).is_absolute(),
                 "{spelling} has to be absolute to exercise the short-circuit"
@@ -1765,6 +1767,307 @@ fn a_proc_cwd_checklist_target_is_denied() {
             );
         }
     }
+}
+
+// ── Every other per-process `/proc` view (regression) ────────────────────────
+//
+// The sixth and seventh ways through the same deny, and the ones that finally
+// named the generator behind all of them.
+//
+// The `/proc/self/cwd` fix matched a FIXED four-component prefix: `/`, `proc`,
+// a process selector, `cwd`. Everything else fell into `absolutize`'s
+// `is_absolute()` branch untouched and was then `canonicalize`d in the HOOK's
+// own process — which is the one resolution the gate must never trust, because
+// the harness performs the same resolution in a different process and reaches
+// a different file. Three siblings walked straight past it: `…/root/…` re-roots
+// on another process's mount namespace, `…/fd/<n>/…` names a descriptor only
+// that process holds, and `…/task/<tid>/…` names one of its threads. And
+// `/tmp/../proc/self/cwd/…` was not a coverage gap at all but an ORDERING one:
+// the prefix match ran on the raw path inside `absolutize`, while
+// `pathnorm::normalize` ran later inside `resolve_for_classification`, so a
+// `..` that lexically produces the canonical prefix arrived too early to be
+// seen and too late to be stripped — the fix for the `..` bypass defeating the
+// fix for the `/proc` one.
+//
+// Both are now closed by the invariant rather than by two more special cases:
+// the path is normalized FIRST, and process-relativeness is a property of the
+// component sequence (a `proc` component followed by a process selector,
+// anywhere) instead of a recognized prefix. The one re-rootable form
+// (`…/cwd/<rest>`) is re-rooted on the envelope's cwd; every other form is
+// never canonicalized here and is judged lexically, erring toward the deny.
+//
+// Purely lexical, so these assert the same decision on Linux, where the
+// spellings resolve, and on macOS, where `/proc` does not exist — deliberately,
+// for the reason the `/proc/self/cwd` block above gives: a Linux-only bypass is
+// exactly the kind a developer on macOS reintroduces without noticing.
+
+/// Every `/proc` form whose meaning belongs to a process other than this one is
+/// denied when it spells a checklist, by either route.
+///
+/// None of these can be faithfully re-rooted, so the gate refuses to resolve
+/// them at all and decides from the shape of the path — which is what makes the
+/// answer identical on a machine with no `/proc`.
+#[test]
+fn every_per_process_proc_view_of_a_checklist_is_denied() {
+    let repo = repo();
+    // Not a conventional name, so the pointer route is the only thing that can
+    // catch the second spelling below.
+    repo.point_at("state/tracker.json");
+
+    for prefix in [
+        // Another process's mount namespace, wrapped around the very spelling
+        // the previous fix recognized: the 4th component is `root`, so the
+        // fixed-prefix match returned `None` and the path was canonicalized
+        // here.
+        "/proc/self/root/proc/self/cwd",
+        // A thread's cwd rather than the process's: 4th component `task`.
+        "/proc/self/task/991/cwd",
+        // A file descriptor the calling process holds, which is a directory
+        // handle when it points at one.
+        "/proc/self/fd/3",
+        // The same three by numeric pid, since the selector is not only `self`.
+        "/proc/4321/root/proc/4321/cwd",
+        "/proc/thread-self/fd/7",
+    ] {
+        for (rel, route) in [
+            ("docs/actions/2026-08-new.checklist.json", "the convention"),
+            ("state/tracker.json", "the pointer"),
+        ] {
+            let spelling = format!("{prefix}/{rel}");
+            let env = envelope(
+                &repo.root,
+                "Write",
+                serde_json::json!({ "file_path": &spelling }),
+            );
+            let outcome = run(&env, &repo.root, &default_config());
+            assert_denied_as_checklist(
+                &outcome,
+                "Write",
+                &format!(
+                    "a Write of `{spelling}`, a checklist by {route} reached through a \
+                     per-process /proc view the hook cannot resolve"
+                ),
+            );
+        }
+    }
+}
+
+/// A `..` is cancelled BEFORE the path's nature is decided, not after — the
+/// first of the three moves the invariant is built from.
+///
+/// Two shapes, and they fail differently, which is the point:
+///
+/// * `/tmp/../proc/self/cwd/x` is not a `/proc` path by its leading components
+///   and is one after reduction. This is the shape round 4 named: the prefix
+///   match ran on the raw path while the reduction ran later, so the `..`
+///   arrived too early to be seen and too late to be stripped. It is now closed
+///   TWICE — the component-sequence scan finds the selector wherever it sits,
+///   so it no longer needs the reduction to have happened first.
+/// * `/proc/self/fd/3/docs/actions/foo/../x.checklist.json` is closed by the
+///   ordering alone. A per-process view is never canonicalized here, so the
+///   only thing left to judge it by is the SHAPE of the path — and unreduced,
+///   its parent reads as `docs/actions/foo`, which the naming convention does
+///   not recognise while the filesystem cancels the hop and writes the real
+///   checklist. Reduce first and the shape is the one the write will reach.
+///
+/// Keep both. The first documents the bug that was reported; the second is what
+/// actually fails if the reduction is moved back after the decision.
+#[test]
+fn a_parent_component_is_cancelled_before_the_path_is_judged() {
+    let repo = repo();
+    repo.point_at("state/tracker.json");
+
+    for (spelling, route) in [
+        // `..` producing the re-rootable prefix.
+        (
+            "/tmp/../proc/self/cwd/docs/actions/2026-08-new.checklist.json",
+            "the convention",
+        ),
+        ("/tmp/../proc/self/cwd/state/tracker.json", "the pointer"),
+        // Two hops and a `.` thrown in: a reduction, not a one-segment special
+        // case.
+        (
+            "/usr/local/../../proc/self/./cwd/docs/actions/2026-08-new.checklist.json",
+            "the convention",
+        ),
+        // `..` in the TAIL of a view that cannot be re-rooted, where the
+        // lexical shape test is the only judge there is.
+        (
+            "/proc/self/fd/3/docs/actions/foo/../2026-08-new.checklist.json",
+            "the convention",
+        ),
+        (
+            "/proc/self/root/proc/self/task/9/cwd/state/nested/../tracker.json",
+            "the pointer",
+        ),
+    ] {
+        // The precondition the bug needs, asserted rather than assumed: read
+        // component by component, before any reduction, none of these is the
+        // path it will turn out to be.
+        assert!(
+            spelling.contains("/.."),
+            "{spelling} has to carry a `..` to exercise the ordering"
+        );
+
+        let env = envelope(
+            &repo.root,
+            "Write",
+            serde_json::json!({ "file_path": spelling }),
+        );
+        let outcome = run(&env, &repo.root, &default_config());
+        assert_denied_as_checklist(
+            &outcome,
+            "Write",
+            &format!(
+                "a Write of `{spelling}`, a checklist by {route} that only reads as one \
+                 once its `..` has been cancelled"
+            ),
+        );
+    }
+}
+
+/// Erring toward the deny must not become denying everything: a `/proc` path
+/// that is not checklist-shaped is still an ordinary read.
+///
+/// The gate refuses to RESOLVE these, which is not the same as refusing them.
+/// If this ever fails, the fail-closed direction has turned into a
+/// fail-everything one and the plugin has started blocking process
+/// introspection it has no business blocking.
+#[test]
+fn a_non_checklist_proc_read_is_still_allowed() {
+    let repo = repo();
+    repo.point_at("state/tracker.json");
+
+    for path in [
+        "/proc/self/status",
+        "/proc/self/environ",
+        "/proc/self/root/etc/hosts",
+        "/proc/self/fd/3",
+        "/proc/1234/cmdline",
+        "/proc/meminfo",
+        // Under the re-rootable prefix too, where the remainder becomes an
+        // ordinary path inside the worktree.
+        "/proc/self/cwd/src/main.rs",
+    ] {
+        let env = envelope(&repo.root, "Read", serde_json::json!({ "file_path": path }));
+        let outcome = run(&env, &repo.root, &default_config());
+        // Not asserting WHICH allow: `/proc/self/status` stats as an empty
+        // file on Linux and does not exist at all on macOS, so the branch that
+        // lets it through differs by platform. What matters is that the
+        // checklist deny is not the answer for any of them.
+        assert!(
+            allowed(&outcome).starts_with("allow:"),
+            "{path} is not checklist-shaped and must go through: {:?}",
+            outcome.detail
+        );
+    }
+}
+
+// ── A target rooted in another worktree (regression) ─────────────────────────
+//
+// The last of the seven, and the one no `/proc` spelling was needed for.
+//
+// `classification_root` walked up from the ENVELOPE's cwd and never looked at
+// the target. Both routes in `is_checklist_path` are root-relative —
+// `matches_convention` opens with `path.strip_prefix(root)` and returns false
+// when that fails, and the pointer route reads the pointer belonging to the
+// CWD's root — so an absolute target legitimately rooted in a different tree
+// matched neither, `classify_checklist` returned `Ordinary`, and the write
+// landed on a real checklist.
+//
+// This is not an adversarial shape. A main checkout plus its worktrees is how
+// this repository is developed, and an absolute path into a sibling tree's
+// `docs/actions/` is an ordinary thing for an agent to write. Every fixture in
+// this file up to here shares one root between cwd and target, which is why
+// four review rounds passed over it: the bug is invisible unless the two roots
+// are deliberately different.
+//
+// The fix derives the candidate roots from the TARGET as well as from the
+// actor, and denies when either says checklist.
+
+/// Two worktrees under one parent, the way a main checkout and its worktrees
+/// sit on disk. Neither is inside the other, and the parent is deliberately
+/// NOT a worktree, so the only way to reach the second root is to walk up from
+/// a path inside it.
+fn two_worktrees() -> (TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let main = base.join("checkout");
+    let other = base.join("worktrees/feature");
+    scaffold_worktree(&main);
+    scaffold_worktree(&other);
+    (dir, main, other)
+}
+
+/// An agent working in one worktree cannot write the checklist of another, by
+/// either route.
+///
+/// The two directions are both real: an agent in a worktree reaching into the
+/// main checkout is the everyday case, and one reaching sideways into a
+/// sibling worktree is the same miss with the roles swapped.
+#[test]
+fn a_checklist_in_another_worktree_is_denied_from_this_one() {
+    let (_dir, checkout, feature) = two_worktrees();
+    // Each root points at a checklist the naming convention would NOT
+    // recognise, so the pointer route has to be read from the TARGET's root
+    // rather than the actor's — the actor's pointer names a different file.
+    record_pointer(&checkout, "state/checkout-tracker.json");
+    record_pointer(&feature, "state/feature-tracker.json");
+
+    for (cwd, target_root, label) in [
+        (&feature, &checkout, "from a worktree into the main checkout"),
+        (&checkout, &feature, "from the main checkout into a worktree"),
+    ] {
+        for (rel, route) in [
+            ("docs/actions/2026-08-new.checklist.json", "the convention"),
+            (
+                if target_root == &checkout {
+                    "state/checkout-tracker.json"
+                } else {
+                    "state/feature-tracker.json"
+                },
+                "the pointer",
+            ),
+        ] {
+            let target = target_root.join(rel);
+            assert!(!target.exists(), "{rel} must be the create case");
+            // The precondition, asserted rather than assumed: the target is
+            // absolute and shares no worktree root with the agent's cwd, so
+            // every root-relative comparison against the actor's root misses.
+            assert!(
+                target.strip_prefix(cwd).is_err(),
+                "the target has to sit outside the agent's own root to exercise the bug"
+            );
+
+            let env = envelope(cwd, "Write", serde_json::json!({ "file_path": &target }));
+            let outcome = run(&env, cwd, &default_config());
+            assert_denied_as_checklist(
+                &outcome,
+                "Write",
+                &format!("a Write of `{rel}` {label}, a checklist by {route}"),
+            );
+        }
+    }
+}
+
+/// The cross-root deny is about checklists, not about crossing roots: an
+/// ordinary file in the other worktree reads exactly as it did.
+#[test]
+fn an_ordinary_file_in_another_worktree_is_unaffected() {
+    let (_dir, checkout, feature) = two_worktrees();
+    record_pointer(&checkout, "state/checkout-tracker.json");
+
+    let notes = checkout.join("docs/actions/notes.md");
+    fs::create_dir_all(notes.parent().unwrap()).unwrap();
+    fs::write(&notes, "x").unwrap();
+
+    let env = envelope(&feature, "Read", serde_json::json!({ "file_path": &notes }));
+    let outcome = run(&env, &feature, &default_config());
+    assert!(
+        allowed(&outcome).starts_with("allow: under the gate"),
+        "a plain file in a sibling worktree must still read: {:?}",
+        outcome.detail
+    );
 }
 
 /// A pointer that cannot be parsed leaves the naming convention as the only
