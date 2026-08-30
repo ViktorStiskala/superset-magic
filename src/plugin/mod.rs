@@ -31,7 +31,8 @@
 //! This module owns only the second-level parse and the dispatch table. The
 //! work lives in siblings: `config.rs` (the typed `plugin` key and its
 //! overlay resolution), `identity.rs` (the `<repo>-<branch>` slug),
-//! `scratchpad.rs` (the `.superset/.magic/` state tree), `tmproot.rs` (the
+//! `scratchpad.rs` (the `.superset/.magic/` state tree), `bypass.rs` (the
+//! one-shot Read-gate claims behind `bypass`), `tmproot.rs` (the
 //! private per-machine temporary root and its fd-lock helper), `hook/` (the
 //! stdin decode, event routing, JSON envelope and fail-open wrapper),
 //! `heartbeat.rs` (the machine-level `hooks.jsonl` row every hook leaves
@@ -45,6 +46,7 @@ use anyhow::Result;
 
 use crate::tui::style;
 
+pub(crate) mod bypass;
 pub(crate) mod cache;
 pub(crate) mod config;
 pub(crate) mod heartbeat;
@@ -399,6 +401,7 @@ fn run_hook(event: &HookEvent) -> Result<ExitCode> {
 fn run_human(verb: HumanVerb, args: &[String]) -> Result<ExitCode> {
     match verb {
         HumanVerb::Scratchpad => scratchpad::run(args),
+        HumanVerb::Bypass => bypass::run(args),
         HumanVerb::Conclude => cache::run_conclude(args),
         HumanVerb::Conclusions => cache::run_conclusions(args),
         HumanVerb::Gc => cache::run_gc(args),
