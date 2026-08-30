@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 
 mod cli;
 mod git;
+mod hashing;
 mod pack;
 mod sync;
 mod tui;

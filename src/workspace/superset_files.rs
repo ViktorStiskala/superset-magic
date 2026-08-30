@@ -343,6 +343,24 @@ pub fn merge_setup_into_config(existing: Option<&Config>, new_setup: Vec<String>
 /// The staged tree is the source of truth: migration stages `magic.sh` +
 /// `magic.json` + `config.json` (+ `magic.local.json`) and asks for
 /// `.superset/setup.sh` to be deleted.
+///
+/// ## Invariant (KTD2): never prunes an unnamed destination entry
+///
+/// This function never removes anything under `repo_root/.superset/` that
+/// isn't named in `delete`. It only ever touches two things: the staged
+/// files it copies IN, and the explicit `delete` list. It never enumerates
+/// `repo_root/.superset/` itself and removes what it finds missing from the
+/// stage — so anything already living there that the stage and `delete`
+/// don't mention is left completely alone. Today that holds by construction
+/// (the loop below reads only the STAGE directory's flat file list, never
+/// the destination's), but it matters because `.superset/.magic/` — the
+/// Claude plugin's session state, conclusion cache, and one-shot claims —
+/// lives *inside* the very destination root this function owns, and is never
+/// staged or named in `delete` by any caller. A future change that walked
+/// `repo_root/.superset/` and pruned whatever it didn't recognize would
+/// silently delete that live state on the next `init` or `migrate`, with no
+/// error and no warning. State this explicitly so a later edit has to break
+/// it on purpose, not by accident.
 pub fn copy_into_repo(stage_root: &Path, repo_root: &Path, delete: &[&str]) -> Result<()> {
     ensure_superset_dir(repo_root)?;
     let stage_dir = stage_root.join(SUPERSET_DIR);

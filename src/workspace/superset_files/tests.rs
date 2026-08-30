@@ -237,6 +237,80 @@ fn copy_into_repo_overwrites_existing_config_json() {
     );
 }
 
+/// Seed a `.superset/.magic/` subtree under `root` shaped like the plugin's
+/// real state: a session directory, a cached conclusion, a pending one-shot
+/// claim, and the checklist pointer file. Returns each file's repo-relative
+/// path paired with the bytes written, so a caller can assert byte-for-byte
+/// survival after `copy_into_repo` runs.
+fn seed_plugin_state(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let entries: &[(&str, &[u8])] = &[
+        (
+            ".superset/.magic/sessions/2026-08-30-abc123/session.json",
+            b"{\"status\":\"active\"}",
+        ),
+        (
+            ".superset/.magic/cache/conclusions/deadbeef.json",
+            b"{\"conclusion\":\"cached result\"}",
+        ),
+        (
+            ".superset/.magic/claims/pending-one-shot.json",
+            b"{\"claim\":\"one-shot-42\"}",
+        ),
+        (".superset/.magic/checklist-pointer.json", b"{\"seq\":7}"),
+    ];
+    let mut written = Vec::new();
+    for (rel, body) in entries {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
+        written.push((PathBuf::from(rel), body.to_vec()));
+    }
+    written
+}
+
+/// KTD2's invariant: `copy_into_repo` never removes a destination entry that
+/// isn't named in its `delete` list. `.superset/.magic/` — the plugin's
+/// session state, conclusion cache, and pending one-shot claims — lives
+/// inside `repo_root/.superset/`, the very directory this function owns, yet
+/// is never staged and never named in `delete`. It must survive byte-for-byte.
+#[test]
+fn copy_into_repo_preserves_untracked_plugin_state_ktd2() {
+    let stage = fresh();
+    let dest = fresh();
+    write_magic_sh(stage.path()).unwrap();
+    write_config_json(
+        stage.path(),
+        &cfg(vec!["./.superset/magic.sh sync"], vec![], vec![]),
+    )
+    .unwrap();
+    write_magic_json(stage.path(), &magic_cfg(&[".env"])).unwrap();
+
+    // Pre-existing plugin state in the destination, absent from the stage
+    // and absent from `delete` — the exact shape the invariant protects.
+    let seeded = seed_plugin_state(dest.path());
+
+    // Also exercise a non-empty `delete` list that names something else
+    // entirely, so the invariant is checked against a real deletion
+    // happening elsewhere in the same call, not just an empty no-op.
+    fs::write(dest.path().join(".superset/setup.sh"), "#!/bin/bash\n").unwrap();
+    copy_into_repo(stage.path(), dest.path(), &[".superset/setup.sh"]).unwrap();
+
+    assert!(
+        !dest.path().join(".superset/setup.sh").exists(),
+        "the named delete target must actually be removed"
+    );
+    for (rel, body) in &seeded {
+        let path = dest.path().join(rel);
+        assert!(path.is_file(), "{} must survive copy_into_repo", rel.display());
+        assert_eq!(
+            &fs::read(&path).unwrap(),
+            body,
+            "{} must survive byte-for-byte",
+            rel.display()
+        );
+    }
+}
+
 #[test]
 fn bootstrap_simulation_preserves_teardown_across_rerun() {
     // Pre-existing config.json on disk carries a non-empty teardown.

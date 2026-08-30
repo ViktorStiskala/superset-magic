@@ -50,6 +50,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
+use crate::hashing;
 use crate::sync::apply;
 use crate::sync::merge::{backup_rel_path, BackupSide, Decision};
 use crate::git;
@@ -881,7 +882,7 @@ pub fn meta_of(path: &Path) -> Result<Option<FileMeta>> {
         Ok(m) => {
             let mtime = m.modified().ok();
             let content_hash = if mtime.is_none() {
-                Some(hash_file(path)?)
+                Some(hashing::hash_file(path)?)
             } else {
                 None
             };
@@ -894,17 +895,6 @@ pub fn meta_of(path: &Path) -> Result<Option<FileMeta>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading metadata of {}", path.display())),
     }
-}
-
-/// Content fingerprint for the mtime-less TOCTOU fallback. Non-cryptographic —
-/// the threat model is a concurrent edit, not an adversary.
-fn hash_file(path: &Path) -> Result<u64> {
-    use std::hash::{Hash, Hasher};
-    let bytes = fs::read(path)
-        .with_context(|| format!("reading {} for the review baseline", path.display()))?;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
-    Ok(h.finish())
 }
 
 /// Capture one offered candidate's review-time `(worktree, main)` baseline,

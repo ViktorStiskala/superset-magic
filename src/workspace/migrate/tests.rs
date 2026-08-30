@@ -1,9 +1,58 @@
 use super::*;
 use std::fs;
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 fn fresh() -> TempDir {
     tempfile::tempdir().unwrap()
+}
+
+/// Seed a `.superset/.magic/` subtree under `root` shaped like the plugin's
+/// real state (a session directory, a cached conclusion, a pending one-shot
+/// claim, and the checklist pointer). Mirrors the identically-named helper
+/// in `superset_files::tests` — this module exercises the invariant (KTD2)
+/// at the `init`/`migrate` call sites rather than at `copy_into_repo`
+/// directly. Returns each file's repo-relative path paired with its bytes,
+/// for a byte-for-byte survival assertion.
+fn seed_plugin_state(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let entries: &[(&str, &[u8])] = &[
+        (
+            ".superset/.magic/sessions/2026-08-30-abc123/session.json",
+            b"{\"status\":\"active\"}",
+        ),
+        (
+            ".superset/.magic/cache/conclusions/deadbeef.json",
+            b"{\"conclusion\":\"cached result\"}",
+        ),
+        (
+            ".superset/.magic/claims/pending-one-shot.json",
+            b"{\"claim\":\"one-shot-42\"}",
+        ),
+        (".superset/.magic/checklist-pointer.json", b"{\"seq\":7}"),
+    ];
+    let mut written = Vec::new();
+    for (rel, body) in entries {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
+        written.push((PathBuf::from(rel), body.to_vec()));
+    }
+    written
+}
+
+/// Assert every `(rel, body)` pair seeded by [`seed_plugin_state`] is still
+/// present under `root`, byte-for-byte.
+fn assert_plugin_state_intact(root: &Path, seeded: &[(PathBuf, Vec<u8>)]) {
+    for (rel, body) in seeded {
+        let path = root.join(rel);
+        assert!(path.is_file(), "{} must survive", rel.display());
+        assert_eq!(
+            &fs::read(&path).unwrap(),
+            body,
+            "{} must survive byte-for-byte",
+            rel.display()
+        );
+    }
 }
 
 fn cfg(setup: Vec<&str>, teardown: Vec<&str>, run: Vec<&str>) -> Config {
@@ -238,6 +287,30 @@ fn migration_transforms_old_layout_into_new() {
     // .gitignore now ignores magic.local.json.
     let gi = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
     assert!(gi.lines().any(|l| l == MAGIC_LOCAL_REL));
+}
+
+/// KTD2: the same pre-existing `.superset/.magic/` plugin state survives
+/// `migrate`, not just `init` — `stage_migration` + the materialize step
+/// (`copy_into_repo` + `rename_setup_config`) never stage or name it, so it
+/// must come through the old→new layout rewrite untouched.
+#[test]
+fn migration_preserves_plugin_state_ktd2() {
+    let repo = fresh();
+    seed_old_layout(repo.path());
+    let seeded = seed_plugin_state(repo.path());
+    let existing = superset_files::load_config(repo.path())
+        .unwrap()
+        .unwrap();
+
+    let stage = fresh();
+    stage_migration(repo.path(), stage.path(), &existing).unwrap();
+    superset_files::copy_into_repo(stage.path(), repo.path(), &[SETUP_SH_REL]).unwrap();
+    rename_setup_config(repo.path()).unwrap();
+
+    // Migration actually ran (sanity check we're not passing vacuously).
+    assert!(!repo.path().join(".superset/setup.sh").exists());
+    assert!(repo.path().join(".superset/magic.json").is_file());
+    assert_plugin_state_intact(repo.path(), &seeded);
 }
 
 /// Regression: a pre-existing magic.local.json (gitignored, therefore
@@ -519,6 +592,22 @@ fn run_init_noninteractive_preserves_existing_magic_local_json() {
         after, custom,
         "init must not clobber an existing magic.local.json"
     );
+}
+
+/// KTD2: a pre-existing `.superset/.magic/` subtree (the Claude plugin's
+/// session state, conclusion cache, and pending one-shot claims) survives
+/// `ss-magic init` byte-for-byte, even though it sits inside the very
+/// `.superset/` directory `copy_into_repo` writes into and is never staged.
+#[test]
+fn run_init_noninteractive_preserves_plugin_state_ktd2() {
+    let repo = fresh();
+    let seeded = seed_plugin_state(repo.path());
+
+    run_init_noninteractive(repo.path(), &["**/.env".to_string()]).unwrap();
+
+    // Init actually ran (sanity check we're not passing vacuously).
+    assert!(repo.path().join(".superset/magic.json").is_file());
+    assert_plugin_state_intact(repo.path(), &seeded);
 }
 
 /// stage_migration with no setup_config.json on disk → magic.json has an
