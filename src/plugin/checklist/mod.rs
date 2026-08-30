@@ -24,22 +24,25 @@
 //! - [`order`] — the canonical arrangement every write re-establishes.
 //! - [`validate`] — what the format leaves implicit, returned as findings
 //!   rather than printed.
+//! - [`render`] (the module) — Markdown rendering, wrapped in the R64
+//!   untrusted-data envelope. [`render`] (the function) is its one entry
+//!   point.
 //!
 //! Nothing here writes a file. Reading one is offered ([`read_document`])
 //! because parsing is this module's business, but the atomic write, the verb
 //! dispatch and the pointer that records which checklist is live belong to the
 //! verb layer.
 
-// Nothing outside this family calls into it yet: the Markdown renderer (U26),
-// the verb dispatch (U27) and the Read/Edit deny (U28) are its callers, and
-// they land next. So the whole surface — every type, and every re-export below
-// — reads as unused. The two module-wide allows are deliberate rather than
-// per-item: 50-odd individual attributes would say the same thing 50 times.
-// Delete them once the verbs are wired; anything still unused then is
-// genuinely dead.
+// Nothing outside this family calls into it yet: the verb dispatch (U27) and
+// the Read/Edit deny (U28) are its callers, and they land next. So the whole
+// surface — every type, and every re-export below — reads as unused. The two
+// module-wide allows are deliberate rather than per-item: 50-odd individual
+// attributes would say the same thing 50 times. Delete them once the verbs
+// are wired; anything still unused then is genuinely dead.
 #![allow(dead_code, unused_imports)]
 
 mod order;
+mod render;
 mod schema;
 mod validate;
 
@@ -48,6 +51,7 @@ mod validate;
 // contract, and a caller building its own sort or its own field checks would
 // be a second, drifting definition of "canonical" and "valid".
 pub use order::{canonicalize, UNRANKED_RANK};
+pub use render::render;
 pub use schema::{
     default_sections, from_json, parse_iso8601, read_document, to_json, ChangelogEntry, Document,
     Instant, Item, ItemKind, Priority, Reference, Section, TimeError, Timestamp, SCHEMA_ID,
