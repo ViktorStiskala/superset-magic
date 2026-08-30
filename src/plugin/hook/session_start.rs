@@ -18,7 +18,7 @@ use anyhow::Result;
 
 use crate::plugin::hook::event::{Payload, Response};
 use crate::plugin::hook::{HookContext, Outcome};
-use crate::plugin::scratchpad::{self, Report};
+use crate::plugin::scratchpad::{self, Refusal, Report};
 
 /// The checklist verb family (R89, R90), spelled out here only so the injected
 /// guidance can name them. The schema and the verbs themselves belong to
@@ -149,6 +149,40 @@ fn version_drift_notice(plugin_root: Option<PathBuf>) -> Option<String> {
     ))
 }
 
+/// How many entries [`render_refusal`] lists inline for a
+/// [`Refusal::TrackedPaths`] before collapsing the rest into a "… and N more"
+/// marker.
+///
+/// `Refusal`'s own `Display` joins the whole path list with no cap, which is
+/// fine for a heartbeat row on disk but not for `additionalContext`: a
+/// repository that gitignores the state tree (so the R63 ignore check
+/// passes) and then `git add -f`s a few hundred files under it would push
+/// this one line past R19's 10,000-character budget on every session start,
+/// crowding out the `## Operator checklist` section that follows it in the
+/// guidance text.
+const MAX_LISTED_TRACKED_PATHS: usize = 20;
+
+/// Render one refusal for the guidance text.
+///
+/// Every variant except [`Refusal::TrackedPaths`] already renders a small,
+/// fixed amount of text via its `Display` impl, so those pass straight
+/// through unchanged. `TrackedPaths` carries a list whose length is decided
+/// by the repository, not by ss-magic, so it is capped here the same way the
+/// cache module bounds an oversized cached body (see `cache::bound`): show
+/// the first [`MAX_LISTED_TRACKED_PATHS`] and say how many more there were,
+/// rather than either dropping them silently or letting the line grow
+/// without limit.
+fn render_refusal(refusal: &Refusal) -> String {
+    match refusal {
+        Refusal::TrackedPaths { paths } if paths.len() > MAX_LISTED_TRACKED_PATHS => {
+            let shown = paths[..MAX_LISTED_TRACKED_PATHS].join(", ");
+            let more = paths.len() - MAX_LISTED_TRACKED_PATHS;
+            format!("refused to adopt tracked path(s): {shown}, … and {more} more")
+        }
+        other => other.to_string(),
+    }
+}
+
 /// `path`, relative to `root`, for display — falling back to the absolute
 /// path on the (never-expected-in-practice) chance it does not sit under
 /// `root` at all. Both are resolved from the same `cwd` by the same git
@@ -176,7 +210,7 @@ fn build_guidance(repo_root: &Path, report: &Report) -> String {
         );
         let _ = writeln!(out);
         for refusal in &report.refusals {
-            let _ = writeln!(out, "- {refusal}");
+            let _ = writeln!(out, "- {}", render_refusal(refusal));
         }
         let _ = writeln!(out);
         let _ = write!(
@@ -212,7 +246,7 @@ fn build_guidance(repo_root: &Path, report: &Report) -> String {
         let _ = writeln!(out);
         let _ = writeln!(out, "Some paths under the tree were left untouched:");
         for refusal in &report.refusals {
-            let _ = writeln!(out, "- {refusal}");
+            let _ = writeln!(out, "- {}", render_refusal(refusal));
         }
     }
 

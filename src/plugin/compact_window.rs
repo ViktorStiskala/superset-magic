@@ -41,6 +41,7 @@
 //! settings file never loses content it already carried.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -49,6 +50,7 @@ use serde_json::{Map, Value};
 
 use crate::git;
 use crate::git::gitignore::{self, PathKind};
+use crate::plugin::atomic;
 use crate::tui::style;
 
 /// Repo-relative path of the harness's per-machine local settings file.
@@ -65,6 +67,13 @@ const WINDOW_KEY: &str = "autoCompactWindow";
 const WINDOW_MIN: u64 = 100_000;
 /// Upper bound `/autocompact`'s own parser enforces (1M tokens).
 const WINDOW_MAX: u64 = 1_000_000;
+
+/// Mode a brand-new `.claude/settings.local.json` is created with, when there
+/// is no existing file to preserve the mode of. Ordinary world-readable,
+/// matching what a plain file write would have produced anyway — this is a
+/// harness settings file, not private state, so there is nothing here that
+/// warrants the owner-only mode the state-tree writers use.
+const NEW_FILE_MODE: u32 = 0o644;
 
 const USAGE: &str = "\
 Usage: ss-magic plugin compact-window --set <TOKENS>
@@ -211,12 +220,32 @@ fn read_settings_object(path: &Path) -> Result<ExistingSettings> {
 
 /// Write `settings` to `path`, pretty-printed with a trailing newline,
 /// creating `.claude/` if it does not exist yet.
+///
+/// Goes through the shared atomic-write helper (a same-directory temp file,
+/// then a rename over `path`) rather than a bare `fs::write`, so a crash
+/// mid-write leaves the previous settings file intact instead of truncated —
+/// this file carries a much larger schema than the one key this verb cares
+/// about (permissions, env, hook overrides, ...), and a half-written replacement
+/// would corrupt all of it, not just the key just added. A rewrite preserves
+/// whatever mode the file already had; a brand-new file gets
+/// [`NEW_FILE_MODE`].
 fn write_settings_object(path: &Path, settings: &Map<String, Value>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let body = format!("{}\n", serde_json::to_string_pretty(settings)?);
-    fs::write(path, body).with_context(|| format!("writing {}", path.display()))
+    let mode = fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(NEW_FILE_MODE);
+    atomic::write_atomically(
+        path,
+        &body,
+        ".settings-",
+        ".tmp",
+        Some(SETTINGS_LOCAL_REL),
+        Some(mode),
+        false,
+    )
 }
 
 /// Report a usage mistake and hand back its exit code.

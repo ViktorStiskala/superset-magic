@@ -166,12 +166,15 @@ pub struct SessionEnd {
 
 /// `file-changed` — fires on a watched file write.
 ///
-/// U30 probed the shape against the pinned 2.1.251 bundle, which declares it
-/// as the common envelope plus `file_path` (one absolute path, singular) and
-/// `event` (one of `change`, `add`, `unlink`). `file_paths` is kept only
-/// because U11 typed it before that was known and a batch spelling costs
-/// nothing to tolerate; the harness does not send it. A handler wanting a
-/// field none of these cover should still read [`Envelope::raw`].
+/// The shape was read out of the pinned 2.1.251 bundle, which declares it as
+/// the common envelope plus `file_path` (one absolute path, singular) and
+/// `event` (one of `change`, `add`, `unlink`). The plural `file_paths` is kept
+/// only because an earlier reading of this envelope guessed a batch spelling;
+/// tolerating it costs nothing and the harness never sends it. A handler
+/// wanting a field none of these cover should still read [`Envelope::raw`].
+///
+/// Note this event is not declared in the shipped manifest - see the plan's
+/// Scope Boundaries - so nothing routes here in practice.
 ///
 /// What the probe did *not* establish is that the event ever reaches a
 /// handler: registering a watch path is what makes it fire, and the plugin
@@ -320,9 +323,8 @@ pub fn cwd_hint(input: &str) -> Option<String> {
 
 /// The only permission decision this binary emits. See the module docs for why
 /// there is no `Allow` and no `Ask`.
-// Constructed by U14's Read gate and U28's checklist deny; the encoder and the
-// tests here already exercise it.
-#[allow(dead_code)]
+// Constructed by the two deny paths in `pre_tool_use`: the oversized-read gate
+// and the checklist deny.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionDecision {
     Deny,
@@ -374,9 +376,8 @@ impl PreToolUseResponse {
 /// [`Response::Silent`] for the events that do not (`PreCompact`,
 /// `SessionEnd`, `file-changed`) and for any handler that decides to say
 /// nothing. Nothing here can express a tool-input rewrite.
-// The non-`Silent` variants are constructed by the per-event handlers of U12
-// onward; the encoder and the tests here already exercise every one.
-#[allow(dead_code)]
+// The non-`Silent` variants are constructed by the per-event handlers; the
+// encoder and the tests here exercise every one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     /// Write nothing. stdout stays completely empty.

@@ -66,11 +66,10 @@
 //! keep working there without anyone having to re-run `init`.
 
 use std::fs;
-use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::io::{IsTerminal as _, Read as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -81,8 +80,9 @@ use super::{
     Document, Finding, Item, ItemKind, Priority, Reference, Severity, Timestamp,
 };
 use crate::git;
+use crate::plugin::atomic;
 use crate::plugin::cache::Budget;
-use crate::plugin::scratchpad::{self, format_rfc3339, STATE_REL};
+use crate::plugin::scratchpad::{self, format_rfc3339, now_secs, STATE_REL};
 use crate::plugin::tmproot;
 use crate::tui::style;
 
@@ -1263,21 +1263,15 @@ fn write_document(path: &Path, doc: &mut Document) -> Result<()> {
         .map(|m| m.permissions().mode() & 0o777)
         .unwrap_or(NEW_FILE_MODE);
 
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".checklist-")
-        .suffix(".tmp")
-        .tempfile_in(dir)
-        .with_context(|| format!("creating a temp file in {}", dir.display()))?;
-    tmp.write_all(body.as_bytes())
-        .context("writing the checklist")?;
-    tmp.flush().context("flushing the checklist")?;
-    tmp.as_file()
-        .set_permissions(fs::Permissions::from_mode(mode))
-        .with_context(|| format!("setting the mode on {}", path.display()))?;
-    tmp.as_file().sync_all().ok();
-    tmp.persist(path)
-        .with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    atomic::write_atomically(
+        path,
+        &body,
+        ".checklist-",
+        ".tmp",
+        Some("the checklist"),
+        Some(mode),
+        true,
+    )
 }
 
 /// Replace the pointer atomically, for exactly the reasons the document write
@@ -1289,18 +1283,15 @@ fn write_pointer(state_root: &Path, pointer: &Pointer) -> Result<()> {
         serde_json::to_string_pretty(pointer).context("serializing the checklist pointer")?
     );
 
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".checklist-")
-        .suffix(".tmp")
-        .tempfile_in(state_root)
-        .with_context(|| format!("creating a temp file in {}", state_root.display()))?;
-    tmp.write_all(body.as_bytes())
-        .context("writing the checklist pointer")?;
-    tmp.flush().context("flushing the checklist pointer")?;
-    tmp.as_file().sync_all().ok();
-    tmp.persist(&path)
-        .with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    atomic::write_atomically(
+        &path,
+        &body,
+        ".checklist-",
+        ".tmp",
+        Some("the checklist pointer"),
+        None,
+        true,
+    )
 }
 
 /// Run `f` holding the advisory lock that serializes checklist writes.
@@ -1439,14 +1430,6 @@ fn refused() -> ExitCode {
 fn fail(message: String) -> ExitCode {
     eprintln!("{}", style::err(format!("error: {message}")));
     refused()
-}
-
-/// Seconds since the Unix epoch, or 0 if the clock is before it.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

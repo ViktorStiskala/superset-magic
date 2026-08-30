@@ -886,15 +886,16 @@ surface out of step, or with a stale digest.
 
 `README.md` (user-facing), `CONTRIBUTING.md` (contributor-facing: from-source
 builds, tests, PR expectations, release/versioning), `CONCEPTS.md` (domain
-vocabulary), and `CLAUDE.md`
+vocabulary), and the repo's contributor-instructions file at the repo root
 (architecture/conventions) must reflect the current state after every
 implementation change — a new command, flag, module, or changed behavior. Flag
 a behavior- or architecture-changing PR that leaves any of them describing the
 old state (e.g. a new subcommand or plugin verb not listed in the README command
 inventory or the
 `main.rs`/`cli.rs` descriptions, a changed build/test/release workflow not
-reflected in `CONTRIBUTING.md`, or a new module absent from the `CLAUDE.md`
-architecture list). The README's command inventory must match `cli.rs`'s `parse`
+reflected in `CONTRIBUTING.md`, or a new module absent from that
+contributor-instructions file's per-module Architecture section). The README's
+command inventory must match `cli.rs`'s `parse`
 and `plugin/mod.rs`'s `HumanVerb`/`HookEvent`, and the documented hook events
 must match what `plugin/hooks/hooks.json` actually registers – flag a doc that
 claims an event the manifest does not declare.

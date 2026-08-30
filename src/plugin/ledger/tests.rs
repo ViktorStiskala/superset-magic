@@ -1020,18 +1020,12 @@ fn token_counts_render_compactly() {
 
 // ── Budget ────────────────────────────────────────────────────────────────────
 
-/// The scan has to fit inside the ~1.15 s a hook body actually gets — the
-/// nominal timeout is 1500 ms, but spawn and start-up have already spent the
-/// difference by the time the handler runs.
-///
-/// The tree here is deliberately shaped like a real one: most of the bytes are
-/// tool-result text on `user` lines, which the two cheap pre-checks in
-/// [`read_line`] skip without parsing. A regression that parsed every line
-/// would show up here long before it reached anyone's session. The bound is
-/// generous on purpose — this guards against an accidental full-parse or a
-/// quadratic walk, not against a slow CI runner.
-#[test]
-fn scanning_a_realistic_tree_fits_the_hook_budget() {
+/// A transcript tree shaped like a real one: 50 main-thread turns, each a
+/// bulky tool-result line paired with a usage line, plus 40 subagent
+/// transcripts of the same shape (41 files, matching a session with real
+/// subagent activity). Shared by the two budget tests below so "realistic"
+/// means the same tree for both of them.
+fn realistic_tree(session_id: &str) -> Tree {
     let usage_line = assistant(
         "claude-sonnet-5",
         "/tmp/p",
@@ -1047,10 +1041,26 @@ fn scanning_a_realistic_tree_fits_the_hook_budget() {
         lines.push(usage_line.clone());
     }
 
-    let tree = Tree::new("s-budget", &lines);
+    let tree = Tree::new(session_id, &lines);
     for n in 0..40 {
         tree.subagent(&format!("subagents/agent-{n}.jsonl"), &lines);
     }
+    tree
+}
+
+/// The scan has to fit inside the ~1.15 s a hook body actually gets — the
+/// nominal timeout is 1500 ms, but spawn and start-up have already spent the
+/// difference by the time the handler runs.
+///
+/// The tree here is deliberately shaped like a real one: most of the bytes are
+/// tool-result text on `user` lines, which the two cheap pre-checks in
+/// [`read_line`] skip without parsing. A regression that parsed every line
+/// would show up here long before it reached anyone's session. The bound is
+/// generous on purpose — this guards against an accidental full-parse or a
+/// quadratic walk, not against a slow CI runner.
+#[test]
+fn scanning_a_realistic_tree_fits_the_hook_budget() {
+    let tree = realistic_tree("s-budget");
 
     let files = transcript_tree(&tree.main);
     assert_eq!(files.len(), 41);
@@ -1064,6 +1074,31 @@ fn scanning_a_realistic_tree_fits_the_hook_budget() {
         elapsed < std::time::Duration::from_millis(1_150),
         "scanned {} bytes in {elapsed:?}, past the ~1.15 s a hook body gets",
         scan.bytes
+    );
+}
+
+/// The same budget, against the function the `SessionEnd` hook actually
+/// calls. `scan_tree` above is only part of what the hook pays: `record`
+/// additionally resolves every distinct `cwd` it saw through one `git`
+/// subprocess each (`resolve_roots`, uncached here the same way the standard
+/// `ingest` fixture leaves it uncached throughout this file), and reads the
+/// ledger twice — once to find the previous row, again inside the locked
+/// commit. A budget asserted only against `scan_tree` would miss a regression
+/// in either of those.
+#[test]
+fn recording_a_realistic_session_fits_the_hook_budget() {
+    let store = store();
+    let tree = realistic_tree("s-record-budget");
+
+    let started = std::time::Instant::now();
+    let outcome = record(store.path(), &ingest("s-record-budget", &tree)).unwrap();
+    let elapsed = started.elapsed();
+
+    let row = written(outcome);
+    assert_eq!(row.tokens.output, 41 * 5_000);
+    assert!(
+        elapsed < std::time::Duration::from_millis(1_150),
+        "recorded in {elapsed:?}, past the ~1.15 s a hook body gets",
     );
 }
 

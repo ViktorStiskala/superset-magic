@@ -236,6 +236,43 @@ fn additional_context_stays_well_under_the_ten_thousand_character_budget() {
     );
 }
 
+/// A `Refusal::TrackedPaths` list is capped, not joined in full, so a
+/// repository that `git add -f`s a few hundred files under the gitignored
+/// state tree cannot push `additionalContext` past R19's 10,000-character
+/// cliff on this one refusal alone. Built directly against [`build_guidance`]
+/// rather than through a real git repo — that keeps the test fast and lets
+/// it name an exact, worst-case-realistic count of tracked paths — and
+/// asserts on the measured length, the property that actually matters, not
+/// on how the truncation is spelled.
+#[test]
+fn a_tracked_paths_refusal_is_capped_so_the_budget_survives_hundreds_of_paths() {
+    let root = PathBuf::from("/repo");
+    let session_dir = root.join(".superset/.magic/sessions/2026-08-30-abc123");
+    let paths: Vec<String> = (0..400)
+        .map(|i| format!(".superset/.magic/sessions/2026-08-30-abc123/leaked-secret-{i:04}.env"))
+        .collect();
+    let report = Report {
+        state_root: root.join(".superset/.magic"),
+        slug: "2026-08-30-abc123".to_string(),
+        session_dir,
+        created: Vec::new(),
+        refusals: vec![Refusal::TrackedPaths { paths }],
+        wrote_state: true,
+    };
+
+    let text = build_guidance(&root, &report);
+
+    assert!(
+        text.len() < 10_000,
+        "additionalContext is {} chars (>= the 10,000 cliff) with 400 tracked paths:\n{text}",
+        text.len()
+    );
+    assert!(
+        text.contains("## Operator checklist"),
+        "the checklist section must survive an inflated tracked-paths refusal: {text}"
+    );
+}
+
 // ── `compact` re-injection (F2) ────────────────────────────────────────────────
 
 /// `compact` is the whole reason this handler runs on all five sources: it

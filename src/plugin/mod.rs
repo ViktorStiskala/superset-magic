@@ -59,6 +59,7 @@ use anyhow::Result;
 
 use crate::tui::style;
 
+pub(crate) mod atomic;
 pub(crate) mod bypass;
 pub(crate) mod cache;
 pub(crate) mod checklist;

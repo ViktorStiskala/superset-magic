@@ -500,6 +500,23 @@ the tree:
 
 ### State: where the plugin keeps things, and why there
 
+- `plugin/atomic.rs` – the one atomic-write primitive every writer below (and
+  several modules outside this section) shares: create a temp file in the
+  target's own directory, write and flush it, chmod it when a mode is given,
+  fsync it when asked, then rename it over the target – so a reader never sees
+  a half-written file, and a crash mid-write leaves the previous file
+  untouched rather than truncated. `write_atomically(path, body, prefix,
+  suffix, what, mode, sync)` used to live in `plugin/heartbeat.rs` under a
+  narrower, hardcoded signature (a fixed `.jsonl` suffix, an always-owner-only
+  mode) shared only with `ledger.rs`. It moved out here, generalized to the
+  union of what every caller needed, once several more modules turned out to
+  have each hand-rolled the identical `tempfile::Builder` -> `write_all` ->
+  `flush` -> chmod -> `persist` sequence with their own suffix/mode/sync
+  choices: `heartbeat.rs`, `ledger.rs`, `cache.rs`, `bypass.rs`,
+  `expect_artifact.rs`, `scratchpad.rs` (the session pointer),
+  `compact_window.rs`, `setup_ci.rs` (the CI workflow writer), and
+  `checklist/verbs.rs` (the document and pointer writers) all call this one
+  copy now; nothing here changed what any of them actually wrote.
 - `plugin/tmproot.rs` – the private, per-machine, cross-session temporary root
   for coordination that predates any repository or session context.
   `resolve_root()` is `/tmp/ss-magic-plugin/<identifier>/`, falling back to
@@ -559,7 +576,9 @@ the tree:
   row stamped in the FUTURE (a backward clock jump) is kept, not dropped; it
   fires only once the file passes `PRUNE_TRIGGER_BYTES` (256 KiB), so the common
   case costs one `stat`. A prune failure never fails an otherwise-good append.
-  `write_atomically` is shared with `ledger.rs`.
+  Appends go through the shared `atomic::write_atomically` helper (see
+  `plugin/atomic.rs` above), which this module originally defined before it
+  moved out to serve the rest of the plugin.
 
 ### Hooks (`plugin/hook/`)
 

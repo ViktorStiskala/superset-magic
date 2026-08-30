@@ -215,3 +215,51 @@ fn ignore_rule_is_not_duplicated_on_a_second_run() {
     let gi_after_second = gitignore_contents(dir.path());
     assert_eq!(gi_after_second, gi_after_first);
 }
+
+// ── The write is atomic, not a bare `fs::write` ─────────────────────────────
+
+/// `write_settings_object` must replace the file via a temp-file-then-rename,
+/// not an in-place truncate — a rename swaps the directory entry for a new
+/// inode, while a bare `fs::write` over an existing file keeps the same one.
+/// Comparing the inode before and after a second write is a deterministic way
+/// to tell the two apart without needing to catch an actual crash mid-write.
+#[test]
+fn the_settings_file_is_replaced_by_a_rename_not_an_in_place_truncate() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = fixture();
+    let path = dir.path().join(SETTINGS_LOCAL_REL);
+    let mut settings = Map::new();
+    settings.insert(WINDOW_KEY.to_string(), json!(200_000));
+    write_settings_object(&path, &settings).unwrap();
+    let ino_before = fs::metadata(&path).unwrap().ino();
+
+    settings.insert("otherKey".to_string(), json!(true));
+    write_settings_object(&path, &settings).unwrap();
+    let ino_after = fs::metadata(&path).unwrap().ino();
+
+    assert_ne!(
+        ino_before, ino_after,
+        "the settings file must be replaced via rename (new inode), not truncated in place"
+    );
+}
+
+/// A rewrite preserves whatever mode the file already had, rather than
+/// resetting it to whatever a fresh temp file happens to get by default.
+#[test]
+fn a_rewrite_preserves_the_files_existing_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fixture();
+    let path = dir.path().join(SETTINGS_LOCAL_REL);
+    let mut settings = Map::new();
+    settings.insert(WINDOW_KEY.to_string(), json!(200_000));
+    write_settings_object(&path, &settings).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+    settings.insert("otherKey".to_string(), json!(true));
+    write_settings_object(&path, &settings).unwrap();
+
+    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640, "a rewrite must preserve the existing file's mode");
+}

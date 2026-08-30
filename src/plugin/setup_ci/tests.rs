@@ -15,6 +15,7 @@
 //! in each of them.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -258,6 +259,37 @@ fn rendering_substitutes_every_placeholder() {
         "an unsubstituted placeholder would download a release that cannot exist"
     );
     assert!(out.contains(&format!("SS_MAGIC_VERSION: \"{V}\"")));
+}
+
+/// Every assertion elsewhere in this file is a `.contains(...)` substring
+/// check, which cannot notice a template edit that corrupts the YAML *around*
+/// the substrings it looks for — a stray tab, or an indent that drifts off
+/// the file's own two-space grid. This is not a YAML parser (the crate
+/// carries no YAML dependency, and a handful of tests do not justify adding
+/// one); it is the cheapest possible tripwire, run against what actually gets
+/// written to a user's `.github/workflows/`.
+#[test]
+fn the_rendered_workflow_has_sane_indentation() {
+    let out = render(V);
+
+    assert!(
+        !out.contains('\t'),
+        "the workflow must not contain tab characters"
+    );
+
+    for (n, line) in out.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        assert!(
+            indent % 2 == 0,
+            "line {} has a {}-space indent, not a multiple of 2: {line:?}",
+            n + 1,
+            indent
+        );
+    }
 }
 
 /// The template must carry the placeholder and no literal version of its own:

@@ -52,6 +52,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::git;
 use crate::git::gitignore::{self, PathKind};
+use crate::plugin::atomic;
 use crate::plugin::identity::{self, Identity};
 use crate::tui::style;
 
@@ -250,8 +251,18 @@ pub struct Report {
     pub created: Vec<String>,
     /// Everything the run declined to do.
     pub refusals: Vec<Refusal>,
-    /// Whether the run got as far as writing anything at all. `false` means a
-    /// hard refusal: the tree on disk is exactly as it was.
+    /// Whether the state tree is safe for a caller to write into.
+    ///
+    /// Read this before writing, not as a record of what happened. `false`
+    /// means some path under the state root escaped the worktree, was tracked,
+    /// or was not ignored - and a caller that writes anyway does so through
+    /// whatever that path actually points at, which is the escape R56 exists to
+    /// refuse. Every caller branches on it for exactly that reason.
+    ///
+    /// It is deliberately not "nothing was written": the two late refusal sites
+    /// (the pointer, and `scaffold`) can fire after some directories already
+    /// exist, and `created` is the accurate record of that. `false` with a
+    /// non-empty `created` is a real and expected combination.
     pub wrote_state: bool,
 }
 
@@ -259,12 +270,16 @@ impl Report {
     /// One line summarizing the run, for the heartbeat row and for the human
     /// verb's own output.
     // Consumed by U11's heartbeat writer; asserted by the tests today.
-    #[allow(dead_code)]
     pub fn heartbeat_note(&self) -> String {
         if self.refusals.is_empty() {
             return format!("scratchpad ready ({} created)", self.created.len());
         }
         let reasons: Vec<String> = self.refusals.iter().map(ToString::to_string).collect();
+        // A late refusal - the pointer, or `scaffold` - can fire after some
+        // directories already exist, so this wording can read "refused" for a
+        // run that created something. `created` is the accurate record of what
+        // happened; this line is a summary, and the flag it follows is the one
+        // callers act on.
         let prefix = if self.wrote_state {
             "scratchpad partial"
         } else {
@@ -482,6 +497,10 @@ pub fn ensure(cwd: &Path) -> Result<Report> {
     dirs.extend(CLAIM_DIRS.iter().map(|d| state_root.join(d)));
     for dir in &dirs {
         if let Err(refusal) = ctx.verify_contained(dir) {
+            // Clear the flag rather than leaving it set from above: callers
+            // read `wrote_state` as "the tree is safe to write into", and a
+            // containment refusal means precisely the opposite.
+            report.wrote_state = false;
             report.refusals.push(refusal);
             return Ok(report);
         }
@@ -506,6 +525,7 @@ pub fn ensure(cwd: &Path) -> Result<Report> {
     let pointer = state_root.join(POINTER_NAME);
     if !ctx.is_tracked(&pointer) {
         if let Err(refusal) = ctx.verify_contained(&pointer) {
+            report.wrote_state = false;
             report.refusals.push(refusal);
             return Ok(report);
         }
@@ -531,6 +551,10 @@ fn scaffold(ctx: &Ctx, path: &Path, body: &str, report: &mut Report) -> Result<(
         return Ok(());
     }
     if let Err(refusal) = ctx.verify_contained(path) {
+        // One escaping path is enough to distrust the whole tree: `ensure`
+        // carries on scaffolding the siblings, but the caller must not treat
+        // what it produced as safe to write into.
+        report.wrote_state = false;
         report.refusals.push(refusal);
         return Ok(());
     }
@@ -593,25 +617,34 @@ fn write_pointer(
         serde_json::to_string_pretty(&pointer).context("serializing the session pointer")?
     );
 
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".current-")
-        .tempfile_in(state_root)
-        .with_context(|| format!("creating a temp file in {}", state_root.display()))?;
-    tmp.write_all(body.as_bytes())
-        .context("writing the session pointer")?;
-    tmp.flush().context("flushing the session pointer")?;
-    tmp.persist(path)
-        .with_context(|| format!("replacing {}", path.display()))?;
+    atomic::write_atomically(
+        path,
+        &body,
+        ".current-",
+        "",
+        Some("the session pointer"),
+        None,
+        false,
+    )?;
     Ok(())
+}
+
+/// Seconds since the Unix epoch, or 0 if the clock is before it.
+///
+/// Shared crate-wide: bypass claims, the conclusion cache, the cost ledger,
+/// artifact expectations, checklist documents, and the hook dispatcher each
+/// used to define this same function locally — one copy here instead of six
+/// byte-identical ones.
+pub(crate) fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The current UTC time as RFC 3339, to the second.
 fn now_rfc3339() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format_rfc3339(secs)
+    format_rfc3339(now_secs())
 }
 
 /// Format `secs` since the Unix epoch as `YYYY-MM-DDTHH:MM:SSZ`.

@@ -711,6 +711,35 @@ fn a_version_line_yields_its_last_token() {
     assert_eq!(parse_version_line(""), None);
 }
 
+// ── run_bounded: the timeout path ──────────────────────────────────────────
+
+/// `run_bounded` is what keeps a wedged `claude plugin list --json` from
+/// making `status` hang: it polls the child and kills it once `timeout`
+/// elapses. Drive it directly with a command that deliberately outlives a
+/// short bound (`probe_harness` can't be steered this way without touching
+/// `PATH`) and assert two things: it returns near the bound rather than
+/// waiting out the child, and the result is a bounded-failure `Err` — not the
+/// success path with truncated output.
+#[test]
+fn run_bounded_kills_a_command_that_outlives_its_timeout() {
+    let mut cmd = std::process::Command::new("sleep");
+    cmd.arg("5");
+
+    let started = std::time::Instant::now();
+    let result = run_bounded(cmd, std::time::Duration::from_millis(100), "sleep 5");
+    let elapsed = started.elapsed();
+
+    let err = result.expect_err("a command that outlives its bound must not succeed");
+    assert!(
+        err.contains("did not finish within"),
+        "expected a timeout message, got: {err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "run_bounded should return near its bound, not wait out the 5s child; took {elapsed:?}"
+    );
+}
+
 // ── AE35 (status half): the heartbeat ─────────────────────────────────────────
 
 /// After a fail-open row, that event's last-fired-at and its error class are

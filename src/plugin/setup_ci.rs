@@ -45,14 +45,13 @@
 //! flag that a person or a skill had to type after seeing what `--check` said.
 
 use std::fs;
-use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
 use crate::git;
+use crate::plugin::atomic;
 use crate::plugin::checklist::{ACTIONS_REL, CHECKLIST_SUFFIX};
 use crate::tui::style;
 
@@ -440,21 +439,15 @@ fn write_workflow(path: &Path, body: &str) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("."));
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".ss-magic-checklist-")
-        .suffix(".tmp")
-        .tempfile_in(&dir)
-        .with_context(|| format!("creating a temp file in {}", dir.display()))?;
-    tmp.write_all(body.as_bytes())
-        .context("writing the workflow")?;
-    tmp.flush().context("flushing the workflow")?;
-    tmp.as_file()
-        .set_permissions(fs::Permissions::from_mode(FILE_MODE))
-        .with_context(|| format!("setting the mode on {}", path.display()))?;
-    tmp.as_file().sync_all().ok();
-    tmp.persist(path)
-        .with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    atomic::write_atomically(
+        path,
+        body,
+        ".ss-magic-checklist-",
+        ".tmp",
+        Some("the workflow"),
+        Some(FILE_MODE),
+        true,
+    )
 }
 
 #[cfg(test)]

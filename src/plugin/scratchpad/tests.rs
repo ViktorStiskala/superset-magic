@@ -318,6 +318,126 @@ fn a_regular_file_where_the_state_root_belongs_is_refused() {
     );
 }
 
+// ── R56 × `wrote_state`: a late refusal must clear the flag (regression) ─────
+//
+// The three tests below guard one property that is easy to get wrong and
+// expensive when it is: `Report::wrote_state` must be FALSE after any
+// containment refusal, including the ones raised late.
+//
+// `ensure` sets `wrote_state = true` once the R63 ignore probe and the R17
+// tracked probe have passed, because from that point on it does start
+// creating things. Three containment checks (R56) come AFTER that line: the
+// directory loop, `scaffold`, and the pointer. Each of those used to push a
+// `Refusal` and leave the flag as it found it — true.
+//
+// That flag is the whole contract with callers. `bypass`, `cache`,
+// `expect-artifact`, `subagent_stop` and `pre_compact` all branch on
+// `!report.wrote_state` to decide whether to stop; with the flag still true
+// they printed the refusal as a mere warning and then wrote their own file
+// into `report.state_root` anyway — straight through the symlink R56 had just
+// refused to follow. Planting `.superset/.magic/bypass` as a symlink out of
+// the worktree was enough to make `ss-magic plugin bypass <file>` deposit its
+// claim outside the repository.
+//
+// The trap for a future reader: the two long-standing containment tests above
+// (`a_state_root_symlinked_*`) both refuse EARLY, before the flag is ever set,
+// so they pass whether or not the late sites clear it. A test that plants a
+// symlink and only checks that a refusal was reported passes with the bug
+// present too — the refusal was always reported. `wrote_state` is the
+// assertion that bites, so each test below asserts it FIRST and by name.
+
+/// A directory somewhere outside any worktree, for a symlink to escape into.
+fn outside_dir() -> TempDir {
+    tempfile::tempdir().unwrap()
+}
+
+/// Site 1 of 3 — the directory loop. `.superset/.magic/bypass` is a symlink
+/// out of the worktree, which is the exact shape that turned into a real
+/// escape: the claim directories are what `bypass` and the conclusion cache
+/// write into.
+#[test]
+fn a_claim_directory_symlinked_out_of_the_worktree_clears_wrote_state() {
+    let (_dir, root) = ignored_repo();
+    let outside = outside_dir();
+    // A real state root, so the R63 ignore probe and the R17 tracked probe
+    // both answer and `wrote_state` is genuinely set to true before the loop
+    // reaches the symlink.
+    fs::create_dir_all(root.join(STATE_REL)).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join(STATE_REL).join("bypass")).unwrap();
+
+    let report = ensure(&root).unwrap();
+
+    assert!(
+        !report.wrote_state,
+        "wrote_state stayed true after a containment refusal in the directory \
+         loop; every caller reads it as `the state tree is safe to write into` \
+         and would now write through the escaping symlink"
+    );
+    assert_eq!(report.refusals.len(), 1, "{:?}", report.refusals);
+    assert_eq!(report.refusals[0].code(), "escapes-worktree");
+    assert!(
+        fs::read_dir(outside.path()).unwrap().next().is_none(),
+        "the bootstrap wrote through the symlink into {}",
+        outside.path().display()
+    );
+}
+
+/// Site 2 of 3 — the pointer. `current.json` is the one file rewritten on
+/// every run, so a symlink there is a standing write primitive rather than a
+/// one-off.
+#[test]
+fn a_pointer_symlinked_out_of_the_worktree_clears_wrote_state() {
+    let (_dir, root) = ignored_repo();
+    let outside = outside_dir();
+    let planted = outside.path().join("stolen.json");
+    fs::write(&planted, "not ours\n").unwrap();
+    fs::create_dir_all(root.join(STATE_REL)).unwrap();
+    std::os::unix::fs::symlink(&planted, root.join(STATE_REL).join(POINTER_NAME)).unwrap();
+
+    let report = ensure(&root).unwrap();
+
+    assert!(
+        !report.wrote_state,
+        "wrote_state stayed true after the pointer's containment refusal"
+    );
+    assert_eq!(report.refusals.len(), 1, "{:?}", report.refusals);
+    assert_eq!(report.refusals[0].code(), "escapes-worktree");
+    assert_eq!(fs::read_to_string(&planted).unwrap(), "not ours\n");
+}
+
+/// Site 3 of 3 — `scaffold`, which is the odd one out: it does NOT return.
+/// One escaping state file is refused and the run carries on creating that
+/// file's siblings, so the flag is the only thing left telling the caller the
+/// tree is not trustworthy. Nothing about the run's shape says so.
+#[test]
+fn a_state_file_symlinked_out_of_the_worktree_clears_wrote_state_and_scaffolding_continues() {
+    let (_dir, root) = ignored_repo();
+    let outside = outside_dir();
+    // Dangling on purpose: `create_new` follows a symlink, so without the
+    // containment check this scaffold would CREATE the file outside the
+    // worktree rather than merely failing on an existing one.
+    let escape = outside.path().join("STATUS.md");
+    let session = root.join(session_rel(&root));
+    fs::create_dir_all(&session).unwrap();
+    std::os::unix::fs::symlink(&escape, session.join("STATUS.md")).unwrap();
+
+    let report = ensure(&root).unwrap();
+
+    assert!(
+        !report.wrote_state,
+        "wrote_state stayed true after `scaffold` refused an escaping state \
+         file; the run does not return here, so the flag is the caller's only \
+         signal that the tree is unsafe"
+    );
+    assert_eq!(report.refusals.len(), 1, "{:?}", report.refusals);
+    assert_eq!(report.refusals[0].code(), "escapes-worktree");
+    assert!(!escape.exists(), "the scaffold wrote outside the worktree");
+    // The sibling that follows STATUS.md in the same loop is still created —
+    // this is what makes the flag load-bearing rather than redundant with an
+    // early return.
+    assert!(session.join("TASKS.md").is_file());
+}
+
 // ── R48: the pointer claim ──────────────────────────────────────────────────
 
 /// Two bootstraps racing each other must not interleave into a half-written
@@ -427,3 +547,4 @@ fn heartbeat_note_shape() {
     report.wrote_state = false;
     assert!(report.heartbeat_note().starts_with("scratchpad refused: "));
 }
+

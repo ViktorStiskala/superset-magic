@@ -51,7 +51,6 @@ pub struct Identity {
 /// documented fallback rather than propagating an error.
 // consumed by later units: the scratchpad bootstrap, the hook wrapper, and
 // every human verb that reports or acts on a session directory.
-#[allow(dead_code)]
 pub fn resolve(cwd: &Path) -> Option<Identity> {
     let root = git::cwd_repo_root(cwd).ok()?;
     let repo = repo_component(&root);

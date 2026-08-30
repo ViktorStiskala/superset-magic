@@ -154,14 +154,32 @@ fn append_note(
     custom_instructions: Option<&str>,
 ) -> Result<()> {
     let path = session_dir.join(NOTE_NAME);
-    let is_new = !path.exists();
 
-    let mut file = fs::OpenOptions::new()
-        .create(true)
+    // Newness is decided by the open itself, not by a `path.exists()` check
+    // made beforehand: the harness can spawn duplicate hooks for the same
+    // event (see `claim.rs`'s module doc), and two such invocations racing
+    // here could both see "not there yet" before either had opened the file,
+    // then both go on to write HEADER — a duplicated header mid-file.
+    // `create_new` opens with `O_EXCL`, which the kernel guarantees at most
+    // one of two racing opens can win; the loser's `AlreadyExists` is exactly
+    // the fact that the file is no longer new, so it falls back to an
+    // ordinary append-mode open and skips the header.
+    let (mut file, is_new) = match fs::OpenOptions::new()
         .append(true)
+        .create_new(true)
         .mode(FILE_MODE)
         .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    {
+        Ok(file) => (file, true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            (file, false)
+        }
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
 
     if is_new {
         file.write_all(HEADER.as_bytes())

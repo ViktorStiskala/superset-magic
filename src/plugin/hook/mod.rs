@@ -58,13 +58,13 @@ use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
 use crate::git;
 use crate::plugin::config::{self, PluginConfig};
 use crate::plugin::heartbeat::{self, Outcome as RowOutcome, Row};
+use crate::plugin::scratchpad::now_secs;
 use crate::plugin::HookEvent;
 
 pub mod event;
@@ -120,9 +120,9 @@ const REASON_ENCODE_FAILED: &str = "encode-failed";
 /// [`HookContext::diagnostic`].
 // The pipeline builds every field; the readers are the per-event handlers of
 // U12 onward, so until those land the compiler sees write-only fields.
-#[allow(dead_code)]
 pub struct HookContext<'a> {
     /// The event, as argv named it.
+    #[allow(dead_code)]
     pub event: &'a HookEvent,
     /// The decoded envelope, including its untouched raw JSON.
     pub envelope: &'a Envelope,
@@ -152,7 +152,6 @@ impl<'a> HookContext<'a> {
     /// The envelope's working directory.
     // Read by the per-event handlers of U12 onward; the tests here already
     // exercise it.
-    #[allow(dead_code)]
     pub fn cwd(&self) -> &Path {
         Path::new(&self.envelope.common.cwd)
     }
@@ -190,7 +189,6 @@ impl Outcome {
     /// A handler that wants `response` written to stdout.
     // Used by the per-event handlers as they land; the stubs below return
     // `silent`.
-    #[allow(dead_code)]
     pub fn new(response: Response) -> Self {
         Self {
             response,
@@ -244,8 +242,9 @@ pub struct Route {
 pub fn route(event: &HookEvent) -> Option<Route> {
     let (module, handler, writes_state): (_, Handler, _) = match event {
         HookEvent::SessionStart => ("session_start", session_start::handle, true),
-        // U14's Read gate is wired; U28 (the checklist deny) and U29 (the
-        // commit nudge) plug into the same handler.
+        // Three checks share this one handler: the checklist deny (which must
+        // run ahead of every exemption), the oversized-read gate, and the
+        // advisory commit nudge on Bash.
         HookEvent::PreToolUse => ("pre_tool_use", pre_tool_use::handle, true),
         HookEvent::PreCompact => ("pre_compact", pre_compact::handle, true),
         HookEvent::SubagentStop => ("subagent_stop", subagent_stop::handle, true),
@@ -263,9 +262,6 @@ pub fn route(event: &HookEvent) -> Option<Route> {
         writes_state,
     })
 }
-
-// The stand-in handler that stood here until U30 is gone: every one of the six
-// routed events now reaches a real module.
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -527,14 +523,6 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         return s.clone();
     }
     "handler panicked with a non-string payload".to_string()
-}
-
-/// Seconds since the Unix epoch, or 0 if the system clock is set before it.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -83,7 +83,6 @@ use crate::hashing;
 // helpers below DO have an in-crate caller — `plugin::heartbeat` locks its
 // own store with `with_lock` — but nothing outside this module needs the
 // namespace name itself yet.
-#[allow(dead_code)]
 pub const NAMESPACE_DIR: &str = "ss-magic-plugin";
 
 /// The lock file name for the one coordination point both implementations
@@ -127,7 +126,6 @@ impl std::error::Error for NoValidRoot {}
 /// of `home` (exactly as it arrives — an unset `$HOME` and an empty `$HOME`
 /// are indistinguishable here on purpose, matching `bootstrap.sh`'s shell
 /// side, which cannot tell the difference either).
-#[allow(dead_code)]
 pub fn identifier(home: &str) -> String {
     let hex = hashing::sha256_hex(home.as_bytes());
     hex[..IDENTIFIER_HEX_LEN].to_string()
@@ -141,7 +139,6 @@ pub fn identifier(home: &str) -> String {
 /// falls back to `/tmp` when `$TMPDIR` is unset) from the real environment
 /// and this process's real effective uid. See [`resolve_root_at`] for the
 /// injectable core this delegates to.
-#[allow(dead_code)]
 pub fn resolve_root() -> Result<PathBuf, NoValidRoot> {
     let home = std::env::var("HOME").unwrap_or_default();
     resolve_root_at(

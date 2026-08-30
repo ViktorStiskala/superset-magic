@@ -63,8 +63,8 @@
 //! entry behind with no way to ever match again.
 
 use std::fs;
-use std::io::{Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt as _};
+use std::io::Read as _;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -73,7 +73,8 @@ use anyhow::{Context, Result};
 
 use crate::git;
 use crate::hashing;
-use crate::plugin::scratchpad::{self, STATE_REL};
+use crate::plugin::atomic;
+use crate::plugin::scratchpad::{self, now_secs, STATE_REL};
 use crate::tui::style;
 
 // ── Layout ────────────────────────────────────────────────────────────────────
@@ -383,20 +384,15 @@ pub fn write(
     }
 
     let path = entry_path(dir, &key);
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".conclusion-")
-        .suffix(".tmp")
-        .tempfile_in(dir)
-        .with_context(|| format!("creating a temp file in {}", dir.display()))?;
-    tmp.write_all(stored.as_bytes())
-        .context("writing the conclusion entry")?;
-    tmp.flush().context("flushing the conclusion entry")?;
-    tmp.as_file()
-        .set_permissions(fs::Permissions::from_mode(FILE_MODE))
-        .with_context(|| format!("setting owner-only mode on {}", path.display()))?;
-    tmp.as_file().sync_all().ok();
-    tmp.persist(&path)
-        .with_context(|| format!("replacing {}", path.display()))?;
+    atomic::write_atomically(
+        &path,
+        &stored,
+        ".conclusion-",
+        ".tmp",
+        Some("the conclusion entry"),
+        Some(FILE_MODE),
+        true,
+    )?;
     Ok(path)
 }
 
@@ -440,7 +436,6 @@ pub enum Budget {
     /// a mutilated envelope.
     // Constructed by the Read gate, which passes the configured inline byte
     // budget; the tests here exercise it in the meantime.
-    #[allow(dead_code)]
     Bytes(usize),
 }
 
@@ -731,14 +726,6 @@ pub fn gc(dir: &Path) -> Result<GcReport> {
 
     report.pruned = prune(dir, ENTRIES_KEPT, MAX_AGE_SECS, now_secs(), None)?;
     Ok(report)
-}
-
-/// Seconds since the Unix epoch, or 0 if the clock is before it.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 // ── The verbs ─────────────────────────────────────────────────────────────────

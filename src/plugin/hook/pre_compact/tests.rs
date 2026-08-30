@@ -293,6 +293,50 @@ fn a_large_existing_note_file_is_appended_to_not_replaced() {
     assert_eq!(after.matches("manual").count(), 1, "{after}");
 }
 
+// ── The header TOCTOU (duplicate hooks racing the first write) ───────────────
+
+/// The harness can spawn duplicate hooks for the same event (see `claim.rs`'s
+/// module doc), so the first compaction of a session can be raced by more
+/// than one invocation of this handler. Ten threads all calling
+/// [`append_note`] against a log that does not exist yet, released at the
+/// same instant, must still leave exactly one header — the old
+/// `!path.exists()` check, made separately from the `open()` call, left a
+/// window where every racing thread could see "not there yet" and each write
+/// its own header.
+#[test]
+fn a_racing_first_write_never_duplicates_the_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().to_path_buf();
+    const RACERS: usize = 10;
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
+    let handles: Vec<_> = (0..RACERS)
+        .map(|i| {
+            let session_dir = session_dir.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                append_note(&session_dir, NOW + i as u64, "auto", None).unwrap();
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let note = fs::read_to_string(session_dir.join(NOTE_NAME)).unwrap();
+    assert_eq!(
+        note.matches("Pre-compact log").count(),
+        1,
+        "a racing first write must produce exactly one header:\n{note}"
+    );
+    assert_eq!(
+        note.matches("## ").count(),
+        RACERS,
+        "none of the racing entries may be lost:\n{note}"
+    );
+}
+
 // ── R17: a tracked path under the state tree is never adopted ────────────────
 
 /// A public repository could commit a file at this exact predictable path.

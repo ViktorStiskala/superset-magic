@@ -187,6 +187,46 @@ fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
         .join(path)
 }
 
+/// The target resolved to the same basis the classification root uses.
+///
+/// `canonicalize` only works on a path that exists, and the interesting case
+/// here is precisely the one that does not: a `Write` creating a checklist, or
+/// an `Edit` recreating a deleted one. Falling back to the raw spelling looks
+/// harmless but is not, because [`classification_root`] canonicalizes
+/// unconditionally — so on any machine where an ancestor is a symlink (macOS
+/// resolves `/tmp` to `/private/tmp`, and a symlinked home or checkout is
+/// ordinary), the root is canonical while the target is not, every prefix
+/// comparison in [`is_checklist_path`] misses, and the R88 deny silently does
+/// not fire.
+///
+/// So resolve the deepest ancestor that does exist and re-attach the tail that
+/// does not. That yields a canonical path for a file that was never created,
+/// which is what the comparison needs. A path with no existing ancestor at all
+/// (an empty path, or a root that has vanished) keeps its spelling — there is
+/// nothing to resolve against, and the lexical comparison is then no worse off
+/// than before.
+fn resolve_for_classification(target: &Path) -> PathBuf {
+    if let Ok(real) = target.canonicalize() {
+        return real;
+    }
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut current = target;
+    while let Some(parent) = current.parent() {
+        if let Some(name) = current.file_name() {
+            tail.push(name);
+        }
+        if let Ok(real) = parent.canonicalize() {
+            let mut out = real;
+            for name in tail.iter().rev() {
+                out.push(name);
+            }
+            return out;
+        }
+        current = parent;
+    }
+    target.to_path_buf()
+}
+
 /// Whether `path` is the checklist, by either route.
 fn is_checklist_path(root: &Path, path: &Path) -> bool {
     // Purely lexical and free, so it goes first — and it is the only one of the
@@ -347,7 +387,7 @@ fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
     // the same case as naming it outright; a target that is not there yet keeps
     // the path as spelled, which the classifier compares lexically.
     if let Some(target) = &target {
-        let realpath = target.canonicalize().unwrap_or_else(|_| target.clone());
+        let realpath = resolve_for_classification(target);
         if let Classification::Checklist { reason } = classify(ctx, &realpath) {
             return Ok(deny(reason, "deny: checklist path"));
         }
@@ -581,6 +621,23 @@ fn non_text_extension(path: &Path) -> Option<String> {
 /// works. A pattern that does not compile is dropped rather than failing the
 /// gate: that can only shrink the exemption list and make the gate fire more
 /// often, which is the safe direction.
+///
+/// This canonicalizes `path` itself rather than accepting an already-resolved
+/// one from the caller, even though [`gate`] separately resolves the same
+/// target via [`resolve_for_classification`] a few lines earlier for the
+/// checklist check. That looks like a redundant `canonicalize()` on every
+/// matching `Read` — and for a target that exists, it is exactly that, byte
+/// for byte. But `resolve_for_classification` exists specifically to handle a
+/// target that does *not* exist yet (a `Write` creating a file, an `Edit`
+/// recreating a deleted one): it resolves the deepest existing ancestor and
+/// re-attaches the missing tail, which is a *different* fallback value than
+/// this function's own `unwrap_or_else(|_| path.to_path_buf())` produces for
+/// the same non-existent path. Reusing the caller's resolved value would
+/// therefore change which pattern this function reports matching for that
+/// case — not the gate's final allow/deny (a non-existent target is allowed
+/// either way, via the stat failure a few steps below), but the exemption
+/// match itself, which is exactly the thing a hot-path cleanup here must not
+/// touch. Left as its own `canonicalize()` call on purpose, not an oversight.
 fn configured_exemption<'a>(
     patterns: &'a [String],
     root: &Path,

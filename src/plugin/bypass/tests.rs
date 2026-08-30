@@ -211,6 +211,46 @@ fn the_verb_writes_nothing_while_the_state_tree_is_not_ignored() {
     assert!(!consume(&dir_for_root(&root), &file, NOW));
 }
 
+/// The caller's half of the `wrote_state` contract, and the actual exploit the
+/// flag prevents.
+///
+/// `run_core` bootstraps through `scratchpad::ensure` and then writes its claim
+/// into `report.state_root.join("bypass")` — it does not re-check containment,
+/// because `!report.wrote_state` is supposed to have already stopped it. A
+/// containment refusal raised late in `ensure` (R56) used to leave that flag
+/// true, so this verb printed the refusal as a warning and wrote the claim
+/// anyway, straight through the symlink `ensure` had just declined to follow.
+///
+/// The trap: the exit code is only half the story. Asserting `ExitCode::from(1)`
+/// alone would be satisfied by a run that refused AFTER writing, so this also
+/// asserts the escape directory is still empty — that is the file that must
+/// never appear.
+#[test]
+fn the_verb_writes_no_claim_when_the_claim_directory_escapes_the_worktree() {
+    let (_dir, root) = ignored_repo();
+    let file = root.join("big.rs");
+    fs::write(&file, "x").unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.join(crate::plugin::scratchpad::STATE_REL)).unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir_for_root(&root)).unwrap();
+
+    let code = run_core(&root, file.to_str().unwrap(), NOW).unwrap();
+
+    assert!(
+        fs::read_dir(outside.path()).unwrap().next().is_none(),
+        "the verb wrote a bypass claim outside the worktree, into {} — \
+         `scratchpad::ensure` refused the symlink and the verb wrote through \
+         it anyway",
+        outside.path().display()
+    );
+    assert_eq!(
+        code,
+        ExitCode::from(1),
+        "the verb must stop on a containment refusal, not warn and continue"
+    );
+}
+
 #[test]
 fn the_verb_rejects_unknown_flags_and_extra_arguments() {
     let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();

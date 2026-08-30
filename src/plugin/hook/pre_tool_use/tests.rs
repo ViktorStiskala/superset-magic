@@ -78,6 +78,14 @@ impl Repo {
 fn repo() -> Repo {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
+    scaffold_worktree(&root);
+    Repo { _dir: dir, root }
+}
+
+/// The `.superset/` layout that makes `root` a worktree the gate can resolve.
+/// Split out of [`repo`] so the symlinked fixture below builds the same tree
+/// somewhere other than the tempdir's own top level.
+fn scaffold_worktree(root: &Path) {
     fs::create_dir_all(root.join(".superset/.magic/conclusions")).unwrap();
     fs::create_dir_all(root.join(".superset/.magic/bypass")).unwrap();
     fs::write(
@@ -85,7 +93,6 @@ fn repo() -> Repo {
         r#"{"files":[],"plugin":{"enabled":true}}"#,
     )
     .unwrap();
-    Repo { _dir: dir, root }
 }
 
 /// The envelope a real invocation carries.
@@ -1291,6 +1298,143 @@ fn a_write_of_a_checklist_that_does_not_exist_yet_is_denied() {
         serde_json::json!({ "file_path": &by_pointer }),
     );
     checklist_denial(&run(&env, &repo.root, &default_config()));
+}
+
+// ── The symlinked-ancestor bypass (regression) ───────────────────────────────
+//
+// The two tests below are the regression guard for a hole that let a `Write`
+// or `Edit` CREATE a checklist the R88 deny never saw. Read this before
+// touching either of them, because the obvious version of both passes while
+// the bug is present.
+//
+// The gate compares two paths: the worktree root from `classification_root`,
+// and the tool's target. The root is canonicalized UNCONDITIONALLY — the walk
+// in `walk_for_root` starts from `cwd.canonicalize()`. The target used to be
+// resolved with `canonicalize().unwrap_or_else(|_| target.clone())`, and
+// `canonicalize` fails on a path that is not on disk. So for exactly the case
+// R88 cares most about — a checklist being created, or recreated after a
+// delete — the target kept the spelling the tool sent while the root did not.
+// If any ancestor in that spelling is a symlink (macOS resolves `/tmp` to
+// `/private/tmp`; a symlinked home or checkout is ordinary), the two sides no
+// longer share a prefix: `matches_convention`'s `strip_prefix` misses, the
+// pointer's `==` misses, the pointer's `canonicalize` fallback misses because
+// the file is not there — and the deny silently does not fire. `Write` and
+// `Edit` then fall straight through to `allow: not a Read`.
+//
+// Every other checklist test here uses the `repo()` fixture, whose root is
+// canonicalized at construction and whose targets are built by joining onto
+// that canonical root. Fixture and target therefore already agree, and no
+// amount of "the file does not exist" testing on that fixture can reach the
+// bug. The mismatch has to be built deliberately, which is what
+// `repo_behind_a_symlink` is for.
+
+/// A worktree plus a symlink that reaches it: `root` is the canonical
+/// directory the gate resolves, and the returned path is the SAME directory
+/// spelled through a symlink and deliberately left unresolved. A target joined
+/// onto it is what an agent sends when its cwd or home is a symlink.
+fn repo_behind_a_symlink() -> (Repo, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let root = base.join("actual");
+    scaffold_worktree(&root);
+    let link = base.join("checkout");
+    std::os::unix::fs::symlink(&root, &link).unwrap();
+    // Only the last component differs, so a failure here is unambiguous: the
+    // paths are the same directory, spelled two ways.
+    assert_ne!(link, root);
+    (Repo { _dir: dir, root }, link)
+}
+
+/// Assert the R88 deny fired, with a message that names the security property
+/// rather than the shape of the response.
+///
+/// `denial` alone would panic with "expected a denial, got Silent", which
+/// reads like a plumbing mismatch. What actually happened is that a write to
+/// the operator checklist was waved through, so say that.
+fn assert_denied_as_checklist(outcome: &Outcome, tool: &str, what: &str) {
+    assert_eq!(
+        outcome.detail.as_deref(),
+        Some("deny: checklist path"),
+        "R88 did not fire: {what} was allowed ({:?}). \
+         `{tool}` can then write the operator checklist directly, bypassing \
+         the `ss-magic-plugin checklist` verbs entirely.",
+        outcome.detail
+    );
+    assert!(
+        checklist_denial(outcome).starts_with(&format!("ss-magic blocked this {tool}")),
+        "the deny should name the {tool} that was blocked"
+    );
+}
+
+/// R88 must deny a checklist named by the CONVENTION through a symlinked
+/// ancestor even though the file does not exist yet — the create case, which
+/// is the one `canonicalize` cannot answer.
+///
+/// A failure here means `Write` and `Edit` can put a checklist on disk without
+/// ever going through the `ss-magic-plugin checklist` verbs, which is the
+/// whole of R88. See the block comment above for why the mismatch is built by
+/// hand.
+#[test]
+fn a_checklist_created_through_a_symlinked_ancestor_is_denied_by_convention() {
+    let (repo, link) = repo_behind_a_symlink();
+
+    // A `Write` with no `docs/` on disk at all: nothing below the worktree
+    // root exists, so the target's deepest existing ancestor is the symlink
+    // itself.
+    let fresh = link.join("docs/actions/2026-08-new.checklist.json");
+    assert!(!fresh.exists());
+    let env = envelope(&repo.root, "Write", serde_json::json!({ "file_path": &fresh }));
+    let outcome = run(&env, &repo.root, &default_config());
+    assert_denied_as_checklist(
+        &outcome,
+        "Write",
+        "a Write creating a conventionally-named checklist through a symlinked ancestor",
+    );
+
+    // And an `Edit` recreating one that was deleted, where the directory does
+    // still exist — the deepest existing ancestor is then `docs/actions`, so
+    // this exercises the other half of the walk.
+    fs::create_dir_all(repo.root.join("docs/actions")).unwrap();
+    let deleted = link.join("docs/actions/2026-08-gone.checklist.json");
+    assert!(!deleted.exists());
+    let env = envelope(
+        &repo.root,
+        "Edit",
+        serde_json::json!({ "file_path": &deleted }),
+    );
+    let outcome = run(&env, &repo.root, &default_config());
+    assert_denied_as_checklist(
+        &outcome,
+        "Edit",
+        "an Edit recreating a deleted checklist through a symlinked ancestor",
+    );
+}
+
+/// The same hole by the POINTER route. `init` records the intended path before
+/// the document is written, so the pointer names a file that is not there —
+/// and both of the pointer's comparisons need the target on the same basis as
+/// the root to match it.
+///
+/// A failure here means an agent can pre-empt `checklist init` by writing the
+/// pointer's target itself, at a path the naming convention does not cover.
+#[test]
+fn a_checklist_created_through_a_symlinked_ancestor_is_denied_by_the_pointer() {
+    let (repo, link) = repo_behind_a_symlink();
+    repo.point_at("state/tracker.json");
+
+    let target = link.join("state/tracker.json");
+    assert!(!target.exists());
+    let env = envelope(
+        &repo.root,
+        "Write",
+        serde_json::json!({ "file_path": &target }),
+    );
+    let outcome = run(&env, &repo.root, &default_config());
+    assert_denied_as_checklist(
+        &outcome,
+        "Write",
+        "a Write of the pointer's not-yet-written target through a symlinked ancestor",
+    );
 }
 
 /// A pointer that cannot be parsed leaves the naming convention as the only

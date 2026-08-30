@@ -64,15 +64,15 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write as _};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::git;
+use crate::plugin::atomic;
 use crate::plugin::heartbeat;
-use crate::plugin::scratchpad::format_rfc3339;
+use crate::plugin::scratchpad::{format_rfc3339, now_secs};
 use crate::plugin::tmproot;
 use crate::tui::style;
 
@@ -338,7 +338,15 @@ fn write_offsets(store: &Path, updates: &Offsets) -> Result<()> {
         merged.insert(path.clone(), *mark);
     }
     let body = format!("{}\n", serde_json::to_string_pretty(&merged)?);
-    heartbeat::write_atomically(&store.join(OFFSETS_FILE_NAME), &body, ".offsets-")
+    atomic::write_atomically(
+        &store.join(OFFSETS_FILE_NAME),
+        &body,
+        ".offsets-",
+        ".jsonl",
+        None,
+        Some(FILE_MODE),
+        false,
+    )
 }
 
 // ── Reading the ledger ────────────────────────────────────────────────────────
@@ -1011,7 +1019,15 @@ fn replace_row(store: &Path, rows: &[Row], row: &Row) -> Result<()> {
         body.push_str(&serde_json::to_string(keep).context("encoding a ledger row")?);
         body.push('\n');
     }
-    heartbeat::write_atomically(&ledger_path(store), &body, ".cost-")
+    atomic::write_atomically(
+        &ledger_path(store),
+        &body,
+        ".cost-",
+        ".jsonl",
+        None,
+        Some(FILE_MODE),
+        false,
+    )
 }
 
 /// Write the price table's snapshot for this version, once. A version already
@@ -1034,7 +1050,7 @@ fn snapshot_prices(store: &Path) -> Result<()> {
         "{}\n",
         serde_json::to_string_pretty(&price_table_snapshot())?
     );
-    heartbeat::write_atomically(&path, &body, ".prices-")
+    atomic::write_atomically(&path, &body, ".prices-", ".jsonl", None, Some(FILE_MODE), false)
 }
 
 // ── Locating a transcript ─────────────────────────────────────────────────────
@@ -1065,14 +1081,6 @@ fn find_transcript(root: &Path, session_id: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Seconds since the Unix epoch, or 0 if the clock is set before it.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 // ── The verb ──────────────────────────────────────────────────────────────────
