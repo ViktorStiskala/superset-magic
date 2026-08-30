@@ -177,16 +177,42 @@ fn contained_join(root: &Path, rel: &str) -> Option<PathBuf> {
 /// True when `path` follows the `docs/actions/<stem>.checklist.json` naming
 /// convention inside `root`. Purely lexical: nothing is stat'd, so a file that
 /// does not exist yet still matches.
+///
+/// The directory segment and the suffix are compared **case-insensitively**,
+/// which is deliberate over-matching. macOS APFS and Windows NTFS are
+/// case-insensitive but case-preserving by default, so a write to
+/// `DOCS/actions/x.checklist.json` lands on exactly the same file as
+/// `docs/actions/x.checklist.json` while a byte comparison says they differ -
+/// and this predicate feeds a deny (R88), where the cost of matching one path
+/// too many is a redirect to the CLI, and the cost of matching one too few is
+/// the operator checklist written unlocked, unvalidated and ungated. On a
+/// case-sensitive filesystem the fold costs a repository nothing unless it
+/// deliberately keeps two directories differing only in case.
 pub fn matches_convention(root: &Path, path: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(root) else {
         return false;
     };
-    if rel.parent() != Some(Path::new(ACTIONS_REL)) {
+    let parent_matches = rel
+        .parent()
+        .and_then(|p| p.to_str())
+        .is_some_and(|p| p.eq_ignore_ascii_case(ACTIONS_REL));
+    if !parent_matches {
         return false;
     }
     rel.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|name| name.ends_with(CHECKLIST_SUFFIX) && name.len() > CHECKLIST_SUFFIX.len())
+        .is_some_and(|name| {
+            // The tail is taken with `get` rather than `name[i..]`: indexing a
+            // `str` PANICS when the offset falls inside a character, which a name
+            // like `aé.checklist.jso` produces - and this predicate runs on every
+            // tool target, so that panic would be reachable from a tool call.
+            // `None` is also the right answer there: if the last fifteen bytes are
+            // not a whole `.checklist.json`, the name is not a checklist.
+            name.len() > CHECKLIST_SUFFIX.len()
+                && name
+                    .get(name.len() - CHECKLIST_SUFFIX.len()..)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(CHECKLIST_SUFFIX))
+        })
 }
 
 // ── Parsing ───────────────────────────────────────────────────────────────────

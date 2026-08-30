@@ -227,6 +227,23 @@ fn resolve_for_classification(target: &Path) -> PathBuf {
     target.to_path_buf()
 }
 
+/// Whether two paths name the same file, ignoring ASCII case.
+///
+/// Used only by the checklist classification, where a miss means the R88 deny
+/// does not fire. macOS APFS and Windows NTFS fold case by default, so
+/// `DOCS/actions/x` and `docs/actions/x` are one file there while a byte
+/// comparison says otherwise; folding here costs a case-sensitive filesystem
+/// nothing unless it deliberately keeps two paths differing only in case, and
+/// the failure it prevents is the operator checklist written outside its verbs.
+fn paths_equal_ignoring_case(a: &Path, b: &Path) -> bool {
+    match (a.to_str(), b.to_str()) {
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+        // A non-UTF-8 path cannot be folded; fall back to the exact comparison
+        // rather than declaring two undecidable paths equal.
+        _ => a == b,
+    }
+}
+
 /// Whether `path` is the checklist, by either route.
 fn is_checklist_path(root: &Path, path: &Path) -> bool {
     // Purely lexical and free, so it goes first — and it is the only one of the
@@ -243,7 +260,11 @@ fn is_checklist_path(root: &Path, path: &Path) -> bool {
     // so a checklist that has not been written yet still compares equal here.
     // That matters: without it an agent could read (or create) the document by
     // getting to it before `init` does.
-    if target == path {
+    // Compared case-insensitively for the same reason `matches_convention`
+    // folds case: on a case-insensitive, case-preserving filesystem the two
+    // spellings name one file, and this feeds a deny where over-matching is the
+    // safe direction.
+    if paths_equal_ignoring_case(&target, path) {
         return true;
     }
 
@@ -252,7 +273,9 @@ fn is_checklist_path(root: &Path, path: &Path) -> bool {
     // agree only after both sides are resolved. A target that is not there
     // fails this, which is exactly right — the lexical comparison above is the
     // answer for that case.
-    target.canonicalize().is_ok_and(|resolved| resolved == path)
+    target
+        .canonicalize()
+        .is_ok_and(|resolved| paths_equal_ignoring_case(&resolved, path))
 }
 
 /// The tool's own name, for the first line of the denial. Reads it back out of
@@ -387,7 +410,16 @@ fn gate(ctx: &HookContext<'_>, classify: Classifier) -> Result<Outcome> {
     // the same case as naming it outright; a target that is not there yet keeps
     // the path as spelled, which the classifier compares lexically.
     if let Some(target) = &target {
-        let realpath = resolve_for_classification(target);
+        // Absolutize against the ENVELOPE's cwd before resolving. A bare
+        // `canonicalize` on a relative path resolves against the hook process's
+        // own working directory, which is not the agent's: the harness invokes
+        // the binary directly, so a relative `docs/actions/x.checklist.json`
+        // would resolve against whatever directory the process happens to be
+        // in - the main checkout, say, while the agent is in a worktree - and
+        // the classification root would not match. The harness meanwhile
+        // resolves the same spelling against the agent's real cwd and touches
+        // the real file.
+        let realpath = resolve_for_classification(&absolutize(ctx.cwd(), target));
         if let Classification::Checklist { reason } = classify(ctx, &realpath) {
             return Ok(deny(reason, "deny: checklist path"));
         }

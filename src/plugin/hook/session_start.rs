@@ -196,14 +196,25 @@ fn display_rel(root: &Path, path: &Path) -> String {
 
 /// Turn one [`scratchpad::Report`] into the `additionalContext` body.
 ///
-/// A hard refusal (`wrote_state == false`) gets a short explanation instead
-/// of the usual guidance — nothing was written this run, so nothing here may
-/// claim a state file exists.
+/// A run that refused before creating anything gets a short explanation
+/// instead of the usual guidance: there is no tree to describe, so nothing
+/// here may claim a state file exists.
+///
+/// That case is decided by `created` being empty as well as `wrote_state`
+/// being false, not by `wrote_state` alone. `wrote_state` answers "is this
+/// tree safe to write into", and the two late refusal sites (the session
+/// pointer, and `scaffold`) can fire *after* directories have already been
+/// created — so "unsafe" and "wrote something" is a real combination. Such a
+/// run gets the ordinary guidance, the `## Operator checklist` section
+/// included, with a refusal block that says the scaffold did not finish;
+/// telling it "nothing was written" would be false, and dropping the checklist
+/// verbs with that sentence would withhold them from a run that mostly
+/// succeeded.
 fn build_guidance(repo_root: &Path, report: &Report) -> String {
     let state_root_rel = display_rel(repo_root, &report.state_root);
     let mut out = String::new();
 
-    if !report.wrote_state {
+    if !report.wrote_state && report.created.is_empty() {
         let _ = writeln!(
             out,
             "ss-magic: the session scratchpad at {state_root_rel}/ is not set up yet."
@@ -244,7 +255,22 @@ fn build_guidance(repo_root: &Path, report: &Report) -> String {
 
     if !report.refusals.is_empty() {
         let _ = writeln!(out);
-        let _ = writeln!(out, "Some paths under the tree were left untouched:");
+        // Two different situations share this block. `wrote_state` still true
+        // means the run completed and merely skipped a path or two (a tracked
+        // file it must not overwrite). False here means the scaffold stopped
+        // part-way: some of the files named above were created and some were
+        // not, and the tree is not safe to write into until the reason is
+        // fixed. Both need the reasons; only the second needs the warning.
+        let _ = writeln!(
+            out,
+            "{}",
+            if report.wrote_state {
+                "Some paths under the tree were left untouched:"
+            } else {
+                "The scaffold did not finish, so some of the files named above may not \
+                 exist — do not write into the tree until this is fixed:"
+            }
+        );
         for refusal in &report.refusals {
             let _ = writeln!(out, "- {}", render_refusal(refusal));
         }

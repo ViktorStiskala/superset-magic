@@ -40,7 +40,10 @@ use anyhow::{Context, Result};
 ///   temp file's mode alone — for a caller that does not manage permissions
 ///   here (either it does not care, or, like the checklist document, it
 ///   means to preserve whatever mode the existing file already had, and computes
-///   that mode itself before calling in).
+///   that mode itself before calling in). A chmod failure names the mode that
+///   was asked for, because that is what says whether the failure matters:
+///   most callers here pass owner-only `0600` for a file under the state tree,
+///   and a file that misses it is readable by everyone on the machine.
 /// - `sync`, when true, fsyncs the temp file's contents to disk before the
 ///   rename (best-effort — a sync failure is ignored, same as every call site
 ///   already did), for a caller where surviving a crash right after the write
@@ -68,7 +71,14 @@ pub(crate) fn write_atomically(
     if let Some(mode) = mode {
         tmp.as_file()
             .set_permissions(fs::Permissions::from_mode(mode))
-            .with_context(|| format!("setting the mode on {}", path.display()))?;
+            // Naming the mode is what the four owner-only call sites said in
+            // their own wording before this was consolidated ("setting
+            // owner-only mode on …"): a chmod failure on `0600` means the
+            // secret in the file may be world-readable, which is worth seeing
+            // in the error. Spelling the octal rather than the word keeps one
+            // message that also reads correctly for a caller passing an
+            // explicit, deliberately non-restrictive mode.
+            .with_context(|| format!("setting mode {mode:04o} on {}", path.display()))?;
     }
     if sync {
         tmp.as_file().sync_all().ok();

@@ -1437,6 +1437,151 @@ fn a_checklist_created_through_a_symlinked_ancestor_is_denied_by_the_pointer() {
     );
 }
 
+// ── Case-folded spellings of the same file (regression) ──────────────────────
+//
+// The two tests below guard a second way through the same deny. Read this
+// before touching either of them, because the obvious version of both passes
+// while the bug is present.
+//
+// Both routes compared bytes against a lowercase constant: `matches_convention`
+// tested `rel.parent() == "docs/actions"` and `name.ends_with(".checklist.json")`,
+// and the pointer route tested `target == path`. macOS APFS and Windows NTFS are
+// case-INSENSITIVE but case-PRESERVING by default, so on the machines this plugin
+// actually runs on, `<root>/DOCS/actions/x.checklist.json` and
+// `<root>/docs/actions/x.checklist.json` are ONE file — a `Write` to the cased
+// spelling missed every comparison and landed on exactly the operator checklist.
+// Nothing recovers afterwards either: `checklist init`'s own `path.exists()` is
+// case-insensitive there too, so the next legitimate `init` sees a file already
+// present and adopts whatever the ungated write put in it.
+//
+// Every other checklist test here spells the path exactly as the constants do,
+// so the byte comparison agrees and the deny fires for reasons that have
+// nothing to do with case. Only a spelling that differs from the constant can
+// reach the bug.
+//
+// These run identically on a case-sensitive filesystem, deliberately. The
+// targets do not exist, so nothing here asks the filesystem whether the two
+// spellings are one file: the assertion is on the gate's own predicate, which
+// must deny either way. On a case-sensitive filesystem the cased spelling is a
+// different file that R88 denies anyway — over-matching is the safe direction
+// for this gate, where the cost of one path too many is a redirect to the CLI
+// and the cost of one too few is the checklist written unlocked and unvalidated.
+
+/// A checklist named by the CONVENTION in a different case is still a
+/// checklist: the directory segment and the suffix both fold.
+#[test]
+fn a_case_folded_checklist_spelling_is_denied_by_convention() {
+    let repo = repo();
+
+    for rel in [
+        // The directory segment cased.
+        "DOCS/actions/2026-08-new.checklist.json",
+        // The suffix cased — the other half of the comparison.
+        "docs/actions/2026-08-new.CHECKLIST.JSON",
+        // And both at once, which is what a shell completion on a
+        // case-insensitive filesystem hands somebody.
+        "Docs/Actions/2026-08-new.Checklist.Json",
+    ] {
+        let target = repo.root.join(rel);
+        assert!(!target.exists(), "{rel} must be the create case");
+        let env = envelope(
+            &repo.root,
+            "Write",
+            serde_json::json!({ "file_path": &target }),
+        );
+        let outcome = run(&env, &repo.root, &default_config());
+        assert_denied_as_checklist(
+            &outcome,
+            "Write",
+            &format!("a Write creating `{rel}`, the checklist under a folded spelling"),
+        );
+    }
+}
+
+/// The same fold on the POINTER route, which has its own comparison and so its
+/// own way through. The pointer's target is deliberately not a conventional
+/// name, so the convention route above cannot be what denies these.
+#[test]
+fn a_case_folded_pointer_target_is_denied() {
+    let repo = repo();
+    repo.point_at("state/tracker.json");
+
+    for rel in ["STATE/tracker.json", "state/TRACKER.json"] {
+        let target = repo.root.join(rel);
+        assert!(!target.exists(), "{rel} must be the create case");
+        let env = envelope(
+            &repo.root,
+            "Write",
+            serde_json::json!({ "file_path": &target }),
+        );
+        let outcome = run(&env, &repo.root, &default_config());
+        assert_denied_as_checklist(
+            &outcome,
+            "Write",
+            &format!("a Write of the pointer's target spelled `{rel}`"),
+        );
+    }
+}
+
+// ── A relative target (regression) ───────────────────────────────────────────
+//
+// The third way through the same deny, and the one every test above was blind
+// to by construction: they all build their target by joining onto the fixture's
+// canonical root, so every `file_path` they send is already absolute.
+//
+// `gate` used to hand the raw target straight to `resolve_for_classification`,
+// whose bare `canonicalize` resolves a relative path against the HOOK PROCESS's
+// working directory. The harness invokes this binary directly rather than from
+// the agent's cwd, so those are not the same directory — the main checkout
+// while the agent works in a worktree, say. A relative
+// `docs/actions/x.checklist.json` therefore resolved somewhere the
+// classification root does not cover, the deny did not fire, and the harness's
+// own tool then resolved the identical spelling against the agent's real cwd
+// and wrote the real checklist.
+
+/// A relative `file_path` is resolved against the ENVELOPE's cwd — the agent's
+/// working directory — and not the hook process's own.
+#[test]
+fn a_relative_checklist_target_is_resolved_against_the_envelopes_cwd() {
+    let repo = repo();
+    // Not a conventional name, so the pointer route is what has to catch it —
+    // and its first segment exists relative to the crate root, which is the
+    // precondition asserted below.
+    repo.point_at("docs/tracker.json");
+
+    for (rel, route) in [
+        ("docs/actions/2026-08-new.checklist.json", "the convention"),
+        ("docs/tracker.json", "the pointer"),
+    ] {
+        // The precondition the bug needs, asserted rather than assumed.
+        // Resolved the way the buggy code did — against this process's own
+        // working directory, the crate root under `cargo test` — the spelling
+        // has to land on an absolute path OUTSIDE the fixture for the miss to
+        // happen at all. A relative path that resolves nowhere keeps its
+        // spelling instead, and `classify_checklist`'s own `absolutize` then
+        // joins it onto the envelope's cwd after all, so a test built on one
+        // would pass with the bug present and prove nothing. Both spellings
+        // here start at the crate's own `docs/`, which is what makes them
+        // resolve.
+        let as_the_process_would = resolve_for_classification(Path::new(rel));
+        assert!(
+            as_the_process_would.is_absolute() && !as_the_process_would.starts_with(&repo.root),
+            "this test needs `{rel}` to resolve to an absolute path outside the fixture \
+             against the process's own cwd; it resolved to {} instead, which cannot \
+             exercise the bug",
+            as_the_process_would.display()
+        );
+
+        let env = envelope(&repo.root, "Write", serde_json::json!({ "file_path": rel }));
+        let outcome = run(&env, &repo.root, &default_config());
+        assert_denied_as_checklist(
+            &outcome,
+            "Write",
+            &format!("a Write of the relative path `{rel}`, a checklist by {route}"),
+        );
+    }
+}
+
 /// A pointer that cannot be parsed leaves the naming convention as the only
 /// route, rather than failing the classification open or shut for everything.
 #[test]

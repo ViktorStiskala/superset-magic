@@ -273,6 +273,95 @@ fn a_tracked_paths_refusal_is_capped_so_the_budget_survives_hundreds_of_paths() 
     );
 }
 
+/// A run that created directories and THEN refused must not be told "nothing
+/// was written", and must not lose the `## Operator checklist` section with
+/// that sentence.
+///
+/// `wrote_state` is not a record of what happened — it answers "is this tree
+/// safe to write into". The two late refusal sites (the session pointer, and
+/// `scaffold`) fire after the directory pass has already created things, so
+/// `wrote_state == false` with a non-empty `created` is a real and expected
+/// combination. Branching the "nothing was written" wording on the flag rather
+/// than on `created` told the model something false about a run that mostly
+/// succeeded, and returned early past the checklist verbs it still needs.
+///
+/// Built against [`build_guidance`] directly: producing this state through a
+/// real repository would mean making one path under the tree escape the
+/// worktree mid-scaffold, which says nothing more about the rendering than
+/// naming the combination outright does.
+#[test]
+fn a_refusal_after_directories_were_created_keeps_the_checklist_and_admits_the_writes() {
+    let root = PathBuf::from("/repo");
+    let session_dir = root.join(".superset/.magic/sessions/2026-08-30-abc123");
+    let report = Report {
+        state_root: root.join(".superset/.magic"),
+        slug: "2026-08-30-abc123".to_string(),
+        session_dir: session_dir.clone(),
+        created: vec![
+            ".superset/.magic".to_string(),
+            ".superset/.magic/sessions".to_string(),
+            ".superset/.magic/sessions/2026-08-30-abc123".to_string(),
+        ],
+        refusals: vec![Refusal::Escapes {
+            path: ".superset/.magic/sessions/2026-08-30-abc123/STATUS.md".to_string(),
+            detail: "resolves to /elsewhere/STATUS.md".to_string(),
+        }],
+        wrote_state: false,
+    };
+
+    let text = build_guidance(&root, &report);
+
+    assert!(
+        !text.contains("Nothing was written"),
+        "three directories were created; the guidance must not deny it: {text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("not set up yet"),
+        "the tree was partly set up, so this wording is false: {text}"
+    );
+    assert!(
+        text.contains("## Operator checklist"),
+        "a partial run still needs the checklist verbs: {text}"
+    );
+    assert!(
+        text.contains("ss-magic-plugin checklist list"),
+        "and the verbs themselves, not just the heading: {text}"
+    );
+    // The refusal still has to reach the model in both branches — it is the
+    // only signal that the tree is not safe to write into.
+    assert!(
+        text.contains("/elsewhere/STATUS.md"),
+        "the refusal must survive into the full guidance: {text}"
+    );
+    assert!(
+        text.contains("did not finish"),
+        "and it must be flagged as a stopped scaffold, not a skipped path: {text}"
+    );
+}
+
+/// The mirror of the case above: a completed run that merely skipped a tracked
+/// path keeps the softer wording, so the warning above stays meaningful.
+#[test]
+fn a_completed_run_with_a_skipped_path_is_not_reported_as_a_stopped_scaffold() {
+    let root = PathBuf::from("/repo");
+    let report = Report {
+        state_root: root.join(".superset/.magic"),
+        slug: "2026-08-30-abc123".to_string(),
+        session_dir: root.join(".superset/.magic/sessions/2026-08-30-abc123"),
+        created: vec![".superset/.magic".to_string()],
+        refusals: vec![Refusal::TrackedPaths {
+            paths: vec![".superset/.magic/README.md".to_string()],
+        }],
+        wrote_state: true,
+    };
+
+    let text = build_guidance(&root, &report);
+
+    assert!(text.contains("left untouched"), "{text}");
+    assert!(!text.contains("did not finish"), "{text}");
+    assert!(text.contains("## Operator checklist"), "{text}");
+}
+
 // ── `compact` re-injection (F2) ────────────────────────────────────────────────
 
 /// `compact` is the whole reason this handler runs on all five sources: it

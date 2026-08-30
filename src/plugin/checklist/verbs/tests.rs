@@ -1000,6 +1000,40 @@ fn the_naming_convention_is_lexical_and_scoped_to_docs_actions() {
     ));
 }
 
+/// The suffix comparison must not slice the file name at a byte offset that
+/// falls inside a character.
+///
+/// Folding the suffix's case replaced `name.ends_with(CHECKLIST_SUFFIX)` with a
+/// comparison against `name[name.len() - CHECKLIST_SUFFIX.len()..]`, and
+/// indexing a `str` at an offset that is not a character boundary panics.
+/// `a\u{e9}.checklist.jso` is seventeen bytes with the `\u{e9}` spanning bytes 1..3,
+/// so the fifteen-byte suffix starts in the middle of it — and a `Read` or
+/// `Write` of a file with that name goes through this predicate, so the panic
+/// would have been reachable from a tool call. `str::get` returns `None` at
+/// such an offset, which is also the right answer: a name whose last fifteen
+/// bytes are not a whole `.checklist.json` is not a checklist.
+#[test]
+fn a_name_whose_suffix_offset_splits_a_character_is_rejected_without_panicking() {
+    let root = Path::new("/repo");
+
+    let split = "a\u{e9}.checklist.jso";
+    assert_eq!(split.len(), CHECKLIST_SUFFIX.len() + 2);
+    assert!(
+        !split.is_char_boundary(split.len() - CHECKLIST_SUFFIX.len()),
+        "this test is only meaningful if the offset really does split a character"
+    );
+    assert!(!matches_convention(
+        root,
+        &root.join(format!("docs/actions/{split}"))
+    ));
+
+    // And a multi-byte stem in front of a whole suffix still matches, folded.
+    assert!(matches_convention(
+        root,
+        &root.join("docs/actions/na\u{ef}ve.CHECKLIST.JSON")
+    ));
+}
+
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
 /// Both rendering verbs go through the shared renderer, so both carry the

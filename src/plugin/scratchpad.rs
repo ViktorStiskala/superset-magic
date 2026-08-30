@@ -254,10 +254,18 @@ pub struct Report {
     /// Whether the state tree is safe for a caller to write into.
     ///
     /// Read this before writing, not as a record of what happened. `false`
-    /// means some path under the state root escaped the worktree, was tracked,
-    /// or was not ignored - and a caller that writes anyway does so through
-    /// whatever that path actually points at, which is the escape R56 exists to
-    /// refuse. Every caller branches on it for exactly that reason.
+    /// means some path under the state root escaped the worktree, a regular
+    /// file sits where the state root belongs, git does not ignore the tree (or
+    /// could not be asked), or the tracked-file probe failed - and a caller
+    /// that writes anyway does so through whatever that path actually points
+    /// at, which is the escape R56 exists to refuse. Every caller branches on
+    /// it for exactly that reason.
+    ///
+    /// A [`Refusal::TrackedPaths`] is deliberately NOT one of those cases and
+    /// leaves this `true`: the tracked files are simply left alone while their
+    /// untracked siblings are scaffolded as usual, so the tree stays safe to
+    /// write into. (A [`Refusal::TrackedProbeFailed`] is the opposite - an
+    /// unanswered question about what is tracked is not permission.)
     ///
     /// It is deliberately not "nothing was written": the two late refusal sites
     /// (the pointer, and `scaffold`) can fire after some directories already
