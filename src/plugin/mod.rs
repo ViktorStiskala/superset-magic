@@ -40,8 +40,9 @@
 //! stdin decode, event routing, JSON envelope and fail-open wrapper),
 //! `heartbeat.rs` (the machine-level `hooks.jsonl` row every hook leaves
 //! behind), `cache.rs` (the hash-keyed conclusion cache behind `conclude` /
-//! `conclusions` / `gc`) and, added by later units, `status.rs`, `checklist/`
-//! and `ledger.rs`.
+//! `conclusions` / `gc`), `ledger.rs` (the machine-level cost ledger
+//! `SessionEnd` appends to, and the `cost` verb that reports it) and, added by
+//! later units, `status.rs` and `checklist/`.
 
 use std::process::ExitCode;
 
@@ -57,6 +58,7 @@ pub(crate) mod expect_artifact;
 pub(crate) mod heartbeat;
 pub(crate) mod hook;
 pub(crate) mod identity;
+pub(crate) mod ledger;
 pub(crate) mod scratchpad;
 pub(crate) mod tmproot;
 
@@ -270,7 +272,7 @@ Hook entry point (driven by a JSON envelope on stdin, for the harness):
 
 Verbs (driven by argv, for humans and skills):
   status                What the plugin sees, and why it is or is not acting
-  cost                  Token/cost ledger for this repository's sessions
+  cost                  What recorded sessions cost, across every worktree
   spill-index           List the harness's spill files for this worktree
   scratchpad            Bootstrap and inspect the scratchpad state tree
   conclude              Record a conclusion about a file
@@ -411,6 +413,7 @@ fn run_human(verb: HumanVerb, args: &[String]) -> Result<ExitCode> {
         HumanVerb::Conclude => cache::run_conclude(args),
         HumanVerb::Conclusions => cache::run_conclusions(args),
         HumanVerb::Gc => cache::run_gc(args),
+        HumanVerb::Cost => ledger::run(args),
         _ => {
             eprintln!(
                 "{}",

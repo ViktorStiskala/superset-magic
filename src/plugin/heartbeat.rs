@@ -333,23 +333,30 @@ fn prune(path: &Path, keep: usize, max_age: u64, now: u64) -> Result<usize> {
     if !body.is_empty() {
         body.push('\n');
     }
-    write_atomically(path, &body)?;
+    write_atomically(path, &body, ".hooks-")?;
     Ok(total - kept.len())
 }
 
 /// Replace `path`'s contents with `body` via a temp file in the same
-/// directory, so a crash mid-prune leaves the old log intact rather than a
-/// truncated one.
-fn write_atomically(path: &Path, body: &str) -> Result<()> {
+/// directory, so a crash mid-write leaves the old file intact rather than a
+/// truncated one. `prefix` names the temp file, which only ever matters when
+/// somebody is looking at the directory mid-write.
+///
+/// Shared with `plugin::ledger`, whose ledger, offsets store and price
+/// snapshots need exactly this and must not grow a second copy of it: the
+/// owner-only mode and the same-directory rename are the parts that would
+/// drift.
+pub fn write_atomically(path: &Path, body: &str, prefix: &str) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::Builder::new()
-        .prefix(".hooks-")
+        .prefix(prefix)
         .suffix(".jsonl")
         .tempfile_in(dir)
         .with_context(|| format!("creating a temp file in {}", dir.display()))?;
     tmp.write_all(body.as_bytes())
-        .context("writing the pruned heartbeat log")?;
-    tmp.flush().context("flushing the pruned heartbeat log")?;
+        .with_context(|| format!("writing {}", path.display()))?;
+    tmp.flush()
+        .with_context(|| format!("flushing {}", path.display()))?;
     tmp.as_file()
         .set_permissions(std::fs::Permissions::from_mode(FILE_MODE))
         .with_context(|| format!("setting owner-only mode on {}", path.display()))?;

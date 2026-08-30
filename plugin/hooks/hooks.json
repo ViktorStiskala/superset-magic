@@ -68,8 +68,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_DATA}/bin/ss-magic",
-            "args": ["plugin", "hook", "session-end"],
-            "timeout": 10
+            "args": ["plugin", "hook", "session-end"]
           }
         ]
       }

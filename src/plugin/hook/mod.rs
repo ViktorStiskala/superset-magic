@@ -70,6 +70,7 @@ use crate::plugin::HookEvent;
 pub mod event;
 mod pre_compact;
 mod pre_tool_use;
+mod session_end;
 mod session_start;
 mod subagent_stop;
 
@@ -247,8 +248,7 @@ pub fn route(event: &HookEvent) -> Option<Route> {
         HookEvent::PreToolUse => ("pre_tool_use", pre_tool_use::handle, true),
         HookEvent::PreCompact => ("pre_compact", pre_compact::handle, true),
         HookEvent::SubagentStop => ("subagent_stop", subagent_stop::handle, true),
-        // U17.
-        HookEvent::SessionEnd => ("session_end", not_implemented, false),
+        HookEvent::SessionEnd => ("session_end", session_end::handle, false),
         // U30.
         HookEvent::FileChanged => ("file_changed", not_implemented, false),
         HookEvent::Unknown(_) | HookEvent::Missing => return None,

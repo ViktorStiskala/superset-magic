@@ -683,29 +683,27 @@ fn a_well_formed_envelope_reaches_the_handler_with_its_context_resolved() {
     assert_eq!(run.row.outcome, heartbeat::Outcome::Ok);
 }
 
-/// The remaining shipped events all reach their (still unimplemented)
-/// handlers and leave a successful row saying so. `SessionStart` (U12),
-/// `PreToolUse` (U14) and `PreCompact` (U15) have real handlers now and are
-/// deliberately left out of this list — see `session_start/tests.rs`,
-/// `pre_tool_use/tests.rs` and `pre_compact/tests.rs`. Until each remaining
-/// unit lands, "no handler yet" must be indistinguishable from "the handler
-/// had nothing to do" everywhere except the heartbeat note.
+/// `file-changed` is the last event still on the stand-in handler (U30 owns
+/// it). Reaching it must be indistinguishable, from the harness's side, from
+/// reaching a handler that decided it had nothing to do — the heartbeat note
+/// is the only place the difference shows. Every other event now has a real
+/// handler and is covered by its own module's tests: `SessionStart` (U12),
+/// `PreToolUse` (U14), `PreCompact` (U15), `SubagentStop` (U16) and
+/// `SessionEnd` (U17).
 #[test]
-fn the_unimplemented_handlers_are_silent_successes() {
+fn the_unimplemented_handler_is_a_silent_success() {
     let (_dir, root) = enabled_repo();
+    let event = HookEvent::FileChanged;
 
-    for event in [HookEvent::SessionEnd, HookEvent::FileChanged] {
-        let (_d, run) = drive(&event, &envelope("X", &root, ""));
-        assert_eq!(run.stdout, "", "{event:?}");
-        assert_eq!(run.stderr, "", "{event:?}");
-        assert_eq!(run.row.outcome, heartbeat::Outcome::Ok, "{event:?}");
-        assert_eq!(run.row.event, event.as_str(), "{event:?}");
-        assert_eq!(
-            run.row.detail.as_deref(),
-            Some("handler not implemented yet"),
-            "{event:?}"
-        );
-    }
+    let (_d, run) = drive(&event, &envelope("X", &root, ""));
+    assert_eq!(run.stdout, "");
+    assert_eq!(run.stderr, "");
+    assert_eq!(run.row.outcome, heartbeat::Outcome::Ok);
+    assert_eq!(run.row.event, event.as_str());
+    assert_eq!(
+        run.row.detail.as_deref(),
+        Some("handler not implemented yet")
+    );
 }
 
 /// R50: exactly one row per invocation, on every path there is.
