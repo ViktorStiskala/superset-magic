@@ -56,6 +56,7 @@ use globset::Glob;
 use crate::plugin::bypass;
 use crate::plugin::cache;
 use crate::plugin::checklist;
+use crate::plugin::pathnorm;
 use crate::plugin::hook::event::{
     Payload, PermissionDecision, PreToolUse, PreToolUseResponse, Response,
 };
@@ -179,6 +180,13 @@ fn classification_root(ctx: &HookContext<'_>) -> PathBuf {
 /// differently. Stat'ing here would defeat the point, since the file this
 /// branch exists for is precisely the one that is not there.
 fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
+    // `/proc/self/cwd/x` passes `is_absolute` and is still process-relative:
+    // the kernel resolves `self` against whoever asks, and the hook is not the
+    // process that will perform the write. Treat the remainder as relative so
+    // it lands on the envelope's cwd, the way the harness will resolve it.
+    if let Some(rel) = pathnorm::strip_proc_cwd(path) {
+        return cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()).join(rel);
+    }
     if path.is_absolute() {
         return path.to_path_buf();
     }
@@ -206,6 +214,13 @@ fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
 /// nothing to resolve against, and the lexical comparison is then no worse off
 /// than before.
 fn resolve_for_classification(target: &Path) -> PathBuf {
+    // Cancel `.` and `..` first. `canonicalize` would do it, but only for a
+    // path that exists, and the whole point of this function is the one that
+    // does not — so the ancestor walk below would otherwise reconstruct a
+    // *different* path than the filesystem will reach. Reducing lexically here
+    // means both halves agree before anything is compared.
+    let normalized = pathnorm::normalize(target);
+    let target = normalized.as_path();
     if let Ok(real) = target.canonicalize() {
         return real;
     }

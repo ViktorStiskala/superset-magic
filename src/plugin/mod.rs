@@ -71,6 +71,7 @@ pub(crate) mod heartbeat;
 pub(crate) mod hook;
 pub(crate) mod identity;
 pub(crate) mod ledger;
+pub(crate) mod pathnorm;
 pub(crate) mod scratchpad;
 pub(crate) mod setup_ci;
 pub(crate) mod spill_index;

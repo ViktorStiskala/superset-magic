@@ -1582,6 +1582,191 @@ fn a_relative_checklist_target_is_resolved_against_the_envelopes_cwd() {
     }
 }
 
+// ── A `..` component (regression) ────────────────────────────────────────────
+//
+// The fourth way through the same deny. Read this before touching either test
+// below, because the obvious version of both passes while the bug is present.
+//
+// `resolve_for_classification` rebuilds a target that is not on disk by walking
+// up with `parent()`, collecting each `file_name()` until some ancestor
+// canonicalizes, and re-attaching the collected tail. That walk reads like a
+// faithful reduction and is not: `Path::file_name()` returns `None` for a
+// component of `..`, so the loop SKIPS that hop instead of cancelling it, and
+// the segment the `..` was meant to remove survives.
+// `<root>/docs/actions/foo/../x.checklist.json` was therefore reconstructed as
+// `<root>/docs/actions/foo/x.checklist.json`, whose parent is
+// `docs/actions/foo` — `matches_convention` wants `docs/actions` exactly, so it
+// missed; the pointer's equality missed for the same reason; and `Write` fell
+// straight through to `allow: not a Read`. The OS then cancelled `foo/..` for
+// real and the bytes landed on the operator checklist.
+//
+// The fix is `pathnorm::normalize`, called before the walk. That module has its
+// own unit tests, but they cannot guard this: the hole was never in the
+// reduction, it was in the gate reaching the comparison without one. Only a
+// test that drives `gate` end to end fails when the call is dropped again.
+//
+// The segment each `..` cancels is deliberately left OFF disk in every case
+// here. When it exists, `canonicalize` inside the walk cancels the `..` itself
+// and the deny fires with or without the fix — so a test built on a directory
+// that is present proves nothing. Only a `..` the gate has to reduce lexically
+// can reach the bug.
+
+/// A `..` in a target named by the CONVENTION is cancelled the way the
+/// filesystem cancels it, so the deny is decided about the file the write will
+/// actually reach rather than about a path that only the classifier ever sees.
+#[test]
+fn a_parent_component_in_a_checklist_target_is_cancelled_by_convention() {
+    let repo = repo();
+
+    for rel in [
+        // One `..` cancelling the segment before it: the plain shape.
+        "docs/actions/foo/../2026-08-new.checklist.json",
+        // Out of `docs/actions` and back in, which puts the `..` right against
+        // the directory segment the convention compares.
+        "docs/actions/../actions/2026-08-new.checklist.json",
+        // Out of `docs` entirely and back in by the same route: consecutive
+        // `..`s, which the buggy walk skipped one after another.
+        "docs/actions/../../docs/actions/2026-08-new.checklist.json",
+    ] {
+        let target = repo.root.join(rel);
+        assert!(!target.exists(), "{rel} must be the create case");
+        let env = envelope(
+            &repo.root,
+            "Write",
+            serde_json::json!({ "file_path": &target }),
+        );
+        let outcome = run(&env, &repo.root, &default_config());
+        assert_denied_as_checklist(
+            &outcome,
+            "Write",
+            &format!("a Write creating `{rel}`, the checklist reached through a `..`"),
+        );
+    }
+
+    // The other half of the walk. With `docs/actions` on disk the deepest
+    // existing ancestor is that directory rather than the worktree root, so the
+    // tail is re-attached after a different number of iterations. The segment
+    // the `..` cancels (`gone`) is still absent, which is what keeps the
+    // reduction lexical and the bug reachable.
+    fs::create_dir_all(repo.root.join("docs/actions")).unwrap();
+    let deleted = repo
+        .root
+        .join("docs/actions/gone/../2026-08-gone.checklist.json");
+    assert!(!repo.root.join("docs/actions/gone").exists());
+    let env = envelope(
+        &repo.root,
+        "Edit",
+        serde_json::json!({ "file_path": &deleted }),
+    );
+    let outcome = run(&env, &repo.root, &default_config());
+    assert_denied_as_checklist(
+        &outcome,
+        "Edit",
+        "an Edit recreating a checklist through a `..` below an existing docs/actions",
+    );
+}
+
+/// The same `..` hole on the POINTER route, which compares for equality against
+/// the recorded path instead of stripping a prefix — a different comparison,
+/// missed the same way, and the one that covers a checklist whose name the
+/// convention does not recognise.
+#[test]
+fn a_parent_component_in_a_pointer_target_is_cancelled() {
+    let repo = repo();
+    repo.point_at("state/tracker.json");
+
+    for rel in [
+        "state/nested/../tracker.json",
+        "state/../state/tracker.json",
+    ] {
+        let target = repo.root.join(rel);
+        assert!(!target.exists(), "{rel} must be the create case");
+        let env = envelope(
+            &repo.root,
+            "Write",
+            serde_json::json!({ "file_path": &target }),
+        );
+        let outcome = run(&env, &repo.root, &default_config());
+        assert_denied_as_checklist(
+            &outcome,
+            "Write",
+            &format!("a Write of the pointer's target spelled `{rel}`, through a `..`"),
+        );
+    }
+}
+
+// ── A `/proc`-relative cwd (regression) ──────────────────────────────────────
+//
+// The fifth way through the same deny, and the one the round-2 relative-target
+// fix was blind to by construction. That fix joined a target onto the
+// envelope's cwd only when `path.is_absolute()` said it was relative, and
+// `/proc/self/cwd/x` is absolute by every syntactic test while being
+// PROCESS-relative in meaning: the kernel resolves `self` against whichever
+// process asks. The hook is not the process that performs the write, so the
+// gate resolved the spelling against the hook's own working directory while the
+// harness resolved the identical string against the agent's and touched the
+// real file. The same divergence as a bare relative path, wearing a leading
+// slash.
+//
+// `absolutize` now strips the prefix and treats the remainder as relative to
+// the envelope's cwd, which is what the harness will do with it.
+//
+// The fix is purely lexical — `strip_proc_cwd` never stats `/proc` — so this
+// test asserts the same decision on Linux, where the spelling resolves, and on
+// macOS, where `/proc` does not exist at all. That is deliberate rather than
+// incidental: gating it behind `#[cfg(target_os = "linux")]` would make it
+// silently absent on the machine this is developed on, which is close to having
+// no test, and a Linux-only bypass is exactly the kind a developer on macOS
+// would reintroduce without noticing.
+//
+// Without the strip the two platforms fail differently and both fail: on Linux
+// the walk resolves `/proc/self/cwd/docs` to the crate's own `docs/`, on macOS
+// nothing under `/proc` canonicalizes and the spelling survives intact. Neither
+// result is under the fixture's worktree root, so both comparisons miss and the
+// write is allowed.
+
+/// A `/proc`-relative cwd spelling of the checklist is denied, by either route
+/// and for either way of naming a process.
+#[test]
+fn a_proc_cwd_checklist_target_is_denied() {
+    let repo = repo();
+    // Not a conventional name, so the pointer route is the only thing that can
+    // catch the second spelling below.
+    repo.point_at("state/tracker.json");
+
+    for prefix in ["/proc/self/cwd", "/proc/thread-self/cwd", "/proc/4321/cwd"] {
+        for (rel, route) in [
+            ("docs/actions/2026-08-new.checklist.json", "the convention"),
+            ("state/tracker.json", "the pointer"),
+        ] {
+            let spelling = format!("{prefix}/{rel}");
+            // The precondition the bug needs, asserted rather than assumed:
+            // the spelling is absolute, so `absolutize`'s `is_absolute`
+            // short-circuit would return it untouched and the classification
+            // would be decided about a path in some other process's tree.
+            assert!(
+                Path::new(&spelling).is_absolute(),
+                "{spelling} has to be absolute to exercise the short-circuit"
+            );
+
+            let env = envelope(
+                &repo.root,
+                "Write",
+                serde_json::json!({ "file_path": &spelling }),
+            );
+            let outcome = run(&env, &repo.root, &default_config());
+            assert_denied_as_checklist(
+                &outcome,
+                "Write",
+                &format!(
+                    "a Write of `{spelling}`, a checklist by {route} reached through a \
+                     process-relative /proc path"
+                ),
+            );
+        }
+    }
+}
+
 /// A pointer that cannot be parsed leaves the naming convention as the only
 /// route, rather than failing the classification open or shut for everything.
 #[test]

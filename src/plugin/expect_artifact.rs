@@ -52,7 +52,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::DirBuilderExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -60,6 +60,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::git;
 use crate::hashing;
+use crate::plugin::pathnorm::normalize;
 use crate::plugin::atomic;
 use crate::plugin::claim;
 use crate::plugin::scratchpad::{self, now_secs};
@@ -401,25 +402,6 @@ fn resolve_declared(cwd: &Path, root_canon: &Path, target: &str) -> Result<PathB
     }
 
     Ok(resolved)
-}
-
-/// Remove `.` components and resolve `..` textually. Purely lexical: the
-/// caller canonicalizes the existing part afterwards, which is what handles
-/// symlinks.
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 // ── The verb ─────────────────────────────────────────────────────────────────
