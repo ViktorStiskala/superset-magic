@@ -16,6 +16,15 @@ fn cfg(setup: Vec<&str>, teardown: Vec<&str>, run: Vec<&str>) -> Config {
     }
 }
 
+/// A `MagicConfig` with no extras — the shape a fixture wants when it isn't
+/// exercising unknown-key preservation itself.
+fn magic_cfg(files: &[&str]) -> MagicConfig {
+    MagicConfig {
+        files: files.iter().map(|s| s.to_string()).collect(),
+        extras: serde_json::Map::new(),
+    }
+}
+
 #[test]
 fn write_config_json_emits_expected_shape() {
     let dir = fresh();
@@ -181,7 +190,7 @@ fn copy_into_repo_materializes_all_staged_files() {
         &cfg(vec!["./.superset/magic.sh sync"], vec![], vec![]),
     )
     .unwrap();
-    write_magic_json(stage.path(), &[".env".to_string()]).unwrap();
+    write_magic_json(stage.path(), &magic_cfg(&[".env"])).unwrap();
 
     copy_into_repo(stage.path(), dest.path(), &[]).unwrap();
 
@@ -211,7 +220,7 @@ fn copy_into_repo_overwrites_existing_config_json() {
         &cfg(vec!["./.superset/magic.sh sync", "uv sync"], vec![], vec![]),
     )
     .unwrap();
-    write_magic_json(stage.path(), &[".env".to_string()]).unwrap();
+    write_magic_json(stage.path(), &magic_cfg(&[".env"])).unwrap();
 
     let dest_dir = dest.path().join(".superset");
     fs::create_dir_all(&dest_dir).unwrap();
@@ -245,7 +254,7 @@ fn bootstrap_simulation_preserves_teardown_across_rerun() {
     let stage = fresh();
     write_magic_sh(stage.path()).unwrap();
     write_config_json(stage.path(), &merged).unwrap();
-    write_magic_json(stage.path(), &[]).unwrap();
+    write_magic_json(stage.path(), &magic_cfg(&[])).unwrap();
 
     copy_into_repo(stage.path(), dest.path(), &[]).unwrap();
 
@@ -361,7 +370,7 @@ fn write_magic_json_is_pretty_with_trailing_newline_and_round_trips() {
     let dir = fresh();
     let root = dir.path();
     let patterns = vec!["**/.env".to_string(), ".dev.vars".to_string()];
-    write_magic_json(root, &patterns).unwrap();
+    write_magic_json(root, &magic_cfg(&["**/.env", ".dev.vars"])).unwrap();
 
     let raw = fs::read_to_string(root.join(".superset/magic.json")).unwrap();
     assert!(raw.contains('\n'), "expected pretty-printed JSON");
@@ -369,6 +378,121 @@ fn write_magic_json_is_pretty_with_trailing_newline_and_round_trips() {
 
     let result = load_overlaid(root).unwrap().unwrap();
     assert_eq!(result.files, patterns);
+}
+
+/// AE2 — a magic.json written by a newer ss-magic can carry top-level keys
+/// this version doesn't know about (a `plugin` block, plus an arbitrary
+/// future key). The load-modify-write pattern every write path now follows
+/// (read the current file, change just `files` via
+/// `merge_files_into_magic_config`, write back) must not drop them.
+#[test]
+fn ae2_write_magic_json_preserves_unknown_top_level_keys() {
+    let dir = fresh();
+    let root = dir.path();
+    write_magic_json_raw(
+        root,
+        r#"{"files":["**/.env"],"plugin":{"enabled":true,"name":"foo"},"future_key":"stays"}"#,
+    );
+
+    let existing = load_magic_json(root).unwrap();
+    let mut new_files = existing.as_ref().map(|c| c.files.clone()).unwrap_or_default();
+    new_files.push("**/.dev.vars".to_string());
+    let updated = merge_files_into_magic_config(existing.as_ref(), new_files);
+    write_magic_json(root, &updated).unwrap();
+
+    let raw = fs::read_to_string(root.join(".superset/magic.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        value["files"],
+        serde_json::json!(["**/.env", "**/.dev.vars"]),
+        "files must be updated"
+    );
+    assert_eq!(
+        value.get("plugin"),
+        Some(&serde_json::json!({"enabled": true, "name": "foo"})),
+        "plugin block must survive the rewrite"
+    );
+    assert_eq!(
+        value.get("future_key"),
+        Some(&serde_json::json!("stays")),
+        "unrecognized future key must survive the rewrite"
+    );
+}
+
+/// An empty `extras` map (the common case — no unknown keys at all) produces
+/// exactly today's shape: only `files`, nothing else.
+#[test]
+fn write_magic_json_with_empty_extras_matches_files_only_shape() {
+    let dir = fresh();
+    let root = dir.path();
+    let cfg = MagicConfig {
+        files: vec!["**/.env".to_string()],
+        extras: serde_json::Map::new(),
+    };
+    write_magic_json(root, &cfg).unwrap();
+
+    let raw = fs::read_to_string(root.join(".superset/magic.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"files": ["**/.env"]}),
+        "no extras must mean no extra keys in the output"
+    );
+}
+
+/// Two successive load-modify-write round trips through the same unknown
+/// keys keep those keys' values unchanged (order may be normalized by the
+/// underlying map, but content and repeatability must hold).
+#[test]
+fn extras_survive_two_successive_round_trips() {
+    let dir = fresh();
+    let root = dir.path();
+    write_magic_json_raw(
+        root,
+        r#"{"files":["**/.env"],"zeta":"z","alpha":"a"}"#,
+    );
+
+    for next_pattern in ["**/.dev.vars", ".env.local"] {
+        let existing = load_magic_json(root).unwrap();
+        let mut files = existing.as_ref().map(|c| c.files.clone()).unwrap_or_default();
+        files.push(next_pattern.to_string());
+        let updated = merge_files_into_magic_config(existing.as_ref(), files);
+        write_magic_json(root, &updated).unwrap();
+    }
+
+    let raw = fs::read_to_string(root.join(".superset/magic.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        value["files"],
+        serde_json::json!(["**/.env", "**/.dev.vars", ".env.local"])
+    );
+    assert_eq!(value["zeta"], serde_json::json!("z"));
+    assert_eq!(value["alpha"], serde_json::json!("a"));
+}
+
+/// `merge_files_into_magic_config` with `existing: None` (no prior file, the
+/// first-ever init) starts from an empty extras map — nothing to preserve,
+/// nothing fabricated.
+#[test]
+fn merge_files_into_magic_config_with_none_yields_empty_extras() {
+    let merged = merge_files_into_magic_config(None, vec!["**/.env".to_string()]);
+    assert_eq!(merged.files, vec!["**/.env".to_string()]);
+    assert!(merged.extras.is_empty());
+}
+
+/// A malformed magic.json is still a hard error when loaded for the
+/// load-modify-write path — extras preservation must not paper over a
+/// genuinely broken file.
+#[test]
+fn load_magic_json_malformed_returns_clean_error_before_merge() {
+    let dir = fresh();
+    let root = dir.path();
+    write_magic_json_raw(root, "{not json");
+
+    let err = load_magic_json(root).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("magic.json"), "msg: {msg}");
+    assert!(msg.contains("malformed JSON"), "msg: {msg}");
 }
 
 /// empty magic.json files array + non-empty local → local entries appended.

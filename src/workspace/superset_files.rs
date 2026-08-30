@@ -57,14 +57,25 @@ pub struct SetupConfig {
 /// Shape of `.superset/magic.json` (committed) and `.superset/magic.local.json`
 /// (gitignored local overlay).
 ///
-/// Currently holds only `files`; future keys (e.g. per-pattern exclude rules)
-/// should be added here rather than inventing a parallel type.
+/// Named fields hold the keys this version of ss-magic actually understands
+/// (currently just `files`); everything else lands in `extras` (KTD8) via
+/// `#[serde(flatten)]` instead of being dropped. That matters because a
+/// `magic.json` written by a NEWER ss-magic can carry keys this build has
+/// never heard of (e.g. a future `plugin` block) — every writer must
+/// round-trip those keys unchanged rather than silently deleting
+/// configuration it doesn't recognize. Add a new known key as its own named
+/// field rather than reaching into `extras` for it, so future units (typing
+/// a `plugin` field, `config set`/`enable`/`disable`) build on this
+/// unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MagicConfig {
     /// Glob patterns for files to sync from main into worktrees.
     #[serde(default)]
     pub files: Vec<String>,
-    // Future keys go here.
+    /// Every top-level key this build of ss-magic has no named field for.
+    /// Serialized back out verbatim alongside `files` on every write.
+    #[serde(flatten)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Read and overlay `.superset/magic.json` with `.superset/magic.local.json`.
@@ -106,24 +117,55 @@ pub fn load_overlaid(root: &Path) -> Result<Option<MagicConfig>> {
         }
     }
 
+    // Merge extras (KTD8) per the rule documented above: local's value wins
+    // per key; a key present only in base is kept as-is.
+    let mut merged_extras = base.extras.clone();
+    for (key, value) in &local.extras {
+        merged_extras.insert(key.clone(), value.clone());
+    }
+
     Ok(Some(MagicConfig {
         files: merged_files,
+        extras: merged_extras,
     }))
 }
 
-/// Rewrite `.superset/magic.json` from `files`, pretty-printed with a
-/// trailing newline.
-// consumed by U9
-#[allow(dead_code)]
-pub fn write_magic_json(root: &Path, files: &[String]) -> Result<()> {
+/// Rewrite `.superset/magic.json` from `cfg` (including whatever it carries
+/// in `extras`), pretty-printed with a trailing newline.
+///
+/// This is the plain writer — it serializes exactly what `cfg` holds. It does
+/// NOT itself preserve anything: a caller updating `files` on top of an
+/// existing on-disk file must first load that file and carry its `extras`
+/// forward (see [`merge_files_into_magic_config`]), the same
+/// load-modify-write discipline `merge_setup_into_config` already uses for
+/// `config.json`.
+pub fn write_magic_json(root: &Path, cfg: &MagicConfig) -> Result<()> {
     ensure_superset_dir(root)?;
     let path = superset_dir(root).join(MAGIC_JSON);
-    let cfg = MagicConfig {
-        files: files.to_vec(),
-    };
-    let body = format!("{}\n", serde_json::to_string_pretty(&cfg)?);
+    let body = format!("{}\n", serde_json::to_string_pretty(cfg)?);
     fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// Build a fresh `MagicConfig` with `new_files`, carrying forward the
+/// unknown top-level keys (KTD8) from `existing`, if any. Mirrors
+/// `merge_setup_into_config`'s preservation discipline for `config.json`:
+/// every write path (init, migrate, edit-config) loads the current on-disk
+/// `magic.json`, calls this to change just `files`, then writes the result —
+/// never rebuilding a `MagicConfig` from parts alone, which would silently
+/// drop any key this build doesn't have a named field for.
+pub fn merge_files_into_magic_config(
+    existing: Option<&MagicConfig>,
+    new_files: Vec<String>,
+) -> MagicConfig {
+    let extras = match existing {
+        Some(cfg) => cfg.extras.clone(),
+        None => serde_json::Map::new(),
+    };
+    MagicConfig {
+        files: new_files,
+        extras,
+    }
 }
 
 /// Default patterns included in every freshly-written `magic.json`.

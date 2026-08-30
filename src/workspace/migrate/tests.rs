@@ -396,7 +396,14 @@ fn copy_into_repo_materializes_magic_layout_and_deletes_setup_sh() {
 
     // Stage the new layout.
     let stage = fresh();
-    superset_files::write_magic_json(stage.path(), &["**/.env".to_string()]).unwrap();
+    superset_files::write_magic_json(
+        stage.path(),
+        &superset_files::MagicConfig {
+            files: vec!["**/.env".to_string()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
     superset_files::write_magic_sh(stage.path()).unwrap();
     superset_files::write_config_json(
         stage.path(),
@@ -537,6 +544,75 @@ fn stage_migration_without_setup_config_yields_empty_files() {
         .unwrap()
         .unwrap();
     assert!(staged_magic.files.is_empty());
+}
+
+/// `stage_migration` preserves unknown top-level keys (KTD8) already present
+/// in the repo's `magic.json` — the half-migrated case (both the old
+/// setup.sh marker and the new magic.sh marker present) can already have one.
+#[test]
+fn stage_migration_preserves_existing_magic_json_unknown_keys() {
+    let repo = fresh();
+    let dot = repo.path().join(".superset");
+    fs::create_dir_all(&dot).unwrap();
+    fs::write(dot.join("setup.sh"), "#!/bin/bash\n").unwrap();
+    fs::write(
+        dot.join("config.json"),
+        r#"{"setup":["./.superset/setup.sh"],"teardown":[],"run":[]}"#,
+    )
+    .unwrap();
+    fs::write(
+        dot.join("magic.json"),
+        r#"{"files":["**/.env"],"plugin":{"enabled":true}}"#,
+    )
+    .unwrap();
+    let existing = superset_files::load_config(repo.path())
+        .unwrap()
+        .unwrap();
+
+    let stage = fresh();
+    stage_migration(repo.path(), stage.path(), &existing).unwrap();
+
+    let raw = fs::read_to_string(stage.path().join(".superset/magic.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        value.get("plugin"),
+        Some(&serde_json::json!({"enabled": true})),
+        "plugin block must survive migration staging"
+    );
+}
+
+/// The edit-config path is `run_init` reused verbatim (see `tui/menu.rs`),
+/// and `run_init_noninteractive` shares its exact staging logic
+/// (`merge_files_into_magic_config`). Covering the non-interactive path
+/// covers the shared mechanism `run_init`/edit-config relies on without
+/// driving the interactive picker prompts.
+#[test]
+fn run_init_noninteractive_preserves_unknown_top_level_keys() {
+    let repo = fresh();
+    fs::create_dir_all(repo.path().join(".superset")).unwrap();
+    fs::write(
+        repo.path().join(".superset/magic.json"),
+        r#"{"files":["**/.env"],"plugin":{"enabled":true,"name":"foo"},"future_key":"stays"}"#,
+    )
+    .unwrap();
+
+    run_init_noninteractive(repo.path(), &["**/.dev.vars".to_string()]).unwrap();
+
+    let raw = fs::read_to_string(repo.path().join(".superset/magic.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        value.get("plugin"),
+        Some(&serde_json::json!({"enabled": true, "name": "foo"})),
+        "plugin block must survive `ss-magic init` re-run"
+    );
+    assert_eq!(
+        value.get("future_key"),
+        Some(&serde_json::json!("stays")),
+        "unrecognized future key must survive `ss-magic init` re-run"
+    );
+    let files = value["files"].as_array().unwrap();
+    let files: Vec<&str> = files.iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(files.contains(&"**/.dev.vars"), "files: {files:?}");
 }
 
 // ── build_pattern_options ───────────────────────────────────────────────

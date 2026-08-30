@@ -203,7 +203,12 @@ fn stage_migration(repo_root: &Path, stage_root: &Path, existing: &Config) -> Re
     let files = superset_files::load_setup_config(repo_root)?
         .map(|c| c.files)
         .unwrap_or_default();
-    superset_files::write_magic_json(stage_root, &files)?;
+    // Preserve any unknown top-level keys (KTD8) already sitting in
+    // magic.json — a repo mid-migration (both the old setup.sh marker and
+    // the new magic.sh marker present in `setup`) can already have one.
+    let existing_magic = superset_files::load_magic_json(repo_root)?;
+    let magic_cfg = superset_files::merge_files_into_magic_config(existing_magic.as_ref(), files);
+    superset_files::write_magic_json(stage_root, &magic_cfg)?;
 
     // magic.sh wrapper.
     superset_files::write_magic_sh(stage_root)?;
@@ -389,9 +394,13 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
     // ---- Capture decisions. Nothing written to repo_root yet. ----
 
     // Read existing base magic.json (absent → empty). Custom patterns are
-    // preserved via build_pattern_options so they survive an edit-config rewrite.
-    let existing_magic_files: Vec<String> = superset_files::load_magic_json(repo_root)?
-        .map(|m| m.files)
+    // preserved via build_pattern_options so they survive an edit-config rewrite;
+    // any unknown top-level keys (KTD8) are carried forward below via
+    // `merge_files_into_magic_config` so this same rewrite never drops them.
+    let existing_magic = superset_files::load_magic_json(repo_root)?;
+    let existing_magic_files: Vec<String> = existing_magic
+        .as_ref()
+        .map(|m| m.files.clone())
         .unwrap_or_default();
 
     // Precompute filesystem hits for the preconfigured OPTIONS.
@@ -423,7 +432,8 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
         .tempdir()
         .context("creating init staging tempdir")?;
     let stage_root = staging.path();
-    superset_files::write_magic_json(stage_root, &files)?;
+    let magic_cfg = superset_files::merge_files_into_magic_config(existing_magic.as_ref(), files);
+    superset_files::write_magic_json(stage_root, &magic_cfg)?;
     superset_files::write_magic_sh(stage_root)?;
     let merged =
         superset_files::merge_setup_into_config(existing, vec![MAGIC_WRAPPER_ENTRY.to_string()]);
@@ -459,7 +469,8 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
 /// finishing-action prompt. Files land on disk uncommitted (equivalent to the
 /// interactive "Done" action); no git operations run. Patterns are seeded into
 /// `magic.json` `files` alongside the defaults (`.superset/magic.local.json`),
-/// deduped. An existing `magic.local.json` is preserved, not clobbered.
+/// deduped. An existing `magic.local.json` is preserved, not clobbered. Any
+/// unknown top-level keys (KTD8) already in `magic.json` survive the rewrite.
 pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<ExitCode> {
     let files = init_magic_files(patterns);
 
@@ -468,7 +479,9 @@ pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<
         .tempdir()
         .context("creating init staging tempdir")?;
     let stage_root = staging.path();
-    superset_files::write_magic_json(stage_root, &files)?;
+    let existing_magic = superset_files::load_magic_json(repo_root)?;
+    let magic_cfg = superset_files::merge_files_into_magic_config(existing_magic.as_ref(), files);
+    superset_files::write_magic_json(stage_root, &magic_cfg)?;
     superset_files::write_magic_sh(stage_root)?;
     let existing = superset_files::load_config(repo_root)?;
     let merged = superset_files::merge_setup_into_config(

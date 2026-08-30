@@ -29,7 +29,10 @@ fn init_repo() -> TempDir {
 fn write_magic(root: &Path, patterns: &[&str]) {
     fs::create_dir_all(root.join(".superset")).unwrap();
     let files: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
-    let cfg = superset_files::MagicConfig { files };
+    let cfg = superset_files::MagicConfig {
+        files,
+        ..Default::default()
+    };
     let body = format!("{}\n", serde_json::to_string_pretty(&cfg).unwrap());
     fs::write(root.join(".superset/magic.json"), body).unwrap();
 }
