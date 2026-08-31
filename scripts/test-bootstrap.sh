@@ -206,6 +206,35 @@ run_wrapper() {
     RC=$?
 }
 
+# The hook shim, run the way the harness runs it: `bash <root>/hooks/run-hook.sh
+# <event>`. SHIM_DATA empty means CLAUDE_PLUGIN_DATA is absent from the
+# environment, which is the reload/first-session case the shim exists for.
+run_shim() { # event
+    : >"$sb/sout"; : >"$sb/serr"
+    if [ -n "${SHIM_DATA:-}" ]; then
+        env -i PATH="/usr/bin:/bin" HOME="$sb/home" TMPDIR="$sb/tmp" \
+            CLAUDE_PLUGIN_DATA="$SHIM_DATA" \
+            SS_MAGIC_FAKE_LOG="$sb/fakebin.log" \
+            bash "$sb/plugin/hooks/run-hook.sh" "$@" >"$sb/sout" 2>"$sb/serr"
+    else
+        env -i PATH="/usr/bin:/bin" HOME="$sb/home" TMPDIR="$sb/tmp" \
+            SS_MAGIC_FAKE_LOG="$sb/fakebin.log" \
+            bash "$sb/plugin/hooks/run-hook.sh" "$@" >"$sb/sout" 2>"$sb/serr"
+    fi
+    RC=$?
+}
+
+# The shim's whole contract in one place: it never breaks a session and it never
+# says anything. Stdout silence is load-bearing (a SessionStart hook's stdout
+# enters the model's context); stderr silence is what separates it from the
+# wrapper, since PreToolUse fires on nearly every tool call.
+assert_shim_inert() { # label
+    assert_eq 0 "$RC" "$1: exit status is 0"
+    assert_eq 0 "$(wc -c <"$sb/sout" | tr -d ' ')" "$1: stdout is empty"
+    assert_eq 0 "$(wc -c <"$sb/serr" | tr -d ' ')" "$1: stderr is empty"
+    assert_eq "" "$(cat "$sb/fakebin.log")" "$1: the binary was not invoked"
+}
+
 stderr_lines() { wc -l <"$sb/err" | tr -d ' '; }
 stdout_bytes() { wc -c <"$sb/out" | tr -d ' '; }
 archive_fetches() { grep -c 'tar\.gz$' "$sb/curl.log" 2>/dev/null | tr -d ' '; }
@@ -434,9 +463,28 @@ for g in other:
     m = g.get("matcher")
     assert m is None or all(s in m for s in ("resume", "clear", "compact", "fork")), (
         "the ss-magic session-start handler must still fire on compact")
+
+# The manifest invariant, over EVERY entry rather than the bootstrap alone.
+# A command naming ${CLAUDE_PLUGIN_DATA} is a path the bootstrap creates at
+# runtime, so on a first install the harness posix_spawns something that is not
+# there yet and the session dies with ENOENT instead of running inert (R77).
+# Fail-open has to live in a shim that always exists, not inside the artifact
+# that may be missing. This assertion used to cover the bootstrap group only,
+# which is exactly why the other five drifted.
+for ev, egroups in spec["hooks"].items():
+    for g in egroups:
+        for h in g["hooks"]:
+            c = h["command"]
+            assert "CLAUDE_PLUGIN_DATA" not in c, (
+                f"{ev}: command names a runtime-created artifact ({c}); "
+                "spawn a ${CLAUDE_PLUGIN_ROOT} script instead")
+            assert c == "bash", f"{ev}: command is {c!r}, expected the exec form 'bash'"
+            a0 = h.get("args", [None])[0]
+            assert isinstance(a0, str) and a0.startswith("${CLAUDE_PLUGIN_ROOT}/"), (
+                f"{ev}: args[0] is {a0!r}; it must be a path under the plugin root")
 print("ok")
 PY
-    then pass "AE64: bootstrap runs on startup only; the handler still covers compact"
+    then pass "AE64: startup-only bootstrap, compact-covering handler, no runtime-path commands"
     else fail "AE64: hooks.json wiring is wrong (see above)"
     fi
 else
@@ -515,6 +563,48 @@ printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic.version"
 run_bootstrap
 assert_never_fails_session "AE67 second install"
 assert_eq 0 "$(stderr_lines)" "AE67: a later successful install is silent"
+
+# ==========================================================================
+# AE9 - the hook shim is inert when the pinned binary is absent
+#
+# The case that shipped broken: hooks.json used to name the binary directly, so
+# a first session posix_spawned a path the bootstrap had not created yet and the
+# user saw ENOENT. R77 and AE9 both specify "inert", and nothing tested it -
+# every Rust test exercises the binary BY RUNNING IT, so none of them can observe
+# the state where it is missing.
+# ==========================================================================
+current_case="AE9 no binary installed at all"
+new_sandbox ae9 0.10.0
+: >"$sb/fakebin.log"
+SHIM_DATA="" run_shim pre-tool-use
+assert_shim_inert "AE9 (no handoff, no binary)"
+
+current_case="AE9 CLAUDE_PLUGIN_DATA set but nothing installed there"
+: >"$sb/fakebin.log"
+SHIM_DATA="$sb/data" run_shim session-start
+assert_shim_inert "AE9 (data dir set, binary absent)"
+
+current_case="AE9 execs the installed binary through the handoff"
+publish_release 0.10.0
+run_bootstrap
+: >"$sb/fakebin.log"
+SHIM_DATA="" run_shim pre-tool-use
+assert_eq 0 "$RC" "AE9: exits 0 with the binary present"
+assert_eq "plugin hook pre-tool-use" "$(cat "$sb/fakebin.log")" "AE9: execs with exactly 'plugin hook <event>'"
+assert_eq 0 "$(wc -c <"$sb/sout" | tr -d ' ')" "AE9: the shim itself adds nothing to stdout"
+
+current_case="AE9 handoff removed after install"
+shim_root="/tmp/ss-magic-plugin/$SB_ID"
+[ -d "$shim_root" ] || shim_root="$sb/tmp/ss-magic-plugin/$SB_ID"
+rm -f "$shim_root/data-root"
+: >"$sb/fakebin.log"
+SHIM_DATA="" run_shim session-end
+assert_shim_inert "AE9 (handoff removed)"
+
+current_case="AE9 no event argument"
+: >"$sb/fakebin.log"
+SHIM_DATA="$sb/data" run_shim
+assert_shim_inert "AE9 (missing event token)"
 
 # ==========================================================================
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$passed" "$failed"

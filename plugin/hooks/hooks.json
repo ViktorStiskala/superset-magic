@@ -17,8 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_DATA}/bin/ss-magic",
-            "args": ["plugin", "hook", "session-start"],
+            "command": "bash",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh", "session-start"],
             "timeout": 10
           }
         ]
@@ -30,8 +30,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_DATA}/bin/ss-magic",
-            "args": ["plugin", "hook", "pre-tool-use"],
+            "command": "bash",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh", "pre-tool-use"],
             "timeout": 5
           }
         ]
@@ -43,8 +43,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_DATA}/bin/ss-magic",
-            "args": ["plugin", "hook", "pre-compact"],
+            "command": "bash",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh", "pre-compact"],
             "timeout": 10
           }
         ]
@@ -55,8 +55,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_DATA}/bin/ss-magic",
-            "args": ["plugin", "hook", "subagent-stop"],
+            "command": "bash",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh", "subagent-stop"],
             "timeout": 10
           }
         ]
@@ -67,8 +67,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_DATA}/bin/ss-magic",
-            "args": ["plugin", "hook", "session-end"]
+            "command": "bash",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh", "session-end"]
           }
         ]
       }

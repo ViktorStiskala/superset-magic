@@ -467,6 +467,19 @@ status` is the one place that reports both, plus whether the state tree is
 gitignored, whether the binary arrived, and whether its version matches the
 plugin's pin – run it first whenever nothing seems to be happening.
 
+**The first session after installing does nothing, and that is expected.** The
+plugin ships without a binary; a `SessionStart` hook fetches the pinned release
+in the background. Hooks on one event run at the same time, so that first session
+is already underway before the download lands, and every ss-magic hook is
+deliberately inert for it – silently, without failing anything. Start a new
+session and the plugin is live.
+
+For the same reason, `/reload-plugins` alone is not enough after a fresh install
+or a version bump. It re-registers the plugin, but it emits no session-start
+event, so nothing fetches the binary: the plugin stays inert until the next real
+session. `ss-magic plugin status` tells you which of the two you are looking at –
+it reports whether the binary arrived and whether its version matches the pin.
+
 ### Verbs
 
 ```plaintext
