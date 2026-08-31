@@ -88,7 +88,10 @@ pub(crate) fn init_main_repo(branch: &str) -> TempDir {
 pub(crate) fn write_magic(root: &Path, patterns: &[&str]) {
     fs::create_dir_all(root.join(".superset")).unwrap();
     let files: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
-    let cfg = crate::workspace::superset_files::MagicConfig { files };
+    let cfg = crate::workspace::superset_files::MagicConfig {
+        files,
+        ..Default::default()
+    };
     let body = format!("{}\n", serde_json::to_string_pretty(&cfg).unwrap());
     fs::write(root.join(".superset/magic.json"), body).unwrap();
 }

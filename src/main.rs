@@ -6,7 +6,9 @@ use anyhow::{Context, Result};
 
 mod cli;
 mod git;
+mod hashing;
 mod pack;
+mod plugin;
 mod sync;
 mod tui;
 mod update;
@@ -40,6 +42,14 @@ use crate::cli::{Command, Parsed};
 /// `Command::Pack` and `Command::ReverseSync` are gated alongside `Bare`/`Sync`:
 /// each is a non-interactive "do work" command, so gating keeps their users
 /// self-updating.
+///
+/// `ss-magic plugin` is absent from `Command` altogether — it parses to
+/// `Parsed::Plugin` and is dispatched before this helper is ever reached, so no
+/// plugin invocation can self-update. That is deliberate rather than an
+/// oversight: the marketplace ships the binary together with the skills, hooks
+/// and Markdown that describe its behavior, and a mid-session swap would leave
+/// the two disagreeing. Keep this an INCLUSION list; adding a plugin arm here,
+/// or inverting it to exclusions, would silently reintroduce the update.
 pub fn should_run_update_gate(cmd: Command, guard_active: bool) -> bool {
     if guard_active {
         return false;
@@ -51,13 +61,32 @@ pub fn should_run_update_gate(cmd: Command, guard_active: bool) -> bool {
 }
 
 fn run() -> Result<ExitCode> {
-    tui::style::init();
-    // Composition order: tui::style::init (above) → parse argv → [help check] →
-    // [auto-update gate for Bare/Sync] → dispatch (menu / sync / update).
-    // Parsing and the help response happen before the gate so `--help`
-    // answers instantly without a network call.
+    // Composition order: parse argv → style init → [help check] → [auto-update
+    // gate for Bare/Sync] → dispatch (menu / sync / update). Parsing and the
+    // help response happen before the gate so `--help` answers instantly
+    // without a network call.
+    //
+    // Style is initialized AFTER the parse, and skipped entirely for the plugin
+    // verb tree. The color decision lives in a `OnceLock`, so whichever call
+    // makes it first wins for the whole process — and a `plugin hook` verb must
+    // force color off, because it answers the harness with JSON on stdout and
+    // an ANSI escape would make that unparseable. `plugin::run` therefore makes
+    // the choice itself, once it knows whether it is serving the harness or a
+    // person. Nothing between the parse and that point prints anything.
     let args: Vec<String> = env::args().skip(1).collect();
-    match cli::parse(&args) {
+    let parsed = cli::parse(&args);
+    if !matches!(parsed, Parsed::Plugin(_)) {
+        tui::style::init();
+    }
+
+    match parsed {
+        // `--version`/`-V`: answer and stop. No network call, no dispatch —
+        // a hook shelling out to identify the binary must not trip an update
+        // or a menu.
+        Parsed::Version => {
+            println!("{}", version_line());
+            Ok(ExitCode::SUCCESS)
+        }
         Parsed::Help => {
             println!("{}", cli::usage());
             Ok(ExitCode::SUCCESS)
@@ -73,6 +102,11 @@ fn run() -> Result<ExitCode> {
         // Non-interactive init (AN1): seed the layout from CLI patterns. Not
         // gated — one-time setup shouldn't depend on a network round-trip.
         Parsed::Init(patterns) => init_noninteractive(&patterns),
+        // The plugin verb tree. Handled here, in a sibling arm of the update
+        // gate rather than inside it, so no plugin invocation ever self-updates
+        // or opens the TUI. It is also the one arm that reaches this match with
+        // style still uninitialized, per the note above.
+        Parsed::Plugin(plugin_args) => plugin::run(&plugin_args),
         Parsed::Command(cmd) => {
             // U8: run the daily-cache auto-update gate before any work for
             // `Bare` and `Sync`. On a "newer" verdict, `auto_update` swaps the
@@ -84,6 +118,29 @@ fn run() -> Result<ExitCode> {
             }
             dispatch(cmd)
         }
+    }
+}
+
+/// The single line `ss-magic --version` prints. Sourced from `Cargo.toml` at
+/// compile time so it can never drift from the released version the self-update
+/// path keys on.
+pub fn version_line() -> String {
+    format!("ss-magic {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Why the interactive menu cannot open, or `None` when it can.
+///
+/// The menu takes over the terminal for arrow-key selection, so both ends have
+/// to be a real tty: with stdin redirected it would read a prompt answer out of
+/// whatever is being piped in, and with stdout redirected it would write escape
+/// sequences into a file and appear to hang. Split from the `IsTerminal` probe
+/// so the decision is unit-testable without allocating a pty.
+pub fn menu_blocked_reason(stdin_tty: bool, stdout_tty: bool) -> Option<&'static str> {
+    match (stdin_tty, stdout_tty) {
+        (true, true) => None,
+        (false, true) => Some("stdin is not a terminal"),
+        (true, false) => Some("stdout is not a terminal"),
+        (false, false) => Some("neither stdin nor stdout is a terminal"),
     }
 }
 
@@ -108,12 +165,32 @@ fn init_noninteractive(patterns: &[String]) -> Result<ExitCode> {
 }
 
 /// Route a parsed command to its handler. `Bare` routes to the
-/// location-aware operation menu (U10); `Sync`/`Update` route to their
-/// respective handlers.
+/// location-aware operation menu (U10) once both terminal ends check out;
+/// `Sync`/`Update` route to their respective handlers.
 fn dispatch(cmd: Command) -> Result<ExitCode> {
     let cwd = env::current_dir().context("getting current directory")?;
     match cmd {
-        Command::Bare => tui::menu::run(&cwd),
+        Command::Bare => {
+            use std::io::IsTerminal;
+            if let Some(reason) =
+                menu_blocked_reason(std::io::stdin().is_terminal(), std::io::stdout().is_terminal())
+            {
+                eprintln!(
+                    "{}",
+                    tui::style::err(format!(
+                        "error: cannot open the interactive menu — {reason}."
+                    ))
+                );
+                eprintln!(
+                    "{}",
+                    tui::style::info(
+                        "Run `ss-magic --help` for the non-interactive commands."
+                    )
+                );
+                return Ok(ExitCode::from(2));
+            }
+            tui::menu::run(&cwd)
+        }
         Command::Sync { no_backup } => run_sync_flow(&cwd, no_backup),
         Command::ReverseSync { no_backup } => run_reverse_sync_flow(&cwd, no_backup),
         Command::Pack => run_pack_flow(&cwd),
@@ -182,7 +259,7 @@ fn print_pack_event(ev: &pack::PackEvent) {
             println!();
             println!(
                 "{}",
-                tui::style::ok(format!("Packed {count} entries → {}", real.display()))
+                tui::style::ok(format!("Packed {count} files → {}", real.display()))
             );
             println!(
                 "{}",

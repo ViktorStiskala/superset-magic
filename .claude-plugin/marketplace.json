@@ -1,0 +1,16 @@
+{
+  "name": "ss-magic",
+  "owner": { "name": "Viktor Stiskala" },
+  "description": "The ss-magic plugin for the Superset workspace contract: durable session scratchpad, context page-fault gate, operator checklist, and cost ledger",
+  "plugins": [
+    {
+      "name": "ss-magic",
+      "source": {
+        "source": "archive",
+        "url": "https://github.com/ViktorStiskala/superset-magic/releases/download/v0.10.0/ss-magic-plugin-v0.10.0.zip",
+        "sha256": "ba623616b89eb014e1733ebe4d938c41aa3c818c1059b284547a9d0afee2a940"
+      },
+      "description": "Session scratchpad, context page-fault gate, operator checklist, and cost ledger for the Superset workspace contract"
+    }
+  ]
+}

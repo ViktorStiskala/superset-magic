@@ -282,3 +282,119 @@ fn duplicate_match_across_patterns_is_deduplicated() {
         "only one Copy event for a deduped match"
     );
 }
+
+// ── Excluded state trees (whole-tree enumeration filter) ────────────────
+
+/// AE86. A bare `.superset` LITERAL in a repository's `files` list never
+/// reaches `walk_source` — `expand_patterns` appends the rel directly — so the
+/// copy walk is the only place left to guard. It must copy the contract files
+/// into the worktree and nothing from the two state trees underneath.
+#[test]
+fn bare_superset_literal_copies_contract_files_but_not_state_trees() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write(src.path(), ".superset/config.json", "{}\n");
+    write(src.path(), ".superset/magic.sh", "#!/bin/sh\n");
+    write(src.path(), ".superset/magic.json", "{\"files\":[]}\n");
+    write(src.path(), ".superset/.magic/state.json", "{\"token\":\"s3cret\"}\n");
+    write(
+        src.path(),
+        ".superset/backups/20260101-000000/worktree/.env",
+        "RECOVERED=1\n",
+    );
+
+    let (summary, _) = collect(src.path(), dest.path(), &[".superset"]);
+    assert_eq!(summary.skipped, 0);
+    for want in [
+        ".superset/config.json",
+        ".superset/magic.sh",
+        ".superset/magic.json",
+    ] {
+        assert!(dest.path().join(want).is_file(), "{want} must be copied");
+    }
+    assert!(
+        !dest.path().join(".superset/.magic").exists(),
+        "the plugin state tree must never be copied into the worktree"
+    );
+    assert!(
+        !dest.path().join(".superset/backups").exists(),
+        "the backups tree must never be copied into the worktree"
+    );
+}
+
+/// AE18. A `.superset/**` glob would otherwise match paths inside the plugin's
+/// state tree. `walk_source` must never yield them, whatever the pattern's
+/// breadth, while `.superset/magic.json` still syncs.
+#[test]
+fn glob_over_superset_skips_the_magic_state_tree() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write(src.path(), ".superset/magic.json", "{\"files\":[]}\n");
+    write(src.path(), ".superset/.magic/state.json", "{\"token\":\"s3cret\"}\n");
+    write(src.path(), ".superset/.magic/nested/more.json", "{}\n");
+
+    let (_, events) = collect(src.path(), dest.path(), &[".superset/**"]);
+    let copied = copy_events_of(&events);
+    assert!(
+        copied.contains(&Path::new(".superset/magic.json")),
+        "the contract file must still sync: {copied:?}"
+    );
+    assert!(
+        !copied.iter().any(|p| p.starts_with(".superset/.magic")),
+        "the state tree must not be enumerated: {copied:?}"
+    );
+    assert!(!dest.path().join(".superset/.magic").exists());
+}
+
+/// A broad `**` sweep must skip every excluded tree — including `.git` and the
+/// third-party `.scratchpad/` — while ordinary files still copy.
+#[test]
+fn broad_glob_skips_every_excluded_tree() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write(src.path(), "keep.txt", "keep\n");
+    write(src.path(), ".git/config", "[core]\n");
+    write(src.path(), ".scratchpad/notes.md", "scratch\n");
+    write(src.path(), ".superset/.magic/state.json", "{}\n");
+    write(
+        src.path(),
+        ".superset/backups/20260101-000000/main/.env",
+        "R=1\n",
+    );
+
+    let (_, events) = collect(src.path(), dest.path(), &["**"]);
+    let copied = copy_events_of(&events);
+    assert!(copied.contains(&Path::new("keep.txt")), "got {copied:?}");
+    for forbidden in [".git", ".scratchpad", ".superset/.magic", ".superset/backups"] {
+        assert!(
+            !copied.iter().any(|p| p.starts_with(forbidden)),
+            "{forbidden} must not be enumerated: {copied:?}"
+        );
+        assert!(
+            !dest.path().join(forbidden).exists(),
+            "{forbidden} must not be copied into the destination"
+        );
+    }
+}
+
+/// The whole-tree exclusion is keyed on the exact component path: a sibling
+/// `.superset/.magicked/`, a sibling `.superset/backupsfoo/`, and a root-level
+/// file named `.magic` are ordinary files that must still sync.
+#[test]
+fn excluded_trees_match_exact_components_not_prefixes() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write(src.path(), ".superset/.magicked/keep.txt", "keep\n");
+    write(src.path(), ".superset/backupsfoo/keep.txt", "keep\n");
+    write(src.path(), ".magic", "root-level file\n");
+
+    let (summary, _) = collect(src.path(), dest.path(), &["**"]);
+    assert_eq!(summary.skipped, 0);
+    for want in [
+        ".superset/.magicked/keep.txt",
+        ".superset/backupsfoo/keep.txt",
+        ".magic",
+    ] {
+        assert!(dest.path().join(want).is_file(), "{want} must be copied");
+    }
+}

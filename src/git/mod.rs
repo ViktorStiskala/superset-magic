@@ -282,7 +282,33 @@ pub fn is_ignored(repo_root: &Path, rel: &Path) -> Result<bool> {
 /// (no slash, dir absent) is treated as a file and MISSES it. Exit 0 → ignored,
 /// exit 1 → not ignored, any other exit is a real error.
 pub fn is_ignored_str(repo_root: &Path, rel_str: &str) -> Result<bool> {
-    let out = git_raw(&["check-ignore", "-q", "--", rel_str], Some(repo_root))?;
+    check_ignore(repo_root, rel_str, false)
+}
+
+/// Like [`is_ignored_str`], but asking ONLY what the `.gitignore` rules say —
+/// `--no-index` makes git skip its "is this already in the index?" shortcut.
+///
+/// The difference is not academic. By default `git check-ignore` reports a path
+/// as NOT ignored once anything at or under it is tracked, whatever the rules
+/// say, so a repository that committed one file inside an otherwise-ignored
+/// directory makes the whole directory read as unignored. The plugin's state
+/// tree asks the rules-only question ("would a file created here be invisible
+/// to git?") because it answers the tracked question separately and positively,
+/// via [`tracked_files`].
+pub fn is_ignored_no_index_str(repo_root: &Path, rel_str: &str) -> Result<bool> {
+    check_ignore(repo_root, rel_str, true)
+}
+
+/// Shared body of the two ignore probes: exit 0 → ignored, exit 1 → not
+/// ignored, anything else (an unreadable repo, a pathspec that crosses a
+/// symlink) is a real error carrying git's own message.
+fn check_ignore(repo_root: &Path, rel_str: &str, no_index: bool) -> Result<bool> {
+    let mut args: Vec<&str> = vec!["check-ignore", "-q"];
+    if no_index {
+        args.push("--no-index");
+    }
+    args.extend_from_slice(&["--", rel_str]);
+    let out = git_raw(&args, Some(repo_root))?;
     match out.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -307,67 +333,72 @@ pub fn tracked_files(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<PathBuf
     Ok(parse_ls_files_z(&git(&args, Some(repo_root))?))
 }
 
-/// Resolve the `.gitignore` rule that COVERS `rel` in the working tree rooted
-/// at `repo_root`, via `git check-ignore -v --no-index -- <rel>`.
+/// `git status --porcelain -- <pathspecs>`, parsed into `(status, path)` pairs.
 ///
-/// Returns `Ok(Some(pattern))` when a rule matches (the bare pattern text,
-/// e.g. `**/.dev.vars`), `Ok(None)` when no rule covers the path.
-///
-/// `-v` prints `<source>:<line>:<pattern>\t<pathname>`. We parse the pattern
-/// out of the colon-delimited prefix before the tab. `--no-index` makes the
-/// check independent of whether the path is tracked, so a covering rule is
-/// found even for a path that git would otherwise consider already tracked.
-///
-/// A leading `!` (negation) pattern means the path is explicitly *un*-ignored;
-/// such a match is reported as `None` so the caller falls back to the literal
-/// path rather than copying a negation rule into main.
-// consumed by U11 (gitignore::find_covering_rule)
-pub fn check_ignore_pattern(repo_root: &Path, rel: &Path) -> Result<Option<String>> {
-    let rel_str = rel
-        .to_str()
-        .with_context(|| format!("non-UTF-8 path: {}", rel.display()))?;
-    let out = git_raw(
-        &["check-ignore", "-v", "--no-index", "--", rel_str],
-        Some(repo_root),
-    )?;
-    match out.status.code() {
-        // 0 → matched; parse the pattern. 1 → no match. Other → error.
-        Some(1) => return Ok(None),
-        Some(0) => {}
-        _ => {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            bail!("`git check-ignore -v --no-index -- {rel_str}` failed: {stderr}");
-        }
+/// Porcelain v1's short format is two status letters — index state, then
+/// worktree state — followed by a space and the path; stable across git
+/// versions and plain enough to read without a diff parser. Used by the
+/// `PreToolUse[Bash]` commit nudge (R91) to tell a checklist that is staged
+/// from one that only has local, unstaged edits, or none at all. An empty
+/// `pathspecs` would list the whole repository rather than nothing, which no
+/// caller here wants, so it short-circuits to an empty result instead.
+pub fn status_porcelain(repo_root: &Path, pathspecs: &[&str]) -> Result<Vec<(String, PathBuf)>> {
+    if pathspecs.is_empty() {
+        return Ok(Vec::new());
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout.lines().next().unwrap_or("").trim_end();
-    Ok(parse_check_ignore_line(line))
+    let mut args: Vec<&str> = vec!["status", "--porcelain", "--"];
+    args.extend_from_slice(pathspecs);
+    // NOT the shared `git` helper: its blanket `.trim()` is meant for a single
+    // trimmed value and would eat the leading space of the FIRST line here —
+    // porcelain's index column is a literal space when a file is modified
+    // only in the worktree, so trimming it shifts every field on that line by
+    // one and corrupts both the code and the path. `git_raw` keeps the output
+    // untouched; only the surrounding whole-output whitespace (a trailing
+    // newline) is stripped, never a line's own leading column.
+    let out = git_raw(&args, Some(repo_root))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        bail!("`git {}` failed: {stderr}", args.join(" "));
+    }
+    // `str::lines()` only splits on line boundaries (stripping a trailing
+    // `\r` before an `\n`, same as `.trim()` would, but nothing else) — it
+    // never touches a line's own leading or trailing content the way `.trim()`
+    // on the whole string would.
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let code = line.get(0..2)?.to_string();
+            let path = line.get(3..)?;
+            (!path.is_empty()).then(|| (code, PathBuf::from(path)))
+        })
+        .collect())
 }
 
-/// Parse one `git check-ignore -v` line into its bare pattern.
-///
-/// Format: `<source>:<line>:<pattern>\t<pathname>`. The source path may itself
-/// contain colons, so we split off the trailing `\t<pathname>` first, then
-/// take everything AFTER the second colon as the pattern (so a pattern that
-/// contains colons survives). A blank pattern (no matching gitignore source —
-/// e.g. a command-line `-e` exclude renders as `::pattern`) still parses. A
-/// negation pattern (`!…`) is reported as `None`.
-fn parse_check_ignore_line(line: &str) -> Option<String> {
-    if line.is_empty() {
-        return None;
-    }
-    // Strip the trailing `\t<pathname>` if present.
-    let prefix = line.split('\t').next().unwrap_or(line);
-    // `<source>:<line>:<pattern>` — find the first two colons. The pattern is
-    // everything after the second colon (it may contain further colons).
-    let first = prefix.find(':')?;
-    let rest = &prefix[first + 1..];
-    let second = rest.find(':')?;
-    let pattern = rest[second + 1..].trim();
-    if pattern.is_empty() || pattern.starts_with('!') {
-        return None;
-    }
-    Some(pattern.to_string())
+// ---------------------------------------------------------------------------
+// Read-only probes used by the plugin identity slug (U7).
+// ---------------------------------------------------------------------------
+
+/// `git symbolic-ref --quiet --short HEAD`: the short name of the branch HEAD
+/// currently points at, or `None` when HEAD is detached (the command exits 1
+/// rather than erroring — `--quiet` suppresses the stderr message for that
+/// case). `--short` returns e.g. `feature/x` rather than the full
+/// `refs/heads/feature/x`. Deliberately NOT `git rev-parse --abbrev-ref HEAD`,
+/// which returns the literal string `HEAD` under detached HEAD instead of
+/// failing — a value indistinguishable from an actual branch named `HEAD`,
+/// which `symbolic-ref`'s exit code sidesteps entirely.
+pub fn symbolic_ref_head(cwd_root: &Path) -> Result<Option<String>> {
+    git_optional(
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        Some(cwd_root),
+    )
+}
+
+/// `git rev-parse --short HEAD`: the abbreviated commit hash HEAD resolves to,
+/// or `None` when there is no commit to resolve yet (an unborn HEAD in a
+/// brand-new repository). Used to build the `detached-<short-sha>` identity
+/// fallback.
+pub fn short_head_sha(cwd_root: &Path) -> Result<Option<String>> {
+    git_optional(&["rev-parse", "--short", "HEAD"], Some(cwd_root))
 }
 
 /// Shell out to `date +%Y%m%d-%H%M%S` for the feature-branch suffix.

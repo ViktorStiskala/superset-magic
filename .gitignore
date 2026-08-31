@@ -1,2 +1,8 @@
 /target
 .superset/magic.local.json
+.superset/backups/
+
+# The plugin release asset, built by scripts/build-plugin-zip.py at the repo
+# root. It is published from CI, never committed; the digest in
+# .claude-plugin/marketplace.json is what the repository carries instead.
+/ss-magic-plugin-v*.zip

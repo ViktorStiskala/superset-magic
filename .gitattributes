@@ -1,0 +1,18 @@
+# Line-ending policy for the packaged plugin tree (R97).
+#
+# scripts/build-plugin-zip.py hashes the bytes of everything under plugin/, and
+# .claude-plugin/marketplace.json pins that SHA-256 so the Claude Code client
+# refuses an archive whose contents do not match. Git's autocrlf/eol machinery
+# would otherwise rewrite line endings in the working tree at checkout time, so
+# the same commit would build a different zip on a Windows developer's machine
+# than on the Linux CI runner and the pin would be a function of who ran the
+# builder. Marking the packaged tree as -text disables every working-tree
+# conversion for it: what is in the object store is what lands on disk,
+# everywhere.
+plugin/** -text
+
+# Not packaged, so they cannot reach the digest; kept LF-only anyway so a
+# cross-platform checkout does not produce gratuitous whitespace diffs in the
+# builder or in the manifest that carries the digest.
+scripts/build-plugin-zip.py text eol=lf
+.claude-plugin/marketplace.json text eol=lf

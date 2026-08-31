@@ -111,16 +111,36 @@ fn git_init(root: &Path) {
 }
 
 /// A glob rule covering the path is returned as the glob, NOT the literal
-/// path — so reverse sync copies the broad rule into main.
+/// path — so reverse sync copies the broad rule into main — paired with the
+/// (repo-root) directory that owns it.
 #[test]
 fn covering_rule_returns_glob_not_literal() {
     let dir = fresh();
     git_init(dir.path());
     fs::write(dir.path().join(".gitignore"), "**/.dev.vars\n").unwrap();
 
-    let got =
-        find_covering_rule(dir.path(), Path::new("apps/api/.dev.vars")).unwrap();
-    assert_eq!(got, Some("**/.dev.vars".to_string()));
+    let got = find_covering_rule(dir.path(), Path::new("apps/api/.dev.vars"))
+        .unwrap()
+        .expect("a covering rule");
+    assert_eq!(got.pattern, "**/.dev.vars");
+    assert_eq!(got.source_dir.as_deref(), Some(Path::new("")));
+}
+
+/// A glob rule owned by a NESTED `.gitignore` reports that nested directory
+/// as its `source_dir` — the piece [`ensure_path_ignored`] needs to detect a
+/// scope mismatch (R1).
+#[test]
+fn covering_rule_reports_owning_nested_directory() {
+    let dir = fresh();
+    git_init(dir.path());
+    fs::create_dir_all(dir.path().join("apps/api")).unwrap();
+    fs::write(dir.path().join("apps/api/.gitignore"), "*.log\n").unwrap();
+
+    let got = find_covering_rule(dir.path(), Path::new("apps/api/debug.log"))
+        .unwrap()
+        .expect("a covering rule");
+    assert_eq!(got.pattern, "*.log");
+    assert_eq!(got.source_dir.as_deref(), Some(Path::new("apps/api")));
 }
 
 /// No covering rule → None → caller falls back to the literal path.
@@ -130,9 +150,8 @@ fn covering_rule_none_when_uncovered() {
     git_init(dir.path());
     fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
 
-    let got =
-        find_covering_rule(dir.path(), Path::new("apps/api/.dev.vars")).unwrap();
-    assert_eq!(got, None);
+    let got = find_covering_rule(dir.path(), Path::new("apps/api/.dev.vars")).unwrap();
+    assert!(got.is_none());
 }
 
 // ── ensure_path_ignored (Task 5) ─────────────────────────────────────────
@@ -301,4 +320,116 @@ fn ensure_path_ignored_prefers_covering_glob_from_source_root() {
         git::is_ignored_str(target.path(), "apps/api/.dev.vars").unwrap(),
         "the target must now ignore the secret"
     );
+}
+
+// ── covering-rule re-anchor fix (U1 / R1) ────────────────────────────────
+
+/// Reproduces the live three-command defect (R1 / AE13): a NESTED
+/// `.gitignore` covers the reverse-synced file in the source tree with a bare
+/// `*` — the shape `.scratchpad/.gitignore` already takes in Superset
+/// worktrees (a fixture stand-in; the plugin itself never creates such a
+/// file). The target tree has no `.gitignore` at that same nested directory,
+/// so the only place the OLD code could reuse the pattern was the target's
+/// closest EXISTING `.gitignore` — here, none exists at all, so it would land
+/// at the target repo root, turning "ignore everything under `.scratchpad/`"
+/// into "ignore the entire repo". The fix must recognize the scope mismatch
+/// and fall through to an anchored literal instead.
+#[test]
+fn ensure_path_ignored_does_not_reanchor_nested_wildcard_at_broader_scope() {
+    let source = fresh();
+    let target = fresh();
+    git_init(source.path());
+    git_init(target.path());
+
+    // Source's `.scratchpad/` subtree is entirely self-ignored via a nested
+    // `.gitignore` containing a bare `*`.
+    fs::create_dir_all(source.path().join(".scratchpad")).unwrap();
+    fs::write(source.path().join(".scratchpad/.gitignore"), "*\n").unwrap();
+
+    let rel = Path::new(".scratchpad/notes.txt");
+    let outcome = ensure_path_ignored(target.path(), source.path(), rel, PathKind::File).unwrap();
+    assert_eq!(outcome, Ignored::Appended);
+
+    // The target root .gitignore (created or not) must never carry the bare
+    // `*` verbatim — that would ignore the whole repo.
+    let root_gi_path = target.path().join(".gitignore");
+    if root_gi_path.exists() {
+        let root_gi = fs::read_to_string(&root_gi_path).unwrap();
+        assert!(
+            !root_gi.lines().any(|l| l == "*"),
+            "the target root .gitignore must never gain a bare `*`; got: {root_gi:?}"
+        );
+    }
+    assert!(
+        !target.path().join(".scratchpad/.gitignore").exists(),
+        "the fix must not fabricate a nested .gitignore just to host the reused rule"
+    );
+    // The file must still end up ignored — via the anchored-literal fallback.
+    assert!(
+        git::is_ignored_str(target.path(), ".scratchpad/notes.txt").unwrap(),
+        "the target must still ignore the file, via the anchored literal fallback"
+    );
+}
+
+/// AE46 shape (R40): the repo already carries its own nested `.superset/
+/// .gitignore`. A same-root `Dir` rule for a path under it must land in that
+/// closer file, not the repository root — and this placement must survive
+/// the R1 fix (i.e. the fix must not become so conservative that it starts
+/// mis-routing plain anchored-literal placement too).
+#[test]
+fn ensure_path_ignored_ae46_lands_in_existing_nested_gitignore_not_root() {
+    let dir = fresh();
+    git_init(dir.path());
+    fs::create_dir_all(dir.path().join(".superset")).unwrap();
+    fs::write(dir.path().join(".superset/.gitignore"), "magic.local.json\n").unwrap();
+
+    let got = ensure_path_ignored(
+        dir.path(),
+        dir.path(),
+        Path::new(".superset/backups"),
+        PathKind::Dir,
+    )
+    .unwrap();
+    assert_eq!(got, Ignored::Appended);
+
+    let nested = fs::read_to_string(dir.path().join(".superset/.gitignore")).unwrap();
+    assert_eq!(nested, "magic.local.json\n/backups/\n");
+    assert!(
+        !dir.path().join(".gitignore").exists(),
+        "the rule must land in the closer nested file, not a newly created repo-root .gitignore"
+    );
+    assert!(git::is_ignored_str(dir.path(), ".superset/backups/").unwrap());
+}
+
+/// When the target tree already has its own `.gitignore` at the SAME
+/// relative directory that owns the covering rule in the source tree, the
+/// pattern is reused there verbatim (not converted to an anchored literal,
+/// and not lifted to the root) — the scopes line up, so this is unaffected
+/// by the R1 fix.
+#[test]
+fn ensure_path_ignored_reuses_covering_rule_when_target_has_matching_nested_gitignore() {
+    let source = fresh();
+    let target = fresh();
+    git_init(source.path());
+    git_init(target.path());
+
+    fs::create_dir_all(source.path().join("apps/api")).unwrap();
+    fs::write(source.path().join("apps/api/.gitignore"), "*.log\n").unwrap();
+    fs::create_dir_all(target.path().join("apps/api")).unwrap();
+    fs::write(target.path().join("apps/api/.gitignore"), "node_modules/\n").unwrap();
+
+    let rel = Path::new("apps/api/debug.log");
+    let outcome = ensure_path_ignored(target.path(), source.path(), rel, PathKind::File).unwrap();
+    assert_eq!(outcome, Ignored::Appended);
+
+    let nested = fs::read_to_string(target.path().join("apps/api/.gitignore")).unwrap();
+    assert_eq!(
+        nested, "node_modules/\n*.log\n",
+        "the covering pattern must be reused in the matching nested file, got: {nested:?}"
+    );
+    assert!(
+        !target.path().join(".gitignore").exists(),
+        "the rule must not be lifted to the repo root"
+    );
+    assert!(git::is_ignored_str(target.path(), "apps/api/debug.log").unwrap());
 }

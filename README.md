@@ -57,6 +57,13 @@ normal git commits and merges. And ss-magic is not a secrets manager: the
 files remain ordinary files on disk, and you decide which paths may be copied
 or packed.
 
+ss-magic also ships a **Claude Code plugin** built on the same
+`.superset/magic.json` contract – a durable per-worktree scratchpad, a gate that
+keeps oversized file reads out of the context window, an operator checklist, and
+a per-session cost ledger. It installs from a marketplace, is off until you
+enable it per repository, and is described in
+[its own section](#the-claude-code-plugin) below.
+
 If you work with git worktrees and carry per-developer gitignored files, this
 tool is for you. It is built for Superset's workspace lifecycle, but forward
 sync, reverse sync, pack, and init are ordinary CLI commands that work in any
@@ -165,7 +172,10 @@ ss-magic pack         # archive the configured files into ss-magic-<repo>.tar.bz
 ss-magic update       # force a self-update to the latest release
 ss-magic init [PATTERN...]   # non-interactively seed .superset (magic.json
                              # layout); extra args become magic.json `files`
+ss-magic plugin <VERB>       # Claude Code plugin entry point (see below);
+                             # never self-updates, never opens the menu
 ss-magic --help       # usage
+ss-magic --version    # print the version and exit
 ```
 
 `sync` and `reverse-sync` both take a timestamped backup of every file they're
@@ -175,7 +185,9 @@ menu opened by bare `ss-magic` offers a single interactive **Sync** entry that
 reconciles files in both directions through the merge cockpit; there's no
 separate forward/reverse choice there. `SS_MAGIC_NO_UPDATE=1` disables the
 auto-update gate (the explicit `ss-magic update` ignores it and always
-checks).
+checks). `ss-magic plugin` is deliberately outside the gate entirely – it never
+checks for an update and never opens the menu, because the plugin's binary is
+pinned to the skills and hooks shipped alongside it.
 
 ### `ss-magic` — the interactive menu
 
@@ -393,6 +405,155 @@ operations, and skips the auto-update gate.
 Checks GitHub for the latest release regardless of the daily cache and reports
 the resulting version or "already latest". See [Self-update](#self-update).
 
+## The Claude Code plugin
+
+An optional [Claude Code](https://claude.com/claude-code) plugin, published from
+this repository and built on the same `.superset/` contract. It is off until you
+turn it on, and it does four things:
+
+- **A durable session scratchpad.** Each worktree gets
+  `.superset/.magic/sessions/<repo>-<branch>/` with `STATUS.md`, `TASKS.md`,
+  `DECISIONS.md`, `LEARNINGS.md`, `CONTEXT.md` and `OPERATOR-CHECKLIST.md`, so
+  working state survives a context compaction by living on disk. The directory
+  name is derived from git alone, so the same worktree always resolves to the
+  same place. It is gitignored, never committed, and the plugin refuses to write
+  anything until git confirms that.
+- **A read gate with a conclusion cache.** A `Read` of a file past the
+  configured size threshold is denied and routed to an Explore agent instead, so
+  a large file never lands whole in the context window. The agent's answer is
+  recorded, and any later read of the same file is answered with that conclusion
+  inline. The gate is advisory, not a security boundary – a timeout, a malformed
+  envelope, or a missing binary all leave the read to proceed.
+- **An operator checklist.** One JSON document per action under
+  `docs/actions/`, with the steps a change needs before it is safe to ship. The
+  plugin's own verbs are the only write path (direct reads and edits of the file
+  are denied), which is what keeps the document canonically ordered and valid,
+  and a GitHub Actions workflow can render it into a pull-request comment.
+- **A cost ledger.** One row per ended session, read from that session's own
+  transcript, using the harness's priced records where they exist and a
+  versioned price table otherwise. A relative signal for comparing branches,
+  never an authoritative bill.
+
+### Install and enable
+
+The marketplace is the only delivery path – there is no `ss-magic plugin
+install`, and `ss-magic sync` never installs anything. In Claude Code:
+
+```plaintext
+/plugin marketplace add ViktorStiskala/superset-magic
+/plugin install ss-magic
+```
+
+The marketplace entry pins the plugin archive by SHA-256, so the client refuses
+an archive whose bytes do not match. On the first session after install, a
+`SessionStart` hook downloads the pinned `ss-magic` binary the hooks run,
+verifying it against the release's published checksum before anything is moved
+into place. That bootstrap never fails a session: offline, DNS failure, proxy,
+404, checksum mismatch, unwritable data directory, or an unsupported platform
+all end in "do nothing, one line on stderr, carry on", and an already-installed
+binary is never touched by a failed install.
+
+Then, in each repository you want it to act on:
+
+```sh
+ss-magic plugin enable          # writes plugin.enabled into .superset/magic.json
+ss-magic plugin enable --local  # ...or into the gitignored magic.local.json
+ss-magic plugin status          # what it sees, and why it is or isn't acting
+```
+
+Both layers must be on: the plugin must be installed and enabled in Claude Code,
+**and** `plugin.enabled` must be true for the repository. `ss-magic plugin
+status` is the one place that reports both, plus whether the state tree is
+gitignored, whether the binary arrived, and whether its version matches the
+plugin's pin – run it first whenever nothing seems to be happening.
+
+### Verbs
+
+```plaintext
+ss-magic plugin status            # what the plugin sees, and why it is or isn't acting
+ss-magic plugin cost              # what recorded sessions cost, across every worktree
+ss-magic plugin spill-index       # list the harness's own oversized-output files
+ss-magic plugin scratchpad ensure # create/refresh this worktree's state tree
+ss-magic plugin conclude <FILE>   # record a conclusion about a file
+ss-magic plugin conclusions [KEY] # list or show recorded conclusions
+ss-magic plugin gc                # prune expired plugin state
+ss-magic plugin bypass <FILE>     # let the next Read of that file through, once
+ss-magic plugin expect-artifact <FILE> [--note TEXT]
+                                  # require the next subagent to produce a file
+ss-magic plugin enable  [--local] # turn the hooks on for this repository
+ss-magic plugin disable [--local] # stop them acting (leaves the install alone)
+ss-magic plugin config get <plugin.DOTTED.KEY>      # e.g. plugin.gate.threshold_lines
+ss-magic plugin config set <plugin.DOTTED.KEY> <VALUE> [--local]
+ss-magic plugin compact-window --set <TOKENS>
+                                  # opt into an absolute auto-compaction window
+ss-magic plugin setup-github-ci [--check] [--force]
+                                  # write the checklist PR-comment workflow
+ss-magic plugin checklist <SUBVERB>
+                                  # init, add-item, add-entry, set, done, list,
+                                  # verify, render-md — the only write path
+ss-magic plugin --help
+```
+
+`status`, `cost` and `spill-index` also take `--json`. Inside a Claude Code
+session the shipped skills invoke these through a `ss-magic-plugin` wrapper on
+the session's `PATH`, so `ss-magic-plugin checklist list` is the same command.
+
+### Hooks
+
+The plugin registers five hook events:
+
+| Event | What it does |
+| --- | --- |
+| `SessionStart` | Installs/refreshes the pinned binary, scaffolds the scratchpad, and injects the operating guidance. |
+| `PreToolUse` | The read gate, the checklist-file deny, and an advisory nudge to update the checklist before `git commit` / `git push` / `gh pr create`. |
+| `PreCompact` | Records that a compaction is about to happen. Never blocks or slows it. |
+| `SubagentStop` | Salvages a subagent's result text, and blocks the stop once if a declared artifact is missing. |
+| `SessionEnd` | Writes the session's cost-ledger row. |
+
+Every hook fails open: an error, a panic, or a timeout looks to Claude Code
+exactly like a hook that decided to do nothing, because a tool that is only
+advisory must never break a session in progress. The commit nudge in particular
+never blocks the command it comments on.
+
+### Configuration
+
+The plugin reads a `plugin` block from the same overlaid `magic.json` /
+`magic.local.json` pair the sync patterns live in:
+
+```json
+{
+  "files": [".env"],
+  "plugin": {
+    "enabled": true,
+    "gate": {
+      "threshold_lines": 3000,
+      "inline_byte_budget": 10000,
+      "exemptions": ["docs/reference/*.md"]
+    }
+  }
+}
+```
+
+`enabled` is always read from the **main checkout's** config, because a
+worktree's own `magic.local.json` is itself a forward-sync target. Every field
+is optional and every malformed value falls back to a safe default rather than
+failing – an out-of-range number is clamped, not rejected. Read and write them
+with `ss-magic plugin config get` / `set`, which preserve every other key in the
+file.
+
+### What it stores, and where
+
+- `.superset/.magic/` in each worktree – the scratchpad, conclusion cache, and
+  the one-shot bypass / expected-artifact records. Gitignored (the plugin
+  refuses to write until git says so), owner-only, and excluded from sync and
+  pack, so it never travels between trees or into an archive.
+- A per-machine data directory outside any repository – the hook heartbeat log
+  and the cost ledger, which have to outlive the worktrees they describe.
+
+Nothing is sent anywhere: every file above is local, and the only network access
+the plugin makes is the bootstrap's download of the pinned binary from this
+repository's GitHub releases.
+
 ## The `.superset/` contract
 
 A repo using ss-magic carries:
@@ -444,9 +605,16 @@ all expand the same overlaid pattern list with the same rules:
   copied/archived recursively by forward sync and pack; the Sync menu and
   `ss-magic reverse-sync` reconcile individual files only, so a directory
   match yields no candidate of its own.
-- The Sync menu, `ss-magic reverse-sync`, and pack additionally exclude the
-  tool's own `.superset/backups/` tree, so a backed-up secret copy is never
-  re-offered for reconciliation or re-archived.
+- Four directory trees are excluded from every operation – forward sync's copy
+  walk, the Sync menu's reconcile set, `ss-magic reverse-sync`, and pack:
+  `.superset/backups/` (the tool's own copies of overwritten bytes, so a
+  recovered secret is never re-offered or re-archived), `.superset/.magic/` (the
+  Claude Code plugin's gitignored local state), `.scratchpad/`, and `.git/`.
+  Each is matched as an exact path, so a sibling like `.superset/.magicked/` is
+  unaffected – and `.superset/` itself is never excluded, so the contract files
+  still sync and pack normally. The exclusion is applied during the directory
+  walk, so a broad pattern such as `.superset` or `**` cannot re-admit the
+  subtrees through an ancestor match.
 - Existing files in the destination are overwritten (forward sync; the Sync
   menu instead classifies every match against both roots – differs /
   worktree-only / main-only / identical – and reconciles them in the merge
@@ -460,8 +628,12 @@ all expand the same overlaid pattern list with the same rules:
 ## Self-update
 
 Every invocation of `ss-magic` (bare), `sync`, `reverse-sync`, and `pack` runs
-a cheap, daily-cached check for a newer GitHub release (`init` and `--help`
-skip the gate; the `update` subcommand forces its own path instead):
+a cheap, daily-cached check for a newer GitHub release. `init`, `--help`,
+`--version` and every `ss-magic plugin` verb skip the gate entirely; the
+`update` subcommand forces its own path instead. (`plugin` skips it by design,
+not by omission: the plugin's binary is pinned alongside the skills and hooks
+shipped with it, so a silent mid-session swap would leave the two describing
+different behavior.)
 
 - The version cache lives in the OS cache dir; if it's fresh (< 24 h) no
   network call is made.
@@ -497,6 +669,8 @@ Escape hatches:
 | `NO_COLOR` | Disable ANSI color output. Stdout is also checked for TTY support and color is auto-disabled when piping. |
 | `SS_MAGIC_NO_UPDATE` | Disable the self-update gate. |
 | `SS_MAGIC_UPDATED` | Internal re-exec guard preventing update loops — not meant to be set by hand. |
+| `CLAUDE_CONFIG_DIR` | Read (not set) by `ss-magic plugin` to locate Claude Code's own state when it is not at `~/.claude`. |
+| `CLAUDE_PLUGIN_ROOT` | Set by Claude Code for a running plugin; read to find the version pin. Not meant to be set by hand. |
 
 ## Contributing
 

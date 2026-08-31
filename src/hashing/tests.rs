@@ -1,0 +1,110 @@
+use super::*;
+use std::fs;
+
+/// KTD3's whole point: pin `fnv1a_64` to a literal output for a literal
+/// input. If anyone ever changes the constants or the algorithm, this test
+/// goes red — the alternative is a cache key that silently changes on a
+/// rebuild, which looks exactly like the cache just not working.
+#[test]
+fn fnv1a_64_matches_known_vector() {
+    assert_eq!(fnv1a_64(b"hello"), 0xa430d84680aabd0b);
+}
+
+/// The empty input still has a defined hash: the FNV-1a offset basis
+/// itself, since the loop never runs.
+#[test]
+fn fnv1a_64_of_empty_input_is_offset_basis() {
+    assert_eq!(fnv1a_64(b""), FNV_OFFSET_BASIS);
+}
+
+/// Same bytes, different length-adjacent inputs, must not collide — a
+/// sanity check that the hash actually mixes in every byte rather than only
+/// the last one written.
+#[test]
+fn fnv1a_64_distinguishes_similar_inputs() {
+    assert_ne!(fnv1a_64(b"hello"), fnv1a_64(b"hellp"));
+    assert_ne!(fnv1a_64(b"hello"), fnv1a_64(b"hello "));
+}
+
+#[test]
+fn hash_file_matches_fnv1a_64_of_its_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("content.txt");
+    fs::write(&path, b"hello").unwrap();
+    assert_eq!(hash_file(&path).unwrap(), fnv1a_64(b"hello"));
+}
+
+/// An empty file hashes the same as an empty byte slice — the read-then-hash
+/// path has no special case that would make a zero-length file behave
+/// differently from any other input.
+#[test]
+fn hash_file_of_empty_file_is_offset_basis() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty.txt");
+    fs::write(&path, b"").unwrap();
+    assert_eq!(hash_file(&path).unwrap(), FNV_OFFSET_BASIS);
+}
+
+/// A large file (bigger than any single read buffer) still hashes correctly
+/// — the read is a single `fs::read` of the whole file, so there is no
+/// buffering boundary that could drop or duplicate bytes.
+#[test]
+fn hash_file_over_large_content_is_stable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.bin");
+    let content = vec![0xABu8; 5 * 1024 * 1024]; // 5 MiB, uniform bytes.
+    fs::write(&path, &content).unwrap();
+    let first = hash_file(&path).unwrap();
+    let second = hash_file(&path).unwrap();
+    assert_eq!(first, second, "hashing the same large file twice must agree");
+    assert_eq!(first, fnv1a_64(&content));
+}
+
+#[test]
+fn hash_file_missing_path_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = hash_file(&dir.path().join("nope.txt")).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("nope.txt"),
+        "error should name the unreadable path"
+    );
+}
+
+// ── sha256 (R80's cross-language identifier hash) ─────────────────────────────
+
+/// FIPS 180-4's canonical example vector. If this ever goes red, the
+/// implementation has diverged from the standard — and, more concretely,
+/// from whatever `shasum -a 256` on the shell side of R80 would compute for
+/// the same bytes.
+#[test]
+fn sha256_matches_known_vector_abc() {
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+/// The empty input is its own well-known vector (there is no message block
+/// with real content, only the padding) — exercised on its own because R80's
+/// identifier must be well-defined even when `$HOME` is unset or empty (see
+/// `tmproot::tests`), which hashes exactly this input.
+#[test]
+fn sha256_matches_known_vector_empty() {
+    assert_eq!(
+        sha256_hex(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+}
+
+/// A input spanning more than one 64-byte block exercises the message
+/// schedule's cross-block carry (`h` folded forward into the next block's
+/// compression), not just the single-block padding path the two vectors
+/// above take.
+#[test]
+fn sha256_matches_known_vector_two_blocks() {
+    let input = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    assert_eq!(
+        sha256_hex(input),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+    );
+}

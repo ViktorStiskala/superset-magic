@@ -29,13 +29,28 @@ instructions (the installer script and prebuilt-binary download) live in
 README.md; from-source builds and the rest of the contributor docs (tests,
 PR expectations, release/versioning) live in CONTRIBUTING.md.
 
+The Claude Code plugin ships on the SAME release. `plugin/` is the packaged
+marketplace tree (`.claude-plugin/plugin.json`, `hooks/hooks.json`,
+`hooks/bootstrap.sh`, `bin/ss-magic-plugin`, `lib/tmproot.sh`, `skills/`,
+`ss-magic.version`); `scripts/build-plugin-zip.py` packs it byte-reproducibly
+(sorted entries, fixed 1980-01-01 timestamps, normalized modes, STORED not
+deflated, `create_system` forced to unix, `.DS_Store` excluded, symlinks and
+non-ASCII names refused loudly), and `.claude-plugin/marketplace.json` pins the
+resulting zip by SHA-256. Four version surfaces must agree – `Cargo.toml`,
+`plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version`, and the release
+URL in `marketplace.json`. Verify with `python3 scripts/build-plugin-zip.py
+--check`; after any change under `plugin/`, re-pin with `--update-manifest`
+then re-run `--check`. `.gitattributes` marks `plugin/**` as `-text` so a
+checkout's line-ending conversion can never move the digest.
+
 ## Architecture
 
 Layered to keep the pure logic unit-testable in isolation from the
 interactive layer. Source is grouped by purpose: `git/` (git plumbing),
 `sync/` (the sync engine), `tui/` (interactive layer), `workspace/`
-(`.superset` contract I/O + lifecycle), `update/` (self-update), with
-`main.rs` and `cli.rs` at the root:
+(`.superset` contract I/O + lifecycle), `update/` (self-update), `plugin/`
+(the Claude Code plugin verb tree – its own section below), with `main.rs`,
+`cli.rs`, `pack.rs` and `hashing.rs` at the root:
 
 - `git/mod.rs` — read-only probes (`is_worktree`, `main_checkout_root`,
   `cwd_repo_root`, `main_branch_name`, `origin_url` (backs pack's
@@ -46,7 +61,15 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   POSITIVE tracked determination for the secret push gate: a path NOT in this
   set is treated as an untracked secret, so an unenumerable name fails closed),
   `is_ignored`, `is_ignored_str` (the raw-pathname variant so a caller can force
-  git's directory-only match with a trailing slash), `check_ignore_pattern`;
+  git's directory-only match with a trailing slash), `is_ignored_no_index_str`
+  (the `--no-index` variant that asks whether the IGNORE RULES cover a path,
+  ignoring the index – what the plugin's state-tree gate needs, since a tracked
+  file inside the tree must not read as "the tree is unignored"),
+  `status_porcelain` (parsed `(status, path)` pairs behind the checklist commit
+  nudge – built on `git_raw`, NEVER the trimming `git` helper, because porcelain's
+  leading column is a literal space for a worktree-only modification and a blanket
+  `.trim()` shifts every field), `symbolic_ref_head` / `short_head_sha` (the branch
+  name and abbreviated SHA behind the plugin's `<repo>-<branch>` identity slug);
   `parse_ls_files_z` is the shared NUL-split behind BOTH `untracked_files` and
   `tracked_files`, defensively dropping any absolute / `..`-bearing entry in one
   place) and mutating primitives (`stage_paths`, `commit`, `push`,
@@ -62,8 +85,15 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   array while preserving `teardown` and `run` from disk;
   `write_config_json` always rewrites pretty-printed. `load_overlaid`
   reads `magic.json` and overlays `magic.local.json` (union+dedupe
-  `files`, base order first); `write_magic_json`, `write_magic_sh`,
-  `bootstrap_magic_local_json`, and `default_magic_files` are the
+  `files`, base order first); `load_magic_json` / `load_magic_local_json` read
+  each layer on its own (what the plugin's config write path needs, since it
+  load-modify-writes exactly one file). `write_magic_json(root, &MagicConfig)`
+  and `write_magic_local_json` take the whole typed config – `MagicConfig`
+  carries a `#[serde(flatten)] extras` map, so an unknown key a newer build or a
+  hand edit put in the file survives a rewrite instead of being dropped;
+  `merge_files_into_magic_config` folds a new `files` list into an existing
+  config for the same reason. `write_magic_sh`,
+  `bootstrap_magic_local_json`, and `default_magic_files` round out the
   init/migration writers. `load_setup_config` / `SetupConfig` survive as
   a READ-ONLY legacy path: migration reads the old `setup_config.json`
   `files` to carry them into `magic.json`. `existing_unknown_entries`
@@ -71,6 +101,27 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   materializes the staged `.superset/` tree atomically (files always
   overwritten — preservation happens upstream of the write; `*.sh` are
   chmod 0755'd; a `delete` set strips the retired `setup.sh`).
+- `sync/mod.rs` – the sync engine's root, and the home of the ONE
+  excluded-trees rule every enumeration layer applies. `EXCLUDED_TREES` lists
+  four whole directory trees no walk may ever yield, each as its exact sequence
+  of path components: `.superset/backups` (the tool's own copies of overwritten
+  bytes – recovered secrets), `.superset/.magic` (the plugin's gitignored,
+  machine-local state), `.scratchpad` (a tree ss-magic does not own but must
+  never push into the shared main checkout), and `.git`.
+  `under_excluded_tree(rel)` answers "is this rel one of them, or inside one",
+  via the component-by-component `starts_with_components` – NEVER a string
+  prefix or a bare name, so a sibling `.superset/.magicked/` stays includable, a
+  root-level `.magic` file is untouched, and `.superset` ITSELF is never
+  excluded (widening the rule would drop the contract files `config.json`,
+  `magic.sh` and `magic.json` out of sync and pack entirely). Returning `true`
+  for a tree root is what lets a `WalkDir::filter_entry` caller prune the whole
+  subtree. It is applied at every point of FINAL enumeration –
+  `apply::walk_source`, `apply::copy_dir_recursive(root, src, dst)` (which takes
+  the tree root precisely so it can classify each entry's rel), reverse sync's
+  candidate computation, and pack's `append_dir_excluding_trees` – never only on
+  an upstream match list. Distinct from `apply::DEFAULT_EXCLUDES`, which drops a
+  match containing one of a few directory NAMES (`node_modules`, `.venv`) at ANY
+  depth. (This generalizes the retired `reverse_sync::under_backups_dir`.)
 - `sync/repo_scan.rs` — `matches_for_patterns(root, &[&str])` walks the
   working tree once with a multi-pattern `GlobSet` and returns a bool
   vector aligned to the input. `pattern_matches_any` is the single-
@@ -181,7 +232,16 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   the subcommand token, deliberately asymmetric with the terminal `-h`/`--help`
   short-circuit). `Command` stays `Copy`/`Eq` (`bool` is both). `init
   [PATTERN...]` parses to `Parsed::Init(patterns)` (carried apart from the
-  `Command` enum). Pure and unit-testable without spawning the process.
+  `Command` enum). `plugin [ARGS...]` parses to `Parsed::Plugin(args)` – the
+  remaining argv is carried VERBATIM, flags included (unlike `Init`, which
+  filters them), because the plugin verbs take their own `--json` / `--local` /
+  `--set`. `--version`/`-V` short-circuits to `Parsed::Version` and wins over
+  everything, with two deliberate asymmetries against `-h`/`--help`
+  (`version_requested`): the scan runs PAST a subcommand token, so
+  `ss-magic sync --version` still prints the version rather than falling through
+  to the update-gated `Bare` menu when a hook shells out to identify the binary;
+  and it STOPS at the `PLUGIN_TOKEN`, because a `-V` after `plugin` may be a
+  verb's own flag. Pure and unit-testable without spawning the process.
 - `tui/menu.rs` — bare-invocation operation menu. Location-gated: main
   checkout offers init / migrate / edit config; a worktree offers a SINGLE
   "Sync" entry (`MenuOp::Sync`) that opens the unified `reverse_sync::run`
@@ -292,8 +352,10 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   keystroke) – plus backup-naming (`backup_rel_path(ts, BackupSide, rel)` →
   `<ts>/<side>/<rel>`) and the per-hunk merge model (`merge_segments`,
   `assemble`, `diff_count`, `MergeSegment`, `MergeChoice`, `Decision::Merge`)
-  driving the cockpit's merge overlay; `under_backups_dir` is shared with pack
-  so an archive never captures a recovered secret. `tui/diffmodel.rs` owns the
+  driving the cockpit's merge overlay. The excluded-trees predicate the
+  reconcile set and pack share is `sync::under_excluded_tree` (see
+  `sync/mod.rs`), so neither a recovered secret under `.superset/backups/` nor
+  the plugin's `.superset/.magic/` state is ever re-offered or archived. `tui/diffmodel.rs` owns the
   pure diff-to-rows model plus `normalize_eol` (CRLF → LF, a trailing lone CR
   treated as an EOL, + trailing newline ensured; applied to diff/merge inputs at
   cockpit load – push/pull still copy raw bytes); its `RowTag`/`UnifiedTag`
@@ -308,7 +370,12 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   remote (scheme/userinfo/host stripped, segments sanitized and joined with
   `_` — identical for ssh/https/scp forms; nested GitLab groups keep all
   segments), falling back to the primary worktree basename, then `files`.
-  A successful pack emits `PackEvent::Done { out_path, count }`; the
+  `repo_name_stem` is the extracted stem derivation behind it, reused verbatim
+  by the plugin's identity slug so the two can never disagree about what this
+  repo is called. A successful pack emits `PackEvent::Done { out_path, count }`
+  – `count` is UNIQUE FILE PATHS (the `added: HashSet<PathBuf>` of files and
+  symlinks actually written), not tar entries: archived directories are not
+  counted and two overlapping patterns naming the same file count once; the
   rendering layer (`main.rs::print_pack_event`) owns the summary line, the
   `tar -xjvf` extraction hint, and `copy_to_clipboard` (pbcopy/wl-copy/
   xclip/xsel) of the archive's canonical path — clipboard is deliberately
@@ -322,12 +389,15 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   Safety: it never packs a pack archive into itself — every root-level
   `ss-magic-*.tar.bz2` match is excluded (current derived name, legacy fixed
   name, and archives from a previous origin's name; nor a `.` match that
-  resolves to the repo root); it excludes the tool's own `.superset/backups/`
-  tree so a recovered secret is never packed – a LEAF match via the flat
-  `under_backups_dir` retain filter, and a directory match that is an ANCESTOR
-  of `.superset/backups` (a bare `.superset` pattern, or a broad `**`) via
-  `append_dir_excluding_backups`, whose recursive `WalkDir` prunes the backups
-  subtree that the flat filter cannot catch; it classifies each match with
+  resolves to the repo root); it excludes every `sync::EXCLUDED_TREES` tree so
+  neither a recovered secret under `.superset/backups/` nor the plugin's
+  `.superset/.magic/` state is ever packed – a LEAF match via the flat
+  `sync::under_excluded_tree` retain filter, and a directory match that is an
+  ANCESTOR of one (a bare `.superset` pattern, or a broad `**`) via
+  `append_dir_excluding_trees`, whose recursive `WalkDir` `filter_entry` prunes
+  each excluded subtree that the flat filter cannot catch – one directory match
+  can sit above several at once, since `.superset` is the ancestor of BOTH
+  `backups` and `.magic`; it classifies each match with
   `symlink_metadata` (no-follow) so a matched symlink — including one to a
   directory — is stored as a single symlink entry rather than followed
   (`Path::is_dir()` would follow it and archive the target tree); and it
@@ -346,8 +416,12 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   `reverse_sync::ensure_gitignored_in_main`). `ensure_entry` (append a line iff
   no exact match exists, create the file if absent, never reorder) is now the
   building block beneath it, still called directly where the exact rule text is
-  known; `find_covering_rule` resolves the rule covering a path via
-  `git check-ignore -v` (negations excluded); the private `is_ignored_opt`
+  known; the private `find_covering_rule` resolves the rule covering a path via
+  `git check-ignore -v` (negations excluded), returning a typed
+  `CoveringRule { pattern, source_dir }` – the source dir matters because a
+  pattern is only meaningful relative to the `.gitignore` it came from, so the
+  caller can verify the rule actually covers the path before copying it into the
+  target root; `parse_covering_line` is its parser. The private `is_ignored_opt`
   (trailing-slash query for `Dir`), `closest_gitignore_dir`, and
   `anchored_literal` back `ensure_path_ignored`.
 - `update/` — every-invocation self-update: `check.rs` does the
@@ -357,9 +431,25 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   TLS + cargo-dist checksums (no SHA-256-vs-asset-digest check — see the
   KTD5 conformance notes in `update/apply.rs`); `bin_path_in_archive`
   matches cargo-dist's `<bin>-<target>/` tarball layout.
-- `main.rs` — composes everything: `tui::style::init` → `cli::parse` →
+- `hashing.rs` – the crate's content-fingerprint primitives. `fnv1a_64` /
+  `hash_file` are the non-cryptographic hashes behind cache keys and claim-file
+  names; FNV-1a rather than `DefaultHasher` because std explicitly does NOT
+  promise its output is stable across releases or processes, and a long-lived
+  cache keyed on an unstable hash silently rots. `sha256` / `sha256_hex` are a
+  hand-rolled FIPS 180-4 SHA-256 (pinned by literal test vectors), present for
+  ONE reason: the plugin's per-machine temp-root identifier must be derived
+  identically by this Rust code and by the shell bootstrap's `shasum -a 256`, so
+  the algorithm has to be one every platform already implements the same way.
+  (Replaces the removed `reverse_sync::hash_file`.)
+- `main.rs` – composes everything: `cli::parse` → `tui::style::init` (skipped
+  for `Parsed::Plugin`, which makes the color decision itself) →
   [auto-update gate for `Bare`/`Sync`/`ReverseSync`/`Pack`, per
-  `should_run_update_gate`] → `dispatch`. `Bare` routes to `tui::menu::run`;
+  `should_run_update_gate`] → `dispatch`. `Parsed::Version` prints
+  `version_line()` and stops before any dispatch; `Parsed::Plugin` routes to
+  `plugin::run` in a SIBLING arm of the update gate, never inside it, so no
+  plugin invocation can self-update or open the TUI – `should_run_update_gate`
+  is deliberately an INCLUSION list over `Command`, and `plugin` is not a
+  `Command` at all. `Bare` routes to `tui::menu::run`;
   `Sync { no_backup }` runs the non-interactive forward copy (`sync_core`),
   which now runs a pre-copy backup pass (`reverse_sync::backup_forward_targets`)
   before `sync::apply::run` unless `--no-backup`; `ReverseSync { no_backup }`
@@ -369,6 +459,403 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   forces a self-update. `resolve_sync_roots` resolves the cwd + main-checkout
   roots shared by the forward and reverse flows. `print_event` renders the
   `sync::apply::Event` stream.
+
+## The Claude Code plugin (`src/plugin/`)
+
+`ss-magic plugin ...` is a second, largely independent program sharing this
+crate's git, hashing and gitignore plumbing. Three facts shape every module in
+the tree:
+
+- **Two callers, two postures.** The harness invokes `plugin hook <event>`: the
+  envelope arrives on stdin, the answer is JSON on stdout (so nothing else may
+  be printed there), and a hook that cannot do its job exits 0 anyway. A person
+  or a skill invokes a named verb (`status`, `checklist`, ...): problems go to
+  stderr with a non-zero exit, the ordinary CLI contract. Keeping them apart is
+  a safety boundary, not tidiness – only human verbs reach anything that writes
+  configuration (`enable`, `disable`, `config set`), so a repository cannot
+  arrange its own enablement by getting a hook to fire.
+- **No update gate, no TUI, no install verb.** The marketplace is the only
+  delivery path, and the binary is pinned alongside the skills, hooks and
+  Markdown shipped with it; a mid-session self-update would leave the two
+  describing different behavior.
+- **Fail-open, but fail-CLOSED on anything that could leak.** A hook that
+  errors, panics or times out must look exactly like a hook that decided to do
+  nothing. The gates that protect secrets invert that: an unknown answer is the
+  refusing answer.
+
+### Entry point
+
+- `plugin/mod.rs` – the second-level parse and the dispatch table, nothing else.
+  `HookEvent::from_token` and `HumanVerb::from_token` are the two closed
+  vocabularies; `HookEvent::{Unknown, Missing}` are VALUES rather than parse
+  errors, because a manifest from a newer plugin build can name an event this
+  binary never heard of and the contract for that is "exit 0, print nothing,
+  record the unroutable name" – which the wrapper can only do if the name
+  reaches it. `HumanVerb::writes_config` keeps the hook/human split honest.
+  `parse` returns `Parsed::{Invocation, Help, MissingVerb, UnknownVerb}`; `run`
+  calls `style::init_no_color()` for a hook invocation (an ANSI escape would make
+  the JSON unparseable) and the ordinary `style::init()` otherwise, then
+  dispatches. Note `HookEvent::FileChanged` parses and routes, but the shipped
+  manifest declares no `FileChanged` entry – see the hook section.
+
+### State: where the plugin keeps things, and why there
+
+- `plugin/atomic.rs` – the one atomic-write primitive every writer below (and
+  several modules outside this section) shares: create a temp file in the
+  target's own directory, write and flush it, chmod it when a mode is given,
+  fsync it when asked, then rename it over the target – so a reader never sees
+  a half-written file, and a crash mid-write leaves the previous file
+  untouched rather than truncated. `write_atomically(path, body, prefix,
+  suffix, what, mode, sync)` used to live in `plugin/heartbeat.rs` under a
+  narrower, hardcoded signature (a fixed `.jsonl` suffix, an always-owner-only
+  mode) shared only with `ledger.rs`. It moved out here, generalized to the
+  union of what every caller needed, once several more modules turned out to
+  have each hand-rolled the identical `tempfile::Builder` -> `write_all` ->
+  `flush` -> chmod -> `persist` sequence with their own suffix/mode/sync
+  choices: `heartbeat.rs`, `ledger.rs`, `cache.rs`, `bypass.rs`,
+  `expect_artifact.rs`, `scratchpad.rs` (the session pointer),
+  `compact_window.rs`, `setup_ci.rs` (the CI workflow writer), and
+  `checklist/verbs.rs` (the document and pointer writers) all call this one
+  copy now; nothing here changed what any of them actually wrote.
+- `plugin/pathnorm.rs` – the lexical path reduction every gate that decides from
+  a path shares, and the reason the R88 checklist deny stopped growing new
+  bypasses. `normalize` removes `.` and cancels `..` TEXTUALLY (the caller
+  canonicalizes afterwards, which is what handles symlinks – and the order is not
+  interchangeable, because the filesystem cancels a `..` AFTER resolving a
+  symlink); a leading `..` that cannot be cancelled is COUNTED rather than
+  pushed, since a pushed one is poppable by the next `..` and `../../x` would
+  collapse to `x` – a path escaping its tree quietly becoming one inside it, the
+  exact failure a containment check exists to catch. Do NOT reimplement it by
+  walking `parent()`/`file_name()`: `file_name()` is `None` for a `..`
+  component, so such a walk SKIPS the hop instead of cancelling it.
+  `process_view` answers whether resolving a path here would even mean the same
+  thing as resolving it there, as a property of the COMPONENT SEQUENCE rather
+  than a list of recognized prefixes – `…/proc/<selector>/cwd/<rest>` is the one
+  re-rootable form (`Cwd(rest)`), everything else below a process selector
+  (`root`, `fd/<n>`, `task/<tid>`, `ns/…`) is `Opaque`, and the FIRST selector
+  wins so `/proc/self/root/proc/self/cwd/…` cannot be re-rooted on another
+  process's mount namespace. The scan runs over the whole sequence because
+  procfs is mountable anywhere. `home_relative` classifies a LEADING `~`:
+  `Own(rest)` for the current user's home – safe to expand here because the hook
+  inherits the harness's `HOME`, so unlike `/proc/self` the expansion is
+  process-INDEPENDENT – and `Other` for `~name`, whose location only a user
+  database knows, so it is reported unexpandable rather than guessed at
+  `/home/<name>`. It tests the leading byte through `to_string_lossy`, so a
+  non-UTF-8 `~name` is still caught (missing one would leave it unexpanded,
+  which is the unsafe direction).
+- `plugin/tmproot.rs` – the private, per-machine, cross-session temporary root
+  for coordination that predates any repository or session context.
+  `resolve_root()` is `/tmp/ss-magic-plugin/<identifier>/`, falling back to
+  `$TMPDIR`; `identifier(home)` is the first 16 hex chars of SHA-256 of `$HOME`
+  exactly as read, matching the shell bootstrap's `shasum -a 256` byte for byte.
+  A predictable path is NOT evidence of ownership, so each managed component is
+  `lstat`ed (never followed) and must be a real directory owned by this
+  process's euid (raw `geteuid()`, not a shelled `id -u`) at mode exactly 0700;
+  any failure makes that base entirely unusable rather than writing into a root
+  someone else could control. `with_lock` BLOCKS (unlike the self-updater's
+  skip-on-contention lock) because concurrent hook handlers must actually
+  coordinate, not silently skip; `try_with_lock` is the non-blocking variant.
+  `flock` releases on process death, so there is no stale-lock reclaim.
+- `plugin/identity.rs` – the deterministic `<repo>-<branch>` slug, derived from
+  git alone and never from the Superset workspace name (which can be silently
+  renamed). `resolve(cwd)` returns `None` outside a git repo – there is no
+  fallback identity, and the plugin simply does nothing. The repo half reuses
+  `pack::repo_name_stem`; the branch half slugifies HEAD, falling back to
+  `detached-<short-sha>`, and strips diacritics so a precomposed and an
+  NFD-decomposed accented branch name resolve to the SAME directory.
+- `plugin/scratchpad.rs` – the per-worktree state tree at `.superset/.magic/`
+  (`STATE_REL`), holding `sessions/<slug>/` with the six model-owned
+  `STATE_FILES` (`CONTEXT.md`, `DECISIONS.md`, `LEARNINGS.md`,
+  `OPERATOR-CHECKLIST.md`, `STATUS.md`, `TASKS.md`), the `current.json` pointer,
+  and the `conclusions/`, `bypass/` and `expect-artifact/` stores. Three hard
+  rules: (1) **scaffold, never rewrite** – an existing state file is left
+  byte-for-byte alone and only a genuinely missing one is created, via
+  `create_new` so a race cannot clobber; only `current.json` is rewritten each
+  run, under an fd-lock plus temp-file-then-rename so a lock-free reader never
+  sees a half file. (2) **never adopt a tracked path** – POSITIVE tracked
+  determination via `git::tracked_files`, so an unenumerable name fails closed
+  as tracked-and-skipped. (3) **write nothing until git says the tree is
+  ignored** – `ensure` refuses on both "git says no" AND "git could not be
+  asked", using `git::is_ignored_no_index_str` so a tracked file inside the tree
+  does not trigger a blanket refusal. Every path is containment-checked
+  (`verify_contained`: an existing symlink must canonicalize inside the worktree
+  root or the write is refused, checked for the `.superset` and
+  `.superset/.magic` ancestors before creation). Dirs are 0700, files 0600 –
+  defense in depth, NOT the sync-exclusion control, which is
+  `sync::EXCLUDED_TREES`. `Refusal` and `Report` carry the outcome outward;
+  `ensure_state_ignored` is the ONE place the `.superset/.magic/` gitignore rule
+  is written, called eagerly from init/migrate and lazily from `plugin enable`,
+  never from a hook.
+- `plugin/claim.rs` – the exactly-once file claim both one-shot stores are built
+  on. `take(dir, path)` creates a private landing file in the SAME directory and
+  `fs::rename`s the claim onto it; since `rename` requires its source to exist,
+  exactly one racing caller wins. It is deliberately NOT built on `unlink`'s
+  `ENOENT` – see the write-up linked under the plugin hard rules below.
+- `plugin/heartbeat.rs` – the append-only machine-level `hooks.jsonl` every hook
+  invocation leaves a `Row` in (including no-ops and failures), which is what
+  `plugin status` reports last-fired-at and outcome counts from. It lives under
+  `directories`' DATA dir, not the cache dir (a history swept by disk cleanup
+  would be worse than none) and outside any worktree, so rows outlive worktree
+  deletion. `append` holds an exclusive `tmproot::with_lock` covering append AND
+  prune together, since a prune rewrites the file wholesale. `prune` keeps the
+  newest `ROWS_KEPT` (2000) rows and drops anything older than 30 days, but a
+  row stamped in the FUTURE (a backward clock jump) is kept, not dropped; it
+  fires only once the file passes `PRUNE_TRIGGER_BYTES` (256 KiB), so the common
+  case costs one `stat`. A prune failure never fails an otherwise-good append.
+  Appends go through the shared `atomic::write_atomically` helper (see
+  `plugin/atomic.rs` above), which this module originally defined before it
+  moved out to serve the rest of the plugin.
+
+### Hooks (`plugin/hook/`)
+
+- `hook/mod.rs` – the ONE pipeline: decode stdin, gate, dispatch, encode stdout,
+  append a heartbeat row, always exit 0. `run` has no code path that produces a
+  non-zero exit; fail-open is structural, not incidental, and a handler panic is
+  caught with `catch_unwind` so it cannot take the session down. Handlers never
+  touch stdout or stderr themselves – only `HookContext::diagnostic`, flushed to
+  stderr after dispatch. Two gates sit HERE, before dispatch, not in the
+  handlers: `plugin.enabled` re-resolved from disk on every invocation, and –
+  for any route whose `Route.writes_state` is true – a fail-closed check that
+  git reports `.superset/.magic/` ignored. `route()` is the whole routing table.
+- `hook/event.rs` – the pure wire format. Decoding is permissive (unknown keys
+  ignored, only `cwd` required) but routing is not: the argv token picks the
+  `Payload` variant, never the envelope's own `hook_event_name`. Two structural
+  guarantees live in the types rather than in discipline: `PermissionDecision`
+  has only a `Deny` variant (a hook can never GRANT a capability), and there is
+  no `updatedInput` rewrite channel anywhere in `Response`. `PreCompact` and
+  `SessionEnd` have no `Response` variant at all, so their silence is enforced
+  by the compiler. `encode` emits the harness's field names –
+  `hookSpecificOutput`, `hookEventName`, `additionalContext`,
+  `permissionDecision`, `permissionDecisionReason`, `systemMessage`, and a
+  top-level `{decision: "block", reason}` for a `SubagentStop` block.
+- `hook/session_start.rs` – scaffolds the scratchpad and returns the operating
+  guidance as `additionalContext`. A hard scratchpad refusal still returns a
+  response, just a short "not set up yet" explanation – it never claims a state
+  file exists that does not. `version_drift_notice` compares the running binary
+  against the plugin root's pin and reports drift on `systemMessage`, the
+  operator channel, never the model-facing one; it is best-effort and silent on
+  every failure.
+- `hook/pre_tool_use.rs` – three jobs on one event, in a fixed decision order.
+  (1) The **checklist deny**: a Read / Edit / Write / NotebookEdit of a checklist
+  file (matched by the `docs/actions/<stem>.checklist.json` convention or by the
+  pointer's recorded target) is denied with instructions to use the checklist
+  verbs. It deliberately does NOT suggest an Explore agent, unlike the size
+  gate – dispatching an agent to read the checklist would leak it into that
+  agent's context just the same. `resolve_target` is the load-bearing part and
+  runs in a FIXED order: expand a leading `~` on the RAW spelling (ahead of the
+  reduction – the normalizer treats `~` as an ordinary segment, so `~/../x`
+  would otherwise have its `~` popped and come out cwd-relative), reduce
+  lexically, then ask `pathnorm::process_view`. A `Cwd` view re-roots on the
+  ENVELOPE's cwd (the agent's, not this process's); an `Opaque` view is judged
+  WITHOUT a root by the shape test, which then canonicalizes and re-asks only to
+  ADD a denial, never to remove one – so a wrong answer costs a redirect to the
+  CLI rather than the deny itself. (2) The **Read gate**: a `Read` past the
+  configured byte threshold (`threshold_lines * BYTES_PER_LINE`) is denied and
+  routed to an Explore agent, or answered with the cached conclusion when one
+  exists. It never emits an allow – only `Silent` or `Deny` – so it can never
+  grant a capability, and every uncertain stat, path resolution or cache lookup
+  falls through to allow. Escape hatches: a bounded `offset`/`limit` window, a
+  subagent's own read, the `.superset/.magic/` state tree, non-text extensions,
+  configured exemption globs, and a one-shot `bypass` claim. `GateTool::from_name`
+  maps `Read`, then `Edit|MultiEdit|Write|NotebookEdit` (mutating), `Grep|Glob`
+  (inert), and `Bash`. (3) The **commit nudge**: a `Bash` command whose trailing
+  words are `git commit`, `git push`, or `gh pr create` – and NOT `gh pr view` /
+  `list` / `diff`, which open nothing – gets `additionalContext` reminding the
+  model to update the checklist, but ONLY when `git::status_porcelain` shows a
+  candidate checklist untracked or edited-but-unstaged. It never sets a decision;
+  the command is never blocked, and the text says so.
+  Every command these three jobs put in front of the model is spelled
+  `ss-magic-plugin`, the wrapper on the Bash tool's PATH, and NEVER a bare
+  `ss-magic`: the model runs them through Bash, where `${CLAUDE_PLUGIN_DATA}` is
+  not exported and the bootstrapped binary cannot be named directly. The human
+  verbs' own `Usage:` strings keep the bare spelling deliberately, since a person
+  runs those in a terminal. `no_model_facing_deny_text_names_a_bare_ss_magic`
+  asserts the rule over every deny reason rather than per-string, because the
+  checklist deny carried the wrapper from the start while the size gate did not.
+- `hook/pre_compact.rs` – appends one timestamped entry to a tool-owned
+  `PRE-COMPACT.md` in the session dir and returns silence. That file is
+  deliberately NOT one of `STATE_FILES`: those are model-owned and never
+  rewritten by the tool, so this is a seventh file the model is never told to
+  edit. It re-checks the tracked-path refusal for its own file, since
+  `scratchpad::ensure` only guards the paths IT writes. Compaction is never
+  blocked or slowed.
+- `hook/subagent_stop.rs` – two independent jobs. The **artifact contract**:
+  `expect_artifact::take_oldest` removes a pending declaration and, if the named
+  file is missing / empty / not a file, blocks the stop once. With nothing
+  declared, nothing is EVER blocked; "at most once" is guaranteed twice over, by
+  the `stop_hook_active` short-circuit and by the fact that taking the record IS
+  the one-shot flag. The **salvage**: an agent's assistant-message text is pulled
+  from its transcript, tail-kept to `SALVAGE_BYTE_BUDGET` and written to
+  `research-salvage/<ts>-<slug>.md` with `create_new`, so an earlier salvage is
+  never overwritten. Salvage runs unconditionally and independently of the block
+  decision, because data loss is irreversible while a block is retriable, and it
+  can never fail the stop.
+- `hook/session_end.rs` – the only moment the ledger row can be written, since
+  the payload carries no usage data: it scans the session's transcript tree and
+  appends one row. Heavily budgeted against the hook timeout (measured ~0.85 s
+  cold, ~35 ms warm on a 382 MiB / 1257-file worst case, against ~1.15 s of real
+  budget) using the ledger's byte-offset store. Raising the timeout is
+  explicitly NOT the remedy – the CLI blocks on session exit waiting for this
+  hook. It is `writes_state: false`, exempt from the ignored-tree gate, because
+  the ledger is machine-level by design.
+- `hook/file_changed.rs` – **present, tested, and INERT.** The shipped
+  `plugin/hooks/hooks.json` declares five events – `SessionStart`, `PreToolUse`,
+  `PreCompact`, `SubagentStop`, `SessionEnd` – and NO `FileChanged` entry, so
+  nothing in a real session ever invokes this handler. It stays wired into
+  `route()` and reachable by argv so the code stays exercised and landing the
+  feature later is a manifest change rather than a rewrite. Do not describe it as
+  a shipped hook. What it WOULD do: on a watched `.env`/`.envrc` write, ask
+  `direnv status --json` (read-only – it never runs `direnv allow`) whether the
+  user already trusts that file, and only then append the exported environment to
+  the harness-supplied `$CLAUDE_ENV_FILE`, refusing if that target resolves
+  inside the repo and writing nothing at all when the variable is unset.
+
+### Human verbs
+
+- `plugin/config.rs` – the typed `plugin` key in the overlaid `magic.json`, and
+  the write path behind `enable` / `disable` / `config get` / `config set
+  [--local]`. `resolve` is infallible by design: every malformed field degrades
+  to a safe default and an out-of-range number CLAMPS rather than rejecting, so
+  a typo can never turn the gate into something more permissive than configured.
+  `enabled` is always read from the MAIN CHECKOUT's overlay regardless of cwd,
+  because a worktree's own `magic.local.json` is itself a forward-sync target;
+  `gate` resolves against the cwd root. Writes are load-modify-write on exactly
+  one file, preserving every unknown key.
+- `plugin/cache.rs` – the conclusion cache behind `conclude` / `conclusions` /
+  `gc`. `identify` keys an entry on `(realpath, size, stamp)` – NEVER the read's
+  offset or limit, so a conclusion about a file answers every later read of it.
+  `envelope` wraps rendered content in nonce-keyed untrusted-data markers with
+  the framing text placed BEFORE the quoted body; it is shared with the
+  checklist renderer and the transcript salvage, because all three inject
+  repository-authored text into a model's context. `prune`/`gc` are best-effort
+  and never fail the caller.
+- `plugin/bypass.rs` / `plugin/expect_artifact.rs` – the two one-shot stores
+  built on `claim::take`. `bypass <FILE>` lets exactly the next gated Read of a
+  resolved path through (`MAX_AGE_SECS` 24 h; an expired claim is still consumed
+  but does NOT open the gate, so it cannot bypass indefinitely).
+  `expect-artifact <FILE> [--note TEXT]` declares an output a later subagent must
+  produce (6 h, shorter because it waits only for a machine-paced stop; an
+  expired record is dropped rather than enforced, since blocking an unrelated
+  agent hours later is worse than not enforcing). Both resolve and
+  containment-check the path at DECLARE time, write records atomically at 0600,
+  and inherit the scratchpad's ignore-gate refusal so a record can never appear
+  as an untracked file in the working copy.
+- `plugin/ledger.rs` – the machine-level `cost.jsonl` and the `cost [--here]
+  [--backfill REF] [--json]` verb. One row per session id, enforced under an
+  fd-lock held for the commit only (the scan runs outside it). The scan is
+  incremental via a byte-offset store keyed on inode plus size, so a rotated
+  transcript forces a full rescan instead of reading garbage. Two pricing rules
+  matter: the harness's own `cost-state` figure is a cumulative FLOOR (take the
+  max, and add table pricing for the main thread only when no harness figure
+  exists, or the cost double-counts); and cache-write tokens are split 5 m
+  (1.25x) versus 1 h (2x), because reading only the flat total undercounts.
+  `Basis` records which of the two priced a row.
+- `plugin/status.rs` – the one place that answers "why is the plugin not doing
+  anything", across every silent-failure path: config disabled, harness
+  registration missing or disabled, state tree not gitignored, binary not
+  installed, manifest-versus-binary drift. Read-only – it never calls
+  `scratchpad::ensure`, creates a store, or adds a gitignore rule – and it exits
+  0 whenever a report was produced, so a script parsing `--json` never has to
+  special-case an exit code. Every null JSON value carries a non-null `note`;
+  `acting` is `None` rather than a guess when the harness layer is unknown.
+  `DECLARED_EVENTS` lists the five events the manifest actually registers and
+  deliberately excludes `file-changed`. The harness and binary probes are
+  time-bounded and degrade to a note.
+- `plugin/spill_index.rs` – a strictly read-only listing of the harness's own
+  oversized-tool-output files for this worktree, which otherwise have
+  unguessable names and no index. An empty result always carries a note
+  distinguishing "nothing found" from "could not locate the directory".
+- `plugin/setup_ci.rs` – writes `.github/workflows/ss-magic-checklist.yml` from
+  the embedded `assets/workflow/checklist.yml`, pinning the running binary's
+  version. `classify` returns `State::{Absent, Identical, PinStale, Differs}`
+  and only `Differs` (a local edit) needs `--force`; `--check`/`-n` reports
+  without writing. `PinStale` is proved by re-rendering the template at the
+  version found in the file and requiring an exact byte match. Written 0644 –
+  committed content, unlike the 0600 state tree.
+- `plugin/compact_window.rs` – `compact-window --set <TOKENS>` writes an
+  absolute `autoCompactWindow` into the per-machine, gitignored
+  `.claude/settings.local.json`, never the tracked `.claude/settings.json`. It
+  is strictly opt-in (no `--set` prints usage and does nothing), never clobbers
+  an existing value, load-modify-writes so unrelated harness keys survive, and
+  refuses rather than rebuilding a malformed file.
+
+### The operator checklist (`plugin/checklist/`)
+
+The typed document at `docs/actions/<YYYY-MM-slug>.checklist.json` and its verbs.
+Layered like `cache.rs` – a pure model with the hook as one caller – and the
+submodules are PRIVATE behind `checklist/mod.rs`, so no caller can bypass
+canonical ordering or validation. The `PreToolUse` deny above makes these verbs
+the ONLY write path.
+
+- `checklist/schema.rs` – the `Document` / `Section` / `Item` model. Every field
+  is `#[serde(default)]` so a hand-edited or partial file still parses (defects
+  are the validator's job, not the parser's), and every level carries a
+  `#[serde(flatten)] extras` map so a key from a newer build survives a rewrite.
+  `kind` defaults to the strictest `Check`, so a missing kind never silently
+  disables verification; `expected` is `Option<Option<String>>` because an
+  absent key and an explicit null mean different things. `parse_iso8601`
+  (Hinnant's `days_from_civil`, no date crate) requires an explicit offset and
+  rejects `24:00` and leap seconds. `Timestamp` deliberately has no `Ord` –
+  compare through `.instant()`, since `+02:00` can sort lexically after a `Z`
+  stamp that is actually earlier.
+- `checklist/order.rs` – `canonicalize` re-establishes the one arrangement a
+  checklist is ever stored in on every write, so a diff shows real changes.
+  Items sort by `(done, priority rank, created)` with the id as final tie-break,
+  making order a pure function of content rather than of prior position; an
+  unreadable timestamp sorts to the end instead of aborting the sort. Section
+  order is never touched – author-declared order is render order.
+- `checklist/validate.rs` – pure findings, no printing and no I/O. `Severity::Error`
+  blocks `verify` and the renderer; `Warning` describes shape defects the next
+  CLI write self-repairs and must NEVER fail CI.
+- `checklist/render.rs` – the single `render()` behind `list`, `verify`,
+  `render-md`, the commit nudge and the CI PR comment, so all five are
+  byte-identical. Every field of user-authored prose goes through
+  `prose_inline` / `md_link` escaping, and the whole output is wrapped in
+  `cache::envelope` – checklist prose is repository-authored text that reaches a
+  model's context. Timestamps render through the shared UTC formatter, never a
+  local clock, so output is identical across machines and timezones.
+- `checklist/verbs.rs` – `init`, `add-item`, `add-entry`, `set`, `done`, `list`,
+  `verify`, `render-md`. Every mutating verb is read-modify-write over the WHOLE
+  document (read, mutate one field, `canonicalize`, re-stamp `updated`, write
+  back), so `extras` survive; writes are temp-file-then-rename preserving the
+  existing mode. An advisory `tmproot::with_lock` spans the whole
+  read-mutate-write, and spans exist-check plus write for `init`, so concurrent
+  verbs cannot lose an update or duplicate a slug. Exit codes are distinct on
+  purpose: 2 for "the command as typed cannot be carried out", but 1 from
+  `verify` for "the document is invalid", so CI can tell them apart. The
+  `.superset/.magic/checklist.json` pointer's contents are NOT trusted blindly –
+  the target is validated lexically against absolute paths and `..` segments –
+  and `resolve_active` falls back to the naming convention (unambiguous single
+  match only) when no pointer exists.
+
+### Non-Rust assets
+
+`plugin/` (the packaged marketplace tree), `.claude-plugin/marketplace.json`
+(the digest pin), `scripts/build-plugin-zip.py` (the reproducible builder and
+the release assertions), `scripts/test-bootstrap.sh` (the bootstrap's
+failure-path suite), `assets/workflow/checklist.yml` (embedded by `setup_ci.rs`),
+`.gitattributes` (line-ending pinning for the digest), and
+`docs/runbooks/forge-tag-and-release-protection.md` (tag/release immutability
+settings a human must apply by hand – currently NOT applied).
+
+Two shell pieces are worth knowing about, because both are load-bearing and
+neither is Rust. `plugin/hooks/bootstrap.sh` installs the pinned binary into
+`${CLAUDE_PLUGIN_DATA}` – never `${CLAUDE_PLUGIN_ROOT}`, which is version-scoped
+and replaced wholesale on each plugin update. It has no `set -e` and every path
+ends in `exit 0`, prints NOTHING on stdout on success (a SessionStart hook's
+stdout enters the model's context every session, so silence is a token-budget
+rule), never touches an existing binary on a failing install, and fetches the
+platform release ARCHIVE directly, verifying it against that archive's published
+`.sha256` before extracting. It deliberately does NOT fall back to piping
+`ss-magic-installer.sh` into a shell: the release publishes `.sha256` siblings
+for the archives but not for the installer script, so a piped installer would be
+the one executed artifact no published digest covers. `plugin/bin/ss-magic-plugin`
+is the wrapper every skill invokes; it injects the `plugin` verb (so a skill can
+never reach bare `ss-magic`, its update gate or its TUI) and is named
+`ss-magic-plugin` rather than `ss-magic` so it cannot resolve
+non-deterministically against a user's own install. It finds the binary through
+a durable handoff file under the R80 temp root, because `${CLAUDE_PLUGIN_DATA}`
+is exported to hook and MCP processes but NOT to the Bash tool.
 
 ## Source of truth for magic.sh
 
@@ -394,15 +881,37 @@ binary is the sole file-copy implementation.)
   `ratatui::backend::TestBackend` with synthetic key events.
 - Test layout: each module declares `#[cfg(test)] mod tests;` with the
   body in a sibling child file (`<module>/tests.rs`), keeping private-item
-  access. Crate-root tests and shared helpers live in `src/tests/`
+  access – including every module under `src/plugin/`. Crate-root tests and
+  shared helpers live in `src/tests/`
   (`sync.rs`, `reverse_sync_flow.rs`, `update_gate.rs`, `support.rs`). CI
   (`.github/workflows/
   ci.yml`) runs the suite on every PR commit and gates cargo-dist releases
   via `plan-jobs` (see dist-workspace.toml).
+- **`cargo test` is no longer the whole suite.** Three non-Rust suites cover
+  code `cargo test` cannot reach, and CI runs all three:
+  `python3 scripts/build-plugin-zip.py --selftest` (the builder's own
+  reproducibility and refusal tests), `python3 scripts/build-plugin-zip.py
+  --check` (the release assertions: the marketplace `sha256` key exists, the
+  four version surfaces agree, the committed digest matches the tree), and
+  `/bin/bash scripts/test-bootstrap.sh` (the bootstrap's failure paths –
+  offline, corrupted download, hostile pin, unwritable data dir, unsupported
+  platform, concurrent sessions – each asserting exit 0, empty stdout, and an
+  untouched pre-existing binary; written for bash 3.2, so no associative
+  arrays, no `mapfile`, no `${var^^}`).
+- The plugin's packaged tree is **content-pinned**. Any change under `plugin/`
+  moves the zip's digest, so it must be followed by `python3
+  scripts/build-plugin-zip.py --update-manifest` and then `--check`, and by a
+  version bump on all four surfaces – `Cargo.toml`,
+  `plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version`, and the
+  release URL in `.claude-plugin/marketplace.json`. The resolved VERSION, not
+  the digest, is the harness's update signal: changing the zip and its `sha256`
+  without bumping the version leaves every installed user silently on the
+  cached copy.
 - Always bump the crate version (`version` in `Cargo.toml`, and the
   matching `ss-magic` entry in `Cargo.lock`) on any change that alters
   CLI behavior — a fix, a new/changed command or flag, or different
-  output. The binary self-updates from GitHub Releases keyed on version
+  output. A change under `plugin/` bumps the other three version surfaces with
+  it (see the plugin content-pin convention below). The binary self-updates from GitHub Releases keyed on version
   (see Build), so a stale version means users never receive the change.
   Bug fixes bump patch; new/changed user-visible behavior bumps minor
   (pre-1.0).
@@ -439,16 +948,77 @@ the real incident this run fixed.
   gate: phrase the question so the UNKNOWN answer is the SAFE one. See
   [docs/solutions/logic-errors/secret-gate-positive-tracked-determination-fail-closed.md](./docs/solutions/logic-errors/secret-gate-positive-tracked-determination-fail-closed.md).
 - **Enforce a secret-excluding path filter at the point of final enumeration, not
-  on an upstream list.** The `.superset/backups/` exclusion (and any filter meant
-  to keep secrets out) must be applied where the file set is actually materialized
-  — the directory walk (`pack`'s `append_dir_excluding_backups`) — NOT only on the
+  on an upstream list.** The excluded-trees filter (`sync::under_excluded_tree`
+  over `sync::EXCLUDED_TREES` – `.superset/backups`, `.superset/.magic`,
+  `.scratchpad`, `.git`) must be applied where the file set is actually
+  materialized – every directory walk (`pack`'s `append_dir_excluding_trees`,
+  `apply::walk_source`, `apply::copy_dir_recursive`, reverse sync's candidate
+  computation) – NOT only on the
   flat match list, because a later step that re-walks the live filesystem
   (`append_dir_all`, `copy_dir_recursive`, `WalkDir`) bypasses an upstream filter.
   The trap is a directory match that is an ANCESTOR of the excluded subtree (a bare
-  `.superset` pattern, a broad `**`). A comment asserting "X is never included" is a
+  `.superset` pattern, a broad `**`) – and one such match can sit above SEVERAL
+  excluded trees at once, since `.superset` is the ancestor of both `backups` and
+  `.magic`. A comment asserting "X is never included" is a
   red flag unless the guard sits on the enumeration layer; test the directory-match
-  shape, not just the leaf. See
+  shape, not just the leaf. (The write-up below predates the rename: it describes
+  `under_backups_dir` / `append_dir_excluding_backups`, now generalized into
+  `sync::under_excluded_tree` / `pack::append_dir_excluding_trees`.) See
   [docs/solutions/logic-errors/pack-backups-exclusion-must-guard-the-directory-walk.md](./docs/solutions/logic-errors/pack-backups-exclusion-must-guard-the-directory-walk.md).
+
+## Plugin constraints (hard rules)
+
+The plugin adds three surfaces with their own failure modes. Each rule below is
+backed by a `docs/solutions/` write-up of the real incident behind it, except the
+last, which is backed by the eight-bypass sequence recorded in this file.
+
+- **Never build "consume exactly once" on `unlink`'s error, and never validate
+  an exclusivity property sequentially.** Measured here: 8 threads racing to
+  `unlink` one path produced up to 5 successes across 20 trials, while
+  sequential testing shows exactly the `ENOENT` you expect – which is what makes
+  it dangerous. The one-shot bypass token (exactly the next gated Read) was
+  built on it and would have leaked to several concurrent reads. The fix is
+  `rename` onto a private landing file in the same directory
+  (`plugin/claim.rs::take`), which gave exactly one winner in every trial. See
+  [docs/solutions/logic-errors/unlink-is-not-an-exclusive-claim.md](./docs/solutions/logic-errors/unlink-is-not-an-exclusive-claim.md).
+- **Parse-sensitive git output must not go through a trimming convenience
+  wrapper.** The shared `git()` helper trims the whole output, which eats the
+  leading space of the first `git status --porcelain` line – that column is a
+  literal space when a file is modified in the worktree only – shifting every
+  field and silently misreading the status. `git::status_porcelain` is written
+  against `git_raw` for exactly this reason. See
+  [docs/solutions/logic-errors/trimming-wrapper-corrupts-porcelain-status.md](./docs/solutions/logic-errors/trimming-wrapper-corrupts-porcelain-status.md).
+- **Phrase every plugin gate so the UNKNOWN answer is the SAFE one, and never
+  let a hook fail loudly.** The two postures pull in opposite directions and
+  both are load-bearing: a hook that errors, panics or times out must look
+  exactly like one that decided to do nothing (`hook::run` has no non-zero exit
+  path, and a handler panic is caught), while the scratchpad's ignore gate, the
+  tracked-path check and the tmproot ownership check all refuse on "could not
+  ask" as well as on "no". Do not "simplify" either half toward the other.
+
+- **A path gate must perform every expansion the harness performs before it
+  roots a path – or refuse to root it.** Eight bypasses of the R88 checklist deny
+  came from one habit: classifying from the ACTOR (the hook's process, the
+  envelope's cwd) rather than from the TARGET, and recognizing SPELLINGS rather
+  than the property behind them. A symlinked ancestor, a case difference, a
+  relative target, a `..` component, a `/proc/self/cwd` prefix, a leading `..`, a
+  decoy symlink in an opaque path's TAIL and a leading `~` were each found and
+  patched one at a time; each patch produced the next hole. The rule has three
+  moves, in order: (1) perform every expansion the harness performs – or refuse
+  to root the path – and reduce lexically, both before anything else looks at the
+  path; (2) decide process-relativeness as a PROPERTY (`pathnorm::process_view`),
+  never a prefix list, and never trust a resolution whose result depends on which
+  process performs it – canonicalization may be used to ADD a denial but never to
+  CLEAR one; (3) derive comparison roots from the target as well as the actor.
+  Note move 1's phrasing: an earlier form said only "never trust a
+  process-dependent resolution", which quantifies over resolutions the code
+  PERFORMS and so cannot catch one it OMITS – which is exactly what the tilde
+  was. The expansion surface is bounded BY MEASUREMENT, not assumption: `~`
+  diverges (handled), `$HOME` syntax was probed and provably does not (both sides
+  treat it as a literal, deliberately unhandled), `/proc` is move 2. **Do not add
+  speculative expansions – probe first.** Adding spellings on suspicion is what
+  produced the sequence. If a ninth bypass turns up, ask which of the three moves
+  it escaped, not which spelling to add.
 
 ## Documented Solutions
 

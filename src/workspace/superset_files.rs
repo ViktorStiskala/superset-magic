@@ -57,14 +57,25 @@ pub struct SetupConfig {
 /// Shape of `.superset/magic.json` (committed) and `.superset/magic.local.json`
 /// (gitignored local overlay).
 ///
-/// Currently holds only `files`; future keys (e.g. per-pattern exclude rules)
-/// should be added here rather than inventing a parallel type.
+/// Named fields hold the keys this version of ss-magic actually understands
+/// (currently just `files`); everything else lands in `extras` (KTD8) via
+/// `#[serde(flatten)]` instead of being dropped. That matters because a
+/// `magic.json` written by a NEWER ss-magic can carry keys this build has
+/// never heard of (e.g. a future `plugin` block) — every writer must
+/// round-trip those keys unchanged rather than silently deleting
+/// configuration it doesn't recognize. Add a new known key as its own named
+/// field rather than reaching into `extras` for it, so future units (typing
+/// a `plugin` field, `config set`/`enable`/`disable`) build on this
+/// unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MagicConfig {
     /// Glob patterns for files to sync from main into worktrees.
     #[serde(default)]
     pub files: Vec<String>,
-    // Future keys go here.
+    /// Every top-level key this build of ss-magic has no named field for.
+    /// Serialized back out verbatim alongside `files` on every write.
+    #[serde(flatten)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Read and overlay `.superset/magic.json` with `.superset/magic.local.json`.
@@ -106,24 +117,72 @@ pub fn load_overlaid(root: &Path) -> Result<Option<MagicConfig>> {
         }
     }
 
+    // Merge extras (KTD8) per the rule documented above: local's value wins
+    // per key; a key present only in base is kept as-is.
+    let mut merged_extras = base.extras.clone();
+    for (key, value) in &local.extras {
+        merged_extras.insert(key.clone(), value.clone());
+    }
+
     Ok(Some(MagicConfig {
         files: merged_files,
+        extras: merged_extras,
     }))
 }
 
-/// Rewrite `.superset/magic.json` from `files`, pretty-printed with a
-/// trailing newline.
-// consumed by U9
-#[allow(dead_code)]
-pub fn write_magic_json(root: &Path, files: &[String]) -> Result<()> {
+/// Rewrite `.superset/magic.json` from `cfg` (including whatever it carries
+/// in `extras`), pretty-printed with a trailing newline.
+///
+/// This is the plain writer — it serializes exactly what `cfg` holds. It does
+/// NOT itself preserve anything: a caller updating `files` on top of an
+/// existing on-disk file must first load that file and carry its `extras`
+/// forward (see [`merge_files_into_magic_config`]), the same
+/// load-modify-write discipline `merge_setup_into_config` already uses for
+/// `config.json`.
+pub fn write_magic_json(root: &Path, cfg: &MagicConfig) -> Result<()> {
     ensure_superset_dir(root)?;
     let path = superset_dir(root).join(MAGIC_JSON);
-    let cfg = MagicConfig {
-        files: files.to_vec(),
-    };
-    let body = format!("{}\n", serde_json::to_string_pretty(&cfg)?);
+    let body = format!("{}\n", serde_json::to_string_pretty(cfg)?);
     fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// Rewrite `.superset/magic.local.json` from `cfg` (including whatever it
+/// carries in `extras`), pretty-printed with a trailing newline.
+///
+/// The gitignored counterpart to [`write_magic_json`], and equally a plain
+/// writer: it serializes exactly what `cfg` holds and preserves nothing on
+/// its own. A caller changing one key on top of an existing local file (the
+/// `--local` half of `enable`/`disable`/`config set`, R7) must first load
+/// that file with [`load_magic_local_json`] and carry its `extras` forward,
+/// same as every other writer in this module.
+pub fn write_magic_local_json(root: &Path, cfg: &MagicConfig) -> Result<()> {
+    ensure_superset_dir(root)?;
+    let path = superset_dir(root).join(MAGIC_LOCAL_JSON);
+    let body = format!("{}\n", serde_json::to_string_pretty(cfg)?);
+    fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Build a fresh `MagicConfig` with `new_files`, carrying forward the
+/// unknown top-level keys (KTD8) from `existing`, if any. Mirrors
+/// `merge_setup_into_config`'s preservation discipline for `config.json`:
+/// every write path (init, migrate, edit-config) loads the current on-disk
+/// `magic.json`, calls this to change just `files`, then writes the result —
+/// never rebuilding a `MagicConfig` from parts alone, which would silently
+/// drop any key this build doesn't have a named field for.
+pub fn merge_files_into_magic_config(
+    existing: Option<&MagicConfig>,
+    new_files: Vec<String>,
+) -> MagicConfig {
+    let extras = match existing {
+        Some(cfg) => cfg.extras.clone(),
+        None => serde_json::Map::new(),
+    };
+    MagicConfig {
+        files: new_files,
+        extras,
+    }
 }
 
 /// Default patterns included in every freshly-written `magic.json`.
@@ -181,6 +240,19 @@ pub fn load_magic_json(root: &Path) -> Result<Option<MagicConfig>> {
         format!(
             "reading {}",
             superset_dir(root).join(MAGIC_JSON).display()
+        )
+    })
+}
+
+/// Load just `magic.local.json` (the gitignored per-machine overlay) from
+/// `root/.superset/`. `Ok(None)` when the file is absent; error when it
+/// exists but cannot be parsed. Does NOT read or merge `magic.json` — use
+/// [`load_overlaid`] when you want the full union.
+pub fn load_magic_local_json(root: &Path) -> Result<Option<MagicConfig>> {
+    read_json::<MagicConfig>(&superset_dir(root).join(MAGIC_LOCAL_JSON)).with_context(|| {
+        format!(
+            "reading {}",
+            superset_dir(root).join(MAGIC_LOCAL_JSON).display()
         )
     })
 }
@@ -301,6 +373,24 @@ pub fn merge_setup_into_config(existing: Option<&Config>, new_setup: Vec<String>
 /// The staged tree is the source of truth: migration stages `magic.sh` +
 /// `magic.json` + `config.json` (+ `magic.local.json`) and asks for
 /// `.superset/setup.sh` to be deleted.
+///
+/// ## Invariant (KTD2): never prunes an unnamed destination entry
+///
+/// This function never removes anything under `repo_root/.superset/` that
+/// isn't named in `delete`. It only ever touches two things: the staged
+/// files it copies IN, and the explicit `delete` list. It never enumerates
+/// `repo_root/.superset/` itself and removes what it finds missing from the
+/// stage — so anything already living there that the stage and `delete`
+/// don't mention is left completely alone. Today that holds by construction
+/// (the loop below reads only the STAGE directory's flat file list, never
+/// the destination's), but it matters because `.superset/.magic/` — the
+/// Claude plugin's session state, conclusion cache, and one-shot claims —
+/// lives *inside* the very destination root this function owns, and is never
+/// staged or named in `delete` by any caller. A future change that walked
+/// `repo_root/.superset/` and pruned whatever it didn't recognize would
+/// silently delete that live state on the next `init` or `migrate`, with no
+/// error and no warning. State this explicitly so a later edit has to break
+/// it on purpose, not by accident.
 pub fn copy_into_repo(stage_root: &Path, repo_root: &Path, delete: &[&str]) -> Result<()> {
     ensure_superset_dir(repo_root)?;
     let stage_dir = stage_root.join(SUPERSET_DIR);

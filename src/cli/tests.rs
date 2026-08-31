@@ -167,3 +167,101 @@ fn help_mentions_no_backup() {
         "usage should mention --no-backup"
     );
 }
+
+// ── `plugin` verb tree (U6) ───────────────────────────────────────────────────
+
+#[test]
+fn plugin_token_carries_the_rest_of_argv() {
+    assert_eq!(
+        parse(&argv(&["plugin", "hook", "pre-tool-use"])),
+        Parsed::Plugin(vec!["hook".to_string(), "pre-tool-use".to_string()])
+    );
+}
+
+#[test]
+fn plugin_with_no_further_args_is_still_a_plugin_invocation() {
+    // The "no verb" error belongs to `plugin::parse`, not here.
+    assert_eq!(parse(&argv(&["plugin"])), Parsed::Plugin(vec![]));
+}
+
+#[test]
+fn plugin_keeps_flags_in_its_tail() {
+    // Unlike `init`, plugin verbs take their own flags, so nothing is filtered.
+    assert_eq!(
+        parse(&argv(&["plugin", "status", "--json"])),
+        Parsed::Plugin(vec!["status".to_string(), "--json".to_string()])
+    );
+}
+
+#[test]
+fn plugin_never_falls_through_to_bare() {
+    // Bare is the one command that opens the TUI and is gated for auto-update;
+    // no plugin argv may reach it.
+    for tail in [
+        vec!["plugin"],
+        vec!["plugin", "hook", "session-start"],
+        vec!["plugin", "bogus"],
+        vec!["plugin", "--anything"],
+    ] {
+        let parsed = parse(&argv(&tail));
+        assert!(
+            matches!(parsed, Parsed::Plugin(_)),
+            "{tail:?} should parse to Plugin, got {parsed:?}"
+        );
+    }
+}
+
+#[test]
+fn help_mentions_plugin() {
+    assert!(usage().contains("plugin"), "usage should mention plugin");
+}
+
+// ── `--version` / `-V` short-circuit (U6, AE56) ───────────────────────────────
+
+#[test]
+fn version_long_and_short_request_version() {
+    assert_eq!(parse(&argv(&["--version"])), Parsed::Version);
+    assert_eq!(parse(&argv(&["-V"])), Parsed::Version);
+}
+
+#[test]
+fn version_wins_from_any_position_before_the_plugin_token() {
+    // Before a subcommand, after a subcommand, and among other flags: all the
+    // same answer. Without this, an unrecognized `--version` would be skipped
+    // as an unknown flag and land on Command::Bare — a network update check
+    // plus a menu, inside a hook that has no terminal.
+    assert_eq!(parse(&argv(&["--version", "sync"])), Parsed::Version);
+    assert_eq!(parse(&argv(&["sync", "--version"])), Parsed::Version);
+    assert_eq!(parse(&argv(&["pack", "-V"])), Parsed::Version);
+    assert_eq!(parse(&argv(&["--verbose", "-V", "update"])), Parsed::Version);
+}
+
+#[test]
+fn version_after_the_plugin_token_belongs_to_the_plugin_verb() {
+    // Past `plugin` the argv is the verb tree's, and a `-V` there may be a
+    // verb's own flag or a value it was given.
+    assert_eq!(
+        parse(&argv(&["plugin", "conclude", "--version"])),
+        Parsed::Plugin(vec![
+            "conclude".to_string(),
+            "--version".to_string()
+        ])
+    );
+    assert_eq!(
+        parse(&argv(&["plugin", "-V"])),
+        Parsed::Plugin(vec!["-V".to_string()])
+    );
+}
+
+#[test]
+fn version_before_the_plugin_token_still_short_circuits() {
+    assert_eq!(parse(&argv(&["--version", "plugin", "status"])), Parsed::Version);
+}
+
+#[test]
+fn help_mentions_version() {
+    assert!(
+        usage().contains("--version"),
+        "usage should mention --version"
+    );
+}

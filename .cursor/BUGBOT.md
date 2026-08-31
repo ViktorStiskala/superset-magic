@@ -21,10 +21,21 @@ full-screen bidirectional sync merge cockpit; `crossterm` also backs `inquire`),
 `globset` + `walkdir` (pattern
 matching), `serde`/`serde_json` (config I/O), `tempfile` (atomic staging),
 `tar` + `bzip2` (pack archives), `self_update` + `ureq` + `fd-lock`
-(self-update), `supports-color` (palette). No `clap` (the arg parser is
-hand-rolled) and no `git2` (all git/gh is shelled out). Release binaries are
+(self-update and the plugin's advisory locks), `directories` (the plugin's
+machine-level data dir), `supports-color` (palette). No `clap` (the arg parser is
+hand-rolled) and no `git2` (all git/gh is shelled out). Hashing is in-crate
+(`src/hashing.rs`: FNV-1a plus a hand-rolled SHA-256) – flag the addition of a
+hashing crate for these uses. Release binaries are
 built by cargo-dist (`dist-workspace.toml`) and self-update from GitHub
 Releases. Tests use `tempfile` + shell-invoked `git init` / `git worktree add`.
+
+The binary also carries a **Claude Code plugin** (`src/plugin/`, exposed as
+`ss-magic plugin <VERB>`), shipped as a packaged tree under `plugin/` and pinned
+by SHA-256 in `.claude-plugin/marketplace.json`. Two non-Rust pieces are part of
+the product, not tooling: `scripts/build-plugin-zip.py` (python3; the
+reproducible zip builder and the release assertions) and
+`plugin/hooks/bootstrap.sh` + `scripts/test-bootstrap.sh` (bash 3.2 – macOS's
+version, so no associative arrays, no `mapfile`, no `${var^^}`).
 
 ## No External Process Libraries
 
@@ -37,12 +48,25 @@ Releases. Tests use `tempfile` + shell-invoked `git init` / `git worktree add`.
 - **The CLI arg parser is hand-rolled in `src/cli.rs`** — there is NO `clap`.
   `parse(&[String]) -> Parsed` selects the command from the first non-flag
   token; `Command` is `{ Bare, Sync { no_backup }, ReverseSync { no_backup },
-  Pack, Update }`. `sync`/`reverse-sync` read the `-n`/`--no-backup` flag via a
+  Pack, Update }`, and `Parsed` additionally carries `Init(Vec<String>)`,
+  `Plugin(Vec<String>)`, `Version`, `Help` and `Error(token)`.
+  `sync`/`reverse-sync` read the `-n`/`--no-backup` flag via a
   full-argv scan (`has_no_backup`, position-independent – before OR after the
   subcommand), an intentional asymmetry with `-h`/`--help` (a terminal
   short-circuit recognized only BEFORE the subcommand). Flag any addition of
   `clap`/`structopt`/`argh`, command dispatch logic added outside `cli.rs`, or a
   "fix" that makes `has_no_backup` and the `--help` scan match each other.
+- **Three deliberate parse asymmetries protect the plugin, and must not be
+  "harmonised".** (1) `Parsed::Plugin` carries the remaining argv VERBATIM,
+  flags included – unlike `Init`, which filters them – because the plugin verbs
+  take their own `--json`/`--local`/`--set`. (2) `version_requested` scans PAST a
+  subcommand token, so `ss-magic sync --version` prints the version; without
+  that, an unrecognized `--version` is skipped as an unknown flag and falls
+  through to `Command::Bare`, which IS update-gated and opens the interactive
+  menu – exactly wrong when a hook shells out to identify the binary. (3) That
+  same scan STOPS at the `plugin` token, because a `-V` after it may be a verb's
+  own flag. Flag a change that filters `Parsed::Plugin`'s argv, that stops the
+  `--version` scan at the subcommand, or that lets it run past `plugin`.
 
 ## Architecture: Layering (pure logic vs interactive layer)
 
@@ -54,7 +78,11 @@ isolation from the interactive TUI. Preserve this boundary.
   engine), `workspace/superset_files.rs` (`.superset/` I/O), `sync/repo_scan.rs` (working-tree
   scan), `git/gitignore.rs` (`.gitignore` helpers), `sync/merge.rs` (the
   push/pull/merge decision model and per-hunk merge assembly), `tui/diffmodel.rs`
-  (the diff-to-rows model powering the cockpit's diff pane).
+  (the diff-to-rows model powering the cockpit's diff pane), `hashing.rs`
+  (FNV-1a + SHA-256), and effectively all of `src/plugin/` – the plugin's parse
+  (`plugin/mod.rs`), its state modules, its hook handlers, and the whole
+  `plugin/checklist/` family (schema, canonical ordering, validator, renderer,
+  verbs) are unit-tested with no terminal and no harness involved.
 - Interactive/side-effecting: `tui/menu.rs`, `tui/ui.rs` (`inquire` wrappers),
   `tui/style.rs` (palette), the finishing-action prompts in `workspace/migrate.rs` /
   `sync/reverse_sync.rs`, `tui/cockpit.rs` (the full-screen reverse-sync merge
@@ -62,8 +90,11 @@ isolation from the interactive TUI. Preserve this boundary.
   rest of this list, but its render path (`draw`) and key dispatch
   (`handle_key`) are unit-tested via `ratatui::backend::TestBackend`, so a
   regression there IS expected to be caught by `cargo test`).
-- `main.rs` composes: `tui::style::init` → `cli::parse` → [auto-update gate for
-  `Bare`/`Sync`/`Pack`] → `dispatch`.
+- `main.rs` composes: `cli::parse` → `tui::style::init` (SKIPPED for
+  `Parsed::Plugin`, which makes the color decision itself so a hook can force
+  color off) → [auto-update gate for `Bare`/`Sync`/`ReverseSync`/`Pack`] →
+  `dispatch`. `Parsed::Version` answers before any dispatch; `Parsed::Plugin`
+  is handled in a SIBLING arm of the update gate, never inside it.
 
 Flag business/pure logic (glob expansion, config merge, path resolution) added
 directly into `tui/menu.rs`/`tui/ui.rs`/`main.rs` instead of a testable module, and
@@ -96,6 +127,28 @@ structurally valid". The engine's rules:
   recursively.
 - `globset`'s `*` crosses path separators (unlike POSIX shell glob) — do not
   introduce code that assumes `*` matches a single path component.
+- **`EXCLUDED_TREES` is enforced at every point of FINAL enumeration, never on
+  the match list alone.** `src/sync/mod.rs` owns the ONE rule: `EXCLUDED_TREES`
+  = `.superset/backups` (pre-write backups, i.e. recovered secrets),
+  `.superset/.magic` (the plugin's machine-local state), `.scratchpad`, `.git`;
+  `under_excluded_tree(rel)` answers "is this rel one of them, or inside one".
+  It must be applied in `apply::walk_source`, `apply::copy_dir_recursive(root,
+  src, dst)`, reverse sync's candidate computation, AND
+  `pack::append_dir_excluding_trees` – every walk that re-reads the live
+  filesystem after the match set is decided. Filtering the flat match list is
+  NOT sufficient: a directory match that is an ANCESTOR of an excluded tree (a
+  bare `.superset` pattern, a broad `**`) re-admits the whole subtree through
+  the walk, and ONE such match can sit above SEVERAL excluded trees at once,
+  since `.superset` is the ancestor of both `backups` and `.magic`. Matching is
+  per COMPONENT (`starts_with_components`), never a string prefix or a bare
+  name, so `.superset/.magicked/` stays includable and – load-bearing –
+  `.superset` ITSELF is never excluded; widening the rule would drop
+  `config.json`, `magic.sh` and `magic.json` out of sync and pack. Flag a new
+  enumeration path that omits the filter, a filter applied only to `rels`, a
+  widened entry (`.superset` alone, or a bare-name match), or a comment
+  asserting "X is never included" without a guard at the walk layer. Distinct
+  from `DEFAULT_EXCLUDES` (`node_modules`/`.venv`), which drops a NAME at any
+  depth.
 
 Flag any second, divergent glob/exclude implementation — expansion must go
 through `sync/apply.rs` (`run`/`match_paths`) and syntax checks through
@@ -142,9 +195,10 @@ committable and must never leak.
   `classify`: `Differs` (both sides, different bytes), `WorktreeOnly`, `MainOnly`,
   or `Identical` (byte-equal, OR both absent – the walk↔classify race).
   `Identical` rels are dropped. DIRECTORY matches are dropped (reverse sync copies
-  single files; a dir would `EISDIR` in `classify`/the cockpit), and any rel under
-  the tool's own `.superset/backups/` tree (`under_backups_dir`) is excluded so a
-  backed-up secret is never re-offered. Flag a reconcile that scans only one root,
+  single files; a dir would `EISDIR` in `classify`/the cockpit), and any rel in an
+  excluded tree (`sync::under_excluded_tree`) is dropped so neither a backed-up
+  secret under `.superset/backups/` nor the plugin's `.superset/.magic/` state is
+  ever re-offered. Flag a reconcile that scans only one root,
   surfaces a directory match, or re-offers a backup copy.
 - **The review baseline pins the reviewed-absent side to None.** Before the
   cockpit opens, `review_baseline` captures each file's `(worktree, main)`
@@ -232,21 +286,29 @@ committable and must never leak.
   expansion), `write_archive` must discard the temp file and leave any
   existing archive (the derived `ss-magic-<repo>.tar.bz2`) untouched —
   never rename an empty tarball over a
-  prior good backup, and never report "Packed 0 entries" as success. Flag a
-  pack path that persists the temp archive when the added count is zero.
-- **Pack must never archive anything under `.superset/backups/`.** A recovered
-  secret copy under the tool's own backups tree must never re-enter an archive.
-  Two guards enforce this, and BOTH are needed: `pack_core` drops every LEAF match
-  under `.superset/backups/` from `rels` (`under_backups_dir` in the
-  `rels.retain`), AND `write_archive` prunes the backups subtree from any
-  ANCESTOR-directory match (a bare `.superset` pattern, or a broad `**`/`.` that
-  matches the `.superset` component) via `append_dir_excluding_backups`'s guarded
-  `filter_entry` walk rather than a blind `append_dir_all`. `under_backups_dir`
-  needs BOTH the `.superset` and `backups` path components, so the flat retain
-  filter CANNOT catch an ancestor dir – the guarded directory walk is required.
-  Flag removal of either guard, or a new archive path that reaches
-  `append_dir_all`/`append_dir_all`-style recursion for a directory match without
-  pruning the `.superset/backups/` subtree.
+  prior good backup, and never report "Packed 0 files" as success (`main.rs`
+  suppresses `PackEvent::Done` at zero and prints "No packable files remained"
+  instead). `PackEvent::Done.count` is the size of `write_archive`'s `added`
+  set: UNIQUE FILE PATHS actually written, not tar entries – archived
+  directories are not counted and two overlapping patterns naming the same file
+  count once. Flag a
+  pack path that persists the temp archive when the added count is zero, or a
+  change that makes `count` a raw entry tally while the message still says
+  "entries".
+- **Pack must never archive anything in an excluded tree.** A recovered secret
+  copy under `.superset/backups/`, or the plugin's `.superset/.magic/` state,
+  must never enter an archive. Two guards enforce this, and BOTH are needed:
+  `pack_core` drops every LEAF match in an excluded tree from `rels`
+  (`sync::under_excluded_tree` in the `rels.retain`), AND `write_archive` prunes
+  those subtrees from any ANCESTOR-directory match (a bare `.superset` pattern,
+  or a broad `**`/`.` that matches the `.superset` component) via
+  `append_dir_excluding_trees`'s guarded `filter_entry` walk rather than a blind
+  `append_dir_all`. `under_excluded_tree` matches a tree's full component path,
+  so the flat retain filter CANNOT catch an ancestor dir – the guarded directory
+  walk is required, and a single `.superset` match must prune BOTH `backups` and
+  `.magic`. Flag removal of either guard, or a new archive path that reaches
+  `append_dir_all`-style recursion for a directory match without pruning every
+  excluded subtree.
 - Overwrite safety: sync reconciles files through the full-screen
   merge cockpit (`tui/cockpit.rs`), never writing on any keypress. NOTHING is
   pre-selected (every file starts `Undecided`, in either direction), applying
@@ -402,6 +464,327 @@ committable and must never leak.
   skips the gitignore-safety step for an untracked source, or one that appends a
   rule for a tracked source.
 
+## The Claude Code Plugin (`src/plugin/`, `plugin/`, `scripts/`)
+
+`ss-magic plugin <VERB>` is a second program inside the same binary. It runs
+inside a developer's Claude Code session, writes into a state tree beside the
+secrets the rest of the tool moves, and is reached by an automated caller that
+cannot see its errors – so review it with the same suspicion as the sync engine.
+
+### Two callers, two opposite postures
+
+- **`plugin hook <event>` serves the harness.** The envelope arrives on stdin
+  and the ONLY thing allowed on stdout is the JSON response, so a stray
+  `println!`, a progress line, or an ANSI escape corrupts it. `plugin::run`
+  calls `style::init_no_color()` for a hook invocation precisely for this – flag
+  a change that initializes color unconditionally, or that prints to stdout from
+  a handler instead of returning a `Response`. Handler diagnostics go to stderr
+  through `HookContext::diagnostic`, flushed after dispatch.
+- **A named verb (`status`, `checklist`, …) serves a person or a skill**, and
+  reports on stderr with a non-zero exit like any CLI.
+- **Only human verbs may write configuration.** `enable`, `disable` and `config
+  set` are the write path, and nothing reachable from a hook may call one –
+  otherwise a repository could arrange its own enablement by getting a hook to
+  fire. `HumanVerb::writes_config` marks them. Flag any hook handler that
+  reaches a config write, or a new config-writing path added to `hook/`.
+- **There is no `install` verb**, and `ss-magic sync` runs no plugin step: the
+  marketplace is the only delivery path. Flag any code that writes a plugin tree
+  onto the machine.
+
+### A hook fails OPEN; a gate fails CLOSED
+
+These pull in opposite directions and both are load-bearing. Do not "simplify"
+either toward the other.
+
+- **Fail-open, structurally.** `hook::run` has no code path that yields a
+  non-zero exit, a handler panic is caught with `catch_unwind`, and an
+  unroutable event name is a VALUE (`HookEvent::Unknown`) rather than a parse
+  error – a manifest from a newer build can name an event this binary never
+  heard of, and the contract is "exit 0, print nothing, record the name". An
+  error, a panic, or a timeout must look to the harness exactly like a hook that
+  decided to do nothing; a tool that is only advisory must never break a session
+  in progress. Flag a `?`/`bail!` that can propagate out of `hook::run`, a
+  removed `catch_unwind`, or an unroutable event turned into an error.
+- **Fail-closed on anything that could leak.** The state-tree gate refuses on
+  BOTH "git says not ignored" AND "git could not be asked"; the tracked-path
+  check uses POSITIVE tracked determination (`git::tracked_files`), so an
+  unenumerable name defaults to tracked-and-skipped; the temp-root ownership
+  check refuses a base it cannot verify. Flag any of these rewritten so the
+  unknown answer becomes the permissive one.
+- **The gate can only DENY, never ALLOW.** `event::PermissionDecision` has a
+  single `Deny` variant and there is no `updatedInput` rewrite channel anywhere
+  in `Response`; `PreCompact` and `SessionEnd` have no `Response` variant at
+  all, so their silence is enforced by the type system. These are structural
+  guarantees – flag the addition of an `Allow`/`Ask` variant, a rewrite channel,
+  or a response variant for a silent event.
+
+### State: where it goes, and what guards it
+
+- **`.superset/.magic/` is written only after git confirms it is ignored.**
+  `scratchpad::ensure_state_ignored` is the ONE place that gitignore rule is
+  written, called eagerly from init/migrate and lazily from `plugin
+  enable`/`config set plugin.enabled true`, NEVER from a hook. The check uses
+  `git::is_ignored_no_index_str` (rules-only, index-ignoring) so a tracked file
+  inside the tree does not read as "the tree is unignored". Flag a write into
+  the state tree that skips the gate, a hand-rolled gitignore append for it, or
+  a hook that adds the rule.
+- **Scaffold, never rewrite; never adopt a tracked path.** The six model-owned
+  state files are created only when genuinely missing, via `create_new` (atomic
+  against a race), and an existing one is left byte-for-byte alone; only the
+  `current.json` pointer is rewritten each run, under an fd-lock plus
+  temp-file-then-rename. A path git reports as tracked is skipped. Flag a
+  truncating open, a blanket rewrite of a state file, or a tracked path adopted.
+- **Containment is checked before creation.** Every directory and file the
+  scratchpad writes is verified to canonicalize inside the worktree root, so an
+  existing symlink cannot redirect a write outside it. Flag a new write path
+  that skips the containment check.
+- **The machine-level stores are deliberately outside any worktree.** The hook
+  heartbeat log and the cost ledger live in the OS DATA dir (not the cache dir,
+  which disk cleanup sweeps) because their rows must outlive worktree deletion.
+  Flag a move of either into a repository or into the cache dir.
+- **Mode bits: 0600 files / 0700 dirs for anything machine-local**, and 0644
+  only for content that is committed (the generated CI workflow). Flag a
+  world-readable state file or a 0600 committed artifact.
+
+### Exactly-once claims must not be built on `unlink`
+
+**Never treat a successful delete as having won a claim.** Measured on this
+repo's own code: 8 threads racing to `unlink` one path produced up to 5
+successes across 20 trials. Sequential testing shows exactly the `ENOENT` you
+expect, which is what makes it dangerous – the one-shot bypass token ("exactly
+the next gated Read") was built on it and would have admitted every concurrent
+read that raced it.
+
+`plugin/claim.rs::take` is the single correct primitive: create a private
+landing file in the SAME directory (so the rename never crosses a filesystem)
+and `fs::rename` the claim onto it. `rename` requires its source to exist, so
+exactly one caller wins. Flag any new one-shot/exactly-once store built on
+`remove_file(...).is_ok()`, and flag an exclusivity test that only calls the
+claim twice in a row – that proves the state machine, not the exclusion, and a
+correct test must race N threads and assert exactly one winner.
+
+### Parse-sensitive git output must bypass the trimming helper
+
+`git()` and `git_optional()` in `src/git/mod.rs` `.trim()` the whole output.
+That is right for a single value and **destructive** for a fixed-column format:
+`git status --porcelain`'s index column is a literal SPACE when a file is
+modified in the worktree only, so trimming eats the leading space of the FIRST
+line and shifts every field on it – the status is misread and the path loses its
+first character. `git::status_porcelain` is written against `git_raw` and splits
+with `str::lines()` for exactly this reason. Flag a parse-sensitive git call
+(porcelain, `check-ignore -v`, anything NUL-separated or column-indexed) routed
+through `git`/`git_optional`, a per-line `.trim()` applied to such output, or a
+"simplification" of `status_porcelain` back onto the shared helper.
+
+### Config resolution is infallible and load-modify-write
+
+- **Every malformed field degrades to a safe default; an out-of-range number is
+  CLAMPED, not rejected.** A typo must never leave the gate more permissive than
+  configured, and must never hard-fail a session. Flag a `?` that can propagate
+  out of config resolution, or a bad value that widens a limit.
+- **`plugin.enabled` is always read from the MAIN CHECKOUT's overlay**,
+  regardless of the cwd, because a worktree's own `magic.local.json` is itself a
+  forward-sync target. The `gate` block resolves against the cwd root. Flag a
+  change that resolves `enabled` from the worktree.
+- **Writes are load-modify-write on exactly ONE file and preserve unknown
+  keys.** `MagicConfig` carries a flattened `extras` map and
+  `write_magic_json(root, &MagicConfig)` / `write_magic_local_json` take the
+  whole typed config, so a key a newer build or a hand edit put in the file
+  survives. `config set` is scoped to keys rooted at `"plugin"`. Flag a write
+  that rebuilds the file from known fields only, that touches both layers, or
+  that reaches outside the `plugin` key.
+
+### The operator checklist is CLI-write-only
+
+The `PreToolUse` handler denies a direct `Read`/`Edit`/`Write`/`NotebookEdit` of
+a checklist file, so `plugin/checklist/verbs.rs` is the ONLY write path – that
+is what keeps every stored document canonically ordered and valid.
+
+- Every mutating verb is read-modify-write over the WHOLE document (read →
+  mutate one field → `canonicalize` → re-stamp `updated` → write back), so the
+  flattened `extras` on every level survive; writes are temp-file-then-rename
+  preserving the existing mode. An advisory lock spans the entire
+  read-mutate-write, and spans exist-check plus write for `init`. Flag a partial
+  write, a mutation that skips `canonicalize`, or a lock narrowed to the write.
+- `canonicalize` must stay a pure function of content (items sort by `(done,
+  priority rank, created)` with the id as final tie-break) so it is idempotent,
+  and it must compare timestamps through the parsed instant, NEVER as strings –
+  a `+02:00` stamp can sort lexically after a `Z` stamp that is actually
+  earlier. Section order is author-declared and never re-sorted.
+- The schema is permissive on purpose (every field defaulted) so a hand-edited
+  file still parses; defects are the validator's job. `kind` defaults to the
+  strictest variant so a missing kind never silently disables verification, and
+  `expected` is `Option<Option<String>>` because an absent key and an explicit
+  null differ. Flag a field made mandatory at the parse layer, or a defaulted
+  `kind` that is not the strict one.
+- Exit codes are distinct on purpose: 2 for "the command as typed cannot be
+  carried out", 1 from `verify` for "the document is invalid", so CI can tell
+  them apart. `Severity::Warning` describes shape defects the next write
+  self-repairs and must NEVER fail CI. Flag a collapse of the two exit codes, or
+  a warning promoted to a CI failure.
+- The `.superset/.magic/checklist.json` pointer's contents are NOT trusted: the
+  target is validated lexically against absolute paths and `..` segments. Flag a
+  pointer target joined without that check.
+- All rendering goes through one `render()`, so the CLI, the commit-time nudge
+  and the CI comment are byte-identical; user-authored prose is escaped before
+  insertion, timestamps render through a fixed UTC formatter (never a local
+  clock), and the output is wrapped in the shared untrusted-data envelope with
+  the framing text placed BEFORE the quoted body. Flag a second rendering path,
+  unescaped prose, a locale/local-time date, or a bypassed envelope.
+
+### A path gate classifies from the TARGET, in three fixed moves
+
+The checklist deny above is only as good as its answer to "is this path that
+file". Eight separate bypasses of it came from one habit: deciding from the
+ACTOR (the hook's own process, the envelope's cwd) rather than from the TARGET,
+and recognizing SPELLINGS rather than the property behind them. A symlinked
+ancestor, a case difference, a relative target, a `..` component, a
+`/proc/self/cwd` prefix, a leading `..`, a decoy symlink in an opaque path's
+TAIL, and a leading `~` were each patched one at a time, and each patch produced
+the next hole. Review any change to path classification against these three
+moves, in this order.
+
+- **Move 1 – expand, then reduce, before anything else looks at the path.**
+  Perform every expansion the harness performs before it opens a file, or refuse
+  to root the path. A leading `~` must be expanded against `HOME` on the RAW
+  spelling, AHEAD of the lexical reduction: the normalizer treats `~` as an
+  ordinary segment, so `~/../x` would otherwise have its `~` popped and come out
+  working-directory-relative. `~name` (another account's home, known only to a
+  user database) and an unset or non-absolute `HOME` must make the path
+  unrootable, NEVER a guess at `/home/<name>`. Flag a reduction that runs before
+  expansion, a guessed home directory, or a new expansion added on suspicion
+  rather than measurement – the surface is bounded by probing (`~` diverges
+  between harness and hook; `$HOME`-style syntax was probed and provably does
+  not, so it is deliberately unhandled).
+- **Move 2 – decide process-relativeness as a property, not a prefix list.** A
+  path is process-relative when a `proc` component is followed by a process
+  selector (`self`, `thread-self`, or all-digits) ANYWHERE in the component
+  sequence – procfs is mountable anywhere, so a fixed `/proc/...` prefix match is
+  wrong. Only `…/proc/<selector>/cwd/<rest>` is re-rootable; `root`, `fd/<n>`,
+  `task/<tid>` and `ns/…` name what only the selected process sees. The FIRST
+  selector must win, or `/proc/self/root/proc/self/cwd/…` re-roots on another
+  process's mount namespace. Never trust a resolution whose result depends on
+  which process performs it: `canonicalize` may be used to ADD a denial but
+  NEVER to CLEAR one, because it answers about the hook's process and a wrong
+  answer must cost a redirect rather than the deny itself. Flag a prefix match, a
+  last-match scan, or a canonicalize that clears a path.
+- **Move 3 – derive comparison roots from the target as well as the actor,** and
+  compare fold-case where the naming convention does. Flag a comparison whose
+  both sides come from one source: a fixture built that way cannot fail a basis
+  bug, which is what hid three of the eight.
+
+Lexical reduction itself must count leading `..` rather than push them – a
+pushed one is poppable by the next `..`, so `../../x` collapses to `x`, turning a
+path that escapes its tree into a valid-looking one inside it. And it must not be
+reimplemented by walking `parent()`/`file_name()`: `file_name()` returns `None`
+for a `..` component, so such a walk SKIPS the hop instead of cancelling it.
+
+Test both levels. A unit test of the reduction helper is NOT a test of the gate –
+during one of these fixes the helper's own `..` test passed throughout a revert of
+the gate's call to it. Flag a new path-classification behavior covered only by a
+helper unit test.
+
+### The commit nudge is advisory and narrowly scoped
+
+The `PreToolUse[Bash]` nudge matches only a command whose trailing words are
+`git commit`, `git push`, or `gh pr create`. `gh pr view`/`list`/`diff` must NOT
+trigger it – they open nothing. It fires only when `git::status_porcelain` shows
+a candidate checklist untracked or edited-but-unstaged, sets
+`additional_context` and NEVER a decision, and its text says the command was not
+blocked. Flag a nudge that sets a decision, that widens the `gh pr` match beyond
+`create`, or that fires with no checklist in the repository.
+
+### The packaged plugin tree is content-pinned
+
+- `.claude-plugin/marketplace.json` pins the `plugin/` zip by SHA-256; that pin
+  is the ONLY integrity control on the plugin. The `sha256` key is optional in
+  the schema and unknown keys inside a source object are silently ignored, so a
+  typo such as `"sha"` validates cleanly and installs the plugin UNPINNED –
+  which is why `python3 scripts/build-plugin-zip.py --check` asserts the key
+  exists mechanically. Flag a renamed/removed `sha256`, or a source URL that is
+  not https.
+- The zip must stay **byte-reproducible**: sorted entries, fixed 1980-01-01
+  timestamps, normalized modes (0644, 0755 under `bin/` and for `*.sh`),
+  `create_system` forced to unix, STORED not deflated, `.DS_Store` excluded, and
+  a LOUD refusal on a symlink or a non-ASCII filename (macOS normalizes to NFD
+  and Linux to NFC, which hash differently). `.gitattributes` marks `plugin/**`
+  as `-text` so checkout-time line-ending conversion cannot move the digest.
+  Flag a builder change that reads a clock or an mtime, that deflates, that
+  drops a refusal, or a removal of the `plugin/**` `-text` rule.
+- **Any change under `plugin/` must re-pin AND bump the version.** Run `python3
+  scripts/build-plugin-zip.py --update-manifest` then `--check`. The resolved
+  VERSION, not the digest, is the client's update signal – changing the zip and
+  its `sha256` without a version bump leaves every installed user silently on
+  the cached copy. Flag a `plugin/` change with a stale digest or an unbumped
+  version.
+
+### The bootstrap must never fail a session
+
+`plugin/hooks/bootstrap.sh` runs on every fresh session on every machine.
+
+- **No `set -e`; every path ends in `exit 0`.** Offline, DNS failure, proxy,
+  404, checksum mismatch, unwritable data directory, unsupported platform: all
+  are "do nothing, one line on stderr, exit 0".
+- **Nothing on stdout on the success path.** A `SessionStart` hook's stdout
+  enters the model's context every session, so silence is a token-budget rule,
+  not a style preference.
+- **An existing binary is never touched by a failing install.** The download is
+  verified and staged first, and only a verified binary is moved into place; a
+  failed install drops the success marker so the next session retries.
+- **It fetches the platform release ARCHIVE and verifies it against that
+  archive's published `.sha256`.** It must NOT pipe `ss-magic-installer.sh` into
+  a shell, even as a fallback: the release publishes `.sha256` siblings for the
+  archives but not for the installer script, so a piped installer is the one
+  executed artifact no published digest covers. Flag any reintroduction of an
+  installer-script hop.
+- The install target is `${CLAUDE_PLUGIN_DATA}`, never `${CLAUDE_PLUGIN_ROOT}`
+  (which is version-scoped and replaced wholesale on each plugin update), and
+  the braced form is required for harness substitution. Flag either inversion.
+- It is written for **bash 3.2** (macOS's version): no associative arrays, no
+  `mapfile`, no `${var^^}`. Flag bash 4+ syntax here or in
+  `scripts/test-bootstrap.sh`.
+- `plugin/bin/ss-magic-plugin` is the wrapper skills invoke. It must keep
+  injecting the `plugin` verb (so a skill can never reach bare `ss-magic`, its
+  update gate, or its TUI) and must keep its distinct name (a wrapper called
+  `ss-magic` would resolve non-deterministically against a user's own install).
+  A missing binary is a normal state – it exits 0 with one stderr line. No skill
+  body may name `${CLAUDE_PLUGIN_DATA}` or a bare `ss-magic`; CI asserts this.
+- **The wrapper spelling is required in ALL model-facing text, not just skill
+  bodies.** Any command a hook response tells the model to run – every deny
+  reason, nudge, and `additionalContext` – is executed through the Bash tool,
+  where `${CLAUDE_PLUGIN_DATA}` is NOT exported, so only `ss-magic-plugin`
+  resolves. A bare `ss-magic` there reaches nothing on a marketplace-only
+  install (the only delivery path), so a conclusion can never be recorded and a
+  bypass never consumed – the same oversized Read stays a miss forever. This
+  already bit once: the checklist deny carried the wrapper from the start while
+  the size-gate deny quietly did not. Flag a bare `ss-magic` in any string that
+  reaches the model. **The human verbs' own `Usage:` strings are the deliberate
+  exception** – a person runs those in a terminal, where the bare name is
+  correct – so check where the string is printed, not just its text.
+
+### `ss-magic plugin` never self-updates and never opens the TUI
+
+`main.rs` handles `Parsed::Plugin` in a sibling arm of the auto-update gate, and
+`should_run_update_gate` is an INCLUSION list over `Command` – `plugin` is not a
+`Command` at all. The binary is pinned alongside the skills, hooks and Markdown
+the marketplace ships with it, so a silent mid-session swap would leave the two
+describing different behavior. Flag a `plugin` arm added to
+`should_run_update_gate`, an inversion of it to an exclusion list, or any
+interactive-menu construction reachable from a plugin verb.
+
+### The shipped manifest declares FIVE hook events
+
+`plugin/hooks/hooks.json` registers `SessionStart`, `PreToolUse`, `PreCompact`,
+`SubagentStop`, and `SessionEnd` – and no `FileChanged` entry. `HookEvent`
+parses a `file-changed` token and `hook/mod.rs::route()` still has an arm for it,
+so `src/plugin/hook/file_changed.rs` is reachable by argv and stays covered by
+tests, but **nothing in a real session invokes it**. Do not describe it as a
+shipped hook, and do not "fix" the manifest by adding a `FileChanged` entry
+shaped like the others: that matcher is a watch-path list, not a name filter, so
+an entry without one registers zero watch paths and can never fire. Flag
+documentation or a status report that claims `file-changed` is active
+(`status::DECLARED_EVENTS` deliberately lists only the five).
+
 ## Filesystem Writes: Atomic Staging
 
 - `.superset/` materialisation stages the whole tree in a tempdir and copies it
@@ -467,6 +850,9 @@ embedded source of truth).
 - Interactive prompts must be inert on Esc / Ctrl-C (leave the tree untouched
   and exit success) — `tui/menu.rs` and the pickers follow this. Flag an
   interactive path where cancellation mutates the filesystem.
+- A `plugin hook` invocation owns stdout for its JSON envelope: color is forced
+  off there and nothing but the envelope may be printed. Flag a `println!` added
+  to a hook handler, or a style init that ignores the hook case.
 
 ## Version Bump Discipline (REQUIRED)
 
@@ -478,13 +864,38 @@ MUST bump `version` in `Cargo.toml` AND the matching `ss-magic` entry in
 minor (pre-1.0). Flag a behavior-changing PR that does not bump both
 `Cargo.toml` and `Cargo.lock`, or that bumps only one of the two.
 
+**A change under `plugin/` bumps FOUR version surfaces, not one**, and re-pins
+the digest: `Cargo.toml`, `plugin/.claude-plugin/plugin.json`,
+`plugin/ss-magic.version`, and the release-asset URL in
+`.claude-plugin/marketplace.json` must all agree, and the `sha256` there must
+match the rebuilt zip. `python3 scripts/build-plugin-zip.py --check` asserts all
+of it; `--update-manifest` re-pins. The resolved VERSION, not the digest, is the
+client's update signal, so a content change without a version bump leaves every
+installed user silently on the cached copy. Flag a `plugin/` change with any
+surface out of step, or with a stale digest.
+
 ## Test Requirements
 
+- **`cargo test` is not the whole suite.** Three non-Rust suites cover code it
+  cannot reach, and CI runs all of them:
+  `python3 scripts/build-plugin-zip.py --selftest` (the zip builder's
+  reproducibility guarantees and its refusals),
+  `python3 scripts/build-plugin-zip.py --check` (the release assertions: the
+  marketplace `sha256` key exists, the four version surfaces agree, the
+  committed digest matches the tree), and
+  `/bin/bash scripts/test-bootstrap.sh` (the bootstrap's failure paths –
+  offline, corrupted download, hostile pin, unwritable data dir, unsupported
+  platform, concurrent sessions – each asserting exit 0, empty stdout, and an
+  untouched pre-existing binary). Flag a change to `plugin/`, `scripts/`, or the
+  release assertions that leaves these unrun or unmentioned.
 - Tests use `tempfile` for scratch trees and shell-invoked `git init` /
   `git worktree add` for git fixtures. Pure modules (`cli.rs`, `sync/pattern.rs`,
-  `sync/apply.rs`, `pack.rs`, `workspace/superset_files.rs`, `git/mod.rs` probes, `tui/menu.rs`
-  routing via `operations_for`, `sync/merge.rs`, `tui/diffmodel.rs`, and
-  `sync/reverse_sync.rs`'s `apply_decision`/backup/TOCTOU seam) have unit
+  `sync/apply.rs`, `sync/mod.rs`, `pack.rs`, `hashing.rs`,
+  `workspace/superset_files.rs`, `git/mod.rs` probes, `tui/menu.rs`
+  routing via `operations_for`, `sync/merge.rs`, `tui/diffmodel.rs`,
+  `sync/reverse_sync.rs`'s `apply_decision`/backup/TOCTOU seam, and every module
+  under `src/plugin/` – its parse, state modules, hook handlers and the whole
+  `checklist/` family) have unit
   tests; the interactive
   menu/pickers and final-action git ops are validated by manual smoke, not
   unit tests. The reverse-sync merge cockpit (`tui/cockpit.rs`) is the same
@@ -498,13 +909,30 @@ minor (pre-1.0). Flag a behavior-changing PR that does not bump both
   paths, exclusions). Flag a behavior-adding PR to a pure module with no test
   changes.
 - Bug fixes SHOULD include a test that reproduces the issue before the fix.
+- **An exclusivity property must be tested by racing it, never sequentially.** A
+  "consume exactly once" claim checked by calling it twice in a row proves the
+  state machine, not the exclusion – a broken `unlink`-based claim passes that
+  test and admits several concurrent winners. Require N threads contending and
+  an assertion of exactly one winner, repeated enough times to catch a rare
+  interleaving. Flag a new one-shot store whose only test is sequential.
+- **A parser over line-oriented command output needs a SINGLE-LINE fixture.** A
+  defect that corrupts only the first line (a whole-output `.trim()` eating a
+  leading status column, for instance) is completely hidden by a multi-line
+  fixture. For `git status --porcelain` specifically, also cover the
+  worktree-only-modified case (` M`, leading space), not just `M ` and `??`.
 - Test layout: every module declares `#[cfg(test)] mod tests;` with the body
-  in a dedicated child file (`<module>/tests.rs`); crate-root tests and shared
-  helpers live in `src/tests/` (`sync.rs`, `update_gate.rs`, `support.rs`).
+  in a dedicated child file (`<module>/tests.rs`) – including every module under
+  `src/plugin/`; crate-root tests and shared
+  helpers live in `src/tests/` (`sync.rs`, `reverse_sync_flow.rs`,
+  `update_gate.rs`, `support.rs`).
   Flag a PR that adds an inline `mod tests { ... }` block to a source file
   instead of a sibling test file.
-- CI (`.github/workflows/ci.yml`) runs `cargo test --locked` on every PR
-  commit and gates cargo-dist releases via `plan-jobs` in
+- CI (`.github/workflows/ci.yml`) runs `cargo test --locked` on Ubuntu and
+  macOS for every PR commit, plus a `plugin package` job carrying the builder
+  selftest, the release assertions, a check that a content change under
+  `plugin/` came with a version bump, a check that no skill body names
+  `CLAUDE_PLUGIN_DATA`, and the bootstrap failure-path suite; it gates
+  cargo-dist releases via `plan-jobs` in
   `dist-workspace.toml`. Flag hand edits to the generated
   `.github/workflows/release.yml` (regenerate with the pinned `dist` version
   instead) and flag `allow-dirty = ["ci"]` additions.
@@ -521,13 +949,19 @@ minor (pre-1.0). Flag a behavior-changing PR that does not bump both
 ## Documentation Sync (REQUIRED)
 
 `README.md` (user-facing), `CONTRIBUTING.md` (contributor-facing: from-source
-builds, tests, PR expectations, release/versioning), and `CLAUDE.md`
+builds, tests, PR expectations, release/versioning), `CONCEPTS.md` (domain
+vocabulary), and the repo's contributor-instructions file at the repo root
 (architecture/conventions) must reflect the current state after every
 implementation change — a new command, flag, module, or changed behavior. Flag
 a behavior- or architecture-changing PR that leaves any of them describing the
-old state (e.g. a new subcommand not listed in the README command list or the
+old state (e.g. a new subcommand or plugin verb not listed in the README command
+inventory or the
 `main.rs`/`cli.rs` descriptions, a changed build/test/release workflow not
-reflected in `CONTRIBUTING.md`, or a new module absent from the `CLAUDE.md`
-architecture list).
+reflected in `CONTRIBUTING.md`, or a new module absent from that
+contributor-instructions file's per-module Architecture section). The README's
+command inventory must match `cli.rs`'s `parse`
+and `plugin/mod.rs`'s `HumanVerb`/`HookEvent`, and the documented hook events
+must match what `plugin/hooks/hooks.json` actually registers – flag a doc that
+claims an event the manifest does not declare.
 This `.cursor/BUGBOT.md` must likewise be re-synchronised whenever the
 conventions above change.
