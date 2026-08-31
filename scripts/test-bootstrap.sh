@@ -482,6 +482,14 @@ for ev, egroups in spec["hooks"].items():
             a0 = h.get("args", [None])[0]
             assert isinstance(a0, str) and a0.startswith("${CLAUDE_PLUGIN_ROOT}/"), (
                 f"{ev}: args[0] is {a0!r}; it must be a path under the plugin root")
+            # Spelling is not the property that matters - the spawned path has to
+            # EXIST in the packaged tree, or the harness posix_spawns a missing
+            # file and we are back to the ENOENT this whole shape exists to stop.
+            import pathlib
+            rel = a0[len("${CLAUDE_PLUGIN_ROOT}/"):]
+            target = pathlib.Path(sys.argv[1]).parent.parent / rel
+            assert target.is_file() and target.stat().st_size > 0, (
+                f"{ev}: args[0] names {rel}, which is missing or empty in the packaged tree")
 print("ok")
 PY
     then pass "AE64: startup-only bootstrap, compact-covering handler, no runtime-path commands"
@@ -592,6 +600,28 @@ SHIM_DATA="" run_shim pre-tool-use
 assert_eq 0 "$RC" "AE9: exits 0 with the binary present"
 assert_eq "plugin hook pre-tool-use" "$(cat "$sb/fakebin.log")" "AE9: execs with exactly 'plugin hook <event>'"
 assert_eq 0 "$(wc -c <"$sb/sout" | tr -d ' ')" "AE9: the shim itself adds nothing to stdout"
+
+current_case="AE9 execs through CLAUDE_PLUGIN_DATA, the production path"
+# A real hook process always has CLAUDE_PLUGIN_DATA in its environment, so this
+# branch - not the handoff fallback - is what runs in production. It was only
+# covered in its failure direction.
+: >"$sb/fakebin.log"
+SHIM_DATA="$sb/data" run_shim session-start
+assert_eq 0 "$RC" "AE9: exits 0 on the CLAUDE_PLUGIN_DATA fast path"
+assert_eq "plugin hook session-start" "$(cat "$sb/fakebin.log")" "AE9: fast path execs with the right argv"
+assert_eq 0 "$(wc -c <"$sb/sout" | tr -d ' ')" "AE9: fast path adds nothing to stdout"
+assert_eq 0 "$(wc -c <"$sb/serr" | tr -d ' ')" "AE9: fast path adds nothing to stderr"
+
+current_case="AE9 binary path exists but is a directory"
+# `-x` alone is true for a directory with the search bit; exec would then print a
+# diagnostic and exit 126 from the one script that must never do either.
+mv "$sb/data/bin/ss-magic" "$sb/data/bin/ss-magic.real"
+mkdir -p "$sb/data/bin/ss-magic"
+: >"$sb/fakebin.log"
+SHIM_DATA="$sb/data" run_shim pre-tool-use
+assert_shim_inert "AE9 (binary path is a directory)"
+rmdir "$sb/data/bin/ss-magic"
+mv "$sb/data/bin/ss-magic.real" "$sb/data/bin/ss-magic"
 
 current_case="AE9 handoff removed after install"
 shim_root="/tmp/ss-magic-plugin/$SB_ID"

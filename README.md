@@ -474,11 +474,18 @@ is already underway before the download lands, and every ss-magic hook is
 deliberately inert for it – silently, without failing anything. Start a new
 session and the plugin is live.
 
-For the same reason, `/reload-plugins` alone is not enough after a fresh install
-or a version bump. It re-registers the plugin, but it emits no session-start
-event, so nothing fetches the binary: the plugin stays inert until the next real
-session. `ss-magic plugin status` tells you which of the two you are looking at –
-it reports whether the binary arrived and whether its version matches the pin.
+For the same reason, `/reload-plugins` alone is not enough. It re-registers the
+plugin but emits no session-start event, so nothing fetches or updates the
+binary, and what you get depends on which case you are in:
+
+- **After a fresh install**, there is no binary at all, so every hook stays
+  inert until the next real session.
+- **After a version bump**, the previously installed binary is still there and
+  keeps serving hooks – so the session runs the *old* binary against the *new*
+  manifest and skills until a fresh session's bootstrap swaps it.
+
+`ss-magic plugin status` tells the two apart: it reports whether the binary
+arrived at all, and whether its version matches the plugin's pin.
 
 ### Verbs
 

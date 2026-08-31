@@ -61,11 +61,22 @@ if [ -z "$data" ]; then
     root=$(ss_magic_resolve_root) || give_up
     handoff="$root/$SS_MAGIC_DATA_ROOT_FILE"
     [ -r "$handoff" ] || give_up
-    IFS= read -r data <"$handoff" 2>/dev/null
+    # The braces matter, and bootstrap.sh's `write_line` documents the same
+    # trap: `cmd <FILE 2>/dev/null` redirects the stderr of the COMMAND, not of
+    # the shell reporting that the input redirection itself failed. Redirections
+    # apply left to right, so a `<"$handoff"` that fails prints before
+    # `2>/dev/null` is in effect. Reachable as a TOCTOU - the check above passes
+    # and a /tmp sweeper removes the file before it is opened - and this hook has
+    # no stderr budget at all.
+    { IFS= read -r data <"$handoff"; } 2>/dev/null
     [ -n "${data:-}" ] || give_up
 fi
 
 bin="$data/bin/ss-magic"
-[ -x "$bin" ] || give_up
+# `-f` as well as `-x`: `-x` alone is TRUE for a directory carrying the search
+# bit, and `exec` on a directory does not fail quietly - bash prints a diagnostic
+# and exits 126, which on PreToolUse would mean an error line per tool call from
+# the one script whose whole job is to be silent.
+[ -f "$bin" ] && [ -x "$bin" ] || give_up
 
 exec "$bin" plugin hook "$event"

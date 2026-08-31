@@ -64,7 +64,9 @@ if [ -z "$data" ]; then
     handoff="$root/$SS_MAGIC_DATA_ROOT_FILE"
     [ -r "$handoff" ] ||
         explain "the pinned binary has not been installed yet; start a new session to install it."
-    IFS= read -r data <"$handoff" 2>/dev/null
+    # Braced so the suppression covers the redirection itself, not just the
+    # builtin - see hooks/run-hook.sh and bootstrap.sh's `write_line`.
+    { IFS= read -r data <"$handoff"; } 2>/dev/null
     [ -n "${data:-}" ] ||
         explain "the pinned binary has not been installed yet; start a new session to install it."
 fi

@@ -919,16 +919,18 @@ binary is the sole file-copy implementation.)
 - The plugin's packaged tree is **content-pinned**. Any change under `plugin/`
   moves the zip's digest, so it must be followed by `python3
   scripts/build-plugin-zip.py --update-manifest` and then `--check`, and by a
-  version bump on all four surfaces – `Cargo.toml`,
-  `plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version`, and the
-  release URL in `.claude-plugin/marketplace.json`. The resolved VERSION, not
+  version bump on EVERY version surface – `Cargo.toml`, the `ss-magic` entry in
+  `Cargo.lock`, `plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version`,
+  both the tag and the asset name in `.claude-plugin/marketplace.json`'s release
+  URL, and the literal zip filename in `dist-workspace.toml`'s
+  `extra-artifacts`. `--check` enumerates them; do not work from a count. The resolved VERSION, not
   the digest, is the harness's update signal: changing the zip and its `sha256`
   without bumping the version leaves every installed user silently on the
   cached copy.
 - Always bump the crate version (`version` in `Cargo.toml`, and the
   matching `ss-magic` entry in `Cargo.lock`) on any change that alters
   CLI behavior — a fix, a new/changed command or flag, or different
-  output. A change under `plugin/` bumps the other three version surfaces with
+  output. A change under `plugin/` bumps every other version surface with
   it (see the plugin content-pin convention below). The binary self-updates from GitHub Releases keyed on version
   (see Build), so a stale version means users never receive the change.
   Bug fixes bump patch; new/changed user-visible behavior bumps minor
