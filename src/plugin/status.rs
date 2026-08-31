@@ -10,8 +10,8 @@
 //! - `plugin.enabled` is false in the overlaid configuration,
 //! - the harness-side registration is disabled, or was never installed,
 //! - git does not report the state tree ignored, so state-writing hooks refuse,
-//! - the pinned binary is not installed yet, so the hooks' command does not
-//!   exist,
+//! - the pinned binary is not installed yet, so every hook runs and does
+//!   nothing,
 //! - the installed plugin manifest and the bootstrapped binary are different
 //!   versions.
 //!
@@ -1192,8 +1192,8 @@ fn collect_bootstrap(inputs: &Inputs, probes: &Probes, problems: &mut Vec<String
                     None,
                     Some(
                         "no binary at this path yet: the SessionStart bootstrap \
-                         installs it, and until it has, every ss-magic hook runs a \
-                         command that does not exist"
+                         installs it, and until it has, every ss-magic hook runs \
+                         and does nothing"
                             .to_string(),
                     ),
                 )
@@ -1246,9 +1246,9 @@ fn collect_bootstrap(inputs: &Inputs, probes: &Probes, problems: &mut Vec<String
 
     if binary.exists == Some(false) {
         problems.push(format!(
-            "the pinned binary is not installed at {} — the hooks' command does not \
-             exist, so nothing fires. It installs on the next fresh session's \
-             SessionStart bootstrap.",
+            "the pinned binary is not installed at {} — the hooks fire, resolve no \
+             binary and exit silently, so nothing acts. It installs on the next fresh \
+             session's SessionStart bootstrap.",
             binary.path.clone().unwrap_or_else(|| "?".to_string())
         ));
     }

@@ -718,6 +718,38 @@ blocked. Flag a nudge that sets a decision, that widens the `gh pr` match beyond
   the cached copy. Flag a `plugin/` change with a stale digest or an unbumped
   version.
 
+### No hook command may name an artifact created at runtime
+
+Every entry in `plugin/hooks/hooks.json` must spawn something that exists the
+moment the plugin is installed: `"command": "bash"` with `args[0]` a path under
+`${CLAUDE_PLUGIN_ROOT}`. **A command naming `${CLAUDE_PLUGIN_DATA}` – or any other
+path the bootstrap creates at runtime – is a bug**, and it shipped once.
+
+`${CLAUDE_PLUGIN_DATA}/bin/ss-magic` does not exist until the `SessionStart`
+bootstrap fetches it, and hooks on one event fire CONCURRENTLY, so the bootstrap
+cannot be relied on to finish first. A manifest naming the binary directly makes
+the harness `posix_spawn` a path that is not there, and the user's first session
+dies with `ENOENT (posix_spawn)`. The specified behaviour is the opposite: with no
+binary present every hook is INERT and the session behaves normally.
+
+The reason this is a manifest rule and not a code rule: the binary implements
+fail-open itself – its hook entry point has no non-zero exit path and catches
+handler panics – but **that code is unreachable when the binary is the missing
+thing.** Fail-open has to live in a shim that always exists
+(`plugin/hooks/run-hook.sh`), not inside the artifact that may be absent. Flag any
+`command` that is not `bash`, any `args[0]` outside `${CLAUDE_PLUGIN_ROOT}`, and
+any reasoning that treats "the binary handles it" as covering the case where the
+binary is gone.
+
+That shim is silent on BOTH stdout and stderr, unlike `bin/ss-magic-plugin`, which
+prints one explanatory stderr line. The difference is the consumer: the wrapper
+serves a person running a skill, while the shim runs on `PreToolUse`, which fires
+on nearly every tool call. Flag a diagnostic added to the shim.
+
+**Assert this over every entry, never just the one you are touching.** The
+manifest check originally covered the bootstrap group alone, which is exactly how
+the other five entries drifted into naming the binary.
+
 ### The bootstrap must never fail a session
 
 `plugin/hooks/bootstrap.sh` runs on every fresh session on every machine.
@@ -864,10 +896,12 @@ MUST bump `version` in `Cargo.toml` AND the matching `ss-magic` entry in
 minor (pre-1.0). Flag a behavior-changing PR that does not bump both
 `Cargo.toml` and `Cargo.lock`, or that bumps only one of the two.
 
-**A change under `plugin/` bumps FOUR version surfaces, not one**, and re-pins
-the digest: `Cargo.toml`, `plugin/.claude-plugin/plugin.json`,
-`plugin/ss-magic.version`, and the release-asset URL in
-`.claude-plugin/marketplace.json` must all agree, and the `sha256` there must
+**A change under `plugin/` bumps EVERY version surface, not one**, and re-pins
+the digest: `Cargo.toml`, the `ss-magic` entry in `Cargo.lock`,
+`plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version`, both the tag and
+the asset name in `.claude-plugin/marketplace.json`'s release URL, and the
+literal zip filename in `dist-workspace.toml`'s `extra-artifacts` (cargo-dist
+does not template it) must all agree, and the `sha256` there must
 match the rebuilt zip. `python3 scripts/build-plugin-zip.py --check` asserts all
 of it; `--update-manifest` re-pins. The resolved VERSION, not the digest, is the
 client's update signal, so a content change without a version bump leaves every
@@ -881,7 +915,7 @@ surface out of step, or with a stale digest.
   `python3 scripts/build-plugin-zip.py --selftest` (the zip builder's
   reproducibility guarantees and its refusals),
   `python3 scripts/build-plugin-zip.py --check` (the release assertions: the
-  marketplace `sha256` key exists, the four version surfaces agree, the
+  marketplace `sha256` key exists, every version surface agrees, the
   committed digest matches the tree), and
   `/bin/bash scripts/test-bootstrap.sh` (the bootstrap's failure paths –
   offline, corrupted download, hostile pin, unwritable data dir, unsupported

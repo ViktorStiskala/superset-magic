@@ -120,7 +120,7 @@ The last three cover code `cargo test` cannot reach:
   and its loud refusals (a symlink or a non-ASCII filename, either of which
   would make the digest depend on which platform built it).
 - `--check` asserts the three release invariants: the marketplace entry actually
-  carries a `sha256` key, the four version surfaces agree, and the committed
+  carries a `sha256` key, every version surface agrees, and the committed
   digest matches the current `plugin/` tree. Run it after any change under
   `plugin/` – re-pin first with `--update-manifest`.
 - `test-bootstrap.sh` drives `plugin/hooks/bootstrap.sh` through the failure
@@ -180,12 +180,15 @@ release cannot ship with a red suite.
   binary self-updates from GitHub Releases keyed on version, so a change
   without a version bump never reaches users. Pre-1.0 rules: bug fixes bump
   patch; new or changed user-visible behavior bumps minor.
-- **A change under `plugin/` bumps four version surfaces, not one**, and
+- **A change under `plugin/` bumps every version surface, not one**, and
   re-pins the digest. Run `python3 scripts/build-plugin-zip.py
-  --update-manifest`, then `--check`, which asserts that `Cargo.toml`,
-  `plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version` and the release
-  URL in `.claude-plugin/marketplace.json` all agree and that the committed
-  digest matches the tree. The resolved *version*, not the digest, is what tells
+  --update-manifest`, then `--check`, which asserts that `Cargo.toml`, the
+  `ss-magic` entry in `Cargo.lock`, `plugin/.claude-plugin/plugin.json`,
+  `plugin/ss-magic.version`, both the tag and the asset name in
+  `.claude-plugin/marketplace.json`'s release URL, and the literal zip filename in
+  `dist-workspace.toml`'s `extra-artifacts` all agree, and that the committed
+  digest matches the tree. Let `--check` enumerate them rather than working from a
+  remembered count: this file said "four" while the script checked seven. The resolved *version*, not the digest, is what tells
   the Claude Code client to update: changing the zip and its `sha256` without
   bumping the version leaves every installed user silently on the cached copy.
 - Update the docs in the same PR: `README.md` must describe the tool as it is

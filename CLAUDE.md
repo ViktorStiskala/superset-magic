@@ -31,14 +31,19 @@ PR expectations, release/versioning) live in CONTRIBUTING.md.
 
 The Claude Code plugin ships on the SAME release. `plugin/` is the packaged
 marketplace tree (`.claude-plugin/plugin.json`, `hooks/hooks.json`,
-`hooks/bootstrap.sh`, `bin/ss-magic-plugin`, `lib/tmproot.sh`, `skills/`,
-`ss-magic.version`); `scripts/build-plugin-zip.py` packs it byte-reproducibly
+`hooks/bootstrap.sh`, `hooks/run-hook.sh`, `bin/ss-magic-plugin`,
+`lib/tmproot.sh`, `skills/`, `ss-magic.version`); `scripts/build-plugin-zip.py` packs it byte-reproducibly
 (sorted entries, fixed 1980-01-01 timestamps, normalized modes, STORED not
 deflated, `create_system` forced to unix, `.DS_Store` excluded, symlinks and
 non-ASCII names refused loudly), and `.claude-plugin/marketplace.json` pins the
-resulting zip by SHA-256. Four version surfaces must agree – `Cargo.toml`,
-`plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version`, and the release
-URL in `marketplace.json`. Verify with `python3 scripts/build-plugin-zip.py
+resulting zip by SHA-256. Every version surface must agree, and there are more
+than the obvious ones: `Cargo.toml`, the `ss-magic` entry in `Cargo.lock`,
+`plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version`, BOTH the tag and
+the asset name in `marketplace.json`'s release URL, and the literal zip filename
+in `dist-workspace.toml`'s `extra-artifacts` (cargo-dist does not template it).
+Do not work from a remembered count – `--check` enumerates them and is the
+authority; this doc said "four" while the script checked seven, and the gap
+surfaced only when a release check failed. Verify with `python3 scripts/build-plugin-zip.py
 --check`; after any change under `plugin/`, re-pin with `--update-manifest`
 then re-run `--check`. `.gitattributes` marks `plugin/**` as `-text` so a
 checkout's line-ending conversion can never move the digest.
@@ -838,8 +843,8 @@ failure-path suite), `assets/workflow/checklist.yml` (embedded by `setup_ci.rs`)
 `docs/runbooks/forge-tag-and-release-protection.md` (tag/release immutability
 settings a human must apply by hand – currently NOT applied).
 
-Two shell pieces are worth knowing about, because both are load-bearing and
-neither is Rust. `plugin/hooks/bootstrap.sh` installs the pinned binary into
+Three shell pieces are worth knowing about, because all are load-bearing and
+none is Rust. `plugin/hooks/bootstrap.sh` installs the pinned binary into
 `${CLAUDE_PLUGIN_DATA}` – never `${CLAUDE_PLUGIN_ROOT}`, which is version-scoped
 and replaced wholesale on each plugin update. It has no `set -e` and every path
 ends in `exit 0`, prints NOTHING on stdout on success (a SessionStart hook's
@@ -849,7 +854,20 @@ platform release ARCHIVE directly, verifying it against that archive's published
 `.sha256` before extracting. It deliberately does NOT fall back to piping
 `ss-magic-installer.sh` into a shell: the release publishes `.sha256` siblings
 for the archives but not for the installer script, so a piped installer would be
-the one executed artifact no published digest covers. `plugin/bin/ss-magic-plugin`
+the one executed artifact no published digest covers. `plugin/hooks/run-hook.sh` is the shim EVERY hook is spawned
+through, and the indirection is the whole point: `${CLAUDE_PLUGIN_DATA}/bin/ss-magic`
+does not exist until the bootstrap fetches it, and hooks on one event fire
+CONCURRENTLY, so a manifest naming the binary directly makes the harness
+`posix_spawn` a missing path and the session dies with ENOENT on a first install.
+R77 specifies the opposite – every hook INERT for that session. The binary
+implements that fail-open itself (`hook::run` has no non-zero exit path), but that
+code is unreachable when the binary is the missing thing, so the guarantee has to
+live in a script that ships inside `${CLAUDE_PLUGIN_ROOT}` and therefore always
+exists. It is silent on BOTH streams – unlike the wrapper below, which explains
+itself on stderr – because `PreToolUse` fires on nearly every tool call, and
+because a `SessionStart` hook's stdout enters the model's context. It shares
+`lib/tmproot.sh` with the bootstrap and the wrapper rather than reimplementing the
+handoff lookup. `plugin/bin/ss-magic-plugin`
 is the wrapper every skill invokes; it injects the `plugin` verb (so a skill can
 never reach bare `ss-magic`, its update gate or its TUI) and is named
 `ss-magic-plugin` rather than `ss-magic` so it cannot resolve
@@ -891,8 +909,8 @@ binary is the sole file-copy implementation.)
   code `cargo test` cannot reach, and CI runs all three:
   `python3 scripts/build-plugin-zip.py --selftest` (the builder's own
   reproducibility and refusal tests), `python3 scripts/build-plugin-zip.py
-  --check` (the release assertions: the marketplace `sha256` key exists, the
-  four version surfaces agree, the committed digest matches the tree), and
+  --check` (the release assertions: the marketplace `sha256` key exists, every
+  version surface agrees, the committed digest matches the tree), and
   `/bin/bash scripts/test-bootstrap.sh` (the bootstrap's failure paths –
   offline, corrupted download, hostile pin, unwritable data dir, unsupported
   platform, concurrent sessions – each asserting exit 0, empty stdout, and an
@@ -901,16 +919,18 @@ binary is the sole file-copy implementation.)
 - The plugin's packaged tree is **content-pinned**. Any change under `plugin/`
   moves the zip's digest, so it must be followed by `python3
   scripts/build-plugin-zip.py --update-manifest` and then `--check`, and by a
-  version bump on all four surfaces – `Cargo.toml`,
-  `plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version`, and the
-  release URL in `.claude-plugin/marketplace.json`. The resolved VERSION, not
+  version bump on EVERY version surface – `Cargo.toml`, the `ss-magic` entry in
+  `Cargo.lock`, `plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version`,
+  both the tag and the asset name in `.claude-plugin/marketplace.json`'s release
+  URL, and the literal zip filename in `dist-workspace.toml`'s
+  `extra-artifacts`. `--check` enumerates them; do not work from a count. The resolved VERSION, not
   the digest, is the harness's update signal: changing the zip and its `sha256`
   without bumping the version leaves every installed user silently on the
   cached copy.
 - Always bump the crate version (`version` in `Cargo.toml`, and the
   matching `ss-magic` entry in `Cargo.lock`) on any change that alters
   CLI behavior — a fix, a new/changed command or flag, or different
-  output. A change under `plugin/` bumps the other three version surfaces with
+  output. A change under `plugin/` bumps every other version surface with
   it (see the plugin content-pin convention below). The binary self-updates from GitHub Releases keyed on version
   (see Build), so a stale version means users never receive the change.
   Bug fixes bump patch; new/changed user-visible behavior bumps minor

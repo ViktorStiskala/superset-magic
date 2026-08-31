@@ -49,5 +49,5 @@ install-path = "CARGO_HOME"
 # why the plugin's integrity pin lives in .claude-plugin/marketplace.json, which
 # the Claude Code client verifies before extracting anything.
 [[dist.extra-artifacts]]
-artifacts = ["ss-magic-plugin-v0.10.0.zip"]
+artifacts = ["ss-magic-plugin-v0.10.1.zip"]
 build = ["python3", "scripts/build-plugin-zip.py"]
