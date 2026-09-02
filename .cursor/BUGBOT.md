@@ -748,7 +748,59 @@ on nearly every tool call. Flag a diagnostic added to the shim.
 
 **Assert this over every entry, never just the one you are touching.** The
 manifest check originally covered the bootstrap group alone, which is exactly how
-the other five entries drifted into naming the binary.
+the other five entries drifted into naming the binary. Assert the event token as
+well as the script path: a manifest naming the right script with the wrong token
+in `args[1]` routes the event to the wrong handler, and a check that reads only
+`args[0]` passes it.
+
+Note the one entry that must NOT go through the shim: the `SessionStart`
+bootstrap. The shim does nothing when the binary is absent, and the bootstrap is
+what installs it, so routing the bootstrap through the shim would leave the
+plugin inert forever rather than for one session. Flag any change that does this,
+and flag any prose claiming *every* hook is spawned through the shim.
+
+### Deciding a file is runnable needs more than `[ -x ]`, and needs one definition
+
+Before any script `exec`s the pinned binary it must go through
+`ss_magic_is_loadable_executable` in `plugin/lib/execguard.sh`. **A bare
+`[ -x "$bin" ]` is a bug**, and it shipped in two different scripts.
+
+Two failures hide behind that test:
+
+- `-x` is TRUE for a **directory** carrying the search bit. `exec` on a directory
+  does not fail quietly – bash prints its own diagnostic and exits 126.
+- `-f` and `-x` both ask about the FILE. Neither can see `execve` failing on the
+  way into it, and **ENOEXEC is the dangerous one**: when the file is readable but
+  not a loadable executable – a truncated download, a foreign architecture, disk
+  corruption – bash does not report a failure at all. It falls back to POSIX
+  behaviour and REINTERPRETS the bytes as a shell script, so `shopt -s execfail`
+  never fires and the process exits with whatever those bytes parse to. Measured
+  over 30 corrupted binaries on bash 3.2: exit 2 roughly half the time. **Exit 2
+  from a `PreToolUse` hook means BLOCK the tool call**, so a binary damaged after
+  install would silently block nearly every tool call in the session.
+
+The guard is ONE shared file on purpose. The check was added to
+`hooks/run-hook.sh` first while `bin/ss-magic-plugin` kept the weaker `[ -x ]`
+for a whole release – the sibling drift a shared definition prevents. **Flag any
+new inline copy of this check, and flag a fix applied to one of the two scripts
+without the other.**
+
+Its two failure directions are deliberately opposite, so do not "simplify" either
+into the other: an unrecognised magic number fails CLOSED (refuse to exec), while
+a missing `od` or `tr` fails OPEN (proceed), because refusing there would silently
+disable the whole plugin on a machine merely lacking a utility. Callers still set
+`shopt -s execfail` afterwards, for the exec failures no file test can see.
+
+`hooks/bootstrap.sh` is exempt and should stay exempt: at install time it runs the
+staged binary and refuses the install unless it reports the pinned version, which
+is strictly stronger than a magic-number test.
+
+Keep `exec` in both callers. It makes the harness's child pid BE the binary, so a
+hook timeout kills the binary instead of killing the shell and orphaning it –
+which matters most on `SessionEnd`, the hook the CLI blocks on while a session
+exits. Flag a change that drops `exec` for a plain call. Equally, flag
+`exec ... 2>/dev/null`: it applies to the SUCCESS path too and would swallow the
+binary's own diagnostics.
 
 ### The bootstrap must never fail a session
 

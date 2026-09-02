@@ -138,6 +138,11 @@ The last three cover code `cargo test` cannot reach:
   entry names `bash` and a script under `${CLAUDE_PLUGIN_ROOT}` that exists in
   the packaged tree, since a command naming a path the bootstrap creates at
   runtime is what made a first session die with ENOENT.
+- The wrapper `plugin/bin/ss-magic-plugin` is covered the same way, against the
+  contract it states for itself: exit 0 with one line of explanation rather than
+  failing a skill mid-run. Its cases include a directory sitting where the binary
+  should be and a present-but-unloadable binary, both of which reached `exec` and
+  ended in bash's own diagnostic before the shared `lib/execguard.sh` landed.
 
 Conventions worth knowing:
 

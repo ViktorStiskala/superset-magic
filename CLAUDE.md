@@ -32,7 +32,7 @@ PR expectations, release/versioning) live in CONTRIBUTING.md.
 The Claude Code plugin ships on the SAME release. `plugin/` is the packaged
 marketplace tree (`.claude-plugin/plugin.json`, `hooks/hooks.json`,
 `hooks/bootstrap.sh`, `hooks/run-hook.sh`, `bin/ss-magic-plugin`,
-`lib/tmproot.sh`, `skills/`, `ss-magic.version`); `scripts/build-plugin-zip.py` packs it byte-reproducibly
+`lib/tmproot.sh`, `lib/execguard.sh`, `skills/`, `ss-magic.version`); `scripts/build-plugin-zip.py` packs it byte-reproducibly
 (sorted entries, fixed 1980-01-01 timestamps, normalized modes, STORED not
 deflated, `create_system` forced to unix, `.DS_Store` excluded, symlinks and
 non-ASCII names refused loudly), and `.claude-plugin/marketplace.json` pins the
@@ -845,7 +845,7 @@ failure-path suite), `assets/workflow/checklist.yml` (embedded by `setup_ci.rs`)
 `docs/runbooks/forge-tag-and-release-protection.md` (tag/release immutability
 settings a human must apply by hand – currently NOT applied).
 
-Three shell pieces are worth knowing about, because all are load-bearing and
+Four shell pieces are worth knowing about, because all are load-bearing and
 none is Rust. `plugin/hooks/bootstrap.sh` installs the pinned binary into
 `${CLAUDE_PLUGIN_DATA}` – never `${CLAUDE_PLUGIN_ROOT}`, which is version-scoped
 and replaced wholesale on each plugin update. It has no `set -e` and every path
@@ -873,7 +873,24 @@ exists. It is silent on BOTH streams – unlike the wrapper below, which explain
 itself on stderr – because `PreToolUse` fires on nearly every tool call, and
 because a `SessionStart` hook's stdout enters the model's context. It shares
 `lib/tmproot.sh` with the bootstrap and the wrapper rather than reimplementing the
-handoff lookup. `plugin/bin/ss-magic-plugin`
+handoff lookup. `plugin/lib/execguard.sh` holds
+`ss_magic_is_loadable_executable`, the single answer to "will the kernel actually
+run this file", sourced by BOTH the shim and the wrapper. It exists as one file
+because duplicating it is what went wrong: `[ -x ]` alone is true for a directory
+carrying the search bit, and it cannot see execve failing on the way in - most
+dangerously ENOEXEC, where bash does not report a failure at all but REINTERPRETS
+a damaged binary as a shell script and exits with whatever those bytes parse to
+(measured over 30 corrupted binaries on bash 3.2: exit 2 about half the time, and
+exit 2 from `PreToolUse` means BLOCK the tool call). The check was added to the
+shim first and the wrapper kept the weaker test, which is precisely the drift a
+shared definition prevents. It matches on the magic number (ELF, Mach-O 32/64 and
+universal, or `#!`), and the two failure directions are deliberately opposite: an
+unrecognised FORMAT fails closed (refuse), while a missing `od` or `tr` fails OPEN
+(proceed), because refusing there would silently disable the plugin on a machine
+merely lacking a utility. Callers still set `shopt -s execfail` afterwards for the
+exec failures no file test can see. `hooks/bootstrap.sh` deliberately does not use
+it - at install time it runs the staged binary and refuses unless it reports the
+pinned version, which is strictly stronger. `plugin/bin/ss-magic-plugin`
 is the wrapper every skill invokes; it injects the `plugin` verb (so a skill can
 never reach bare `ss-magic`, its update gate or its TUI) and is named
 `ss-magic-plugin` rather than `ss-magic` so it cannot resolve

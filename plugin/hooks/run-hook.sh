@@ -82,35 +82,23 @@ bin="$data/bin/ss-magic"
 # bit, and `exec` on a directory does not fail quietly - bash prints a diagnostic
 # and exits 126, which on PreToolUse would mean an error line per tool call from
 # the one script whose whole job is to be silent.
-[ -f "$bin" ] && [ -x "$bin" ] || give_up
+# `lib/execguard.sh` owns the "will this actually run" test, shared with
+# bin/ss-magic-plugin so the two cannot drift - which is exactly how the weaker
+# `[ -x ]` survived in the wrapper after this script was hardened. It is sourced
+# unconditionally, unlike lib/tmproot.sh below, because the check is needed on
+# the common path where CLAUDE_PLUGIN_DATA is already set.
+guard="$self_dir/../lib/execguard.sh"
+[ -r "$guard" ] || give_up
+# shellcheck source=../lib/execguard.sh
+. "$guard" || give_up
 
-# The `-f`/`-x` tests above ask about the FILE. They cannot see execve failing on
-# the way INTO it, and the two ways that happens need different handling.
-#
-# ENOEXEC is the dangerous one. When the file is readable but is not a loadable
-# executable - a truncated download, a foreign architecture, on-disk corruption -
-# bash falls back to POSIX behaviour and REINTERPRETS it as a shell script. It is
-# not an exec failure at that point, so `execfail` does not catch it, and the
-# process exits with whatever those bytes happen to parse to. Measured over 30
-# corrupted binaries on bash 3.2: exit 2 about half the time, and exit 2 from
-# PreToolUse means BLOCK the tool call. A damaged binary would silently block
-# nearly every tool call in the session, from the one script whose whole job is
-# to be invisible. So the magic number is checked first and anything that is not
-# a real executable is refused before exec ever sees it. The list is the formats
-# this binary actually ships as, plus `#!` so a wrapper script still works; an
-# unrecognised format fails CLOSED (inert), which is the safe direction.
-case "$(od -An -N4 -tx1 <"$bin" 2>/dev/null | tr -d ' ')" in
-    7f454c46) ;;                              # ELF
-    cffaedfe|cefaedfe|feedface|feedfacf) ;;   # Mach-O 32/64, either endianness
-    cafebabe|bebafeca) ;;                     # Mach-O universal ("fat")
-    2321*) ;;                                 # "#!" - an interpreted wrapper
-    *) give_up ;;
-esac
+ss_magic_is_loadable_executable "$bin" || give_up
 
-# The remaining execve failures - a shebang naming a missing interpreter, a
-# noexec mount, EACCES - are real exec failures, and `execfail` makes bash return
-# here instead of exiting 126/127, so control reaches the `exit 0` below and this
-# file's invariant holds: every path exits 0.
+# `execfail` catches the genuine exec failures the check above cannot see from
+# the file alone - a shebang naming a missing interpreter, a noexec mount,
+# EACCES. Without it bash exits 126/127 on those; with it control returns here
+# and falls through to `exit 0`, so this file's invariant holds: every path
+# exits 0.
 #
 # Bash still prints its own one-line diagnostic before returning, and that is
 # accepted rather than suppressed. `exec ... 2>/dev/null` would apply to the

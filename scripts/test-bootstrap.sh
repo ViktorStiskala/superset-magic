@@ -547,6 +547,36 @@ assert_eq 1 "$(wc -l <"$sb/werr" | tr -d ' ')" "AE65: one line of explanation on
 assert_eq 0 "$(wc -c <"$sb/wout" | tr -d ' ')" "AE65: nothing on stdout"
 assert_eq "" "$(cat "$sb/fakebin.log")" "AE65: the binary was not invoked"
 
+current_case="AE65 wrapper: a DIRECTORY where the binary should be"
+# `[ -x ]` is true for a directory carrying the search bit, so before the shared
+# exec guard this reached `exec`, and bash answered with its own diagnostic and
+# exit 126 - breaking the wrapper's promise to exit 0 with one line of
+# explanation rather than failing the skill mid-run. This is the sibling of the
+# same defect fixed earlier in hooks/run-hook.sh; it survived there for a whole
+# release because the guard was duplicated instead of shared.
+mkdir -p "$sb/data/bin/ss-magic.dir/bin"
+mkdir -p "$sb/data/bin/ss-magic.dir/bin/ss-magic"
+: >"$sb/fakebin.log"
+WRAPPER_DATA="$sb/data/bin/ss-magic.dir" run_wrapper checklist list
+assert_eq 0 "$RC" "AE65: a directory in the binary's place still exits 0"
+assert_eq 1 "$(wc -l <"$sb/werr" | tr -d ' ')" "AE65: directory case explains in one line"
+assert_eq 0 "$(wc -c <"$sb/wout" | tr -d ' ')" "AE65: directory case says nothing on stdout"
+assert_eq "" "$(cat "$sb/fakebin.log")" "AE65: directory case did not invoke the binary"
+rm -rf "$sb/data/bin/ss-magic.dir"
+
+current_case="AE65 wrapper: a present, +x, non-loadable binary"
+# The ENOEXEC shape: bash would reinterpret the damaged bytes as a shell script
+# and exit with whatever they parse to, spraying that at a person running a skill.
+mkdir -p "$sb/data/bin/ss-magic.bad/bin"
+head -c 512 /dev/urandom >"$sb/data/bin/ss-magic.bad/bin/ss-magic"
+chmod 755 "$sb/data/bin/ss-magic.bad/bin/ss-magic"
+: >"$sb/fakebin.log"
+WRAPPER_DATA="$sb/data/bin/ss-magic.bad" run_wrapper checklist list
+assert_eq 0 "$RC" "AE65: a damaged binary still exits 0"
+assert_eq 1 "$(wc -l <"$sb/werr" | tr -d ' ')" "AE65: damaged binary explains in one line"
+assert_eq "" "$(cat "$sb/fakebin.log")" "AE65: damaged binary did not invoke anything"
+rm -rf "$sb/data/bin/ss-magic.bad"
+
 current_case="AE65 wrapper pointed at a directory with no binary"
 : >"$sb/fakebin.log"
 WRAPPER_DATA="$sb/nowhere" run_wrapper checklist list
