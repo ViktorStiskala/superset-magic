@@ -68,6 +68,7 @@ Once the plugin has its own release line, "is there a newer plugin release" beco
 - R10. The plugin zip `ss-magic-plugin-v<V>.zip` is published on the plugin release, and `.claude-plugin/marketplace.json` pins `https://github.com/ViktorStiskala/superset-magic/releases/download/ss-magic-plugin-v<V>/ss-magic-plugin-v<V>.zip` by SHA-256.
 - R11. `scripts/build-plugin-zip.py --check` asserts, in addition to the R101 sha256 key and the R96 digest pin: the CLI version group agrees (`crates/ss-magic/Cargo.toml`, the `ss-magic` entry in `Cargo.lock`); the plugin version group agrees (`crates/ss-magic-plugin/Cargo.toml`, the `ss-magic-plugin` entry in `Cargo.lock`, `plugin/.claude-plugin/plugin.json`, `plugin/ss-magic-plugin.version`, the marketplace URL's tag, the marketplace URL's asset name, the extra-artifact zip filename); the two groups' versions differ; every `plugin/hooks/hooks.json` entry spawns `bash` with `${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh` or `${CLAUDE_PLUGIN_ROOT}/hooks/bootstrap.sh` as its first argument; `crates/ss-magic-plugin/Cargo.toml` declares no `self_update` dependency; `crates/ss-magic-core/Cargo.toml` declares `publish = false`.
 - R12. After a plugin release is published, the newest `v*` release is re-marked as the repository's latest release, so `releases/latest` always resolves to a CLI release. This protects installed pre-split binaries, which poll `releases/latest` and parse only a bare triple.
+- R12b. An intermediary CLI release, bare `v0.11.0`, is cut from the commit closing U3 — the last commit before the workspace split — and published BEFORE any plugin release exists. Its binary already resolves updates through the releases LIST with the anchored bare-CLI filter (R16, R17) rather than `releases/latest`, so every install that takes it becomes immune to the latest-mark race described in R12. This is not a tag-shape bridge: the CLI's shape never changes, and a 0.10.x binary would update to a post-split release perfectly well. Its purpose is to shrink, before the plugin line exists at all, the population whose update path depends on a mark that a plugin release transiently steals and a post-announce job has to give back. The commit closing U3 must therefore be a complete, releasable single-package tree: `--check` green with every surface at `0.11.0`.
 - R12a. `README.md`'s documented install line pins the CLI's own release asset (`releases/download/v<V>/ss-magic-installer.sh`) rather than `releases/latest/download/…`, and the pinned tag becomes a CLI version surface asserted by `--check` (R11). A new user's install therefore does not depend on the latest mark at all, so the transient window after each plugin release — before the mark-latest job runs — cannot 404 the documented command. The manual-download link and the attestation example point at the same release.
 - R13. `plugin/hooks/bootstrap.sh` installs `${CLAUDE_PLUGIN_DATA}/bin/ss-magic-plugin` from `releases/download/ss-magic-plugin-v<pin>/ss-magic-plugin-<triple>.tar.gz`, reads the pin from `plugin/ss-magic-plugin.version`, and verifies the `.sha256` sibling as today. It does NOT clean up a stale `${CLAUDE_PLUGIN_DATA}/bin/ss-magic` left by a pre-split install: `ss-magic plugin` is not used in production, so the plugin carries no migration code at all. A dogfooding machine that has one deletes it by hand; the file is inert either way, since nothing spawns that path once `hooks.json` and the wrapper name the new binary.
 - R14. Every event entry in `plugin/hooks/hooks.json` keeps spawning `bash ${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh <event>`; no entry names a binary.
@@ -465,7 +466,7 @@ Per unit:
 |---|---|
 | U1 | AE1–AE4 pass; `run_self_update` takes `&str`; seven surfaces read `0.11.0`; `--check` green |
 | U2 | Equivalence matrix passes; hook pipeline spawns no `git` for the fast-path cases; convention amended in both rule files |
-| U3 | AE7–AE9 pass; `--recommend` never writes; ledger peak survives incremental scans; startup notice once per machine |
+| U3 | AE7–AE9 pass; `--recommend` never writes; ledger peak survives incremental scans; startup notice once per machine; the closing commit is a releasable single-package tree at `0.11.0`, recorded in the PR description by SHA (R12b) |
 | U4 | Workspace builds; `state_tree` is the rule's only owner with eager and lazy callers tested; test count not reduced |
 | U5 | Plugin binary and tree agree; `--check` reports two groups plus three guards; bootstrap suite green with new names; `dist plan` re-verified |
 | U6 | AE10–AE12 pass; hook path constructs no HTTP client; `systemMessage` only |
@@ -506,6 +507,27 @@ Keeping the CLI on bare tags is what makes both columns say "nothing to migrate"
 moved to `ss-magic-vX.Y.Z`, the left column would instead require a transitional bare release
 carrying a prefix-aware binary, published before any prefixed tag, with the rollout order as a
 correctness property whose violation strands the installed base permanently.
+
+### Release order (binding; see R12b)
+
+1. **Cut the intermediary first.** Check out the commit closing U3 (named by SHA in PR #7's
+   description). Verify at that commit: `grep -c '^\[package\]' Cargo.toml` prints `1`;
+   `python3 scripts/build-plugin-zip.py --check` is green with every surface at `0.11.0`;
+   `cargo test --locked` passes. Then tag `v0.11.0` and push.
+2. **Prove it on a real pre-split install.** On a machine reporting `ss-magic 0.10.x`, run
+   `ss-magic update`; it must report the update and then `ss-magic --version` must print
+   `0.11.0`. This is the step that proves the existing autoupdate path still works; do not
+   continue until it does.
+3. **Then the split releases**, plugin before CLI (the marketplace on `main` already names the
+   plugin tag's zip, so a refresh in the gap would 404 — self-correcting, but shorter is better).
+4. **After every plugin release, confirm the mark**: `gh api repos/ViktorStiskala/superset-magic/releases/latest --jq .tag_name`
+   must print a bare `v*` tag. If it prints a plugin tag, the post-announce job did not run —
+   `gh release edit <newest bare v tag> --latest` by hand and record it.
+
+Step 4 is the standing obligation R12 creates. cargo-dist's generated workflow calls plain
+`gh release create` with no `--latest=false`, so a plugin release takes the mark by default and
+the post-announce job gives it back. R12b shrinks who is exposed to that; R12a removes new
+installs from it entirely.
 
 ### Release procedure per line (for `CONTRIBUTING.md`)
 
