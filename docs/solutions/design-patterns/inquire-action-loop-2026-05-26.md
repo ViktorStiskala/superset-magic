@@ -2,7 +2,7 @@
 title: Inquire row-as-action via Select-loop
 date: "2026-05-26"
 category: design-patterns
-module: superset-setup
+module: ui
 problem_type: design_pattern
 component: tooling
 severity: medium
@@ -165,7 +165,7 @@ if selected.contains(&"+ Add new pattern…".to_string()) {
 
 The sentinel row behaves differently from every other row: it needs Space *and* Enter. The caller then has to unpick the sentinel from the returned vec. There is no way to re-render rows after the user adds a new pattern — the next render is a brand-new `MultiSelect` invocation with all the visual flash that entails.
 
-**After — Select-loop (the action-loop pattern), from `projects/superset-setup/src/ui.rs:pick_patterns`.**
+**After — Select-loop (the action-loop pattern), from `src/tui/ui.rs:pick_patterns`.**
 
 ```rust
 loop {
@@ -203,6 +203,11 @@ Enter on any row does exactly what the row says. Cursor returns to the toggled r
 ## Related
 
 - Origin commit: [`410bba3`](https://github.com/ViktorStiskala/monorepo-general/commit/410bba3) on branch `feat/superset-setup`, PR [#18](https://github.com/ViktorStiskala/monorepo-general/pull/18).
-- Canonical implementation: `projects/superset-setup/src/ui.rs` — `pick_patterns`, `render_row`, `Action` enum, `PatternRow` struct.
+- Canonical implementation: `src/tui/ui.rs` — `pick_patterns`, `render_row`,
+  `Action` enum, `Row` struct. The walkthrough above shows the original
+  pattern-specific shapes; both were later generalized so one loop driver could
+  serve any picker. `PatternRow` became `Row`, its `no_match` flag became a
+  caller-supplied `dim_suffix`, and the `AddNew` sentinel became a struct
+  variant carrying the label to show. The pattern itself is unchanged.
 - inquire `Select` docs: https://docs.rs/inquire/0.9/inquire/struct.Select.html
 - inquire `RenderConfig` (for matching prompt styling to the rest of the CLI): https://docs.rs/inquire/0.9/inquire/ui/struct.RenderConfig.html

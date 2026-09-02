@@ -7,6 +7,29 @@ learnings; direct edits are fine. Glossary only, not a spec or catch-all.
 
 ## Sync model
 
+### Worktree
+A linked git checkout that shares its repository's history with the main
+checkout but has its own working tree, so anything that never enters git –
+secrets, local overlays, generated state – is absent from it until something
+copies it there. Superset creates one per workspace; forward sync, reverse
+sync and the merge cockpit exist to move exactly those non-git files between
+a worktree and the main checkout, and which side is source or target is
+decided by where the command is run.
+
+### Workspace contract
+The directory a repository commits so Superset can create and tear down
+workspaces for it: the workspace lifecycle configuration, the wrapper script
+that runs ss-magic when a workspace is set up, the shared sync-pattern list,
+and beside them the optional per-checkout local pattern list. It is the one
+tree ss-magic owns inside a repository and is never itself excluded from
+sync or pack – only the backup and plugin-state subtrees inside it are.
+
+ss-magic writes it in two ways. Initialization lays it out fresh; migration
+converts a repository that predates the current layout, carrying the
+previously configured file list forward. Both stage the whole tree and
+materialize it in one step behind a finishing prompt, so an aborted run
+leaves the previous contract intact.
+
 ### Main checkout
 The primary git checkout that linked worktrees branch from and share a common
 git directory with — the canonical tree reverse sync writes back into and the
@@ -16,7 +39,11 @@ source forward sync copies from.
 The glob patterns that drive both forward and reverse sync, formed by overlaying
 a committed, shared pattern list with an optional per-checkout local list (union,
 de-duplicated). They select which local or untracked files cross between the main
-checkout and a worktree.
+checkout and a worktree. The local list is itself gitignored and is itself a
+forward-sync target, so it travels from the main checkout into a worktree like
+any other local file – which is why a setting that must not be overridable per
+worktree, such as whether the plugin is enabled, is always read from the main
+checkout's copy.
 
 ### Forward sync
 Copying the files matching the sync patterns from the main checkout into a
@@ -54,12 +81,27 @@ A timestamped copy of a file's losing bytes, taken immediately before an
 apply overwrites or deletes it, so a mistaken decision is recoverable.
 Backups live under a gitignored `.superset/backups/` of the root being
 overwritten – the worktree for the merge cockpit and forward sync, main for
-the direct `ss-magic reverse-sync` subcommand – one `YYYYmmdd-HHMMSS` (UTC)
-directory per apply batch, with `worktree/` and `main/` namespaces inside it
-for the side the bytes came from, and are never committed. Taking backups is
+the direct `ss-magic reverse-sync` subcommand – one directory per apply batch,
+named by the batch's timestamp and keeping the copies from each side apart, and
+are never committed. Taking backups is
 opt-out (`--no-backup`/`-n` on the direct subcommands) and, when skipped,
-leaves an overwritten or deleted file with no recovery path. Retention keeps
-the 10 newest batches; older ones are pruned after each apply.
+leaves an overwritten or deleted file with no recovery path. A bounded number of the
+newest batches is kept; older ones are pruned after each apply.
+
+### Review baseline
+The per-candidate snapshot of both sides' file metadata taken the moment the
+merge cockpit opens, and compared against the disk again just before each
+reconcile decision is applied, so a file that changed while the developer
+was reviewing is skipped rather than overwritten with bytes the review never
+saw.
+
+The baseline is coherent with what was reviewed, not with the disk: a side
+the review showed as absent is recorded as absent even if a copy appears
+later, and a side that could not be read is recorded as absent too. Both
+fail closed – an absent baseline against a present file counts as changed
+and the file is skipped; only a genuinely absent target is ever written. The
+direct non-interactive push has no review window, so its baseline is taken
+immediately before the apply and guards only against a concurrent writer.
 
 ### Excluded trees
 The four directory trees no ss-magic operation may ever enumerate, whatever the
@@ -74,9 +116,10 @@ list, so a pattern that matches an *ancestor* of one of them cannot re-admit it.
 ### Pack
 Bundling the files matching the sync patterns from the current git repo root
 into a single `ss-magic-<repo>.tar.bz2` archive at that root, preserving each
-file's repo-relative path. The `<repo>` stem is derived from the normalized
-`origin` remote (owner/path segments joined with `_`), falling back to the
-primary worktree's basename when no origin exists. A third operation on the
+file's repo-relative path. The `<repo>` stem is derived from the
+repository's origin remote, so the same repository yields the same archive name
+from any clone URL form, falling back to the primary worktree's basename when no
+origin exists. A third operation on the
 sync patterns alongside forward and reverse sync — a portable snapshot of the
 configured file set (for backup, machine transfer, or handoff) rather than a
 copy between trees.
@@ -92,8 +135,7 @@ reconcile; every other candidate is offered in the merge cockpit for a
 reconcile decision before anything is written into either tree.
 
 Only a candidate with worktree bytes (worktree-only or differing) can be
-pushed; a main-only candidate has no worktree source, so push is unavailable
-and it can only be pulled or deleted. Pushing a worktree-untracked
+pushed. Pushing a worktree-untracked
 candidate into main also gitignores it there – the secret-safety gate, since
 only an untracked file is treated as a secret needing that protection.
 Pushing a tracked candidate skips that gitignore step: it lands as an
@@ -107,11 +149,75 @@ since there is no worktree copy to push.
 
 ## Claude Code plugin
 
+### Hook
+An entry point the Claude Code harness runs at a session lifecycle event –
+session start, before a tool call, before a context compaction, when a
+subagent stops, and at session end – handing it an envelope on standard
+input and reading a JSON answer on standard output. Everything the plugin
+does inside a session happens through one.
+
+A hook fails open: an error, a panic, a timeout, or a binary that is not
+installed yet must all look exactly like a hook that decided to do nothing,
+and it prints nothing but its answer, since a session-start hook's output
+enters the model's context. A hook can never grant a capability – it may
+deny a tool call or add context, never allow or rewrite one – and nothing
+reachable from a hook can write configuration.
+
+### Human verb
+A named plugin command a person or a skill runs in a terminal – status,
+checklist, enable, config and the rest – as opposed to a hook. It reports
+problems on standard error with a non-zero exit like any command-line tool,
+and it is the only kind of invocation allowed to change configuration, so a
+repository cannot switch the plugin on by arranging for a hook to fire.
+
+### Bootstrap
+The session-start step that fetches the release binary named by the version
+pin into the plugin's data directory, verifies it against the release's
+published checksum, and installs it – doing nothing when the installed
+binary already matches. It never fails a session: offline, a bad download,
+an unwritable directory, or an unsupported platform all end in silence, and
+a failed install never touches an existing binary.
+
+Because hooks on one event run concurrently, the first session after
+installing is already underway before the download lands, so every other
+hook is deliberately inert for that session – each is launched through a
+small shim that exits silently when the binary is not there yet, rather than
+naming a path that does not exist. Reloading plugins re-registers the plugin
+but emits no session-start event, so it does not run the bootstrap; a new
+session does.
+
+### Temp root
+A private per-machine directory, derived from the user's home directory
+alone, where the plugin's shell scripts and its binary coordinate before any
+repository or session context exists: the install lock that serializes
+concurrent bootstraps, the locks the plugin's writers take, and the handoff
+file. Each level of it must be a real directory owned by the current user
+with owner-only permissions; a predictable path is not proof of ownership,
+so anything else makes the root unusable rather than trusted.
+
+The handoff file records where the bootstrap installed the binary. It exists
+because the harness tells hook processes where the plugin's data directory
+is but does not tell the Bash tool, so the wrapper a skill runs, and the
+shim a hook runs through, both find the binary by reading the handoff rather
+than by guessing.
+
+### State tree
+The gitignored directory inside the workspace contract where the plugin
+keeps everything machine-local for one worktree: the session scratchpads,
+the conclusion cache, the pending one-shot claims, and the pointer to the
+active session. It is written only after git confirms the tree is ignored –
+refusing both when git says no and when git cannot be asked – and it is one
+of the excluded trees, so nothing in it is ever synced, packed, or re-
+offered as a candidate.
+
 ### Session scratchpad
-The per-worktree directory of durable working state – `STATUS.md`, `TASKS.md`,
-`DECISIONS.md`, `LEARNINGS.md`, `CONTEXT.md` and research artifacts – that
-survives a context compaction because it lives on disk rather than in the
-window. Its name is derived deterministically from the git repository and
+The per-worktree directory inside the state tree holding durable working state –
+`STATUS.md`, `TASKS.md`, `DECISIONS.md`, `LEARNINGS.md`, `CONTEXT.md`,
+`OPERATOR-CHECKLIST.md` and research artifacts – that survives a context
+compaction because it lives on disk rather than in the window. Its
+`OPERATOR-CHECKLIST.md` is the model's own running notes on operational steps and
+is distinct from the Operator checklist below, which is committed repository
+content managed only through the plugin's verbs. Its name is derived deterministically from the git repository and
 branch, so the same worktree always resolves to the same directory. Working
 state only: it is gitignored, never committed, and anything durable is promoted
 into the repo.
@@ -122,7 +228,10 @@ rather than letting its whole content enter the context window. `Read` is the
 one tool the harness never spills to disk, so an unguarded large read is
 re-read on every later request. The gate is advisory, not a security boundary:
 a timeout, a malformed hook envelope, or a missing binary all leave the read
-to proceed.
+to proceed. It can only deny, never allow – every uncertain lookup falls through
+to letting the read happen – and it has deliberate escape hatches: a bounded
+window of the file, a subagent's own reads, non-text files, configured exemption
+patterns, and a one-shot bypass claim.
 
 ### Conclusion cache
 The store of Explore-agent answers about oversized files, keyed by a file's
@@ -146,7 +255,9 @@ A record whose consumption is its own exactly-once flag, used for the bypass
 token that admits a single gated read and for the artifact a subagent is
 required to produce. Claiming renames the record onto a private name rather than
 deleting it, so exactly one of several concurrent callers can win – a deleting
-claim is not exclusive under a real race, even though it looks like it.
+claim is not exclusive under a real race, even though it looks like it. A claim
+also carries an age limit: an expired bypass is still consumed but does not open
+the gate, so a stale claim can never admit a read indefinitely.
 
 ### Version pin
 The plugin's declared version, which fixes both the binary its hooks run and the
@@ -154,7 +265,42 @@ skills and Markdown shipped beside it. A `SessionStart` bootstrap installs the
 pinned binary and does nothing when it already matches, so updating the plugin is
 what updates the binary; no plugin invocation ever self-updates, because a
 mid-session swap would leave the binary and the shipped assets describing
-different behavior.
+different behavior. When the binary actually running a hook does not match the
+pin, the mismatch is reported to the operator at session start – never as
+model-facing context – and the status verb names it as one reason the plugin may
+be doing nothing.
+
+### Heartbeat log
+The append-only, machine-level record of every hook invocation – including
+the ones that did nothing and the ones that failed – kept outside any
+worktree so its rows survive that worktree's deletion. It is what lets the
+plugin's status verb answer whether a hook is actually firing, since a hook
+that fails open looks from the outside identical to one that had nothing to
+do.
+
+It is bounded: the newest rows are kept and older ones dropped once the file
+grows past a trigger size, and a row stamped in the future by a clock jump
+is kept rather than dropped.
+
+### Artifact contract
+A declaration, recorded before a subagent is dispatched, that the subagent
+must produce a named file. When that agent stops, the pending declaration is
+consumed and, if the file is missing or empty, the stop is blocked once with
+an explanation; with nothing declared, nothing is ever blocked.
+
+Blocking happens at most once per declaration because consuming the record
+is itself the one-shot flag. A declaration left waiting too long is dropped
+rather than enforced – blocking an unrelated agent hours later would be
+worse than not enforcing. Independently of the block decision, the stopping
+agent's own text is salvaged to disk, since a lost transcript is
+irreversible while a block is retriable.
+
+### Commit nudge
+The advisory context a before-tool-call hook adds when the model is about to
+commit, push, or open a pull request while an operator checklist in the
+repository is untracked or has unstaged edits: a reminder to update the
+checklist first. It never blocks the command and says so; it fires only when
+git reports the checklist as stale, so a clean checklist produces nothing.
 
 ### Cost ledger
 The append-only record of what each ended session cost, written once per

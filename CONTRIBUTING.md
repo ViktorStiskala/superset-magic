@@ -128,6 +128,16 @@ The last three cover code `cargo test` cannot reach:
   unwritable data directory, unsupported platform, concurrent sessions) using a
   `curl` shim, asserting for each that it exits 0, prints nothing on stdout, and
   leaves any pre-existing binary untouched. Pass `-v` for per-assertion output.
+- The same script also covers `plugin/hooks/run-hook.sh`, the shim every event
+  hook is spawned through. Those cases run it the way the harness does and
+  assert it exits 0 with both streams empty and the binary un-invoked whenever
+  it cannot resolve one — with no binary installed, with the data directory set
+  but empty, with the handoff removed, with a directory in the binary's place,
+  and with no event argument — plus the two success paths, which must exec with
+  exactly `plugin hook <event>`. A separate assertion checks every `hooks.json`
+  entry names `bash` and a script under `${CLAUDE_PLUGIN_ROOT}` that exists in
+  the packaged tree, since a command naming a path the bootstrap creates at
+  runtime is what made a first session die with ENOENT.
 
 Conventions worth knowing:
 

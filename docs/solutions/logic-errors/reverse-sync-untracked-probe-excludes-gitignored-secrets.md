@@ -45,7 +45,7 @@ patterns." The feature was a silent no-op for its entire reason to exist.
 
 ## What Didn't Work
 
-The unit tests for `compute_candidates` in `src/reverse_sync.rs` *looked* like
+The unit tests for `compute_candidates` in `src/sync/reverse_sync.rs` *looked* like
 they covered the case: they wrote secret-named files (`apps/api/.dev.vars`) into
 a temp git repo and asserted those files appeared as candidates. They passed —
 because the files were written **without** a matching `.gitignore` entry, so
@@ -68,7 +68,7 @@ wrapper's environment.
 
 ## Solution
 
-Two changes in `src/git.rs` plus its call site in `src/reverse_sync.rs`.
+Two changes in `src/git/mod.rs` plus its call site in `src/sync/reverse_sync.rs`.
 
 **1. Drop `--exclude-standard` from the untracked-files probe.**
 
@@ -179,6 +179,6 @@ also covers worktrees created from it.
 ## Related Issues
 
 - Originating plan: [docs/plans/2026-06-28-001-fix-reverse-sync-gitignored-candidates-plan.md](../../plans/2026-06-28-001-fix-reverse-sync-gitignored-candidates-plan.md)
-- `src/gitignore.rs` — `find_covering_rule` / `ensure_entry` are the downstream
+- `src/git/gitignore.rs` — `find_covering_rule` / `ensure_entry` are the downstream
   consumers that assume candidates are gitignored; this fix makes that true in
   practice, not just in theory.

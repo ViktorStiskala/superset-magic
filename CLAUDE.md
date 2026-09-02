@@ -77,9 +77,11 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   name and abbreviated SHA behind the plugin's `<repo>-<branch>` identity slug);
   `parse_ls_files_z` is the shared NUL-split behind BOTH `untracked_files` and
   `tracked_files`, defensively dropping any absolute / `..`-bearing entry in one
-  place) and mutating primitives (`stage_paths`, `commit`, `push`,
-  `push_upstream`, `create_branch`, `pr_create`, `timestamp_branch_suffix`,
-  `gh_available`). All `git`/`gh` invocations shell out via a shared `git_raw`
+  place) and mutating primitives (`stage_paths`, `nothing_to_commit`, `commit`,
+  `push`, `push_upstream`, `create_branch`, `pr_create`,
+  `timestamp_branch_suffix`, `gh_available` — `nothing_to_commit` runs
+  `git diff --cached --quiet` so `workspace/migrate.rs`'s final-action arms can
+  skip an empty commit instead of failing on one). All `git`/`gh` invocations shell out via a shared `git_raw`
   helper that surfaces stderr verbatim; `git` and `git_optional` are thin
   one-liners on top. (The bare location-auto `probe`/`Mode` dispatch was removed
   in U13 – routing is now the menu via `is_worktree` + `main_checkout_root`.)
@@ -854,8 +856,12 @@ platform release ARCHIVE directly, verifying it against that archive's published
 `.sha256` before extracting. It deliberately does NOT fall back to piping
 `ss-magic-installer.sh` into a shell: the release publishes `.sha256` siblings
 for the archives but not for the installer script, so a piped installer would be
-the one executed artifact no published digest covers. `plugin/hooks/run-hook.sh` is the shim EVERY hook is spawned
-through, and the indirection is the whole point: `${CLAUDE_PLUGIN_DATA}/bin/ss-magic`
+the one executed artifact no published digest covers. `plugin/hooks/run-hook.sh` is the shim the five EVENT
+hooks are spawned through — every entry in `hooks.json` except the `SessionStart`
+bootstrap, which must keep naming `bootstrap.sh` directly, because the shim does
+nothing when the binary is absent and the bootstrap is the thing that installs
+it; routing it through the shim would leave the plugin inert forever rather than
+for one session. The indirection is the whole point: `${CLAUDE_PLUGIN_DATA}/bin/ss-magic`
 does not exist until the bootstrap fetches it, and hooks on one event fire
 CONCURRENTLY, so a manifest naming the binary directly makes the harness
 `posix_spawn` a missing path and the session dies with ENOENT on a first install.
@@ -914,8 +920,12 @@ binary is the sole file-copy implementation.)
   `/bin/bash scripts/test-bootstrap.sh` (the bootstrap's failure paths –
   offline, corrupted download, hostile pin, unwritable data dir, unsupported
   platform, concurrent sessions – each asserting exit 0, empty stdout, and an
-  untouched pre-existing binary; written for bash 3.2, so no associative
-  arrays, no `mapfile`, no `${var^^}`).
+  untouched pre-existing binary; PLUS the hook shim's own inertness contract,
+  which drives `plugin/hooks/run-hook.sh` directly and asserts exit 0 with both
+  streams empty and the binary un-invoked when it cannot resolve one; PLUS a
+  manifest invariant asserted over EVERY `hooks.json` entry rather than the
+  bootstrap group alone. Written for bash 3.2, so no associative arrays, no
+  `mapfile`, no `${var^^}`).
 - The plugin's packaged tree is **content-pinned**. Any change under `plugin/`
   moves the zip's digest, so it must be followed by `python3
   scripts/build-plugin-zip.py --update-manifest` and then `--check`, and by a
@@ -981,8 +991,10 @@ the real incident this run fixed.
   excluded trees at once, since `.superset` is the ancestor of both `backups` and
   `.magic`. A comment asserting "X is never included" is a
   red flag unless the guard sits on the enumeration layer; test the directory-match
-  shape, not just the leaf. (The write-up below predates the rename: it describes
-  `under_backups_dir` / `append_dir_excluding_backups`, now generalized into
+  shape, not just the leaf. (The write-up below records the incident under the
+  names the code carried at the time, `under_backups_dir` /
+  `append_dir_excluding_backups`; its Problem and What-Didn't-Work sections keep
+  those deliberately, while its Solution and Related sections name the current
   `sync::under_excluded_tree` / `pack::append_dir_excluding_trees`.) See
   [docs/solutions/logic-errors/pack-backups-exclusion-must-guard-the-directory-walk.md](./docs/solutions/logic-errors/pack-backups-exclusion-must-guard-the-directory-walk.md).
 

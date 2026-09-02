@@ -3,8 +3,13 @@
 # The hook entry point: run `ss-magic plugin hook <event>` if the pinned binary
 # is there, and do nothing at all if it is not.
 #
-# Every hook in hooks.json is spawned through this script rather than naming the
-# binary directly, and that indirection is the whole point of the file.
+# Every EVENT hook in hooks.json is spawned through this script rather than
+# naming the binary directly, and that indirection is the whole point of the
+# file. The one entry that is NOT spawned through it is the SessionStart
+# bootstrap, which must keep naming bootstrap.sh directly: this script does
+# nothing when the binary is absent, and the bootstrap is what installs it, so
+# routing the bootstrap through here would leave the plugin inert forever
+# instead of for one session.
 # ${CLAUDE_PLUGIN_DATA}/bin/ss-magic does not exist until the SessionStart
 # bootstrap fetches it, and hooks on one event fire CONCURRENTLY - so on a first
 # install the harness would posix_spawn a path that is not there yet and the
@@ -79,4 +84,43 @@ bin="$data/bin/ss-magic"
 # the one script whose whole job is to be silent.
 [ -f "$bin" ] && [ -x "$bin" ] || give_up
 
+# The `-f`/`-x` tests above ask about the FILE. They cannot see execve failing on
+# the way INTO it, and the two ways that happens need different handling.
+#
+# ENOEXEC is the dangerous one. When the file is readable but is not a loadable
+# executable - a truncated download, a foreign architecture, on-disk corruption -
+# bash falls back to POSIX behaviour and REINTERPRETS it as a shell script. It is
+# not an exec failure at that point, so `execfail` does not catch it, and the
+# process exits with whatever those bytes happen to parse to. Measured over 30
+# corrupted binaries on bash 3.2: exit 2 about half the time, and exit 2 from
+# PreToolUse means BLOCK the tool call. A damaged binary would silently block
+# nearly every tool call in the session, from the one script whose whole job is
+# to be invisible. So the magic number is checked first and anything that is not
+# a real executable is refused before exec ever sees it. The list is the formats
+# this binary actually ships as, plus `#!` so a wrapper script still works; an
+# unrecognised format fails CLOSED (inert), which is the safe direction.
+case "$(od -An -N4 -tx1 <"$bin" 2>/dev/null | tr -d ' ')" in
+    7f454c46) ;;                              # ELF
+    cffaedfe|cefaedfe|feedface|feedfacf) ;;   # Mach-O 32/64, either endianness
+    cafebabe|bebafeca) ;;                     # Mach-O universal ("fat")
+    2321*) ;;                                 # "#!" - an interpreted wrapper
+    *) give_up ;;
+esac
+
+# The remaining execve failures - a shebang naming a missing interpreter, a
+# noexec mount, EACCES - are real exec failures, and `execfail` makes bash return
+# here instead of exiting 126/127, so control reaches the `exit 0` below and this
+# file's invariant holds: every path exits 0.
+#
+# Bash still prints its own one-line diagnostic before returning, and that is
+# accepted rather than suppressed. `exec ... 2>/dev/null` would apply to the
+# SUCCESSFUL path too and swallow the binary's own HookContext::diagnostic
+# output, which is a real channel this hook is supposed to carry.
+#
+# `exec` itself is deliberate and must stay: it makes the harness's child pid BE
+# the binary, so a hook timeout kills the binary rather than killing this shell
+# and orphaning it. That matters most on SessionEnd, which the CLI blocks on
+# while a session exits.
+shopt -s execfail
 exec "$bin" plugin hook "$event"
+exit 0

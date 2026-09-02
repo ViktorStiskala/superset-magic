@@ -445,6 +445,17 @@ if command -v python3 >/dev/null 2>&1; then
     if python3 - "$PLUGIN_SRC/hooks/hooks.json" <<'PY'
 import json, sys
 spec = json.load(open(sys.argv[1]))
+
+# The event token each shim entry must pass as args[1]. These are the tokens
+# HookEvent::from_token parses in src/plugin/mod.rs; a rename on either side
+# without the other is exactly the drift this asserts against.
+SHIM_TOKENS = {
+    "SessionStart": "session-start",
+    "PreToolUse": "pre-tool-use",
+    "PreCompact": "pre-compact",
+    "SubagentStop": "subagent-stop",
+    "SessionEnd": "session-end",
+}
 groups = spec["hooks"]["SessionStart"]
 boot = [g for g in groups
         if any("bootstrap.sh" in a for h in g["hooks"] for a in h.get("args", []))]
@@ -479,9 +490,21 @@ for ev, egroups in spec["hooks"].items():
                 f"{ev}: command names a runtime-created artifact ({c}); "
                 "spawn a ${CLAUDE_PLUGIN_ROOT} script instead")
             assert c == "bash", f"{ev}: command is {c!r}, expected the exec form 'bash'"
-            a0 = h.get("args", [None])[0]
+            a = h.get("args") or [None]
+            a0 = a[0]
             assert isinstance(a0, str) and a0.startswith("${CLAUDE_PLUGIN_ROOT}/"), (
                 f"{ev}: args[0] is {a0!r}; it must be a path under the plugin root")
+            # args[0] alone is not the property that matters. Every shim entry also
+            # has to dispatch ITS OWN event: the token in args[1] is what run-hook.sh
+            # passes to `plugin hook`, so a manifest that names the right script with
+            # the wrong token routes the event to the wrong handler and every other
+            # assertion here still passes.
+            if "run-hook.sh" in a0:
+                expected = SHIM_TOKENS.get(ev)
+                assert expected, f"{ev}: no expected shim token is defined for this event"
+                assert len(a) == 2, f"{ev}: expected exactly 2 args, got {a!r}"
+                assert a[1] == expected, (
+                    f"{ev}: dispatches {a[1]!r}, expected {expected!r}")
             # Spelling is not the property that matters - the spawned path has to
             # EXIST in the packaged tree, or the harness posix_spawns a missing
             # file and we are back to the ENOENT this whole shape exists to stop.
@@ -635,6 +658,80 @@ current_case="AE9 no event argument"
 : >"$sb/fakebin.log"
 SHIM_DATA="$sb/data" run_shim
 assert_shim_inert "AE9 (missing event token)"
+
+current_case="AE9 binary is present and +x but is not a loadable executable"
+# `-f` and `-x` both pass here: the file is a regular file with the execute bit.
+# What they cannot see is execve failing on the way in. On the ENOEXEC path bash
+# does NOT report an exec failure - it falls back to reinterpreting the file as a
+# shell script, so `shopt -s execfail` never fires, and the process exits with
+# whatever those bytes parse to. Measured over 30 corrupted binaries on bash 3.2:
+# exit 2 roughly half the time, and exit 2 from PreToolUse means BLOCK the tool
+# call. That is why run-hook.sh checks the magic number before exec.
+head -c 512 /dev/urandom >"$sb/data/bin/ss-magic"
+chmod 755 "$sb/data/bin/ss-magic"
+: >"$sb/fakebin.log"
+SHIM_DATA="$sb/data" run_shim pre-tool-use
+assert_shim_inert "AE9 (binary is not a loadable executable)"
+
+current_case="AE9 a shebang wrapper is still accepted"
+# The magic check must not become a rule that only real compiled binaries pass:
+# an interpreted wrapper is a legitimate shape, and the suite's own fake binary
+# is one, so a guard that rejected `#!` would make every other case vacuous.
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"${SS_MAGIC_FAKE_LOG:-/dev/null}"\nexit 0\n' >"$sb/data/bin/ss-magic"
+chmod 755 "$sb/data/bin/ss-magic"
+: >"$sb/fakebin.log"
+SHIM_DATA="$sb/data" run_shim pre-tool-use
+assert_eq 0 "$RC" "AE9: a shebang wrapper still execs"
+assert_eq "plugin hook pre-tool-use" "$(cat "$sb/fakebin.log")" "AE9: shebang wrapper receives the right argv"
+
+# ==========================================================================
+# AE64 (dynamic) - every manifest entry dispatches ITS OWN event, end to end
+#
+# The static assertion above reads hooks.json as JSON. That is not the same as
+# running it: nothing else in the suite expands ${CLAUDE_PLUGIN_ROOT} and spawns
+# the command the way the harness does, because AE9 invokes the shim directly
+# with a token this script chose. So a manifest could name the right script with
+# the wrong token and every other test would stay green.
+# ==========================================================================
+current_case="AE64 dynamic: each entry reaches the binary with its own event"
+if command -v python3 >/dev/null 2>&1; then
+    manifest_entries=$(python3 - "$sb/plugin/hooks/hooks.json" <<'PY_ENTRIES'
+import json, sys
+spec = json.load(open(sys.argv[1]))
+TOK = {"SessionStart": "session-start", "PreToolUse": "pre-tool-use",
+       "PreCompact": "pre-compact", "SubagentStop": "subagent-stop",
+       "SessionEnd": "session-end"}
+for ev, groups in spec["hooks"].items():
+    for g in groups:
+        for h in g["hooks"]:
+            a = h.get("args") or []
+            if not a or "run-hook.sh" not in a[0]:
+                continue          # the bootstrap entry is spawned directly, by design
+            print("%s\t%s\t%s\t%s" % (ev, TOK[ev], h["command"], " ".join(a)))
+PY_ENTRIES
+)
+    entry_count=0
+    while IFS="$(printf '\t')" read -r ev tok cmd argv; do
+        [ -n "$ev" ] || continue
+        entry_count=$((entry_count + 1))
+        : >"$sb/fakebin.log"
+        expanded=$(printf '%s' "$argv" | sed "s|\${CLAUDE_PLUGIN_ROOT}|$sb/plugin|g")
+        # Deliberately unquoted: $expanded is the manifest's argv vector, and the
+        # harness spawns it as separate arguments, not as one string.
+        env -i PATH="/usr/bin:/bin" HOME="$sb/home" TMPDIR="$sb/tmp" \
+            CLAUDE_PLUGIN_DATA="$sb/data" SS_MAGIC_FAKE_LOG="$sb/fakebin.log" \
+            "$cmd" $expanded </dev/null >"$sb/sout" 2>"$sb/serr"
+        assert_eq 0 "$?" "AE64 dynamic: $ev exits 0"
+        assert_eq "plugin hook $tok" "$(cat "$sb/fakebin.log")" \
+            "AE64 dynamic: $ev reaches the binary as '$tok'"
+        assert_eq 0 "$(wc -c <"$sb/sout" | tr -d ' ')" "AE64 dynamic: $ev adds nothing to stdout"
+    done <<MANIFEST_ENTRIES
+$manifest_entries
+MANIFEST_ENTRIES
+    assert_eq 5 "$entry_count" "AE64 dynamic: all five event hooks were exercised"
+else
+    printf '  skip AE64 dynamic: python3 is not available\n'
+fi
 
 # ==========================================================================
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$passed" "$failed"
