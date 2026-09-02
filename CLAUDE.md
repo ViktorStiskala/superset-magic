@@ -431,13 +431,38 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   target root; `parse_covering_line` is its parser. The private `is_ignored_opt`
   (trailing-slash query for `Dir`), `closest_gitignore_dir`, and
   `anchored_literal` back `ensure_path_ignored`.
-- `update/` — every-invocation self-update: `check.rs` does the
-  daily-cached GitHub latest check (ureq, ETag, 5 s timeout, silent
-  fall-through); `update/apply.rs` does the fd-lock / download / atomic swap /
-  spawn-and-wait re-exec via the `self_update` crate. Integrity rests on
+- `update/` — every-invocation self-update. `check.rs` does the daily-cached,
+  PER-RELEASE-LINE GitHub check (ureq, ETag, 5 s timeout, silent
+  fall-through). One repository hosts two release lines – the CLI on bare
+  `vX.Y.Z` tags and the plugin on `ss-magic-plugin-vX.Y.Z` – so the
+  repository-wide `releases/latest` mark no longer identifies the newest CLI
+  release: the check fetches the first page of `/releases?per_page=100`,
+  drops drafts and prereleases, keeps only the tags that pass its `Line`'s
+  anchored filter (`parse_line_tag`: `tag.strip_prefix(line.tag_prefix)` then
+  exactly three ASCII-digit components and nothing else – `CLI_LINE` is `v`,
+  `PLUGIN_LINE` is `ss-magic-plugin-v`; the latter is declared here but
+  `#[allow(dead_code)]` until U6's `release-check` verb consumes it), and
+  `select_newest` takes the GREATEST triple, never the first entry, because
+  the list is in creation order. A line with no release among the newest 100
+  reads as "no update" – conservative by design. The on-disk
+  `Cache { checked_at, tag_name, etag }` shape is unchanged so an older
+  binary's cache file still parses; `tag_name` now holds the SELECTED tag, and
+  a cached tag of the other line reads as `UpToDate`. `resolve_newest_uncached`
+  is the cache-free resolver behind `ss-magic update`. `update/mod.rs`'s
+  `update_command_with` decides in a fixed order before any download: no tag
+  resolved → `UpdateReport::Unavailable` ("could not check", deliberately
+  distinct from "already latest", and the backend is never constructed); a
+  tag failing the CLI filter → `Unavailable`; not newer → `AlreadyLatest`;
+  else the swap. `update/apply.rs` does the fd-lock / download / atomic swap /
+  spawn-and-wait re-exec via the `self_update` crate, and EVERY entry point
+  (`apply_update`, `apply_update_unlocked`, `run_self_update`) takes a
+  mandatory `&str` tag – `target_version_tag` is always pinned, so the
+  backend can never pick "latest" itself and install a plugin release over
+  the CLI; a compile-time test pins the signatures. Integrity rests on
   TLS + cargo-dist checksums (no SHA-256-vs-asset-digest check — see the
   KTD5 conformance notes in `update/apply.rs`); `bin_path_in_archive`
-  matches cargo-dist's `<bin>-<target>/` tarball layout.
+  matches cargo-dist's `<bin>-<target>/` tarball layout, and a test pins
+  `BIN_NAME == CARGO_PKG_NAME` because that name is the `<bin>` half.
 - `hashing.rs` – the crate's content-fingerprint primitives. `fnv1a_64` /
   `hash_file` are the non-cryptographic hashes behind cache keys and claim-file
   names; FNV-1a rather than `DefaultHasher` because std explicitly does NOT

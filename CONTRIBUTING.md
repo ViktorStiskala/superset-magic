@@ -242,8 +242,8 @@ URL. Reproducibility is what lets the digest be computed and committed *before*
 the release exists and re-derived identically by CI; `.gitattributes` marks
 `plugin/**` as `-text` so a checkout's line-ending conversion can never move it.
 
-Because the binary self-updates from the latest release, the version number is
-the release mechanism: publishing a release with a higher version rolls it out
+Because the binary self-updates from the newest `vX.Y.Z` release it finds in
+the repository's release list, the version number is the release mechanism: publishing a release with a higher version rolls it out
 to every installed binary within a day (or immediately via `ss-magic update`).
 The plugin's binary is the exception – it is pinned by
 `plugin/ss-magic.version` and updated only when the plugin itself is, so the

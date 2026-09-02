@@ -411,13 +411,15 @@ pub fn run_reverse_sync_flow(cwd: &Path, no_backup: bool) -> Result<ExitCode> {
     sync::reverse_sync::run_bulk(&cwd_root, &main_root, no_backup)
 }
 
-/// `ss-magic update` (R4): force a self-update regardless of the 24h cache.
+/// `ss-magic update`: force a self-update regardless of the 24h cache.
 ///
-/// Routes straight to the forced apply path (U7), which bypasses the daily
-/// cache, runs the `self_update` lock/download/swap if a newer release exists,
-/// and reports the resulting version or "already latest". Unlike the bare/sync
-/// auto-update gate (U8), this does not re-exec — the update itself is the
-/// requested work.
+/// Routes straight to the forced apply path, which resolves the CLI line's
+/// newest release from GitHub without the daily cache, runs the `self_update`
+/// lock/download/swap pinned to that tag if it is newer, and reports the
+/// resulting version, "already latest", or – when the release list could not
+/// be fetched – that it could not check at all (the two are deliberately
+/// distinct: offline is not "up to date"). Unlike the bare/sync auto-update
+/// gate, this does not re-exec — the update itself is the requested work.
 fn update_flow() -> Result<ExitCode> {
     tui::style::print_section("Self-update");
     match update::update_command() {
@@ -427,6 +429,13 @@ fn update_flow() -> Result<ExitCode> {
         }
         update::UpdateReport::AlreadyLatest => {
             println!("{}", tui::style::info("Already on the latest release."));
+            Ok(ExitCode::SUCCESS)
+        }
+        update::UpdateReport::Unavailable => {
+            println!(
+                "{}",
+                tui::style::warn("Could not check for a release; try again.")
+            );
             Ok(ExitCode::SUCCESS)
         }
         update::UpdateReport::Skipped => {

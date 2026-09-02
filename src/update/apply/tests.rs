@@ -92,7 +92,7 @@ fn ae2_lock_held_makes_second_caller_contend_and_skip() {
     );
 
     // apply_update on the same contended lock must Skip without waiting.
-    let outcome = apply_update(&lock_path, Some("v999.0.0"));
+    let outcome = apply_update(&lock_path, "v999.0.0");
     assert_eq!(
         outcome,
         ApplyOutcome::Skipped,
@@ -222,4 +222,25 @@ fn child_exit_code_propagates_through_seam() {
 fn split_slug_splits_owner_and_repo() {
     assert_eq!(split_slug("owner/repo"), ("owner", "repo"));
     assert_eq!(split_slug("ViktorStiskala/superset-magic"), ("ViktorStiskala", "superset-magic"));
+}
+
+// ── Archive layout and the always-pinned apply (R18) ────────────────────
+
+/// cargo-dist names each app's archive `<app>-<target>` with the binary one
+/// directory deep, and `bin_path_in_archive` is built from `BIN_NAME`, so the
+/// constant must be this crate's own package name or extraction silently
+/// fails and reports "up to date".
+#[test]
+fn bin_name_matches_the_crate_name() {
+    assert_eq!(BIN_NAME, env!("CARGO_PKG_NAME"));
+}
+
+/// No apply path can ask the backend to choose a release: every entry point
+/// takes a MANDATORY tag. Pinned at compile time – if a signature regrows an
+/// `Option<&str>`, this stops building.
+#[test]
+fn every_apply_entry_point_takes_a_mandatory_tag() {
+    let _run: fn(&str) -> Result<Option<String>, Box<dyn std::error::Error>> = run_self_update;
+    let _locked: fn(&Path, &str) -> ApplyOutcome = apply_update;
+    let _unlocked: fn(&str) -> ApplyOutcome = apply_update_unlocked;
 }

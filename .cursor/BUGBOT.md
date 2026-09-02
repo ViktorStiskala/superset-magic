@@ -909,11 +909,27 @@ embedded source of truth).
 
 ## Self-Update Safety (`update/`)
 
-- The daily-cached "latest release" check (`update/check.rs`) uses `ureq` with
-  an ETag and a short timeout, and must fall through SILENTLY on any offline /
-  non-200 / timeout result — a failed update check must never block or slow a
-  normal invocation. Flag an update-check change that surfaces a hard error or
-  removes the timeout.
+- The daily-cached release check (`update/check.rs`) lists `/releases` (first
+  page) and filters PER RELEASE LINE with an anchored, exact tag filter
+  (`parse_line_tag`: `CLI_LINE` accepts only `v` + `MAJOR.MINOR.PATCH`,
+  `PLUGIN_LINE` only `ss-magic-plugin-v` + `MAJOR.MINOR.PATCH` – nothing
+  before, nothing after, case-sensitive, ASCII digits only), drops drafts and
+  prereleases, and selects the GREATEST triple rather than the first entry.
+  Flag any change that reads `releases/latest`, matches a tag by substring or
+  an unanchored regex, takes the first match, or lets a tag of the other line
+  through. It uses `ureq` with an ETag and a short timeout, and must fall
+  through SILENTLY on any offline / non-200 / timeout / non-JSON-array result –
+  a failed update check must never block or slow a normal invocation. Flag an
+  update-check change that surfaces a hard error or removes the timeout.
+- Every `self_update` call is pinned: `apply_update`, `apply_update_unlocked`
+  and `run_self_update` (`update/apply.rs`) take a mandatory `&str` tag and
+  always set `target_version_tag`. Flag a signature that regrows
+  `Option<&str>` or any path that lets the backend choose "latest" itself –
+  with two release lines in one repository it could install a plugin release
+  over the CLI. `ss-magic update` resolves the tag first
+  (`check::resolve_newest_uncached`, no cache) and maps a failed resolution to
+  `UpdateReport::Unavailable` ("could not check"), never to `AlreadyLatest`;
+  flag a change that conflates the two.
 - The apply path (`update/apply.rs`) takes an advisory `fd-lock`
   (skip-on-contention), downloads over TLS, atomically swaps the binary, then
   re-execs and blocks on the child. The re-exec loop guard (`SS_MAGIC_UPDATED`

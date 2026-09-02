@@ -169,7 +169,7 @@ ss-magic reverse-sync # non-interactive bulk copy: current worktree → main,
                        # for git-untracked files matching the configured
                        # patterns
 ss-magic pack         # archive the configured files into ss-magic-<repo>.tar.bz2
-ss-magic update       # force a self-update to the latest release
+ss-magic update       # force a self-update to the newest CLI release
 ss-magic init [PATTERN...]   # non-interactively seed .superset (magic.json
                              # layout); extra args become magic.json `files`
 ss-magic plugin <VERB>       # Claude Code plugin entry point (see below);
@@ -402,8 +402,11 @@ operations, and skips the auto-update gate.
 
 ### `ss-magic update` — force a self-update
 
-Checks GitHub for the latest release regardless of the daily cache and reports
-the resulting version or "already latest". See [Self-update](#self-update).
+Resolves the newest CLI release from GitHub's release list regardless of the
+daily cache, installs it when it is newer than the running binary, and reports
+the resulting version, "already latest", or – when the list could not be
+fetched – that it could not check (being offline is never reported as being up
+to date). See [Self-update](#self-update).
 
 ## The Claude Code plugin
 
@@ -657,13 +660,19 @@ different behavior.)
 
 - The version cache lives in the OS cache dir; if it's fresh (< 24 h) no
   network call is made.
-- Otherwise `GET /releases/latest` runs with an ETag and a 5 s timeout. Any
-  offline / non-200 / timeout response falls through silently on the installed
-  version.
+- Otherwise the first page of `GET /releases` (100 entries) runs with an ETag
+  and a 5 s timeout. Drafts and pre-releases are dropped, only tags of the
+  exact shape `vMAJOR.MINOR.PATCH` count – the plugin's own
+  `ss-magic-plugin-v…` release line and any other spelling are ignored – and
+  the greatest version wins, not the most recently created entry. Any
+  offline / non-200 / timeout / malformed response falls through silently on
+  the installed version.
 - When a newer release is found, ss-magic acquires an advisory lock
-  (skip-on-contention), downloads the release archive over TLS, atomically
-  swaps the running binary, then re-execs the original command on the new
-  binary and blocks until it finishes (propagating its exit code). Integrity
+  (skip-on-contention), downloads that exact release's archive over TLS (the
+  updater always pins the tag it resolved; it never asks GitHub for "latest"
+  itself), atomically swaps the running binary, then re-execs the original
+  command on the new binary and blocks until it finishes (propagating its exit
+  code). Integrity
   rests on the TLS-authenticated GitHub download plus cargo-dist's published
   per-archive checksums; there is no separate SHA-256-vs-GitHub-digest check
   and the updater does not consume the release attestations — binary signing
@@ -680,7 +689,8 @@ Escape hatches:
 - `SS_MAGIC_UPDATED=1` — set internally on the re-exec'd child to prevent
   re-check loops.
 - `ss-magic update` — force a check regardless of the 24 h cache and report
-  the resulting version or "already latest".
+  the resulting version, "already latest", or "could not check for a release"
+  when GitHub could not be reached.
 
 ## Environment variables
 

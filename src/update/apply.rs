@@ -71,7 +71,9 @@ use std::time::{Duration, SystemTime};
 
 use super::check::REPO_SLUG;
 
-/// Binary name shipped in release archives (matches `[[bin]] name`).
+/// Binary name shipped in release archives (matches `[[bin]] name`). It is
+/// also the `<app>` half of cargo-dist's `<app>-<target>/` archive layout, so
+/// it must equal this crate's package name – a test pins the two together.
 const BIN_NAME: &str = "ss-magic";
 
 /// Lock file name inside the cache dir (sibling of the version cache).
@@ -311,8 +313,11 @@ pub enum ApplyOutcome {
     Updated { version: String },
 }
 
-/// Run the `self_update` download/verify/swap for `target_tag` (or the latest
-/// compatible release when `None`), holding the update lock for the duration.
+/// Run the `self_update` download/verify/swap for `target_tag`, holding the
+/// update lock for the duration. The tag is MANDATORY: the backend is never
+/// asked to choose a release itself, because with two release lines in one
+/// repository its notion of "latest" could name a plugin release (R18). The
+/// caller resolves the tag through the per-line check first.
 ///
 /// `lock_path` is injected (tempdir in tests). On lock contention → returns
 /// [`ApplyOutcome::Skipped`] WITHOUT waiting (AE2). Any download/verify/swap
@@ -323,7 +328,7 @@ pub enum ApplyOutcome {
 /// unit-tested directly (the SEAMS — lock state, exit-code propagation — are
 /// tested in isolation). It is exercised by manual smoke against a real
 /// release.
-pub fn apply_update(lock_path: &Path, target_tag: Option<&str>) -> ApplyOutcome {
+pub fn apply_update(lock_path: &Path, target_tag: &str) -> ApplyOutcome {
     // Acquire + HOLD the lock for the whole critical section. We open the file
     // and keep the `RwLock` alive in this scope so the guard lives as long as
     // the swap runs.
@@ -364,7 +369,8 @@ pub fn apply_update(lock_path: &Path, target_tag: Option<&str>) -> ApplyOutcome 
 /// cache dir resolves (so there's nowhere to put a lock file) on the explicit
 /// `ss-magic update` force path. Every supported platform resolves a cache
 /// dir, so this is rarely reached; locking is preferred via [`apply_update`].
-pub fn apply_update_unlocked(target_tag: Option<&str>) -> ApplyOutcome {
+/// Like [`apply_update`], it takes a mandatory, already-resolved tag.
+pub fn apply_update_unlocked(target_tag: &str) -> ApplyOutcome {
     match run_self_update(target_tag) {
         Ok(Some(version)) => ApplyOutcome::Updated { version },
         Ok(None) => ApplyOutcome::NoUpdate,
@@ -374,13 +380,17 @@ pub fn apply_update_unlocked(target_tag: Option<&str>) -> ApplyOutcome {
 
 /// Drive the `self_update` GitHub backend. Returns `Ok(Some(version))` on a
 /// successful swap, `Ok(None)` when already up to date, `Err` on any failure
-/// (network, archive, swap). `target_tag` pins a specific release tag when
-/// known (the forced/checked path); `None` lets the backend pick the latest.
+/// (network, archive, swap). `target_tag` ALWAYS pins the release: the
+/// backend then fetches `/releases/tags/<tag>` and installs that release's
+/// asset without a version comparison of its own, so what gets installed is
+/// exactly what the per-line check selected (R18). There is deliberately no
+/// `None` form – letting the backend pick "latest" would let it pick the
+/// other release line.
 ///
 /// Configured `no_confirm(true)` + `show_output(false)` so it runs silently
 /// and unattended (no TTY prompt). The binary is replaced in place at
 /// `current_exe()` (the backend's default `bin_install_path`).
-fn run_self_update(target_tag: Option<&str>) -> Result<Option<String>, Box<dyn std::error::Error>> {
+fn run_self_update(target_tag: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let (owner, repo) = split_slug(REPO_SLUG);
 
     let mut builder = self_update::backends::github::Update::configure();
@@ -397,10 +407,8 @@ fn run_self_update(target_tag: Option<&str>) -> Result<Option<String>, Box<dyn s
         .current_version(env!("CARGO_PKG_VERSION"))
         .no_confirm(true)
         .show_output(false)
-        .show_download_progress(false);
-    if let Some(tag) = target_tag {
-        builder.target_version_tag(tag);
-    }
+        .show_download_progress(false)
+        .target_version_tag(target_tag);
 
     let status = builder.build()?.update()?;
     match status {
