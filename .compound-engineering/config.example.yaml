@@ -71,8 +71,8 @@
 # on your session model and the run says so. Invalid/commented/missing -> no
 # elevation.
 
-plan_model: fable              # model alias for the plan-authoring step (no default)
-brainstorm_model: fable        # model alias for approach generation (no default)
+# plan_model: fable              # model alias for the plan-authoring step (no default)
+# brainstorm_model: fable        # model alias for approach generation (no default)
 
 # --- PR concept teaching (ce-commit-push-pr) ---
 # When a PR introduces a concept new to the codebase, the generated PR
@@ -128,7 +128,7 @@ brainstorm_model: fable        # model alias for approach generation (no default
 # the peer cannot honor skips the pass with a stated reason -- never substituted.
 
 # cross_model_review_mode: off   # auto | off (default: auto)
-cross_model_peer: codex          # codex | claude | grok | cursor | composer | opencode
+# cross_model_peer: codex          # codex | claude | grok | cursor | composer | opencode
 # cross_model_model: fable         # model alias or full id for the resolved peer target (no default)
 # cross_model_effort: xhigh        # reasoning effort for the resolved peer target (no default)
 
@@ -152,12 +152,6 @@ cross_model_peer: codex          # codex | claude | grok | cursor | composer | o
 #   - harness: codex
 #     model: "gpt-5.6"
 #   - harness: claude             # configured default model
-
-work_engine_mode: prefer        # off | prefer | require (default: off)
-work_engine_preferences:
-  - harness: codex
-    model: "gpt-5.6-sol"
-  - harness: claude             # configured default model
 
 # --- ce-promote ---
 # Written automatically when you decline the Spiral setup offer in /ce-promote.

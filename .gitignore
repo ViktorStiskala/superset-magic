@@ -6,3 +6,6 @@
 # root. It is published from CI, never committed; the digest in
 # .claude-plugin/marketplace.json is what the repository carries instead.
 /ss-magic-plugin-v*.zip
+
+# Compound Engineering local scratch
+.context/compound-engineering/
