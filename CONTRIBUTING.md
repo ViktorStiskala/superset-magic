@@ -25,8 +25,9 @@ cargo install --git https://github.com/ViktorStiskala/superset-magic
 …or from a clone of this repo:
 
 ```sh
-make build     # cargo build --release
-make install   # cargo install --path .
+make build     # cargo build --release --workspace
+make install   # cargo install --path crates/ss-magic
+make test      # cargo test --workspace --locked
 make clean     # cargo clean
 ```
 
@@ -40,22 +41,57 @@ release.
 
 ## Code layout
 
+The repository is a Cargo workspace. The root `Cargo.toml` is a virtual
+manifest (no `[package]`): it owns the shared package metadata and both build
+profiles (`release` with `opt-level = "z"`, and `dist`, which cargo-dist uses
+and which inherits it), and lists the members under `crates/`:
+
+- `crates/ss-magic-core` – the library both binaries share (`publish = false`;
+  its `0.1.0` version is never released or tagged). Nothing in it opens a
+  prompt, draws a TUI, or self-updates.
+- `crates/ss-magic` – the interactive sync CLI. Until the plugin gets its own
+  member, the whole `plugin/` verb tree still compiles here.
+
 Source is layered so the pure logic stays unit-testable in isolation from the
-interactive layer, and grouped by purpose under `src/`:
+interactive layer, and grouped by purpose under each crate's `src/`.
+
+In `ss-magic-core`:
 
 - `git/` — git plumbing (read-only probes and mutating primitives; all git/gh
-  interaction shells out via `std::process::Command` — **no `git2`**).
-- `sync/` — pattern validation and the glob/exclude/copy engine shared by
-  forward sync, reverse sync, and pack; `merge.rs` owns the reverse-sync
-  push/pull/merge decision model and per-hunk merge assembly (`similar`-based
-  diffing); `reverse_sync.rs` owns the backup-first, TOCTOU-guarded apply seam
-  that writes a cockpit decision to disk.
-- `tui/` — the interactive layer: `inquire` menus and pickers, styling, the
+  interaction shells out via `std::process::Command` — **no `git2`**), the
+  `.gitignore` helpers, and `discover`, the filesystem-only root discovery the
+  plugin's hook path uses.
+- `sync/` — pattern validation, the working-tree scan, the glob/exclude/copy
+  engine shared by forward sync, reverse sync, and pack, and the
+  `EXCLUDED_TREES` rule every enumeration applies.
+- `superset_files.rs` — `.superset/` contract I/O.
+- `style.rs` — the palette and the process-wide color decision (no `inquire`).
+- `reponame.rs` — the `<repo>` name stem the pack archive and the plugin's
+  session identity both derive from.
+- `state_tree.rs` — the `.superset/.magic` constant and the one writer of its
+  gitignore rule (called eagerly by `init`/`migrate`, lazily by `plugin
+  enable`).
+- `release.rs` — the per-line, daily-cached GitHub release check.
+- `hashing.rs` — FNV-1a for cache keys and a hand-rolled SHA-256 the plugin's
+  shell bootstrap has to reproduce with `shasum`.
+- `testutil.rs` — shared test fixtures, compiled only for tests (see below).
+
+In `ss-magic`:
+
+- `sync/` — `merge.rs` owns the reverse-sync push/pull/merge decision model and
+  per-hunk merge assembly (`similar`-based diffing); `reverse_sync.rs` owns the
+  backup-first, TOCTOU-guarded apply seam that writes a cockpit decision to
+  disk; `mod.rs` re-exports core's pure half so `crate::sync::apply` still
+  resolves.
+- `tui/` — the interactive layer: `inquire` menus and pickers, `theme.rs`
+  (installs the `inquire` render config from core's color decision), the
   pure diff/decision models (`diffmodel`, also built on `similar`), and the
-  full-screen `ratatui`
-  reverse-sync merge cockpit (`cockpit`, on the `crossterm` backend).
-- `workspace/` — `.superset/` contract I/O and the init/migration lifecycle.
-- `update/` — the self-update check and apply paths.
+  full-screen `ratatui` reverse-sync merge cockpit (`cockpit`, on the
+  `crossterm` backend). `tui/mod.rs` re-exports core's `style`.
+- `workspace/` — the init/migration lifecycle (`migrate.rs`); re-exports core's
+  `superset_files`.
+- `update/` — the self-update apply path and the `update` verb, on top of
+  core's `release`.
 - `plugin/` – the Claude Code plugin's verb tree: `hook/` (the stdin decode,
   gates, per-event handlers and JSON envelope), `checklist/` (the typed
   document, its ordering, validator, renderer and verbs), and the state and
@@ -64,14 +100,13 @@ interactive layer, and grouped by purpose under `src/`:
   stderr and exits non-zero – and only human verbs may write configuration, so
   a repository cannot arrange its own enablement by getting a hook to fire.
   Nothing here touches the update gate or the TUI.
-- `pack.rs`, `hashing.rs`, `cli.rs`, `main.rs` – the pack engine, the shared
-  content-hash primitives (FNV-1a for cache keys, a hand-rolled SHA-256 the
-  plugin's shell bootstrap has to reproduce with `shasum`), the hand-rolled arg
-  parser (**no `clap`** – this is also where the `-n`/`--no-backup` flag for
-  `sync`/`reverse-sync` is parsed), and composition (update gate, dispatch,
-  event rendering).
+- `pack.rs`, `cli.rs`, `main.rs` – the pack engine (re-exporting core's
+  `repo_name_stem`), the hand-rolled arg parser (**no `clap`** – this is also
+  where the `-n`/`--no-backup` flag for `sync`/`reverse-sync` is parsed), and
+  composition (update gate, dispatch, event rendering; `main.rs` re-exports
+  core's `git` and `hashing` under their old `crate::` names).
 
-Outside `src/`, the plugin ships as a packaged tree: `plugin/` (its manifest,
+Outside the crates, the plugin ships as a packaged tree: `plugin/` (its manifest,
 hooks, bootstrap script, wrapper and skills), `.claude-plugin/marketplace.json`
 (which pins that tree's zip by SHA-256), `scripts/build-plugin-zip.py` (the
 reproducible builder and the release assertions), `scripts/test-bootstrap.sh`,
@@ -104,10 +139,11 @@ A few boundaries to preserve:
 
 ## Tests
 
-`cargo test` is no longer the whole suite. Run all four the way CI does:
+`cargo test` is no longer the whole suite. Run all four the way CI does, from
+the repository root:
 
 ```sh
-cargo test --locked                              # the Rust suite
+cargo test --workspace --locked                  # the Rust suite, both crates
 python3 scripts/build-plugin-zip.py --selftest   # the plugin builder's own tests
 python3 scripts/build-plugin-zip.py --check      # the release assertions
 /bin/bash scripts/test-bootstrap.sh              # the bootstrap's failure paths
@@ -148,9 +184,18 @@ Conventions worth knowing:
 
 - Each module declares `#[cfg(test)] mod tests;` with the body in a sibling
   child file (`<module>/tests.rs`), keeping private-item access – including
-  every module under `src/plugin/`. Crate-root
-  integration tests and shared helpers live in `src/tests/` (`sync.rs`,
-  `reverse_sync_flow.rs`, `update_gate.rs`, `support.rs`).
+  every module under `plugin/`. The CLI's crate-root integration tests live in
+  `crates/ss-magic/src/tests/` (`sync.rs`, `reverse_sync_flow.rs`,
+  `update_gate.rs`); the shared helpers are `ss_magic_core::testutil`
+  (`crates/ss-magic-core/src/testutil.rs`), compiled for core's own tests and,
+  through core's `testutil` feature, for a binary's – enable it only from
+  `[dev-dependencies]`, so a release build never contains it.
+- `cargo test` starts each test binary in its crate directory
+  (`crates/<name>`), not the repository root. A test that needs a
+  repository-level directory to exist in the process's working directory
+  runs its assertion in a child process with `run_ignored_test_in_child_from`
+  and a scratch cwd, the same way environment-variable tests use
+  `run_ignored_test_in_child` – never `set_current_dir` in a parallel suite.
 - Tests use `tempfile` plus shell-invoked `git init` / `git worktree add` to
   build real repos — no git mocking. They must not depend on or mutate your
   real repositories, global git config, clipboard, or installed `ss-magic`.
@@ -184,20 +229,21 @@ release cannot ship with a red suite.
 
 ## Pull requests
 
-- Make sure `cargo test --locked` passes locally; add or update tests for
+- Make sure `cargo test --workspace --locked` passes locally; add or update tests for
   behavior-bearing changes (bug fixes should include a test that reproduces
   the issue).
 - Make sure the three non-Rust suites above pass too, if your change touches
   `plugin/`, `scripts/`, or anything they assert about.
-- **Bump the crate version** (`version` in `Cargo.toml` and the matching
-  `ss-magic` entry in `Cargo.lock`) on any change that alters CLI behavior — a
+- **Bump the crate version** (`version` in `crates/ss-magic/Cargo.toml` and
+  the matching `ss-magic` entry in `Cargo.lock`) on any change that alters CLI behavior — a
   fix, a new/changed command or flag, or different output. The installed
   binary self-updates from GitHub Releases keyed on version, so a change
   without a version bump never reaches users. Pre-1.0 rules: bug fixes bump
   patch; new or changed user-visible behavior bumps minor.
 - **A change under `plugin/` bumps every version surface, not one**, and
   re-pins the digest. Run `python3 scripts/build-plugin-zip.py
-  --update-manifest`, then `--check`, which asserts that `Cargo.toml`, the
+  --update-manifest`, then `--check`, which asserts that
+  `crates/ss-magic/Cargo.toml`, the
   `ss-magic` entry in `Cargo.lock`, `plugin/.claude-plugin/plugin.json`,
   `plugin/ss-magic.version`, both the tag and the asset name in
   `.claude-plugin/marketplace.json`'s release URL, and the literal zip filename in

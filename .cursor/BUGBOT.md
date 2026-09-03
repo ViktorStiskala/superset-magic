@@ -14,7 +14,27 @@ conventions change.
 ## Tech Stack
 
 Standalone interactive Rust CLI (binary: `ss-magic`; repo:
-`ViktorStiskala/superset-magic`). Edition 2021. Key dependencies: `anyhow`
+`ViktorStiskala/superset-magic`). Edition 2021. The repository is a Cargo
+**workspace**: the root `Cargo.toml` is a virtual manifest (no `[package]`)
+that owns `[workspace.package]` and both build profiles (`[profile.release]`
+with `opt-level = "z"` – a measured size/speed decision that applies to every
+member, flag a per-crate override – and `[profile.dist]` inheriting it), and
+the crates live under `crates/`: `crates/ss-magic-core` (library
+`ss-magic-core`, crate name `ss_magic_core`, `publish = false`, version
+`0.1.0`, never a release surface) and `crates/ss-magic` (the CLI binary; it
+still contains the whole `plugin/` verb tree until the plugin becomes its own
+member). Core owns what both binaries share and must stay free of `inquire`,
+`ratatui` and `self_update` – flag any of those three appearing in
+`crates/ss-magic-core/Cargo.toml`, because the plugin binary's inability to
+open a TUI or self-update is meant to hold by construction. Module paths
+below are written relative to a crate's `src/`; `git/`, `hashing.rs`,
+`style.rs` (palette and color decision only), the pure half of `sync/`
+(`mod.rs`, `pattern.rs`, `repo_scan.rs`, `apply.rs`), `superset_files.rs`,
+`reponame.rs`, `state_tree.rs`, `release.rs` and `testutil.rs` are core's;
+everything else named here is the CLI's, which re-exports core's modules
+under the names it used before the split (`crate::git`, `crate::hashing`,
+`crate::tui::style`, `crate::sync::apply`, `crate::workspace::superset_files`).
+Key dependencies: `anyhow`
 (errors), `inquire` (interactive prompts), `ratatui` + `crossterm` (the
 full-screen bidirectional sync merge cockpit; `crossterm` also backs `inquire`),
 `similar` (line/word diffing for the diff model and merge assembly),
@@ -24,14 +44,14 @@ matching), `serde`/`serde_json` (config I/O), `tempfile` (atomic staging),
 (self-update and the plugin's advisory locks), `directories` (the plugin's
 machine-level data dir), `supports-color` (palette). No `clap` (the arg parser is
 hand-rolled) and no `git2` (every git/gh COMMAND is shelled out; the one
-filesystem-only exception is `src/git/discover.rs`, below). Hashing is in-crate
-(`src/hashing.rs`: FNV-1a plus a hand-rolled SHA-256) – flag the addition of a
+filesystem-only exception is core's `git/discover.rs`, below). Hashing is
+in-crate (core's `hashing.rs`: FNV-1a plus a hand-rolled SHA-256) – flag the addition of a
 hashing crate for these uses. Release binaries are
 built by cargo-dist (`dist-workspace.toml`) and self-update from GitHub
 Releases. Tests use `tempfile` + shell-invoked `git init` / `git worktree add`.
 
-The binary also carries a **Claude Code plugin** (`src/plugin/`, exposed as
-`ss-magic plugin <VERB>`), shipped as a packaged tree under `plugin/` and pinned
+The binary also carries a **Claude Code plugin** (`crates/ss-magic/src/plugin/`,
+exposed as `ss-magic plugin <VERB>`), shipped as a packaged tree under `plugin/` and pinned
 by SHA-256 in `.claude-plugin/marketplace.json`. Two non-Rust pieces are part of
 the product, not tooling: `scripts/build-plugin-zip.py` (python3; the
 reproducible zip builder and the release assertions) and
@@ -43,21 +63,21 @@ version, so no associative arrays, no `mapfile`, no `${var^^}`).
 - **All `git` and `gh` COMMANDS shell out via `std::process::Command`** –
   there is NO `git2`/`libgit2`. Flag any addition of `git2`, `gix`, or another
   git-binding crate to `Cargo.toml`. The shared entry point is the `git_raw`
-  helper in `src/git/mod.rs` (surfaces stderr verbatim); `git` and `git_optional`
+  helper in core's `git/mod.rs` (surfaces stderr verbatim); `git` and `git_optional`
   are thin one-liners on top. Flag new git/gh calls that spawn `Command`
   directly instead of routing through these helpers.
-- **`src/git/discover.rs` is the ONE filesystem-only reduction of git
+- **Core's `git/discover.rs` is the ONE filesystem-only reduction of git
   behavior, and it is bounded.** It answers exactly two read-only probes –
   `git rev-parse --show-toplevel` and `--git-common-dir` – by walking the
   filesystem, for the plugin's hook pipeline only; the CLI's own commands keep
-  the subprocess probes. Flag: (1) any new caller outside `src/plugin/hook/`;
+  the subprocess probes. Flag: (1) any new caller outside `plugin/hook/`;
   (2) anything in `discover.rs` that reads refs, the index, or writes –
   resolving `HEAD` to a branch, reading `packed-refs`, parsing more of the
   config than the format check (`core.bare`, `core.worktree`,
   `repositoryformatversion`, `[extensions]`) – that belongs in a subprocess;
   (3) any change that turns an `Undecided` into a `Found`, or alters what a
   `Found` returns, without a matching real-git scenario added to the
-  equivalence matrix in `src/git/discover/tests.rs`. The invariant is that a
+  equivalence matrix in core's `git/discover/tests.rs`. The invariant is that a
   fast answer is byte-equal to git's or there is none: widening the
   `Undecided` set is always safe, narrowing it never is without measurement.
 - **A test that changes the process environment must not use `set_var` for a
@@ -68,7 +88,7 @@ version, so no associative arrays, no `mapfile`, no `${var^^}`).
   `tests::support::run_ignored_test_in_child`. `HOME` under `ENV_LOCK` in the
   checklist-deny tests is the tolerated exception (no concurrent child
   misreads it).
-- **The CLI arg parser is hand-rolled in `src/cli.rs`** — there is NO `clap`.
+- **The CLI arg parser is hand-rolled in `cli.rs`** — there is NO `clap`.
   `parse(&[String]) -> Parsed` selects the command from the first non-flag
   token; `Command` is `{ Bare, Sync { no_backup }, ReverseSync { no_backup },
   Pack, Update }`, and `Parsed` additionally carries `Init(Vec<String>)`,
@@ -102,18 +122,23 @@ isolation from the interactive TUI. Preserve this boundary.
   scan), `git/gitignore.rs` (`.gitignore` helpers), `sync/merge.rs` (the
   push/pull/merge decision model and per-hunk merge assembly), `tui/diffmodel.rs`
   (the diff-to-rows model powering the cockpit's diff pane), `hashing.rs`
-  (FNV-1a + SHA-256), and effectively all of `src/plugin/` – the plugin's parse
+  (FNV-1a + SHA-256), `reponame.rs` (the repo-name stem), `state_tree.rs`
+  (the `.superset/.magic` constant and its gitignore rule; a core test pins the
+  constant equal to the `sync::EXCLUDED_TREES` entry – flag a change to one
+  side without the other), and effectively all of `plugin/` – the plugin's parse
   (`plugin/mod.rs`), its state modules, its hook handlers, and the whole
   `plugin/checklist/` family (schema, canonical ordering, validator, renderer,
   verbs) are unit-tested with no terminal and no harness involved.
 - Interactive/side-effecting: `tui/menu.rs`, `tui/ui.rs` (`inquire` wrappers),
-  `tui/style.rs` (palette), the finishing-action prompts in `workspace/migrate.rs` /
+  `tui/theme.rs` (installs the `inquire` render config from core's `style`
+  color decision; `render_config(false)` must stay `RenderConfig::empty()`),
+  the finishing-action prompts in `workspace/migrate.rs` /
   `sync/reverse_sync.rs`, `tui/cockpit.rs` (the full-screen reverse-sync merge
   cockpit — its event loop and terminal lifecycle are manual-smoke like the
   rest of this list, but its render path (`draw`) and key dispatch
   (`handle_key`) are unit-tested via `ratatui::backend::TestBackend`, so a
   regression there IS expected to be caught by `cargo test`).
-- `main.rs` composes: `cli::parse` → `tui::style::init` (SKIPPED for
+- `main.rs` composes: `cli::parse` → `tui::style::init` + `tui::theme::install` (both SKIPPED for
   `Parsed::Plugin`, which makes the color decision itself so a hook can force
   color off) → [auto-update gate for `Bare`/`Sync`/`ReverseSync`/`Pack`] →
   `dispatch`. `Parsed::Version` answers before any dispatch; `Parsed::Plugin`
@@ -151,7 +176,7 @@ structurally valid". The engine's rules:
 - `globset`'s `*` crosses path separators (unlike POSIX shell glob) — do not
   introduce code that assumes `*` matches a single path component.
 - **`EXCLUDED_TREES` is enforced at every point of FINAL enumeration, never on
-  the match list alone.** `src/sync/mod.rs` owns the ONE rule: `EXCLUDED_TREES`
+  the match list alone.** Core's `sync/mod.rs` owns the ONE rule: `EXCLUDED_TREES`
   = `.superset/backups` (pre-write backups, i.e. recovered secrets),
   `.superset/.magic` (the plugin's machine-local state), `.scratchpad`, `.git`;
   `under_excluded_tree(rel)` answers "is this rel one of them, or inside one".
@@ -487,7 +512,7 @@ committable and must never leak.
   skips the gitignore-safety step for an untracked source, or one that appends a
   rule for a tracked source.
 
-## The Claude Code Plugin (`src/plugin/`, `plugin/`, `scripts/`)
+## The Claude Code Plugin (`crates/ss-magic/src/plugin/`, `plugin/`, `scripts/`)
 
 `ss-magic plugin <VERB>` is a second program inside the same binary. It runs
 inside a developer's Claude Code session, writes into a state tree beside the
@@ -624,7 +649,7 @@ correct test must race N threads and assert exactly one winner.
 
 ### Parse-sensitive git output must bypass the trimming helper
 
-`git()` and `git_optional()` in `src/git/mod.rs` `.trim()` the whole output.
+`git()` and `git_optional()` in core's `git/mod.rs` `.trim()` the whole output.
 That is right for a single value and **destructive** for a fixed-column format:
 `git status --porcelain`'s index column is a literal SPACE when a file is
 modified in the worktree only, so trimming eats the leading space of the FIRST
@@ -920,7 +945,7 @@ interactive-menu construction reachable from a plugin verb.
 `plugin/hooks/hooks.json` registers `SessionStart`, `PreToolUse`, `PreCompact`,
 `SubagentStop`, and `SessionEnd` – and no `FileChanged` entry. `HookEvent`
 parses a `file-changed` token and `hook/mod.rs::route()` still has an arm for it,
-so `src/plugin/hook/file_changed.rs` is reachable by argv and stays covered by
+so `plugin/hook/file_changed.rs` is reachable by argv and stays covered by
 tests, but **nothing in a real session invokes it**. Do not describe it as a
 shipped hook, and do not "fix" the manifest by adding a `FileChanged` entry
 shaped like the others: that matcher is a watch-path list, not a name filter, so
@@ -1018,13 +1043,16 @@ embedded source of truth).
 The binary self-updates from GitHub Releases keyed on the crate version, so a
 stale version means users never receive the change. **Any change that alters
 CLI behavior — a fix, a new/changed command or flag, or different output —
-MUST bump `version` in `Cargo.toml` AND the matching `ss-magic` entry in
-`Cargo.lock`.** Bug fixes bump patch; new/changed user-visible behavior bumps
-minor (pre-1.0). Flag a behavior-changing PR that does not bump both
-`Cargo.toml` and `Cargo.lock`, or that bumps only one of the two.
+MUST bump `version` in `crates/ss-magic/Cargo.toml` AND the matching
+`ss-magic` entry in `Cargo.lock`.** (The root `Cargo.toml` is virtual and
+carries no version; `Cargo.lock` holds one `[[package]]` per crate, so a bump
+must match on the `name = "ss-magic"` line, never on a bare version string.)
+Bug fixes bump patch; new/changed user-visible behavior bumps minor (pre-1.0).
+Flag a behavior-changing PR that does not bump both the CLI manifest and
+`Cargo.lock`, or that bumps only one of the two.
 
 **A change under `plugin/` bumps EVERY version surface, not one**, and re-pins
-the digest: `Cargo.toml`, the `ss-magic` entry in `Cargo.lock`,
+the digest: `crates/ss-magic/Cargo.toml`, the `ss-magic` entry in `Cargo.lock`,
 `plugin/.claude-plugin/plugin.json`, `plugin/ss-magic.version`, both the tag and
 the asset name in `.claude-plugin/marketplace.json`'s release URL, and the
 literal zip filename in `dist-workspace.toml`'s `extra-artifacts` (cargo-dist
@@ -1037,8 +1065,8 @@ surface out of step, or with a stale digest.
 
 ## Test Requirements
 
-- **`cargo test` is not the whole suite.** Three non-Rust suites cover code it
-  cannot reach, and CI runs all of them:
+- **`cargo test --workspace` is not the whole suite.** Three non-Rust suites
+  cover code it cannot reach, and CI runs all of them:
   `python3 scripts/build-plugin-zip.py --selftest` (the zip builder's
   reproducibility guarantees and its refusals),
   `python3 scripts/build-plugin-zip.py --check` (the release assertions: the
@@ -1055,7 +1083,7 @@ surface out of step, or with a stale digest.
   `workspace/superset_files.rs`, `git/mod.rs` probes, `tui/menu.rs`
   routing via `operations_for`, `sync/merge.rs`, `tui/diffmodel.rs`,
   `sync/reverse_sync.rs`'s `apply_decision`/backup/TOCTOU seam, and every module
-  under `src/plugin/` – its parse, state modules, hook handlers and the whole
+  under `plugin/` – its parse, state modules, hook handlers and the whole
   `checklist/` family) have unit
   tests; the interactive
   menu/pickers and final-action git ops are validated by manual smoke, not
@@ -1083,12 +1111,23 @@ surface out of step, or with a stale digest.
   worktree-only-modified case (` M`, leading space), not just `M ` and `??`.
 - Test layout: every module declares `#[cfg(test)] mod tests;` with the body
   in a dedicated child file (`<module>/tests.rs`) – including every module under
-  `src/plugin/`; crate-root tests and shared
-  helpers live in `src/tests/` (`sync.rs`, `reverse_sync_flow.rs`,
-  `update_gate.rs`, `support.rs`).
+  `plugin/`; the CLI's crate-root tests live in `crates/ss-magic/src/tests/`
+  (`sync.rs`, `reverse_sync_flow.rs`, `update_gate.rs`), and the shared
+  helpers are `ss_magic_core::testutil` (`crates/ss-magic-core/src/testutil.rs`:
+  `git_run`, `init_main_repo`, `make_worktree`, `write_magic`, `write_file`,
+  `exit_code_to_u8`, `neutralize_global_excludes`, `run_ignored_test_in_child`,
+  `run_ignored_test_in_child_from`, `test_path_in_binary`), compiled under
+  `cfg(test)` or core's `testutil` feature, which a binary enables from its
+  `[dev-dependencies]` ONLY – flag `features = ["testutil"]` on a normal
+  `[dependencies]` entry, since that would compile test helpers into a release
+  binary. A test whose subject is the process environment (`PATH`, a `GIT_*`
+  variable, or the process's own working directory – `cargo test` starts a
+  binary in `crates/<name>`, not the repository root) runs its assertion in a
+  child process through those two helpers, never through `set_var` /
+  `set_current_dir` in a parallel suite.
   Flag a PR that adds an inline `mod tests { ... }` block to a source file
   instead of a sibling test file.
-- CI (`.github/workflows/ci.yml`) runs `cargo test --locked` on Ubuntu and
+- CI (`.github/workflows/ci.yml`) runs `cargo test --workspace --locked` on Ubuntu and
   macOS for every PR commit, plus a `plugin package` job carrying the builder
   selftest, the release assertions, a check that a content change under
   `plugin/` came with a version bump, a check that no skill body names

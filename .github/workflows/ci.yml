@@ -53,7 +53,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run test suite
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
       # The bootstrap and the wrapper are shell, and macOS ships bash 3.2 - no
       # associative arrays, no `${var^^}`, no `mapfile`. The plugin job below
@@ -154,8 +154,8 @@ jobs:
           if [ ! -f "$artifact" ]; then
             echo "builder produced no $artifact; dist would publish nothing and the" >&2
             echo "marketplace url would 404 for every user. The builder derives its" >&2
-            echo "filename from Cargo.toml's version, so this means dist-workspace.toml" >&2
-            echo "and Cargo.toml disagree." >&2
+            echo "filename from crates/ss-magic/Cargo.toml's version, so this means" >&2
+            echo "dist-workspace.toml and that manifest disagree." >&2
             exit 1
           fi
           python3 - "$artifact" <<'PY'

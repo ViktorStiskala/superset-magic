@@ -1,0 +1,32 @@
+[package]
+name = "ss-magic-core"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+# Never a release surface: core ships only inside the two binaries, so it is
+# not published, not tagged, and bumped only on an incompatible API change.
+publish = false
+
+[dependencies]
+anyhow = "1"
+directories = { version = "6.0.0", default-features = false }
+globset = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+supports-color = "3"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+walkdir = "2"
+# Only the `testutil` module needs it at build time; the feature below turns it
+# on for the binaries' test builds without dragging it into a release build.
+tempfile = { version = "3", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Exposes `ss_magic_core::testutil` – the shared git-fixture and child-process
+# test helpers – to another crate's tests. Enabled ONLY from the binaries'
+# `[dev-dependencies]`; resolver 2 keeps a dev-dependency's features out of a
+# normal build, so a release binary never compiles the helpers.
+testutil = ["dep:tempfile"]

@@ -2485,8 +2485,22 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
- "supports-color",
+ "ss-magic-core",
  "tar",
+ "tempfile",
+ "walkdir",
+]
+
+[[package]]
+name = "ss-magic-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "globset",
+ "serde",
+ "serde_json",
+ "supports-color",
  "tempfile",
  "ureq",
  "walkdir",

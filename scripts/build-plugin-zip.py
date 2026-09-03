@@ -231,10 +231,16 @@ def _dist_artifact_versions(path: Path) -> list[str]:
     return ARTIFACT_RE.findall(path.read_text(encoding="utf-8"))
 
 
+# The CLI crate's manifest. The repository root is a VIRTUAL workspace manifest
+# (no [package] table), so the crate version lives on the member; reading the
+# root would raise "no [package] version found" from every entry point.
+CLI_MANIFEST = Path("crates") / "ss-magic" / "Cargo.toml"
+
+
 def version_surfaces(root: Path) -> dict[str, str]:
     """Every place a release has to advance together (R95)."""
     surfaces: dict[str, str] = {}
-    surfaces["Cargo.toml"] = _cargo_toml_version(root / "Cargo.toml")
+    surfaces[str(CLI_MANIFEST)] = _cargo_toml_version(root / CLI_MANIFEST)
     surfaces["Cargo.lock"] = _cargo_lock_version(root / "Cargo.lock", "ss-magic")
 
     plugin_manifest = json.loads(
@@ -281,8 +287,15 @@ def version_surfaces(root: Path) -> dict[str, str]:
 
 
 def default_out_path(root: Path) -> Path:
-    """Derive the asset filename from the crate version rather than hand-editing it."""
-    return root / f"ss-magic-plugin-v{_cargo_toml_version(root / 'Cargo.toml')}.zip"
+    """Derive the asset filename from the crate version rather than hand-editing it.
+
+    Reads the same member manifest as `version_surfaces`: a bare
+    `python3 scripts/build-plugin-zip.py` (CI's asset step, cargo-dist's
+    extra-artifacts command) goes through here, and only here, so pointing one
+    of the two at the virtual root would break the build while `--check` and
+    `--selftest` stayed green.
+    """
+    return root / f"ss-magic-plugin-v{_cargo_toml_version(root / CLI_MANIFEST)}.zip"
 
 
 # --------------------------------------------------------------------------
