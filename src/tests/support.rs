@@ -7,6 +7,7 @@
 //! machine/system config (e.g. `commit.gpgsign`) is neutralized so commits
 //! never block on a gpg agent.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -77,6 +78,13 @@ pub(crate) fn exit_code_to_u8(code: ExitCode) -> u8 {
 pub(crate) fn init_main_repo(branch: &str) -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     git_run(&["init", "-q", "-b", branch], dir.path());
+    // Disable automatic housekeeping in every fixture repo. `git commit` below
+    // can otherwise spawn `gc --auto`, which repacks `.git/objects` in the
+    // background; a test that walks or copies `.git` then sees `read_dir` yield
+    // an entry that is gone by the time it is stat'd. That race only opens under
+    // parallel load, so it surfaces as an intermittent failure of whichever test
+    // happens to be reading `.git` at the time.
+    git_run(&["config", "gc.auto", "0"], dir.path());
     neutralize_global_excludes(dir.path());
     fs::write(dir.path().join("README.md"), "hi").unwrap();
     git_run(&["add", "."], dir.path());
@@ -122,4 +130,67 @@ pub(crate) fn make_worktree(main_dir: &Path) -> (TempDir, PathBuf) {
     );
     let wt_root = wt_path.canonicalize().unwrap();
     (wt, wt_root)
+}
+
+// ── Running one test in a child process ──────────────────────────────────────
+
+/// Run one `#[ignore]`d test of this same test binary in a CHILD process,
+/// with `env` set and `remove` unset in that child only, and return its
+/// combined output. Panics unless the child ran exactly one test and it
+/// passed.
+///
+/// This exists for tests whose subject is the process environment. Rust runs
+/// tests on parallel threads, and `PATH` or a `GIT_*` variable set with
+/// `std::env::set_var` is inherited by every `Command` any other thread spawns
+/// during the window – a lock only serializes the tests that take it, not the
+/// rest of the suite. A child process gets its own environment, so the
+/// variable exists exactly where the test needs it and nowhere else.
+///
+/// `test_path` is the test's path WITHOUT the crate prefix, as libtest names
+/// it (`git::discover::tests::child_x`); build it from `module_path!()` with
+/// [`test_path_in_binary`]. The child test reads its inputs from the
+/// variables passed here and must return early when they are absent, so an
+/// `--include-ignored` run of the suite does not fail on the child half.
+pub(crate) fn run_ignored_test_in_child(
+    test_path: &str,
+    env: &[(&str, &OsStr)],
+    remove: &[&str],
+) -> String {
+    let exe = std::env::current_exe().expect("the test binary's own path");
+    let mut cmd = Command::new(exe);
+    cmd.args([
+        "--exact",
+        test_path,
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    for name in remove {
+        cmd.env_remove(name);
+    }
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
+    let out = cmd.stdin(Stdio::null()).output().expect("spawn the test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        out.status.success(),
+        "child test `{test_path}` failed ({}):\n{combined}",
+        out.status
+    );
+    // A mistyped path runs zero tests and still exits 0; that must not pass.
+    assert!(
+        stdout.contains("1 passed"),
+        "child did not run exactly one test `{test_path}`:\n{combined}"
+    );
+    combined
+}
+
+/// The libtest name of `child` inside the module `module_path!()` names:
+/// the crate prefix stripped, then `::child` appended.
+pub(crate) fn test_path_in_binary(module_path: &str, child: &str) -> String {
+    let without_crate = module_path.split_once("::").map_or("", |(_, rest)| rest);
+    format!("{without_crate}::{child}")
 }

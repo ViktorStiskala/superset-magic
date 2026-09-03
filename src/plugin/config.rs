@@ -141,24 +141,34 @@ impl Default for GateConfig {
 /// to the corresponding half of [`PluginConfig::default`] rather than
 /// propagating an error to the caller.
 pub fn resolve(cwd_root: &Path) -> PluginConfig {
+    resolve_with_roots(cwd_root, git::main_checkout_root(cwd_root).ok().as_deref())
+}
+
+/// [`resolve`] with the main checkout root supplied by the caller instead of
+/// probed here.
+///
+/// The hook pipeline (U2) discovers both roots from the filesystem before
+/// resolving the configuration and hands the main root in, so that the
+/// enablement gate — which every `PreToolUse` invocation reaches — costs no
+/// `git rev-parse --git-common-dir` subprocess on the ordinary layouts. The
+/// human verbs keep calling [`resolve`], which probes.
+///
+/// `main_root` is trusted as given: `enabled` (R7) is read from ITS overlay.
+/// `None` means no main checkout could be named at all (outside any git
+/// repository, or git could not answer), and `enabled` then falls back to
+/// `cwd_root`'s own overlay — still the safest available answer, and strictly
+/// better than refusing to resolve. `gate` (R53) always resolves against
+/// `cwd_root`.
+pub fn resolve_with_roots(cwd_root: &Path, main_root: Option<&Path>) -> PluginConfig {
     PluginConfig {
-        enabled: resolve_enabled(cwd_root),
+        enabled: enabled_from_value(plugin_value(main_root.unwrap_or(cwd_root)).as_ref()),
         gate: gate_from_value(plugin_value(cwd_root).as_ref()),
     }
 }
 
-/// R7's per-machine toggle: `enabled` read from the main checkout's overlay,
-/// falling back to resolving against `cwd_root` itself when no main
-/// checkout can be found at all (e.g. `cwd_root` is not inside a git
-/// repository, or the `git` invocation otherwise fails) — still the safest
-/// available answer, and strictly better than refusing to resolve.
-fn resolve_enabled(cwd_root: &Path) -> bool {
-    enabled_from_value(plugin_value(&main_checkout_or_self(cwd_root)).as_ref())
-}
-
 /// The main checkout's root, or `cwd_root` itself when none can be found
 /// (outside any git repository, or the `git` invocation otherwise fails) —
-/// the same fallback [`resolve_enabled`] uses, shared here because the
+/// the same fallback [`resolve`] uses for `enabled`, shared here because the
 /// `--local` write path (R7) needs exactly the same root.
 fn main_checkout_or_self(cwd_root: &Path) -> PathBuf {
     git::main_checkout_root(cwd_root).unwrap_or_else(|_| cwd_root.to_path_buf())
@@ -251,7 +261,7 @@ fn gate_from_value(value: Option<&Value>) -> GateConfig {
 //   documents for `files`, applied here to `plugin`.
 // - `--local` (R7) redirects the target from the caller's own repository root
 //   to the MAIN CHECKOUT's `magic.local.json`, resolved with the same
-//   `git::main_checkout_root` fallback [`resolve_enabled`] uses, because a
+//   `git::main_checkout_root` fallback [`resolve`] uses, because a
 //   worktree's own local overlay is itself a forward-sync target and cannot
 //   be trusted to hold the per-machine enable toggle.
 // - `get` always answers from the OVERLAID value (base plus the caller's own

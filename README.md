@@ -538,6 +538,13 @@ exactly like a hook that decided to do nothing, because a tool that is only
 advisory must never break a session in progress. The commit nudge in particular
 never blocks the command it comments on.
 
+Hooks are also cheap to fire: the repository roots are found by walking the
+filesystem, not by spawning `git`, so a hook that stops at the `enabled` check –
+which is every hook in a repository that has not turned the plugin on – runs no
+subprocess at all. The walk hands back to `git rev-parse` whenever a layout is
+unusual (a symlinked `.git`, a `GIT_DIR` in the environment, a submodule, a
+bare repository), and a fast answer is always the same answer git would give.
+
 ### Configuration
 
 The plugin reads a `plugin` block from the same overlaid `magic.json` /

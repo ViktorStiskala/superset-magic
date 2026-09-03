@@ -164,6 +164,7 @@ fn ctx_for<'a>(
         event,
         envelope,
         repo_root: Some(root.to_path_buf()),
+        main_root: Some(root.to_path_buf()),
         config_root: PathBuf::from("/"),
         config,
         now: NOW,

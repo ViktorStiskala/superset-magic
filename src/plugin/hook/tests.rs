@@ -7,15 +7,21 @@
 //! asserted per test: `run` has no expression that can produce a non-zero one,
 //! which `the_entry_point_has_no_non_zero_exit` checks at the source level.
 
+use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use tempfile::TempDir;
 
 use super::*;
+use crate::git::discover::DECLINING_ENV;
 use crate::plugin::heartbeat;
 use crate::plugin::hook::event::Payload;
-use crate::tests::support::{git_run, init_main_repo, make_worktree, write_file};
+use crate::tests::support::{
+    git_run, init_main_repo, make_worktree, run_ignored_test_in_child, test_path_in_binary,
+    write_file,
+};
 
 /// A fixed instant so heartbeat timestamps are stable: 2026-08-30 12:00:00 UTC.
 const NOW: u64 = 1_788_091_200;
@@ -384,6 +390,38 @@ fn a_worktree_takes_its_enablement_from_the_main_checkout() {
     assert_eq!(run.row.cwd.as_deref(), Some(wt_root.to_str().unwrap()));
 }
 
+/// The context a handler receives from a worktree carries both roots: the
+/// worktree as `repo_root`, the main checkout as `main_root`. Both come from
+/// the filesystem walk here, and the row says so by NOT recording a fallback.
+#[test]
+fn a_worktree_context_carries_the_main_root_from_discovery() {
+    let (main_dir, main_root) = enabled_repo();
+    git_run(&["add", "-A"], &main_root);
+    git_run(&["commit", "-q", "-m", "enable"], &main_root);
+    let (_wt, wt_root) = make_worktree(main_dir.path());
+    let store_dir = tempfile::tempdir().unwrap();
+
+    fn assert_roots(ctx: &HookContext<'_>) -> Result<Outcome> {
+        let wt = ctx.cwd().canonicalize().unwrap();
+        assert_eq!(ctx.repo_root.as_deref(), Some(wt.as_path()));
+        assert_eq!(ctx.config_root, wt);
+        let main = ctx.main_root.as_deref().expect("main root");
+        assert_ne!(main, wt);
+        assert!(main.join(".git").is_dir(), "{}", main.display());
+        Ok(Outcome::silent().with_detail("roots checked"))
+    }
+
+    let run = drive_at(
+        &store_dir.path().join("plugin"),
+        &HookEvent::PreToolUse,
+        route_to(assert_roots, true),
+        &envelope("PreToolUse", &wt_root, ""),
+    );
+
+    assert_eq!(run.row.outcome, heartbeat::Outcome::Ok, "{:?}", run.row);
+    assert_eq!(run.row.detail.as_deref(), Some("roots checked"));
+}
+
 // ── AE45 / R63: the ignored-tree gate ─────────────────────────────────────────
 
 /// A repository enabled by hand-editing `magic.json`, without ever running
@@ -659,6 +697,7 @@ fn a_well_formed_envelope_reaches_the_handler_with_its_context_resolved() {
         assert!(ctx.config.enabled);
         assert_eq!(ctx.cwd(), ctx.config_root);
         assert_eq!(ctx.repo_root.as_deref(), Some(ctx.config_root.as_path()));
+        assert_eq!(ctx.main_root.as_deref(), Some(ctx.config_root.as_path()));
         let Payload::SessionStart(p) = &ctx.envelope.payload else {
             panic!("wrong payload variant")
         };
@@ -755,6 +794,171 @@ fn a_heartbeat_that_cannot_be_written_is_reported_not_fatal() {
         "deny"
     );
     assert!(run.stderr.contains("heartbeat"), "{:?}", run.stderr);
+}
+
+// ── Root discovery on the hook path (U2: R20, R22) ────────────────────────────
+
+/// On the ordinary layouts the roots come from the filesystem walk, and the
+/// row does not mention discovery at all – the note is reserved for the
+/// fallback, so its rate is readable from `status`.
+#[test]
+fn a_fast_path_row_records_no_discovery_note() {
+    let (_dir, root) = enabled_repo();
+    let (_d, run) = drive(&HookEvent::SessionEnd, &envelope("SessionEnd", &root, ""));
+    assert_eq!(run.row.outcome, heartbeat::Outcome::Ok, "{:?}", run.row);
+    assert!(
+        !run.row.detail.as_deref().unwrap_or("").contains("discovery"),
+        "{:?}",
+        run.row.detail
+    );
+
+    // The disabled path too: the most frequent row of all.
+    let dir = init_main_repo("main");
+    let root = dir.path().canonicalize().unwrap();
+    let (_d, run) = drive(&HookEvent::PreToolUse, &envelope("PreToolUse", &root, ""));
+    assert_eq!(run.row.reason.as_deref(), Some("disabled"));
+    assert!(
+        !run.row.detail.as_deref().unwrap_or("").contains("discovery"),
+        "{:?}",
+        run.row.detail
+    );
+}
+
+/// When the walk declines, the probes run and the row's detail says so with
+/// the reason – appended to whatever the row already had to say.
+#[test]
+fn a_fallback_row_records_the_discovery_reason() {
+    let (_dir, root) = enabled_repo();
+    let hooks = root.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+
+    // From inside `.git/hooks` there is no worktree root, so `config_root`
+    // is the cwd itself and the enablement gate reads main's overlay.
+    let (_d, run) = drive(&HookEvent::PreToolUse, &envelope("PreToolUse", &hooks, ""));
+    let detail = run.row.detail.clone().unwrap_or_default();
+    assert!(
+        detail.ends_with("discovery: fallback (inside a git directory or bare repository)"),
+        "{detail:?}"
+    );
+    assert!(detail.contains("; discovery: fallback"), "{detail:?}");
+}
+
+/// The proof that matters for R20: with the walk succeeding, the pipeline
+/// spawns NO `git` binary. Run in a child process whose `PATH` holds only a
+/// `git` that fails loudly and leaves a marker; the parent then checks that
+/// the marker was never written. A child process rather than `set_var`
+/// because `PATH` is inherited by every `git` the rest of the suite spawns
+/// concurrently.
+#[test]
+fn the_fast_path_spawns_no_git_at_all() {
+    let dir = init_main_repo("main");
+    let root = dir.path().canonicalize().unwrap();
+    let cwd = root.join("src/deep");
+    fs::create_dir_all(&cwd).unwrap();
+    let shim = GitShim::new();
+
+    let removed: Vec<&str> = DECLINING_ENV.iter().map(|(name, _)| *name).collect();
+    run_ignored_test_in_child(
+        &test_path_in_binary(module_path!(), "child_pipeline_under_a_git_shim"),
+        &[
+            ("PATH", shim.dir.path().as_os_str()),
+            ("SS_MAGIC_TEST_CWD", cwd.as_os_str()),
+            ("SS_MAGIC_TEST_EXPECT", OsStr::new("fast")),
+            ("SS_MAGIC_TEST_GIT_MARKER", shim.marker.as_os_str()),
+        ],
+        &removed,
+    );
+
+    assert!(
+        !shim.marker.exists(),
+        "git was invoked on the fast path:\n{}",
+        fs::read_to_string(&shim.marker).unwrap_or_default()
+    );
+}
+
+/// The control for the test above: the same shim, a layout the walk declines
+/// on. The probes run, hit the shim, and the marker records both of them –
+/// which is what proves the shim is on the pipeline's path at all.
+#[test]
+fn the_git_shim_is_live_when_the_fallback_runs() {
+    let dir = init_main_repo("main");
+    let root = dir.path().canonicalize().unwrap();
+    let cwd = root.join(".git/hooks");
+    fs::create_dir_all(&cwd).unwrap();
+    let shim = GitShim::new();
+
+    let removed: Vec<&str> = DECLINING_ENV.iter().map(|(name, _)| *name).collect();
+    run_ignored_test_in_child(
+        &test_path_in_binary(module_path!(), "child_pipeline_under_a_git_shim"),
+        &[
+            ("PATH", shim.dir.path().as_os_str()),
+            ("SS_MAGIC_TEST_CWD", cwd.as_os_str()),
+            ("SS_MAGIC_TEST_EXPECT", OsStr::new("fallback")),
+            ("SS_MAGIC_TEST_GIT_MARKER", shim.marker.as_os_str()),
+        ],
+        &removed,
+    );
+
+    let invoked = fs::read_to_string(&shim.marker).unwrap_or_default();
+    assert!(
+        invoked.contains("rev-parse --show-toplevel") && invoked.contains("rev-parse --git-common-dir"),
+        "the shim did not see both probes:\n{invoked}"
+    );
+}
+
+/// The child half of the two tests above. Drives one `PreToolUse` invocation
+/// at the cwd the parent named, with `PATH` already replaced by the shim, and
+/// checks the row looks exactly like a normal disabled-repository row – the
+/// shim failing loudly must not change the pipeline's behavior, only leave
+/// its marker.
+#[test]
+#[ignore = "child half of the_fast_path_spawns_no_git_at_all; run by the parent in a subprocess"]
+fn child_pipeline_under_a_git_shim() {
+    let Some(cwd) = std::env::var_os("SS_MAGIC_TEST_CWD") else {
+        return;
+    };
+    let cwd = PathBuf::from(cwd);
+    let expect = std::env::var("SS_MAGIC_TEST_EXPECT").unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+
+    let run = drive_at(
+        &store_dir.path().join("plugin"),
+        &HookEvent::PreToolUse,
+        route_to(handler_ok, true),
+        &envelope("PreToolUse", &cwd, ""),
+    );
+
+    assert_eq!(run.stdout, "");
+    assert_eq!(run.row.reason.as_deref(), Some("disabled"), "{:?}", run.row);
+    let detail = run.row.detail.clone().unwrap_or_default();
+    match expect.as_str() {
+        "fast" => assert!(!detail.contains("discovery"), "{detail:?}"),
+        "fallback" => assert!(detail.contains("discovery: fallback ("), "{detail:?}"),
+        other => panic!("unknown expectation {other:?}"),
+    }
+}
+
+/// A directory holding a `git` that refuses every invocation, and the marker
+/// file it appends each invocation's arguments to.
+struct GitShim {
+    dir: TempDir,
+    marker: PathBuf,
+}
+
+impl GitShim {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("git-was-invoked");
+        let script = dir.path().join("git");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SS_MAGIC_TEST_GIT_MARKER\"\n\
+             echo \"ss-magic test shim: git must not be invoked here: $*\" >&2\nexit 99\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        Self { dir, marker }
+    }
 }
 
 // ── Structural guarantees (KTD1) ──────────────────────────────────────────────

@@ -85,6 +85,43 @@ interactive layer. Source is grouped by purpose: `git/` (git plumbing),
   helper that surfaces stderr verbatim; `git` and `git_optional` are thin
   one-liners on top. (The bare location-auto `probe`/`Mode` dispatch was removed
   in U13 – routing is now the menu via `is_worktree` + `main_checkout_root`.)
+- `git/discover.rs` – the ONE filesystem-only reduction of git behavior in the
+  crate: the two roots the plugin's hook pipeline needs (`cwd_repo_root` and
+  `main_checkout_root`) answered without spawning a process, and by convention
+  never anything more – no ref, index, or write handling (R23). `discover(cwd)`
+  returns `Found(Roots { worktree_root, common_dir, main_checkout_root })`,
+  `NotARepository`, or `Undecided(reason)`; `roots(cwd)` maps `Found` to its
+  roots, `NotARepository` to two `None`s with no subprocess, and `Undecided` to
+  exactly the two probe calls the pipeline made before – in the same order and
+  against the same directories, including the `.git/hooks` shape where
+  `--show-toplevel` fails but `--git-common-dir` still answers. The invariant
+  that makes it safe: **a fast answer is byte-equal to git's, or there is
+  none.** The walk (KTD8) declines on any of six `GIT_*` variables
+  (`DECLINING_ENV`: R21's five plus `GIT_OBJECT_DIRECTORY`), canonicalizes
+  `cwd` (`canonicalize` owns `.`/`..`/symlinks – nothing lexical is
+  reimplemented), and inspects each ancestor: a directory that itself looks
+  like a git dir declines; a symlinked `.git` declines; a `.git` directory
+  yields `{D, D/.git, D}`; a gitfile (`gitdir: `, at most 4 KiB, resolved
+  against `D`, canonicalized) needs a `commondir` beside its target – absent
+  is the submodule shape and declines – and yields `{D, C, parent(C)}`; absent
+  walks up unless the parent is on another filesystem. Measured against git
+  2.55, KTD8's text alone would answer differently from git in a handful of
+  layouts, so each of those DECLINES instead (never a different `Found`):
+  `git_directory_shape` applies git's own `is_git_directory` test (a `HEAD`
+  whose content is a symref or object id – `head_content_is_valid` mirrors
+  `validate_headref` – plus searchable `objects/` and `refs/`, because git
+  WALKS UP past a `.git` that fails it); a `.git` directory carrying a
+  `commondir` declines; a gitfile target that is not a git directory declines;
+  `repository_format_check` scans `<common>/config` (and `config.worktree`)
+  conservatively for `core.worktree`, a `core.bare` other than `false`, an
+  unsupported `repositoryformatversion` or unknown extension – honoring the
+  common config's `core.*` for a linked worktree only under
+  `extensions.worktreeConfig`, as git does – and declines on any line it cannot
+  follow; and directories not owned by this euid decline (git's "dubious
+  ownership"). The equivalence matrix in `git/discover/tests.rs` runs every
+  scenario against real `git` output and asserts `roots()` equals today's
+  answer in ALL of them. Wired into `plugin/hook/mod.rs` only; every CLI
+  command keeps the subprocess probes (R22).
 - `workspace/superset_files.rs` — `.superset/{config.json, magic.sh, magic.json,
   magic.local.json}` I/O (plus the legacy `setup_config.json` reader).
   `load_config` reads Superset-owned `config.json`;
@@ -649,6 +686,15 @@ the tree:
   handlers: `plugin.enabled` re-resolved from disk on every invocation, and –
   for any route whose `Route.writes_state` is true – a fail-closed check that
   git reports `.superset/.magic/` ignored. `route()` is the whole routing table.
+  The two roots the enablement gate needs come from `git::discover::roots`
+  (R20): a filesystem walk that spawns nothing on the ordinary layouts, so a
+  hook that stops at that gate – nearly every `PreToolUse` – runs no `git` at
+  all (a PATH-shim test proves it); when the walk declines, the `rev-parse`
+  probes run and every row from that invocation ends its `detail` with
+  `discovery: fallback (<reason>)`, so the fallback rate is readable from
+  `status`. `HookContext` carries the discovered `main_root` beside
+  `repo_root`. The ignored-tree gate still asks git – it is fail-closed and
+  runs only past the enablement gate.
 - `hook/event.rs` – the pure wire format. Decoding is permissive (unknown keys
   ignored, only `cwd` required) but routing is not: the argv token picks the
   `Payload` variant, never the envelope's own `hook_event_name`. Two structural
@@ -751,8 +797,14 @@ the tree:
   a typo can never turn the gate into something more permissive than configured.
   `enabled` is always read from the MAIN CHECKOUT's overlay regardless of cwd,
   because a worktree's own `magic.local.json` is itself a forward-sync target;
-  `gate` resolves against the cwd root. Writes are load-modify-write on exactly
-  one file, preserving every unknown key.
+  `gate` resolves against the cwd root. `resolve(cwd_root)` finds the main
+  checkout with the `git rev-parse --git-common-dir` probe and is what the
+  human verbs call; `resolve_with_roots(cwd_root, main_root)` takes the main
+  root already discovered and is what the hook pipeline calls, so the
+  enablement gate costs no subprocess on the fast path – `None` falls back to
+  `cwd_root`'s own overlay exactly as `resolve` does outside a repository.
+  Writes are load-modify-write on exactly one file, preserving every unknown
+  key.
 - `plugin/cache.rs` – the conclusion cache behind `conclude` / `conclusions` /
   `gc`. `identify` keys an entry on `(realpath, size, stamp)` – NEVER the read's
   offset or limit, so a conclusion about a file answers every later read of it.
@@ -933,7 +985,13 @@ binary is the sole file-copy implementation.)
 
 ## Conventions
 
-- No `git2` — all git/gh interactions shell out via `std::process::Command`.
+- All git and gh COMMANDS shell out via `std::process::Command`, through the
+  `git_raw` helper in `git/mod.rs`. `git::discover` is the ONE filesystem-only
+  reduction of two read-only probes (`--show-toplevel` and
+  `--git-common-dir`), wired into the plugin's hook pipeline alone, and it
+  must never grow ref, index, or write handling – anything beyond "where are
+  the two roots" is a subprocess. No git-binding crate (`git2`, `gix`) is
+  added.
 - Glob semantics (originally derived from the retired `setup.sh`):
   absolute / `..` rejected, literals must exist, glob-zero-match
   non-fatal, `DEFAULT_EXCLUDES` (`node_modules`, `.venv`) drop matches at
@@ -949,7 +1007,16 @@ binary is the sole file-copy implementation.)
   body in a sibling child file (`<module>/tests.rs`), keeping private-item
   access – including every module under `src/plugin/`. Crate-root tests and
   shared helpers live in `src/tests/`
-  (`sync.rs`, `reverse_sync_flow.rs`, `update_gate.rs`, `support.rs`). CI
+  (`sync.rs`, `reverse_sync_flow.rs`, `update_gate.rs`, `support.rs`). A test
+  whose subject is the process environment – `PATH`, a `GIT_*` variable – runs
+  its assertion in a CHILD process via `support::run_ignored_test_in_child`
+  (an `#[ignore]`d child test, named through `support::test_path_in_binary`,
+  spawned from `current_exe()` with the variable set in the child only): the
+  suite runs multithreaded, and a variable set with `set_var` is inherited by
+  every `git` any other thread spawns during the window, which a mutex around
+  the setter does nothing to prevent. `set_var` under `ENV_LOCK` remains
+  acceptable only for a variable no concurrent test's child could misread
+  (`HOME` in the checklist-deny tests). CI
   (`.github/workflows/
   ci.yml`) runs the suite on every PR commit and gates cargo-dist releases
   via `plan-jobs` (see dist-workspace.toml).

@@ -23,7 +23,8 @@ matching), `serde`/`serde_json` (config I/O), `tempfile` (atomic staging),
 `tar` + `bzip2` (pack archives), `self_update` + `ureq` + `fd-lock`
 (self-update and the plugin's advisory locks), `directories` (the plugin's
 machine-level data dir), `supports-color` (palette). No `clap` (the arg parser is
-hand-rolled) and no `git2` (all git/gh is shelled out). Hashing is in-crate
+hand-rolled) and no `git2` (every git/gh COMMAND is shelled out; the one
+filesystem-only exception is `src/git/discover.rs`, below). Hashing is in-crate
 (`src/hashing.rs`: FNV-1a plus a hand-rolled SHA-256) – flag the addition of a
 hashing crate for these uses. Release binaries are
 built by cargo-dist (`dist-workspace.toml`) and self-update from GitHub
@@ -39,12 +40,34 @@ version, so no associative arrays, no `mapfile`, no `${var^^}`).
 
 ## No External Process Libraries
 
-- **All `git` and `gh` interaction shells out via `std::process::Command`** —
+- **All `git` and `gh` COMMANDS shell out via `std::process::Command`** –
   there is NO `git2`/`libgit2`. Flag any addition of `git2`, `gix`, or another
   git-binding crate to `Cargo.toml`. The shared entry point is the `git_raw`
   helper in `src/git/mod.rs` (surfaces stderr verbatim); `git` and `git_optional`
   are thin one-liners on top. Flag new git/gh calls that spawn `Command`
   directly instead of routing through these helpers.
+- **`src/git/discover.rs` is the ONE filesystem-only reduction of git
+  behavior, and it is bounded.** It answers exactly two read-only probes –
+  `git rev-parse --show-toplevel` and `--git-common-dir` – by walking the
+  filesystem, for the plugin's hook pipeline only; the CLI's own commands keep
+  the subprocess probes. Flag: (1) any new caller outside `src/plugin/hook/`;
+  (2) anything in `discover.rs` that reads refs, the index, or writes –
+  resolving `HEAD` to a branch, reading `packed-refs`, parsing more of the
+  config than the format check (`core.bare`, `core.worktree`,
+  `repositoryformatversion`, `[extensions]`) – that belongs in a subprocess;
+  (3) any change that turns an `Undecided` into a `Found`, or alters what a
+  `Found` returns, without a matching real-git scenario added to the
+  equivalence matrix in `src/git/discover/tests.rs`. The invariant is that a
+  fast answer is byte-equal to git's or there is none: widening the
+  `Undecided` set is always safe, narrowing it never is without measurement.
+- **A test that changes the process environment must not use `set_var` for a
+  variable a concurrent test's `git` child could inherit** (`PATH`, `GIT_*`).
+  The suite runs multithreaded and a lock around the setter does not stop
+  other threads' children from inheriting the value. Flag such tests unless
+  they run the assertion in a child process via
+  `tests::support::run_ignored_test_in_child`. `HOME` under `ENV_LOCK` in the
+  checklist-deny tests is the tolerated exception (no concurrent child
+  misreads it).
 - **The CLI arg parser is hand-rolled in `src/cli.rs`** — there is NO `clap`.
   `parse(&[String]) -> Parsed` selects the command from the first non-flag
   token; `Command` is `{ Bare, Sync { no_backup }, ReverseSync { no_backup },

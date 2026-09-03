@@ -90,6 +90,7 @@ fn ctx_for<'a>(
     HookContext {
         event: &EVENT,
         envelope,
+        main_root: repo_root.clone(),
         repo_root,
         config_root,
         config,

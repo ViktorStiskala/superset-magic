@@ -20,6 +20,64 @@ fn write_local(root: &Path, body: &str) {
 
 // ── R5 / R7: enabled, and the main-checkout redirect ────────────────────────
 
+/// The hook pipeline hands over the main root it discovered (U2) instead of
+/// letting this module spawn `git rev-parse --git-common-dir` itself. The
+/// supplied root is where `enabled` comes from; `gate` still comes from the
+/// cwd root.
+#[test]
+fn resolve_with_roots_reads_enabled_from_the_supplied_main_root() {
+    let main = init_main_repo("main");
+    commit_magic_json(main.path(), r#"{"files":[],"plugin":{"enabled":true}}"#);
+    let (_wt_dir, wt_root) = make_worktree(main.path());
+    write_local(main.path(), r#"{"files":[],"plugin":{"enabled":false}}"#);
+    // A `plugin` key in a local overlay replaces the base block whole, so the
+    // worktree's overlay restates `enabled` beside its gate tuning.
+    write_local(
+        &wt_root,
+        r#"{"files":[],"plugin":{"enabled":true,"gate":{"threshold_lines":700}}}"#,
+    );
+
+    let cfg = resolve_with_roots(&wt_root, Some(main.path()));
+    assert!(!cfg.enabled, "enabled must come from the supplied main root");
+    assert_eq!(cfg.gate.threshold_lines, 700, "gate must come from the cwd root");
+
+    // The supplied root is trusted as given: pointing it at the worktree
+    // itself reads the worktree's own overlay instead.
+    let cfg = resolve_with_roots(&wt_root, Some(&wt_root));
+    assert!(cfg.enabled);
+}
+
+/// No main root at all (outside any repository, or git could not answer)
+/// falls back to the cwd root's own overlay – the same fallback `resolve`
+/// has always used.
+#[test]
+fn resolve_with_roots_without_a_main_root_uses_the_cwd_root() {
+    let dir = tempfile::tempdir().unwrap();
+    write_file(
+        dir.path(),
+        ".superset/magic.json",
+        r#"{"files":[],"plugin":{"enabled":true}}"#,
+    );
+    assert!(resolve_with_roots(dir.path(), None).enabled);
+    assert_eq!(resolve_with_roots(dir.path(), None), resolve(dir.path()));
+}
+
+/// `resolve` is `resolve_with_roots` fed by the subprocess probe: the two
+/// agree from a worktree, where the redirect matters.
+#[test]
+fn resolve_equals_resolve_with_roots_fed_by_the_probe() {
+    let main = init_main_repo("main");
+    commit_magic_json(main.path(), r#"{"files":[],"plugin":{"enabled":true}}"#);
+    let (_wt_dir, wt_root) = make_worktree(main.path());
+    write_local(main.path(), r#"{"files":[],"plugin":{"enabled":false}}"#);
+
+    let probed = crate::git::main_checkout_root(&wt_root).unwrap();
+    assert_eq!(
+        resolve(&wt_root),
+        resolve_with_roots(&wt_root, Some(&probed))
+    );
+}
+
 /// Covers AE3. The main checkout's local override wins over a worktree's own
 /// (here: absent) overlay — R7 exists precisely because a worktree's
 /// `magic.local.json` is itself a forward-sync target and cannot be trusted

@@ -40,7 +40,15 @@
 //!   machine-global; the per-repository `plugin.enabled` key is what keeps an
 //!   install made for one repository from acting in every other one. It is
 //!   resolved fresh from disk on every invocation, so flipping it off takes
-//!   effect on the next hook rather than on the next session.
+//!   effect on the next hook rather than on the next session. The two roots
+//!   that resolution needs – the worktree root and the main checkout root –
+//!   come from [`git::discover::roots`], a filesystem walk that spawns nothing
+//!   on the ordinary layouts and hands back to the `git rev-parse` probes
+//!   whenever the layout is unusual (R20, R21). This gate is where nearly
+//!   every `PreToolUse` invocation stops, so it is the one whose cost every
+//!   tool call pays; when the walk did decline, the row's `detail` ends with
+//!   `discovery: fallback (<reason>)` so the rate of fallbacks is readable
+//!   from `status`.
 //! - **Does git report `.superset/.magic/` ignored?** The state tree holds
 //!   session notes and cached conclusions, and no hook may ever write it into
 //!   somewhere git can see. The rule that makes it ignored is written only by
@@ -134,6 +142,15 @@ pub struct HookContext<'a> {
     /// against: [`Self::repo_root`] when there is one, the envelope's `cwd`
     /// otherwise.
     pub config_root: PathBuf,
+    /// The main checkout's root – the directory holding the shared `.git` –
+    /// as discovery (or the fallback probe) named it, and therefore the root
+    /// `plugin.enabled` was read from. `None` when neither could name one, in
+    /// which case `enabled` came from [`Self::config_root`]'s own overlay.
+    /// Populated by the pipeline so no handler has to re-derive it; the first
+    /// handler to read it arrives with the compaction guidance (U3), and the
+    /// pipeline tests already assert it.
+    #[allow(dead_code)]
+    pub main_root: Option<PathBuf>,
     /// The plugin configuration in force for this repository.
     pub config: &'a PluginConfig,
     /// Seconds since the Unix epoch, captured once at the top of the
@@ -391,13 +408,44 @@ fn pipeline(
             .with_detail(format!("{} is not a directory", cwd.display()));
     }
 
+    // R20 — both roots from the filesystem, without a subprocess, on the
+    // ordinary layouts; the `git rev-parse` probes only when the walk declined
+    // (R21), in which case the answer is exactly what the probes said before
+    // the walk existed. Every row from here on carries the fallback's reason
+    // when it ran, so `status` can show how often the slow path is taken.
+    let discovered = git::discover::roots(&cwd);
+    let fallback = discovered.fallback;
+    let row = gate_and_dispatch(event, route, &envelope, &cwd, discovered, io, now);
+    match fallback {
+        Some(reason) => with_discovery_note(row, reason),
+        None => row,
+    }
+}
+
+/// The half of [`pipeline`] that runs once the envelope is decoded and the
+/// roots are known: the two gates, the dispatch, the encode. Split out so the
+/// discovery note can be applied to every row it produces in one place.
+fn gate_and_dispatch(
+    event: &HookEvent,
+    route: Route,
+    envelope: &Envelope,
+    cwd: &Path,
+    discovered: git::discover::Resolved,
+    io: &mut HookIo<'_>,
+    now: u64,
+) -> Row {
+    let base = || {
+        Row::new(event.as_str(), now, RowOutcome::NoOp).with_cwd(Some(envelope.common.cwd.clone()))
+    };
+
     // Outside a git repository there is no root to resolve against, so the
     // config resolution falls back to `cwd` itself and degrades to its safe
     // defaults — which means `enabled` is false and the invocation stops at the
     // next gate.
-    let repo_root = git::cwd_repo_root(&cwd).ok();
-    let config_root = repo_root.clone().unwrap_or_else(|| cwd.clone());
-    let config = config::resolve(&config_root);
+    let repo_root = discovered.repo_root;
+    let config_root = repo_root.clone().unwrap_or_else(|| cwd.to_path_buf());
+    let main_root = discovered.main_root;
+    let config = config::resolve_with_roots(&config_root, main_root.as_deref());
 
     // R55 — resolved from disk on this invocation, so disabling the plugin
     // takes effect on the next hook and not on the next session.
@@ -417,9 +465,10 @@ fn pipeline(
 
     let ctx = HookContext {
         event,
-        envelope: &envelope,
+        envelope,
         repo_root,
         config_root,
+        main_root,
         config: &config,
         now,
         diagnostics: std::cell::RefCell::new(Vec::new()),
@@ -478,6 +527,20 @@ fn pipeline(
         Some(detail) => row.with_detail(detail),
         None => row,
     }
+}
+
+/// Append `discovery: fallback (<reason>)` to the row's detail, after
+/// whatever the row already had to say. Only ever called when the walk
+/// declined: a row without the phrase is a row whose roots came from the
+/// filesystem, so `grep -c 'discovery: fallback'` over the log is the
+/// fallback rate.
+fn with_discovery_note(row: Row, reason: &str) -> Row {
+    let note = format!("discovery: fallback ({reason})");
+    let detail = match row.detail.as_deref() {
+        Some(existing) if !existing.is_empty() => format!("{existing}; {note}"),
+        _ => note,
+    };
+    row.with_detail(detail)
 }
 
 /// The ignored-tree gate: `None` when git reports `.superset/.magic/` ignored,
