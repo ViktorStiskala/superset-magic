@@ -161,14 +161,37 @@ installed yet must all look exactly like a hook that decided to do nothing,
 and it prints nothing but its answer, since a session-start hook's output
 enters the model's context. A hook can never grant a capability – it may
 deny a tool call or add context, never allow or rewrite one – and nothing
-reachable from a hook can write configuration.
+reachable from a hook can switch the plugin on for a repository.
 
 ### Human verb
-A named plugin command a person or a skill runs in a terminal – status,
+A named plugin command a skill or the person's own request drives – status,
 checklist, enable, config and the rest – as opposed to a hook. It reports
-problems on standard error with a non-zero exit like any command-line tool,
-and it is the only kind of invocation allowed to change configuration, so a
-repository cannot switch the plugin on by arranging for a hook to fire.
+problems on standard error with a non-zero exit like any command-line tool.
+Nobody is expected to type one at a shell prompt: the plugin's binary is
+installed under the harness's plugin data directory and deliberately kept off
+the user's `PATH`, so a verb is reached from inside a session, where a wrapper
+of the binary's own name sits on the tool's `PATH`.
+
+Only a human verb may set the per-repository enablement switch, which is what
+keeps a repository from switching the plugin on by arranging for a hook to
+fire. The rule is about that key specifically, not about configuration in
+general: the bootstrap does invoke one verb that writes configuration – the
+seed below – and that verb has no code path to the enablement key at all.
+
+### Configuration seed
+The one-time write the bootstrap makes after installing the binary: it folds a
+block of the gate's default settings into an *existing* workspace contract
+file, so the knobs are visible and editable in a file the repository already
+tracks. It exists because there is no terminal path to the configuration verbs
+at all, and documenting a command nobody can type would be worse than
+surfacing the settings where a person is already looking.
+
+It is bounded in six ways, each of them a test rather than a convention: it
+never writes the enablement key, never stages the change, writes only when
+there is no configuration block at all, never creates the file, never writes
+through a symlink that leaves the repository, and preserves every other key in
+the file. Turning the plugin on is therefore always a deliberate human edit to
+the seeded block.
 
 ### Bootstrap
 The session-start step that fetches the release binary named by the version
@@ -259,6 +282,16 @@ claim is not exclusive under a real race, even though it looks like it. A claim
 also carries an age limit: an expired bypass is still consumed but does not open
 the gate, so a stale claim can never admit a read indefinitely.
 
+### Release line
+One of the two independent streams of releases this repository publishes: the
+sync CLI's, and the plugin's. Each has its own tag shape, its own version
+number, its own archives, and its own way of reaching an installed machine –
+the CLI polls the release list and replaces itself, while the plugin is
+replaced by the marketplace client. The two versions are deliberately never
+equal, because the release tooling reads a tag without a package prefix as
+"every releasable package sitting at that version", so equal numbers would let
+one line's tag publish the other line's release.
+
 ### Version pin
 The plugin's declared version, which fixes both the binary its hooks run and the
 skills and Markdown shipped beside it. A `SessionStart` bootstrap installs the
@@ -311,5 +344,5 @@ A relative signal for comparing branches, never an authoritative bill.
 ### Spill file
 A tool result the harness itself judged too large, written whole to disk and
 replaced in the model's context by a short envelope naming its path. Spill
-files outlive the session but carry unguessable names and no index, so
-`ss-magic plugin spill-index` lists the ones belonging to the current worktree.
+files outlive the session but carry unguessable names and no index, so the
+plugin's `spill-index` verb lists the ones belonging to the current worktree.

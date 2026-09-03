@@ -84,7 +84,7 @@ const MAGIC_LOCAL_REL: &str = ".superset/magic.local.json";
 ///   does not report that tree ignored, so a repository that never gets this
 ///   rule gets no plugin state at all. `ss-magic sync` deliberately runs no
 ///   plugin step, so `init`/`migrate` here and the explicit
-///   `ss-magic plugin enable` are the only two paths that ever write it — never
+///   `ss-magic-plugin enable` are the only two paths that ever write it — never
 ///   a hook.
 fn ensure_bootstrap_gitignores(repo_root: &Path) -> Result<()> {
     gitignore::ensure_path_ignored(

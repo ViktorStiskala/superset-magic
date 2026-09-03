@@ -13,7 +13,16 @@
 # Nothing here touches the network. A `curl` shim earlier on PATH serves a
 # locally built fake release (a tarball containing a shell script that answers
 # `--version`), and records every URL it is asked for, so "we never composed a
-# URL from a hostile pin" is an assertion rather than a hope.
+# URL from a hostile pin" is an assertion rather than a hope - and so is the
+# positive half, that the URL composed is exactly
+# .../download/ss-magic-plugin-v<pin>/ss-magic-plugin-<triple>.tar.gz.
+#
+# The plugin binary is `ss-magic-plugin`, released on its own
+# `ss-magic-plugin-vX.Y.Z` tag line, pinned by `plugin/ss-magic-plugin.version`,
+# and installed to `${CLAUDE_PLUGIN_DATA}/bin/ss-magic-plugin`. Its argv IS the
+# verb - the shim execs `hook <event>` and the wrapper forwards `"$@"` - so
+# there is no `plugin` token anywhere, and several cases below assert its
+# absence rather than only asserting the new spelling.
 #
 # Written for bash 3.2, which is what macOS ships: no associative arrays, no
 # `${var^^}`, no `mapfile`.
@@ -44,6 +53,18 @@ assert_file_present() {
 }
 assert_contains() { # haystack-file needle label
     if grep -q -- "$2" "$1" 2>/dev/null; then pass "$3"; else fail "$3 (no [$2] in $1)"; fi
+}
+# The fixed-string variant. A URL is mostly punctuation, and `.` and `-` in a
+# basic regular expression would let a near-miss match, which is the one thing a
+# "the URL is spelled exactly this way" assertion must not do.
+assert_contains_fixed() { # haystack-file needle label
+    if grep -qF -- "$2" "$1" 2>/dev/null; then pass "$3"; else fail "$3 (no [$2] in $1)"; fi
+}
+# The negative form: the needle must NOT appear. Used for "no leading `plugin`
+# token", where asserting the new argv alone would still pass if the wrapper
+# grew a second, differently-spelled injection.
+assert_lacks_fixed() { # haystack-file needle label
+    if grep -qF -- "$2" "$1" 2>/dev/null; then fail "$3 (found [$2] in $1)"; else pass "$3"; fi
 }
 
 # --------------------------------------------------------------------------
@@ -95,8 +116,11 @@ new_sandbox() {
     sb="$SANDBOX_ROOT/$1"
     mkdir -p "$sb/home" "$sb/data" "$sb/shim" "$sb/release" "$sb/tmp"
     cp -R "$PLUGIN_SRC" "$sb/plugin"
-    printf '%s\n' "$2" >"$sb/plugin/ss-magic.version"
+    printf '%s\n' "$2" >"$sb/plugin/ss-magic-plugin.version"
     : >"$sb/curl.log"
+    # Created up front so every case can `cat` it, including one that runs
+    # before any binary has ever been invoked.
+    : >"$sb/fakebin.log"
 
     SB_ID=$(printf %s "$sb/home" | sha256_stdin | cut -c1-16)
     CREATED_TMPROOTS="$CREATED_TMPROOTS $SB_ID"
@@ -140,39 +164,64 @@ sha256_stdin() {
     else sha256sum | cut -d' ' -f1; fi
 }
 
-# publish_release <version> [--corrupt-digest|--empty-archive]
+# publish_release <version> [--corrupt-digest|--empty-archive|--wrong-version]
+#
+# Builds the fake release for the plugin's OWN release line: the tag directory is
+# `ss-magic-plugin-v<version>` and the asset is `ss-magic-plugin-<triple>.tar.gz`,
+# holding `ss-magic-plugin-<triple>/ss-magic-plugin`. The curl shim serves
+# $FAKE_RELEASE/<tag dir>/<basename>, so the directory name here is what proves
+# the bootstrap composed the tag the way the release publishes it.
+#
+# The fake binary answers `--version` with `ss-magic-plugin <version>` on one
+# line and exits 0 before anything else, exactly as the real binary must - the
+# bootstrap gates every install on the last field of that line equalling the pin.
+# Any other argv is appended to $SS_MAGIC_FAKE_LOG, which is how a test observes
+# what the binary was actually invoked with (`seed-config`, `hook <event>`, a
+# skill's verb) without the `--version` probes polluting the record.
+#
+# --wrong-version is the companion to that gate: a well-formed, correctly
+# checksummed archive whose binary simply reports a DIFFERENT version, which is
+# what a wrong-architecture or mis-tagged build looks like from here.
 publish_release() {
-    local ver=$1 variant=${2:-} dir build
-    dir="$sb/release/v$ver"
+    local ver=$1 variant=${2:-} dir build reported
+    dir="$sb/release/ss-magic-plugin-v$ver"
     build="$sb/build-$ver"
-    rm -rf "$build"; mkdir -p "$dir" "$build/ss-magic-$TRIPLE"
+    reported=$ver
+    [ "$variant" = "--wrong-version" ] && reported="9.9.9"
+    rm -rf "$build"; mkdir -p "$dir" "$build/ss-magic-plugin-$TRIPLE"
     if [ "$variant" != "--empty-archive" ]; then
-        cat >"$build/ss-magic-$TRIPLE/ss-magic" <<FAKEBIN
+        cat >"$build/ss-magic-plugin-$TRIPLE/ss-magic-plugin" <<FAKEBIN
 #!/usr/bin/env bash
 case "\${1:-}" in
-  --version|-V) echo "ss-magic $ver"; exit 0 ;;
+  --version|-V) echo "ss-magic-plugin $reported"; exit 0 ;;
 esac
 printf '%s\n' "\$*" >>"\${SS_MAGIC_FAKE_LOG:-/dev/null}"
 exit 0
 FAKEBIN
-        chmod 755 "$build/ss-magic-$TRIPLE/ss-magic"
+        chmod 755 "$build/ss-magic-plugin-$TRIPLE/ss-magic-plugin"
     else
         # A well-formed archive that simply does not contain the binary: the
         # shape a layout change or a truncated build would take.
-        printf 'not the binary\n' >"$build/ss-magic-$TRIPLE/README"
+        printf 'not the binary\n' >"$build/ss-magic-plugin-$TRIPLE/README"
     fi
-    tar -czf "$dir/ss-magic-$TRIPLE.tar.gz" -C "$build" "ss-magic-$TRIPLE"
+    tar -czf "$dir/ss-magic-plugin-$TRIPLE.tar.gz" -C "$build" "ss-magic-plugin-$TRIPLE"
     if [ "$variant" = "--corrupt-digest" ]; then
         printf '%s  %s\n' \
             "0000000000000000000000000000000000000000000000000000000000000000" \
-            "ss-magic-$TRIPLE.tar.gz" >"$dir/ss-magic-$TRIPLE.tar.gz.sha256"
+            "ss-magic-plugin-$TRIPLE.tar.gz" >"$dir/ss-magic-plugin-$TRIPLE.tar.gz.sha256"
     else
-        printf '%s  %s\n' "$(sha256_of "$dir/ss-magic-$TRIPLE.tar.gz")" \
-            "ss-magic-$TRIPLE.tar.gz" >"$dir/ss-magic-$TRIPLE.tar.gz.sha256"
+        printf '%s  %s\n' "$(sha256_of "$dir/ss-magic-plugin-$TRIPLE.tar.gz")" \
+            "ss-magic-plugin-$TRIPLE.tar.gz" >"$dir/ss-magic-plugin-$TRIPLE.tar.gz.sha256"
     fi
 }
 
 # run_bootstrap -> writes $sb/out, $sb/err; sets RC
+#
+# SS_MAGIC_FAKE_LOG is passed through so the INSTALLED binary records what the
+# bootstrap invoked it with after the install lands - which is how the R3a
+# seed-config cases below count the call. The `--version` probes never reach the
+# log (the fake binary answers and exits before writing), so a log holding
+# exactly `seed-config` means exactly one post-install invocation happened.
 RC=0
 run_bootstrap() {
     : >"$sb/out"; : >"$sb/err"
@@ -186,6 +235,7 @@ run_bootstrap() {
         FAKE_CURL_LOG="$sb/curl.log" \
         FAKE_CURL_MODE="${FAKE_CURL_MODE:-serve}" \
         FAKE_CURL_DELAY="${FAKE_CURL_DELAY:-0}" \
+        SS_MAGIC_FAKE_LOG="$sb/fakebin.log" \
         bash "$sb/plugin/hooks/bootstrap.sh" >"$sb/out" 2>"$sb/err"
     RC=$?
 }
@@ -253,15 +303,30 @@ new_sandbox ae57 0.10.0
 publish_release 0.10.0
 run_bootstrap                                  # first run installs
 assert_eq 0 "$RC" "AE57: install exits 0"
-assert_file_present "$sb/data/bin/ss-magic" "AE57: binary installed"
-before=$(sha256_of "$sb/data/bin/ss-magic")
+assert_file_present "$sb/data/bin/ss-magic-plugin" "AE57: binary installed"
+before=$(sha256_of "$sb/data/bin/ss-magic-plugin")
 fetches_before=$(archive_fetches)
+
+# The URL the install actually composed, asserted as a fixed string. The plugin
+# rides its own release line, so both halves carry the `ss-magic-plugin` prefix:
+# the tag is `ss-magic-plugin-v<pin>` (not the CLI's bare `v<pin>`) and the asset
+# is `ss-magic-plugin-<triple>.tar.gz`. Getting either half wrong is a 404 that
+# looks exactly like "offline" from the user's side, so it is worth pinning here
+# rather than discovering on a release day.
+assert_contains_fixed "$sb/curl.log" \
+    "/download/ss-magic-plugin-v0.10.0/ss-magic-plugin-$TRIPLE.tar.gz" \
+    "AE57: composed the plugin line's tag and asset name"
+assert_contains_fixed "$sb/curl.log" \
+    "/download/ss-magic-plugin-v0.10.0/ss-magic-plugin-$TRIPLE.tar.gz.sha256" \
+    "AE57: fetched the digest sibling from the same tag"
+assert_lacks_fixed "$sb/curl.log" "/download/v0.10.0/" \
+    "AE57: never reached for the CLI line's bare v<pin> tag"
 
 run_bootstrap                                  # second run must be a no-op
 assert_never_fails_session "AE57"
 assert_eq 0 "$(stderr_lines)" "AE57: stderr is empty on the no-op path"
 assert_eq "$fetches_before" "$(archive_fetches)" "AE57: no further download"
-assert_eq "$before" "$(sha256_of "$sb/data/bin/ss-magic")" "AE57: binary untouched"
+assert_eq "$before" "$(sha256_of "$sb/data/bin/ss-magic-plugin")" "AE57: binary untouched"
 
 # ==========================================================================
 # AE58 - no network at all
@@ -272,7 +337,7 @@ publish_release 0.10.0
 FAKE_CURL_MODE=offline run_bootstrap
 assert_never_fails_session "AE58"
 assert_eq 1 "$(stderr_lines)" "AE58: exactly one stderr line"
-assert_file_absent "$sb/data/bin/ss-magic" "AE58: nothing installed"
+assert_file_absent "$sb/data/bin/ss-magic-plugin" "AE58: nothing installed"
 assert_file_absent "$sb/data/.ss-magic-installed" "AE58: no success marker"
 assert_eq "" "$(ls -d "$sb"/data/.ss-magic-stage.* 2>/dev/null)" "AE58: no staging left behind"
 
@@ -281,12 +346,12 @@ current_case="AE58 offline with an older install present"
 new_sandbox ae58b 0.10.0
 publish_release 0.10.0
 run_bootstrap
-old_digest=$(sha256_of "$sb/data/bin/ss-magic")
-printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic.version"
+old_digest=$(sha256_of "$sb/data/bin/ss-magic-plugin")
+printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic-plugin.version"
 FAKE_CURL_MODE=offline run_bootstrap
 assert_never_fails_session "AE58b"
 assert_eq 1 "$(stderr_lines)" "AE58b: exactly one stderr line"
-assert_eq "$old_digest" "$(sha256_of "$sb/data/bin/ss-magic")" "AE58b: old binary untouched"
+assert_eq "$old_digest" "$(sha256_of "$sb/data/bin/ss-magic-plugin")" "AE58b: old binary untouched"
 assert_file_absent "$sb/data/.ss-magic-installed" "AE58b: marker cleared so the next session retries"
 
 # ==========================================================================
@@ -296,15 +361,15 @@ current_case="AE59 checksum mismatch"
 new_sandbox ae59 0.10.0
 publish_release 0.10.0
 run_bootstrap
-good_digest=$(sha256_of "$sb/data/bin/ss-magic")
-printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic.version"
+good_digest=$(sha256_of "$sb/data/bin/ss-magic-plugin")
+printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic-plugin.version"
 publish_release 0.11.0 --corrupt-digest
 run_bootstrap
 assert_never_fails_session "AE59"
 assert_eq 1 "$(stderr_lines)" "AE59: exactly one stderr line"
 assert_contains "$sb/err" "checksum mismatch" "AE59: says what went wrong"
-assert_eq "$good_digest" "$(sha256_of "$sb/data/bin/ss-magic")" "AE59: existing binary untouched"
-assert_eq "0.10.0" "$("$sb/data/bin/ss-magic" --version | awk '{print $NF}')" "AE59: still the old version"
+assert_eq "$good_digest" "$(sha256_of "$sb/data/bin/ss-magic-plugin")" "AE59: existing binary untouched"
+assert_eq "0.10.0" "$("$sb/data/bin/ss-magic-plugin" --version | awk '{print $NF}')" "AE59: still the old version"
 assert_file_absent "$sb/data/.ss-magic-installed" "AE59: marker cleared"
 assert_eq "" "$(ls -d "$sb"/data/.ss-magic-stage.* 2>/dev/null)" "AE59: no staging left behind"
 
@@ -340,7 +405,7 @@ for pin in "${hostile_pins[@]}"; do
     assert_never_fails_session "AE60 [$pin]"
     assert_eq 1 "$(stderr_lines)" "AE60 [$pin]: exactly one stderr line"
     assert_eq 0 "$(wc -c <"$sb/curl.log" | tr -d ' ')" "AE60 [$pin]: no URL was ever composed"
-    assert_file_absent "$sb/data/bin/ss-magic" "AE60 [$pin]: nothing installed"
+    assert_file_absent "$sb/data/bin/ss-magic-plugin" "AE60 [$pin]: nothing installed"
     # CANARY would appear wherever the substitution ran: the sandbox, the
     # plugin copy, or the directory this harness was started from.
     if [ -e "$sb/CANARY" ] || [ -e "$sb/plugin/CANARY" ] || [ -e "./CANARY" ] ||
@@ -380,8 +445,8 @@ for i in 1 2 3 4; do
     [ -s "$sb/out.$i" ] && concurrent_ok=no
 done
 assert_eq yes "$concurrent_ok" "AE61: every concurrent session exits 0 with empty stdout"
-assert_file_present "$sb/data/bin/ss-magic" "AE61: the binary is installed"
-assert_eq "0.10.0" "$("$sb/data/bin/ss-magic" --version | awk '{print $NF}')" "AE61: correct version"
+assert_file_present "$sb/data/bin/ss-magic-plugin" "AE61: the binary is installed"
+assert_eq "0.10.0" "$("$sb/data/bin/ss-magic-plugin" --version | awk '{print $NF}')" "AE61: correct version"
 assert_eq "" "$(ls -d "$sb"/data/.ss-magic-stage.* 2>/dev/null)" "AE61: no staging left behind"
 if command -v flock >/dev/null 2>&1 || command -v perl >/dev/null 2>&1; then
     assert_eq 1 "$(archive_fetches)" "AE61: the lock collapsed four sessions into one download"
@@ -396,13 +461,13 @@ current_case="AE62 archive without the binary"
 new_sandbox ae62 0.10.0
 publish_release 0.10.0
 run_bootstrap
-kept=$(sha256_of "$sb/data/bin/ss-magic")
-printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic.version"
+kept=$(sha256_of "$sb/data/bin/ss-magic-plugin")
+printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic-plugin.version"
 publish_release 0.11.0 --empty-archive
 run_bootstrap
 assert_never_fails_session "AE62"
 assert_eq 1 "$(stderr_lines)" "AE62: exactly one stderr line"
-assert_eq "$kept" "$(sha256_of "$sb/data/bin/ss-magic")" "AE62: existing binary untouched"
+assert_eq "$kept" "$(sha256_of "$sb/data/bin/ss-magic-plugin")" "AE62: existing binary untouched"
 assert_file_absent "$sb/data/.ss-magic-installed" "AE62: marker cleared"
 assert_eq "" "$(ls -d "$sb"/data/.ss-magic-stage.* 2>/dev/null)" "AE62: staging cleaned up"
 
@@ -417,7 +482,7 @@ else
     chmod 0700 "$sb/data"
     assert_never_fails_session "AE62b"
     assert_eq 1 "$(stderr_lines)" "AE62b: exactly one stderr line"
-    assert_file_absent "$sb/data/bin/ss-magic" "AE62b: nothing installed"
+    assert_file_absent "$sb/data/bin/ss-magic-plugin" "AE62b: nothing installed"
 fi
 
 # ==========================================================================
@@ -428,14 +493,141 @@ new_sandbox ae63 0.10.0
 publish_release 0.10.0
 publish_release 0.11.0
 run_bootstrap
-assert_eq "0.10.0" "$("$sb/data/bin/ss-magic" --version | awk '{print $NF}')" "AE63: starts at the old pin"
-printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic.version"
+assert_eq "0.10.0" "$("$sb/data/bin/ss-magic-plugin" --version | awk '{print $NF}')" "AE63: starts at the old pin"
+printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic-plugin.version"
 run_bootstrap
 assert_never_fails_session "AE63"
-assert_eq "0.11.0" "$("$sb/data/bin/ss-magic" --version | awk '{print $NF}')" "AE63: advanced to the new pin"
+assert_eq "0.11.0" "$("$sb/data/bin/ss-magic-plugin" --version | awk '{print $NF}')" "AE63: advanced to the new pin"
 assert_eq "0.11.0" "$(cat "$sb/data/.ss-magic-installed")" "AE63: marker records the new pin"
 run_bootstrap
 assert_eq 0 "$(stderr_lines)" "AE63: the run after the advance is silent"
+
+# ==========================================================================
+# AE63b - the staged binary's `--version` decides the install, both ways
+#
+# Every install is gated on `"$staged_bin" --version | head -1 | awk '{print
+# $NF}'` equalling the pin: the checksum proves the archive is the published
+# artifact for this TRIPLE, and this proves it is the artifact for this MACHINE
+# (a wrong-architecture build passes every earlier check and then fails to run).
+#
+# Both directions are asserted here on purpose. A negative-only test - "a binary
+# reporting the wrong version installs nothing" - stays green even if the binary
+# never answered `--version` at all, or answered with usage text and exit 2,
+# because an empty last field also fails to equal the pin. The positive case is
+# what pins the contract that the flag ANSWERS: one line, `ss-magic-plugin
+# <version>`, exit 0, ahead of any verb parsing.
+# ==========================================================================
+current_case="AE63b a binary whose --version equals the pin installs"
+new_sandbox ae63b 0.10.0
+publish_release 0.10.0
+run_bootstrap
+assert_never_fails_session "AE63b"
+assert_file_present "$sb/data/bin/ss-magic-plugin" "AE63b: the matching binary was installed"
+assert_eq "ss-magic-plugin 0.10.0" \
+    "$("$sb/data/bin/ss-magic-plugin" --version | head -1)" \
+    "AE63b: --version answers 'ss-magic-plugin <version>' on one line"
+"$sb/data/bin/ss-magic-plugin" --version >/dev/null 2>&1
+assert_eq 0 "$?" "AE63b: --version exits 0"
+assert_eq "0.10.0" "$(cat "$sb/data/.ss-magic-installed")" "AE63b: marker records the pin"
+
+current_case="AE63b a binary whose --version differs from the pin installs nothing"
+new_sandbox ae63c 0.10.0
+publish_release 0.10.0
+run_bootstrap
+kept_digest=$(sha256_of "$sb/data/bin/ss-magic-plugin")
+printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic-plugin.version"
+publish_release 0.11.0 --wrong-version
+run_bootstrap
+assert_never_fails_session "AE63c"
+assert_eq 1 "$(stderr_lines)" "AE63c: exactly one stderr line"
+assert_contains "$sb/err" "did not run as 0.11.0" "AE63c: says the staged binary reported the wrong version"
+assert_eq "$kept_digest" "$(sha256_of "$sb/data/bin/ss-magic-plugin")" "AE63c: existing binary untouched"
+assert_file_absent "$sb/data/.ss-magic-installed" "AE63c: marker cleared so the next session retries"
+assert_eq "" "$(ls -d "$sb"/data/.ss-magic-stage.* 2>/dev/null)" "AE63c: no staging left behind"
+
+# ==========================================================================
+# R3a - the configuration pre-seed
+#
+# After a successful install the bootstrap invokes the binary it just installed
+# once, as `seed-config`, so a `plugin` block of gate defaults appears in an
+# existing .superset/magic.json and the settings are discoverable without any
+# terminal verb (the CLI no longer has a `plugin` subcommand). What the seed
+# writes - and everything it refuses to write, above all the `enabled` key - is
+# the binary's business and is tested in Rust. What is testable HERE is the
+# invocation itself, and its siting: on every session that reaches a usable
+# pinned binary, and never on one that does not.
+#
+# The frequency is the subtle half, and an earlier version of this suite got it
+# exactly backwards. The binary is installed once per MACHINE; the block has to
+# be seeded once per REPOSITORY, and a person opens many repositories on one
+# machine. A seed call placed only after a fresh install therefore seeds the
+# first repository and silently skips every later one, because the
+# already-installed fast path returns above it - which is the steady state, so
+# the failure is the common case rather than an edge. The "no-op session"
+# assertion below used to require exactly that behaviour, certifying the bug.
+# It now requires the opposite, and a separate case opens a SECOND repository on
+# an already-provisioned machine, which is the shape that actually failed.
+# ==========================================================================
+current_case="R3a a successful install seeds the config exactly once"
+new_sandbox seed 0.10.0
+publish_release 0.10.0
+: >"$sb/fakebin.log"
+run_bootstrap
+assert_never_fails_session "R3a"
+assert_eq "seed-config" "$(cat "$sb/fakebin.log")" "R3a: invoked seed-config exactly once after the install"
+
+current_case="R3a a session that installs nothing still seeds"
+# The second session returns at the already-installed check. It must STILL seed:
+# it has a usable binary, and it may be sitting in a repository that has never
+# been seeded. Idempotence is the binary's job, not the caller's - it writes
+# only when there is no `plugin` key at all - so calling it every session costs
+# a read and an exit, and needs no marker file kept in sync.
+: >"$sb/fakebin.log"
+run_bootstrap
+assert_never_fails_session "R3a no-op"
+assert_eq "seed-config" "$(cat "$sb/fakebin.log")" "R3a: an already-installed session still seeds"
+
+current_case="R3a a SECOND repository on the same machine is seeded"
+# The case the once-per-install siting got wrong. Same machine, same installed
+# binary, a different working directory: this is what every session after the
+# first one looks like, and it is where the whole point of R3a lands - with no
+# terminal path to the plugin config, a repository that is never seeded has no
+# discoverable configuration at all.
+second_repo="$sb/second-repo"
+mkdir -p "$second_repo"
+: >"$sb/fakebin.log"
+( cd "$second_repo" && run_bootstrap )
+assert_never_fails_session "R3a second repo"
+assert_contains_fixed "$sb/fakebin.log" "seed-config" \
+    "R3a: a second repository on an already-provisioned machine is seeded"
+
+current_case="R3a a failed install seeds nothing"
+# Offline: the run leaves through give_up long before the install-success marker,
+# and the seed call sits after that marker, so it is unreachable. This is the
+# assertion that pins the SITING - a seed call placed earlier in the file would
+# still satisfy every other case in this suite.
+new_sandbox seedfail 0.10.0
+publish_release 0.10.0
+: >"$sb/fakebin.log"
+FAKE_CURL_MODE=offline run_bootstrap
+assert_never_fails_session "R3a failed install"
+assert_file_absent "$sb/data/bin/ss-magic-plugin" "R3a: nothing was installed"
+assert_eq "" "$(cat "$sb/fakebin.log")" "R3a: a failed install invokes seed-config zero times"
+
+current_case="R3a a failed UPGRADE over a working install seeds nothing"
+# The sharper version of the same property: here a runnable binary IS present,
+# so a seed call that ran unconditionally would find something to execute. The
+# upgrade fails on its checksum, so the run must still leave through give_up.
+new_sandbox seedfail2 0.10.0
+publish_release 0.10.0
+run_bootstrap
+printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic-plugin.version"
+publish_release 0.11.0 --corrupt-digest
+: >"$sb/fakebin.log"
+run_bootstrap
+assert_never_fails_session "R3a failed upgrade"
+assert_eq 1 "$(stderr_lines)" "R3a failed upgrade: exactly one stderr line"
+assert_eq "" "$(cat "$sb/fakebin.log")" "R3a: a failed upgrade invokes seed-config zero times"
 
 # ==========================================================================
 # AE64 - hooks.json runs the bootstrap on `startup` only
@@ -447,8 +639,8 @@ import json, sys
 spec = json.load(open(sys.argv[1]))
 
 # The event token each shim entry must pass as args[1]. These are the tokens
-# HookEvent::from_token parses in src/plugin/mod.rs; a rename on either side
-# without the other is exactly the drift this asserts against.
+# HookEvent::from_token parses in crates/ss-magic-plugin/src/main.rs; a rename
+# on either side without the other is exactly the drift this asserts against.
 SHIM_TOKENS = {
     "SessionStart": "session-start",
     "PreToolUse": "pre-tool-use",
@@ -496,7 +688,7 @@ for ev, egroups in spec["hooks"].items():
                 f"{ev}: args[0] is {a0!r}; it must be a path under the plugin root")
             # args[0] alone is not the property that matters. Every shim entry also
             # has to dispatch ITS OWN event: the token in args[1] is what run-hook.sh
-            # passes to `plugin hook`, so a manifest that names the right script with
+            # passes to the binary as `hook <token>`, so a manifest that names the right script with
             # the wrong token routes the event to the wrong handler and every other
             # assertion here still passes.
             if "run-hook.sh" in a0:
@@ -532,7 +724,15 @@ run_bootstrap
 : >"$sb/fakebin.log"
 WRAPPER_DATA="" run_wrapper checklist list
 assert_eq 0 "$RC" "AE65: wrapper exits 0"
-assert_eq "plugin checklist list" "$(cat "$sb/fakebin.log")" "AE65: injects the plugin verb, no CLAUDE_PLUGIN_DATA in scope"
+# The wrapper forwards its argv VERBATIM - `exec "$bin" "$@"`. The verb tree is
+# its own binary now, so a skill's `ss-magic-plugin checklist list` IS the
+# binary's argv; the wrapper used to prepend a `plugin` token because the same
+# code then lived inside the `ss-magic` CLI.
+assert_eq "checklist list" "$(cat "$sb/fakebin.log")" "AE65: forwards argv verbatim, no CLAUDE_PLUGIN_DATA in scope"
+# Asserted negatively as well as positively. The expectation above would still
+# be satisfiable by a wrapper that stripped and re-added tokens; this one says
+# the word `plugin` never reaches the binary's argv at all.
+assert_lacks_fixed "$sb/fakebin.log" "plugin" "AE65: no 'plugin' token is injected"
 
 current_case="AE65 wrapper with the handoff removed"
 handoff_root="/tmp/ss-magic-plugin/$SB_ID"
@@ -554,28 +754,28 @@ current_case="AE65 wrapper: a DIRECTORY where the binary should be"
 # explanation rather than failing the skill mid-run. This is the sibling of the
 # same defect fixed earlier in hooks/run-hook.sh; it survived there for a whole
 # release because the guard was duplicated instead of shared.
-mkdir -p "$sb/data/bin/ss-magic.dir/bin"
-mkdir -p "$sb/data/bin/ss-magic.dir/bin/ss-magic"
+mkdir -p "$sb/data/bin/ss-magic-plugin.dir/bin"
+mkdir -p "$sb/data/bin/ss-magic-plugin.dir/bin/ss-magic-plugin"
 : >"$sb/fakebin.log"
-WRAPPER_DATA="$sb/data/bin/ss-magic.dir" run_wrapper checklist list
+WRAPPER_DATA="$sb/data/bin/ss-magic-plugin.dir" run_wrapper checklist list
 assert_eq 0 "$RC" "AE65: a directory in the binary's place still exits 0"
 assert_eq 1 "$(wc -l <"$sb/werr" | tr -d ' ')" "AE65: directory case explains in one line"
 assert_eq 0 "$(wc -c <"$sb/wout" | tr -d ' ')" "AE65: directory case says nothing on stdout"
 assert_eq "" "$(cat "$sb/fakebin.log")" "AE65: directory case did not invoke the binary"
-rm -rf "$sb/data/bin/ss-magic.dir"
+rm -rf "$sb/data/bin/ss-magic-plugin.dir"
 
 current_case="AE65 wrapper: a present, +x, non-loadable binary"
 # The ENOEXEC shape: bash would reinterpret the damaged bytes as a shell script
 # and exit with whatever they parse to, spraying that at a person running a skill.
-mkdir -p "$sb/data/bin/ss-magic.bad/bin"
-head -c 512 /dev/urandom >"$sb/data/bin/ss-magic.bad/bin/ss-magic"
-chmod 755 "$sb/data/bin/ss-magic.bad/bin/ss-magic"
+mkdir -p "$sb/data/bin/ss-magic-plugin.bad/bin"
+head -c 512 /dev/urandom >"$sb/data/bin/ss-magic-plugin.bad/bin/ss-magic-plugin"
+chmod 755 "$sb/data/bin/ss-magic-plugin.bad/bin/ss-magic-plugin"
 : >"$sb/fakebin.log"
-WRAPPER_DATA="$sb/data/bin/ss-magic.bad" run_wrapper checklist list
+WRAPPER_DATA="$sb/data/bin/ss-magic-plugin.bad" run_wrapper checklist list
 assert_eq 0 "$RC" "AE65: a damaged binary still exits 0"
 assert_eq 1 "$(wc -l <"$sb/werr" | tr -d ' ')" "AE65: damaged binary explains in one line"
 assert_eq "" "$(cat "$sb/fakebin.log")" "AE65: damaged binary did not invoke anything"
-rm -rf "$sb/data/bin/ss-magic.bad"
+rm -rf "$sb/data/bin/ss-magic-plugin.bad"
 
 current_case="AE65 wrapper pointed at a directory with no binary"
 : >"$sb/fakebin.log"
@@ -617,10 +817,10 @@ publish_release 0.10.0
 publish_release 0.11.0
 run_bootstrap
 assert_never_fails_session "AE67"
-assert_contains "$sb/err" "installed ss-magic 0.10.0" "AE67: names the binary and version"
-assert_contains "$sb/err" "releases/tag/v0.10.0" "AE67: names the release it came from"
+assert_contains "$sb/err" "installed ss-magic-plugin 0.10.0" "AE67: names the binary and version"
+assert_contains "$sb/err" "releases/tag/ss-magic-plugin-v0.10.0" "AE67: names the release it came from"
 assert_contains "$sb/err" "SessionStart" "AE67: names the hooks it registers"
-printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic.version"
+printf '%s\n' "0.11.0" >"$sb/plugin/ss-magic-plugin.version"
 run_bootstrap
 assert_never_fails_session "AE67 second install"
 assert_eq 0 "$(stderr_lines)" "AE67: a later successful install is silent"
@@ -651,7 +851,11 @@ run_bootstrap
 : >"$sb/fakebin.log"
 SHIM_DATA="" run_shim pre-tool-use
 assert_eq 0 "$RC" "AE9: exits 0 with the binary present"
-assert_eq "plugin hook pre-tool-use" "$(cat "$sb/fakebin.log")" "AE9: execs with exactly 'plugin hook <event>'"
+# `hook <event>` and nothing more. The verb tree is its own binary, so its argv
+# IS the verb; the shim used to exec `plugin hook <event>` because the same code
+# then lived inside the `ss-magic` CLI behind a `plugin` token.
+assert_eq "hook pre-tool-use" "$(cat "$sb/fakebin.log")" "AE9: execs with exactly 'hook <event>'"
+assert_lacks_fixed "$sb/fakebin.log" "plugin" "AE9: no 'plugin' token precedes the event"
 assert_eq 0 "$(wc -c <"$sb/sout" | tr -d ' ')" "AE9: the shim itself adds nothing to stdout"
 
 current_case="AE9 execs through CLAUDE_PLUGIN_DATA, the production path"
@@ -661,20 +865,20 @@ current_case="AE9 execs through CLAUDE_PLUGIN_DATA, the production path"
 : >"$sb/fakebin.log"
 SHIM_DATA="$sb/data" run_shim session-start
 assert_eq 0 "$RC" "AE9: exits 0 on the CLAUDE_PLUGIN_DATA fast path"
-assert_eq "plugin hook session-start" "$(cat "$sb/fakebin.log")" "AE9: fast path execs with the right argv"
+assert_eq "hook session-start" "$(cat "$sb/fakebin.log")" "AE9: fast path execs with the right argv"
 assert_eq 0 "$(wc -c <"$sb/sout" | tr -d ' ')" "AE9: fast path adds nothing to stdout"
 assert_eq 0 "$(wc -c <"$sb/serr" | tr -d ' ')" "AE9: fast path adds nothing to stderr"
 
 current_case="AE9 binary path exists but is a directory"
 # `-x` alone is true for a directory with the search bit; exec would then print a
 # diagnostic and exit 126 from the one script that must never do either.
-mv "$sb/data/bin/ss-magic" "$sb/data/bin/ss-magic.real"
-mkdir -p "$sb/data/bin/ss-magic"
+mv "$sb/data/bin/ss-magic-plugin" "$sb/data/bin/ss-magic-plugin.real"
+mkdir -p "$sb/data/bin/ss-magic-plugin"
 : >"$sb/fakebin.log"
 SHIM_DATA="$sb/data" run_shim pre-tool-use
 assert_shim_inert "AE9 (binary path is a directory)"
-rmdir "$sb/data/bin/ss-magic"
-mv "$sb/data/bin/ss-magic.real" "$sb/data/bin/ss-magic"
+rmdir "$sb/data/bin/ss-magic-plugin"
+mv "$sb/data/bin/ss-magic-plugin.real" "$sb/data/bin/ss-magic-plugin"
 
 current_case="AE9 handoff removed after install"
 shim_root="/tmp/ss-magic-plugin/$SB_ID"
@@ -697,8 +901,8 @@ current_case="AE9 binary is present and +x but is not a loadable executable"
 # whatever those bytes parse to. Measured over 30 corrupted binaries on bash 3.2:
 # exit 2 roughly half the time, and exit 2 from PreToolUse means BLOCK the tool
 # call. That is why run-hook.sh checks the magic number before exec.
-head -c 512 /dev/urandom >"$sb/data/bin/ss-magic"
-chmod 755 "$sb/data/bin/ss-magic"
+head -c 512 /dev/urandom >"$sb/data/bin/ss-magic-plugin"
+chmod 755 "$sb/data/bin/ss-magic-plugin"
 : >"$sb/fakebin.log"
 SHIM_DATA="$sb/data" run_shim pre-tool-use
 assert_shim_inert "AE9 (binary is not a loadable executable)"
@@ -707,12 +911,12 @@ current_case="AE9 a shebang wrapper is still accepted"
 # The magic check must not become a rule that only real compiled binaries pass:
 # an interpreted wrapper is a legitimate shape, and the suite's own fake binary
 # is one, so a guard that rejected `#!` would make every other case vacuous.
-printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"${SS_MAGIC_FAKE_LOG:-/dev/null}"\nexit 0\n' >"$sb/data/bin/ss-magic"
-chmod 755 "$sb/data/bin/ss-magic"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"${SS_MAGIC_FAKE_LOG:-/dev/null}"\nexit 0\n' >"$sb/data/bin/ss-magic-plugin"
+chmod 755 "$sb/data/bin/ss-magic-plugin"
 : >"$sb/fakebin.log"
 SHIM_DATA="$sb/data" run_shim pre-tool-use
 assert_eq 0 "$RC" "AE9: a shebang wrapper still execs"
-assert_eq "plugin hook pre-tool-use" "$(cat "$sb/fakebin.log")" "AE9: shebang wrapper receives the right argv"
+assert_eq "hook pre-tool-use" "$(cat "$sb/fakebin.log")" "AE9: shebang wrapper receives the right argv"
 
 # ==========================================================================
 # AE64 (dynamic) - every manifest entry dispatches ITS OWN event, end to end
@@ -752,7 +956,7 @@ PY_ENTRIES
             CLAUDE_PLUGIN_DATA="$sb/data" SS_MAGIC_FAKE_LOG="$sb/fakebin.log" \
             "$cmd" $expanded </dev/null >"$sb/sout" 2>"$sb/serr"
         assert_eq 0 "$?" "AE64 dynamic: $ev exits 0"
-        assert_eq "plugin hook $tok" "$(cat "$sb/fakebin.log")" \
+        assert_eq "hook $tok" "$(cat "$sb/fakebin.log")" \
             "AE64 dynamic: $ev reaches the binary as '$tok'"
         assert_eq 0 "$(wc -c <"$sb/sout" | tr -d ' ')" "AE64 dynamic: $ev adds nothing to stdout"
     done <<MANIFEST_ENTRIES

@@ -5,12 +5,17 @@
 # `ss-magic-core` is the shared library (git plumbing, hashing, the palette, the
 # sync engine's pure half, the `.superset` contract I/O, the repo-name stem, the
 # plugin state-tree constant and its gitignore rule, and the per-line GitHub
-# release check). `ss-magic` is the interactive sync CLI. The Claude Code plugin
-# binary becomes its own member in the next unit of the split; until then the
-# plugin verb tree still lives inside `ss-magic`.
+# release check). `ss-magic` is the interactive sync CLI. `ss-magic-plugin` is
+# the Claude Code plugin's hook runtime and verb tree.
+#
+# The two binaries release independently, on distinct tag shapes: `vX.Y.Z` for
+# `ss-magic`, `ss-magic-plugin-vX.Y.Z` for `ss-magic-plugin`. Their versions
+# must therefore always DIFFER — cargo-dist reads a bare tag as "every dist-able
+# package at that version", so equal versions would make one tag release both.
+# `scripts/build-plugin-zip.py --check` refuses a tree where they match.
 [workspace]
 resolver = "2"
-members = ["crates/ss-magic-core", "crates/ss-magic"]
+members = ["crates/ss-magic-core", "crates/ss-magic", "crates/ss-magic-plugin"]
 
 [workspace.package]
 edition = "2021"

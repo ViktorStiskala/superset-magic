@@ -77,6 +77,42 @@ jobs:
           # tag, so the tags and the history reaching them must both be present.
           fetch-depth: 0
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The workspace publishes two release lines from one repository, and
+      # cargo-dist parses a tag as `[PACKAGE_NAME-]VERSION`:
+      #
+      #   vX.Y.Z                  -> every dist-able package at that version,
+      #                              which is the CLI alone only because the two
+      #                              crate versions always differ (--check
+      #                              enforces that they do)
+      #   ss-magic-plugin-vX.Y.Z  -> the plugin
+      #
+      # Any other shape is a silent, permanent mistake rather than a failed
+      # release. A prefixed CLI tag like `ss-magic-v0.11.1` builds and publishes
+      # perfectly well, but the updater's anchored filter only recognises bare
+      # `vX.Y.Z`, so every already-installed binary ignores that release forever
+      # -- the line is stranded with no error anywhere. This is a plan-phase job,
+      # so failing here stops the release before any artifact is built.
+      - name: Release tag shape (plan phase)
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE:-}" != "tag" ]; then
+            echo "not a tag build (ref type '${GITHUB_REF_TYPE:-none}'); nothing to check."
+            exit 0
+          fi
+          if printf '%s\n' "$GITHUB_REF_NAME" | grep -Eq '^(v|ss-magic-plugin-v)[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "ok: '$GITHUB_REF_NAME' names a known release line."
+            exit 0
+          fi
+          echo "tag '$GITHUB_REF_NAME' matches neither release line." >&2
+          echo "  vX.Y.Z                 releases ss-magic (the CLI)" >&2
+          echo "  ss-magic-plugin-vX.Y.Z releases ss-magic-plugin" >&2
+          echo "A CLI tag must NOT be prefixed: the updater's anchored filter and" >&2
+          echo "every installed binary look for a bare vX.Y.Z, so a prefixed tag" >&2
+          echo "would publish a release the whole installed base ignores." >&2
+          exit 1
 
       # The builder is the one artifact both a human and CI run. If they can
       # ever disagree the pin is meaningless, so its own reproducibility and
@@ -84,12 +120,44 @@ jobs:
       - name: Builder selftest (AE79 reproducibility, AE80 refusals)
         run: python3 scripts/build-plugin-zip.py --selftest
 
-      # Three assertions, and the third is not implied by the second: a
-      # misspelled or absent `sha256` key makes the marketplace entry validate
-      # cleanly and install the plugin unpinned, which removes the only
-      # integrity control on it.
+      # Several assertions, and none is implied by the others: a misspelled or
+      # absent `sha256` key makes the marketplace entry validate cleanly and
+      # install the plugin unpinned; equal versions on the two release lines make
+      # one bare CLI tag publish a plugin release too; a hook entry naming the
+      # binary ENOENTs a first session. `--check` prints one ok/FAIL line each.
       - name: Release assertions (R95 versions, R96 digest pin, R101 sha256 key)
         run: python3 scripts/build-plugin-zip.py --check
+
+      # The plugin's inability to self-update or open a TUI is meant to be
+      # structural (R2), and a `cargo build` can only show that a dependency is
+      # PRESENT -- nothing in a successful build says one is ABSENT. `cargo tree
+      # -p ss-magic-plugin -i <crate>` scopes the resolve to the plugin's own
+      # subgraph and inverts around the crate, so it also catches the crate
+      # arriving transitively through ss-magic-core.
+      #
+      # Exit codes run backwards here: a MATCH exits 0 (and must fail the job),
+      # while "no such package in this subgraph" exits non-zero (and must pass
+      # it). The message is matched explicitly so an unrelated cargo failure --
+      # a missing lockfile, a resolve error -- is reported rather than read as
+      # proof of absence.
+      - name: The plugin links no updater and no TUI (R2)
+        run: |
+          set -euo pipefail
+          for crate in self_update inquire ratatui; do
+            if out=$(cargo tree --locked -p ss-magic-plugin -i "$crate" 2>&1); then
+              printf '%s\n' "$out"
+              echo "ss-magic-plugin links $crate; it must link neither an updater nor a TUI." >&2
+              exit 1
+            fi
+            case "$out" in
+              *"did not match any packages"*)
+                echo "ok: ss-magic-plugin does not link $crate" ;;
+              *)
+                printf '%s\n' "$out"
+                echo "cargo tree failed for an unrelated reason; absence is not proven." >&2
+                exit 1 ;;
+            esac
+          done
 
       # R98: the resolved version, not the digest, is the update signal.
       # `claude plugin update` skips a plugin whose version already matches, so
@@ -99,9 +167,15 @@ jobs:
           set -euo pipefail
           head_commit=$(git rev-parse 'HEAD^{commit}')
           base=""
-          for tag in $(git tag --list --sort=-v:refname --merged HEAD); do
+          # Both release lines are valid baselines: the plugin tree can change on
+          # either one's commit, so the most recent release of EITHER shape is the
+          # last point the tree is known to have been published from. Sorted by
+          # -creatordate rather than -v:refname because the two shapes do not sort
+          # against each other as versions at all -- every `ss-magic-plugin-v*`
+          # tag would sort ahead of every `v*` one regardless of when it was made.
+          for tag in $(git tag --list --sort=-creatordate --merged HEAD); do
             case "$tag" in
-              v[0-9]*.[0-9]*.[0-9]*|[0-9]*.[0-9]*.[0-9]*) ;;
+              v[0-9]*.[0-9]*.[0-9]*|ss-magic-plugin-v[0-9]*.[0-9]*.[0-9]*) ;;
               *) continue ;;
             esac
             # On a tag build HEAD *is* the release tag; compare against the
@@ -132,6 +206,49 @@ jobs:
           fi
           echo "ok: no skill body names CLAUDE_PLUGIN_DATA"
 
+      # `ss-magic plugin <verb>` was the spelling while the plugin lived inside
+      # the sync CLI as a subcommand. It is now its own binary, `ss-magic-plugin
+      # <verb>`, and the old spelling is worse than merely stale: a user who has
+      # the sync CLI installed gets "unknown subcommand" from a real binary, and
+      # a skill body running it through the Bash tool reaches whichever `ss-magic`
+      # happens to be on PATH -- the update gate and the TUI included -- instead
+      # of the pinned plugin binary the wrapper resolves.
+      #
+      # The trailing space is load-bearing: it matches the verb form only, so
+      # prose about "the ss-magic plugin" as a thing still reads naturally.
+      - name: No document spells the old `ss-magic plugin` subcommand
+        run: |
+          set -euo pipefail
+          # docs/solutions/ and CLAUDE.md are in scope too: both are read by
+          # agents working in this repo, so a retired command there is acted on,
+          # not merely misread. docs/plans/ is deliberately NOT in scope - a plan
+          # is a historical record and quotes the spelling that was current when
+          # it was written.
+          if grep -rn 'ss-magic plugin ' \
+              plugin/skills/ docs/solutions/ \
+              README.md CONTRIBUTING.md CONCEPTS.md CLAUDE.md .cursor/BUGBOT.md; then
+            echo "the plugin is its own binary now; spell it 'ss-magic-plugin <verb>'." >&2
+            exit 1
+          fi
+          echo 'ok: no document spells the retired subcommand form'
+
+      # README documents `releases/download/v<V>/ss-magic-installer.sh`, pinned to
+      # a published release, not `releases/latest/download/...`. Two reasons, and
+      # the second is the one that bites: the command a reader copies must be
+      # reproducible, and `latest` is repository-wide -- it resolves to whichever
+      # release was published most recently, which since the split can be a
+      # `ss-magic-plugin-vX.Y.Z` release that carries no installer script at all.
+      # The documented one-liner would then 404 for everyone.
+      - name: README pins the installer to a release, never `latest`
+        run: |
+          set -euo pipefail
+          if grep -n 'releases/latest/download/' README.md; then
+            echo "'latest' is repository-wide and can resolve to a plugin release" >&2
+            echo "that publishes no installer. Pin the URL to a vX.Y.Z release." >&2
+            exit 1
+          fi
+          echo "ok: README names no releases/latest/download/ URL"
+
       # The bootstrap runs at every fresh session on every machine with the
       # plugin enabled, so its failure paths matter more than its success path:
       # offline, a corrupted download, a hostile version pin, an unwritable data
@@ -142,20 +259,36 @@ jobs:
       - name: Plugin bootstrap failure-path tests (AE57-AE67)
         run: bash scripts/test-bootstrap.sh
 
-      # Run the exact command dist-workspace.toml registers as the extra
-      # artifact's build, and confirm it produces the filename `artifacts`
-      # declares. A mismatch there publishes no plugin asset at all, and the
-      # marketplace url would then 404 for every user.
+      # Run the exact command cargo-dist registers as the extra artifact's build,
+      # and confirm it produces the filename `artifacts` declares. A mismatch
+      # there publishes no plugin asset at all, and the marketplace url would then
+      # 404 for every user.
+      #
+      # The declaration lives on the plugin crate now
+      # ([[package.metadata.dist.extra-artifacts]]), so the zip rides the plugin's
+      # tag rather than the CLI's. dist-workspace.toml is still read as a fallback
+      # so a tree that has not moved the entry yet is checked rather than silently
+      # unchecked -- the same order scripts/build-plugin-zip.py uses.
       - name: Build the asset cargo-dist will publish
         run: |
           set -euo pipefail
-          artifact=$(grep -oE 'ss-magic-plugin-v[0-9]+\.[0-9]+\.[0-9]+\.zip' dist-workspace.toml | head -1)
+          pattern='ss-magic-plugin-v[0-9]+\.[0-9]+\.[0-9]+\.zip'
+          artifact=$(grep -oE "$pattern" crates/ss-magic-plugin/Cargo.toml | head -1 || true)
+          if [ -z "$artifact" ]; then
+            artifact=$(grep -oE "$pattern" dist-workspace.toml | head -1 || true)
+          fi
+          if [ -z "$artifact" ]; then
+            echo "no [[package.metadata.dist.extra-artifacts]] entry names a" >&2
+            echo "ss-magic-plugin-vX.Y.Z.zip, in the plugin crate manifest or in" >&2
+            echo "dist-workspace.toml; the plugin zip would not be published." >&2
+            exit 1
+          fi
           python3 scripts/build-plugin-zip.py
           if [ ! -f "$artifact" ]; then
             echo "builder produced no $artifact; dist would publish nothing and the" >&2
             echo "marketplace url would 404 for every user. The builder derives its" >&2
-            echo "filename from crates/ss-magic/Cargo.toml's version, so this means" >&2
-            echo "dist-workspace.toml and that manifest disagree." >&2
+            echo "filename from crates/ss-magic-plugin/Cargo.toml's version, so this" >&2
+            echo "means the declared artifact name and that manifest disagree." >&2
             exit 1
           fi
           python3 - "$artifact" <<'PY'

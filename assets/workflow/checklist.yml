@@ -1,7 +1,7 @@
 # Render this repository's ss-magic operator checklist into a pull-request
 # comment, and fail the pull request when the checklist is not valid.
 #
-# Written by `ss-magic plugin setup-github-ci`, which substitutes the pinned
+# Written by `ss-magic-plugin setup-github-ci`, which substitutes the pinned
 # version below. Do not hand-edit: `setup-github-ci` compares this file against
 # the version it would write, and a local edit makes every later run report the
 # file as "differing" instead of quietly advancing the pin.
@@ -56,11 +56,17 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The pinned ss-magic. `ss-magic plugin setup-github-ci` owns this value and
-  # is the only thing that should change it - the binary, the skills and the
-  # checklist format are released together, so a hand-bumped pin here can name
-  # a version whose output this workflow does not expect.
-  SS_MAGIC_VERSION: "@SS_MAGIC_VERSION@"
+  # The pinned ss-magic-plugin. `ss-magic-plugin setup-github-ci` owns this
+  # value and is the only thing that should change it - the binary, the skills
+  # and the checklist format are released together, so a hand-bumped pin here
+  # can name a version whose output this workflow does not expect.
+  #
+  # This is the PLUGIN's version, on its own release line
+  # (`ss-magic-plugin-vX.Y.Z`), not the `ss-magic` sync CLI's. The two are
+  # separate binaries released independently and their versions are never
+  # equal, so a `v$SS_MAGIC_PLUGIN_VERSION` tag would name a different release
+  # entirely - or none at all.
+  SS_MAGIC_PLUGIN_VERSION: "@SS_MAGIC_PLUGIN_VERSION@"
   SS_MAGIC_REPO: ViktorStiskala/superset-magic
 
 jobs:
@@ -100,14 +106,14 @@ jobs:
             echo 'present=true' >>"$GITHUB_OUTPUT"
           fi
 
-      - name: Install the pinned ss-magic
+      - name: Install the pinned ss-magic-plugin
         if: steps.probe.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
           target=x86_64-unknown-linux-gnu
-          archive="ss-magic-$target.tar.gz"
-          base="https://github.com/$SS_MAGIC_REPO/releases/download/v$SS_MAGIC_VERSION"
+          archive="ss-magic-plugin-$target.tar.gz"
+          base="https://github.com/$SS_MAGIC_REPO/releases/download/ss-magic-plugin-v$SS_MAGIC_PLUGIN_VERSION"
 
           # Everything lands outside the checkout, so a repository cannot ship a
           # file that the download or the extraction would overwrite.
@@ -130,7 +136,8 @@ jobs:
           tar -xzf "$archive"
           # cargo-dist nests the binary one directory deep, named after the
           # archive.
-          install -m 0755 "ss-magic-$target/ss-magic" "$RUNNER_TEMP/ss-magic"
+          install -m 0755 "ss-magic-plugin-$target/ss-magic-plugin" \
+            "$RUNNER_TEMP/ss-magic-plugin"
           cd - >/dev/null
           rm -rf "$work"
 
@@ -139,14 +146,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/ss-magic" plugin checklist verify
+          "$RUNNER_TEMP/ss-magic-plugin" checklist verify
 
       - name: Render the comment body
         if: steps.probe.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/ss-magic" plugin checklist render-md >"$RUNNER_TEMP/checklist.md"
+          "$RUNNER_TEMP/ss-magic-plugin" checklist render-md >"$RUNNER_TEMP/checklist.md"
 
       - name: Upload the rendered body
         if: steps.probe.outputs.present == 'true'

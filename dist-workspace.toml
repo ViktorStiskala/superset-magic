@@ -32,22 +32,29 @@ github-attestations = true
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 
-# Plain vX.Y.Z tag trigger — standalone single-package repo, no tag namespace needed.
-
-# Publish the Claude Code plugin zip as a standalone release asset. It rides the
-# existing `gh release create` call, so the generated release.yml is unchanged.
+# TWO release lines out of one workspace.
 #
-# `artifacts` must name a literal filename (cargo-dist does not template it), so
-# this one string is the only hand-copied version in the release path – CI's
-# version-surface assertion (R95) is what stops it from drifting. The build
-# command takes no --out: scripts/build-plugin-zip.py derives the filename from
-# the crate version in Cargo.toml, so the value is copied here rather than
-# invented twice.
+#   `ss-magic`        – the sync CLI – releases on a bare `vX.Y.Z` tag.
+#   `ss-magic-plugin` – the Claude Code plugin – releases on `ss-magic-plugin-vX.Y.Z`.
 #
-# dist gives an extra artifact no .sha256 sibling and no line in sha256.sum –
-# both are hardcoded to the per-target archives plus the source tarball. That is
-# why the plugin's integrity pin lives in .claude-plugin/marketplace.json, which
-# the Claude Code client verifies before extracting anything.
-[[dist.extra-artifacts]]
-artifacts = ["ss-magic-plugin-v0.11.0.zip"]
-build = ["python3", "scripts/build-plugin-zip.py"]
+# cargo-dist parses a tag as `[PACKAGE_NAME-]VERSION`, so the prefixed shape
+# names the plugin explicitly while the bare shape names "every dist-able package
+# sitting at that version". A bare tag therefore selects the CLI ALONE only
+# because the two crate versions always differ – there is no way to say "this tag
+# means the CLI only". `scripts/build-plugin-zip.py --check` refuses a tree where
+# the two versions match, which is what keeps that invariant true.
+#
+# The CLI's bare shape is not negotiable: the updater's anchored filter and every
+# already-installed binary look for `vX.Y.Z`, so a prefixed `ss-magic-vX.Y.Z` tag
+# would publish a release the whole installed base ignores.
+#
+# The plugin zip is declared as an extra artifact on the PLUGIN crate
+# (`[[package.metadata.dist.extra-artifacts]]` in crates/ss-magic-plugin/Cargo.toml)
+# rather than here, so it rides the plugin's tag and not the CLI's. Do not
+# duplicate it at workspace level: a workspace-level entry would attach the zip to
+# every release, including the CLI's.
+#
+# `installers = ["shell"]` above stays a workspace-level default and is overridden
+# to `[]` on the plugin package – the plugin is delivered by the marketplace, so a
+# second, unpinned install path for it would be a delivery surface nothing
+# verifies.

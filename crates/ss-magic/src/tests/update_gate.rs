@@ -106,40 +106,25 @@ fn reverse_sync_guard_active_gate_does_not_fire() {
     );
 }
 
-// ── U6: which argv can reach the gate at all ────────────────────────────────
+// ── Which argv can reach the gate at all ────────────────────────────────────
 //
-// `should_run_update_gate` only ever sees a `Command`, and `Parsed::Plugin` /
-// `Parsed::Version` are not commands — `main::run` handles them in sibling
-// arms. So the pin for "the plugin never self-updates" lives one level up, at
-// the parse layer: these argvs must never produce a `Parsed::Command`.
+// `should_run_update_gate` only ever sees a `Command`, and `Parsed::Version` is
+// not one — `main::run` handles it in a sibling arm. So the pin lives one level
+// up, at the parse layer: these argvs must never produce a `Parsed::Command`.
+//
+// There used to be a companion test here asserting that no `ss-magic plugin …`
+// argv reached the gate either. It went with the token: the plugin is a
+// separate binary that links no updater, so "the plugin never self-updates" is
+// now a property of the dependency graph (asserted by
+// `build-plugin-zip.py --check`'s workspace-shape guard and by CI's
+// `cargo tree -i self_update`) rather than of this parser.
 
 fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
 
-/// R9, R69: no `ss-magic plugin` invocation is a gated command. The binary is
-/// pinned alongside the skills and hooks the marketplace ships with it, so a
-/// mid-session self-update would desynchronise the two.
-#[test]
-fn plugin_argv_never_produces_a_gated_command() {
-    for tail in [
-        vec!["plugin"],
-        vec!["plugin", "hook", "session-start"],
-        vec!["plugin", "hook", "pre-tool-use"],
-        vec!["plugin", "status", "--json"],
-        vec!["plugin", "checklist", "list"],
-        vec!["plugin", "bogus"],
-    ] {
-        let parsed = cli::parse(&argv(&tail));
-        assert!(
-            matches!(parsed, Parsed::Plugin(_)),
-            "{tail:?} must parse to Plugin (never a gated Command), got {parsed:?}"
-        );
-    }
-}
-
 /// AE56: `--version` answers without a network round-trip, from any position
-/// ahead of the plugin token.
+/// in argv.
 #[test]
 fn version_argv_never_produces_a_gated_command() {
     for tail in [

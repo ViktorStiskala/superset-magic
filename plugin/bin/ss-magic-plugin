@@ -18,10 +18,16 @@
 #     something this plugin controls. Non-deterministic resolution is exactly
 #     what pinning a version exists to prevent, so the wrapper takes a name
 #     nothing else claims.
-#   * It injects the `plugin` verb, so a skill reads `ss-magic-plugin checklist
-#     list` rather than stuttering, and consequently cannot reach bare
-#     `ss-magic` at all - no update gate, no TUI. That posture is enforced by
-#     shape here rather than by care at every call site.
+#   * It forwards its argv VERBATIM to the pinned binary - `exec "$bin" "$@"`,
+#     with nothing prepended. The verb tree is its own binary now, so a skill's
+#     `ss-magic-plugin checklist list` is exactly the binary's own argv. (It
+#     used to prepend a `plugin` token, because the same code then lived inside
+#     the `ss-magic` CLI and was reached as `ss-magic plugin <verb>`; that token
+#     no longer exists on either side.) What has not changed is the posture the
+#     wrapper enforces by shape: the only binary it can ever reach is the
+#     version-pinned plugin binary under ${CLAUDE_PLUGIN_DATA}, never a bare
+#     `ss-magic` on the user's PATH - so a skill can reach neither the CLI's
+#     self-update gate nor its interactive TUI.
 #
 # A missing binary is a normal, expected state, not an error: the first session
 # after an install or a pin bump runs with the binary still arriving, because
@@ -46,7 +52,7 @@ explain() {
 }
 
 self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) ||
-    explain "cannot locate the plugin directory; no ss-magic command was run."
+    explain "cannot locate the plugin directory; no ss-magic-plugin command was run."
 
 # $BIN is resolved through a durable, Bash-visible handoff rather than an
 # environment variable, because no variable naming the data directory reaches
@@ -56,9 +62,9 @@ self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) ||
 # lib/tmproot.sh is the single implementation of that path, sourced by both, so
 # the writer and the reader cannot drift apart.
 lib="$self_dir/../lib/tmproot.sh"
-[ -r "$lib" ] || explain "the plugin tree is incomplete ($lib is missing); no ss-magic command was run."
+[ -r "$lib" ] || explain "the plugin tree is incomplete ($lib is missing); no ss-magic-plugin command was run."
 # shellcheck source=../lib/tmproot.sh
-. "$lib" || explain "the plugin tree is unreadable; no ss-magic command was run."
+. "$lib" || explain "the plugin tree is unreadable; no ss-magic-plugin command was run."
 
 # The variable is preferred when it happens to be set - a hook or MCP process
 # invoking this wrapper already has the authoritative value and need not go
@@ -69,7 +75,7 @@ if [ -z "$data" ]; then
     # creates the root, because a root it had to create would by definition hold
     # no handoff to read.
     root=$(ss_magic_resolve_root) ||
-        explain "the plugin has not run its session-start bootstrap yet; no ss-magic command was run."
+        explain "the plugin has not run its session-start bootstrap yet; no ss-magic-plugin command was run."
     handoff="$root/$SS_MAGIC_DATA_ROOT_FILE"
     [ -r "$handoff" ] ||
         explain "the pinned binary has not been installed yet; start a new session to install it."
@@ -80,7 +86,7 @@ if [ -z "$data" ]; then
         explain "the pinned binary has not been installed yet; start a new session to install it."
 fi
 
-bin="$data/bin/ss-magic"
+bin="$data/bin/ss-magic-plugin"
 # `lib/execguard.sh`, not a bare `[ -x ]`. `-x` is true for a DIRECTORY carrying
 # the search bit, and it cannot see execve failing on the way in, so either shape
 # would reach `exec` and end in bash's own diagnostic plus a 126 - breaking this
@@ -88,9 +94,9 @@ bin="$data/bin/ss-magic"
 # skill mid-run. The guard is shared with hooks/run-hook.sh precisely so the two
 # cannot drift apart again.
 guard="$self_dir/../lib/execguard.sh"
-[ -r "$guard" ] || explain "the plugin tree is incomplete ($guard is missing); no ss-magic command was run."
+[ -r "$guard" ] || explain "the plugin tree is incomplete ($guard is missing); no ss-magic-plugin command was run."
 # shellcheck source=../lib/execguard.sh
-. "$guard" || explain "the plugin tree is unreadable; no ss-magic command was run."
+. "$guard" || explain "the plugin tree is unreadable; no ss-magic-plugin command was run."
 
 ss_magic_is_loadable_executable "$bin" ||
     explain "the pinned binary at $bin is missing or not runnable; start a new session to install it."
@@ -99,5 +105,5 @@ ss_magic_is_loadable_executable "$bin" ||
 # (a missing shebang interpreter, a noexec mount), so control returns here and
 # reaches the explanatory exit instead of bash exiting 126 with its own message.
 shopt -s execfail
-exec "$bin" plugin "$@"
+exec "$bin" "$@"
 explain "the pinned binary at $bin could not be executed; start a new session to reinstall it."

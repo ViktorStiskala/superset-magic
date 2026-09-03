@@ -7,8 +7,8 @@
       "name": "ss-magic",
       "source": {
         "source": "archive",
-        "url": "https://github.com/ViktorStiskala/superset-magic/releases/download/v0.11.0/ss-magic-plugin-v0.11.0.zip",
-        "sha256": "b1e97c61a1b0c45761493cc7976ca7f722aad37af2e0cf8947400a8c51ae9946"
+        "url": "https://github.com/ViktorStiskala/superset-magic/releases/download/ss-magic-plugin-v1.0.0/ss-magic-plugin-v1.0.0.zip",
+        "sha256": "18e696cea7711257b625d30a3356342e07b30da45f225be4d6a7c02834604481"
       },
       "description": "Session scratchpad, context page-fault gate, operator checklist, and cost ledger for the Superset workspace contract"
     }

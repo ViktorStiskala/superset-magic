@@ -68,7 +68,7 @@ pub fn init() {
 /// Initialize the global color decision as OFF, skipping terminal detection
 /// entirely.
 ///
-/// This is what a `ss-magic plugin hook` verb calls instead of [`init`]. Such a
+/// This is what an `ss-magic-plugin hook` verb calls instead of [`init`]. Such a
 /// verb answers the harness with a single JSON object on stdout and puts every
 /// diagnostic on stderr; an ANSI escape would make the first unparseable and
 /// the second harder to read in a transcript. Detection would usually reach the

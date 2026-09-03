@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# The hook entry point: run `ss-magic plugin hook <event>` if the pinned binary
+# The hook entry point: run `ss-magic-plugin hook <event>` if the pinned binary
 # is there, and do nothing at all if it is not.
 #
 # Every EVENT hook in hooks.json is spawned through this script rather than
@@ -10,7 +10,7 @@
 # nothing when the binary is absent, and the bootstrap is what installs it, so
 # routing the bootstrap through here would leave the plugin inert forever
 # instead of for one session.
-# ${CLAUDE_PLUGIN_DATA}/bin/ss-magic does not exist until the SessionStart
+# ${CLAUDE_PLUGIN_DATA}/bin/ss-magic-plugin does not exist until the SessionStart
 # bootstrap fetches it, and hooks on one event fire CONCURRENTLY - so on a first
 # install the harness would posix_spawn a path that is not there yet and the
 # session would surface ENOENT. A hook that cannot do its job must be
@@ -77,7 +77,7 @@ if [ -z "$data" ]; then
     [ -n "${data:-}" ] || give_up
 fi
 
-bin="$data/bin/ss-magic"
+bin="$data/bin/ss-magic-plugin"
 # `-f` as well as `-x`: `-x` alone is TRUE for a directory carrying the search
 # bit, and `exec` on a directory does not fail quietly - bash prints a diagnostic
 # and exits 126, which on PreToolUse would mean an error line per tool call from
@@ -109,6 +109,10 @@ ss_magic_is_loadable_executable "$bin" || give_up
 # the binary, so a hook timeout kills the binary rather than killing this shell
 # and orphaning it. That matters most on SessionEnd, which the CLI blocks on
 # while a session exits.
+#
+# The argv is `hook <event>` and nothing else. There is no `plugin` token any
+# more: the verb tree is its OWN binary now, so its argv IS the verb, where the
+# old shared `ss-magic` binary needed a `plugin` prefix to reach the same code.
 shopt -s execfail
-exec "$bin" plugin hook "$event"
+exec "$bin" hook "$event"
 exit 0

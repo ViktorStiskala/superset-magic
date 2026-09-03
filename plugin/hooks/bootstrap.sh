@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# SessionStart bootstrap: put the pinned `ss-magic` binary at
-# ${CLAUDE_PLUGIN_DATA}/bin/ss-magic, or leave the machine exactly as it was.
+# SessionStart bootstrap: put the pinned `ss-magic-plugin` binary at
+# ${CLAUDE_PLUGIN_DATA}/bin/ss-magic-plugin, or leave the machine exactly as it
+# was.
 #
 # This script runs on every fresh session on every machine that has the plugin
 # enabled, so its failure behaviour matters more than its success behaviour:
@@ -24,6 +25,17 @@
 # The pin lives beside plugin.json inside that version-scoped root, which is
 # what makes a plugin update the thing that triggers a binary update - the two
 # cannot drift.
+#
+# There is deliberately NO cleanup of a stale ${CLAUDE_PLUGIN_DATA}/bin/ss-magic
+# left behind by a pre-split install, when the plugin still shipped inside the
+# `ss-magic` CLI binary and was reached as `ss-magic plugin <verb>`. Nothing
+# spawns that path any more - hooks.json goes through run-hook.sh, and both
+# run-hook.sh and bin/ss-magic-plugin now name bin/ss-magic-plugin - so the old
+# file is inert wherever it survives. Deleting it would mean carrying migration
+# code that runs on every machine forever to tidy one dead file on a handful of
+# dogfooding machines, which is a worse trade: a bug in that code runs at every
+# session start, while the file it removes costs a few megabytes and nothing
+# else. Anyone who wants it gone deletes it by hand.
 
 set -u
 
@@ -88,7 +100,12 @@ if [ -z "$data" ]; then
     data="${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}/plugins/data/ss-magic-ss-magic"
 fi
 
-bin_path="$data/bin/ss-magic"
+# The installed binary is `ss-magic-plugin`; the marker file names below keep
+# their historical `.ss-magic-` spelling on purpose. They are per-machine state
+# keyed to the marketplace plugin name, which is still `ss-magic`, so renaming
+# them would strand every existing install's markers and re-run the one-time
+# disclosure on machines that have already seen it.
+bin_path="$data/bin/ss-magic-plugin"
 state_file="$data/.ss-magic-installed"
 disclosed_marker="$data/.ss-magic-disclosed"
 unsupported_marker="$data/.ss-magic-unsupported"
@@ -131,12 +148,12 @@ publish_data_root
 # The pin, validated before it is used for anything at all (R71)
 # ---------------------------------------------------------------------------
 
-# Whoever can write ss-magic.version decides what every installed machine
+# Whoever can write ss-magic-plugin.version decides what every installed machine
 # downloads and executes at session start, so it is a supply-chain boundary and
 # is treated as untrusted input. It is validated as a bare MAJOR.MINOR.PATCH
 # literal BEFORE it is compared, interpolated, or allowed anywhere near a URL:
 # a pin of `1.2.3; rm -rf ~` or `../../../etc` never reaches a command line.
-pin_file="$plugin_root/ss-magic.version"
+pin_file="$plugin_root/ss-magic-plugin.version"
 [ -r "$pin_file" ] || give_up "no version pin at $pin_file; installed nothing."
 
 pin=$(tr -d '[:space:]' <"$pin_file" 2>/dev/null)
@@ -162,8 +179,10 @@ esac
 
 # Both halves must agree before this is a no-op: the marker says the last
 # install ran to completion (R73) and the binary itself answers with the pinned
-# version. `--version` short-circuits before the update gate and before the TUI,
-# so it is safe to call with no TTY and costs one fast process spawn.
+# version. `ss-magic-plugin --version` prints `ss-magic-plugin <version>` on one
+# line and exits 0 ahead of any verb parsing, so it is safe to call with no TTY,
+# never prompts, and costs one fast process spawn. `awk '{print $NF}'` takes the
+# last field of that line, which is the bare version.
 installed_version() {
     [ -x "$bin_path" ] || return 1
     "$bin_path" --version 2>/dev/null | head -1 | awk '{print $NF}'
@@ -181,7 +200,64 @@ already_installed() {
     [ "$current" = "$pin" ]
 }
 
-already_installed && exit 0
+# ---------------------------------------------------------------------------
+# Pre-seed the configuration block (R3a)
+# ---------------------------------------------------------------------------
+
+# The plugin used to be reachable from a terminal as `ss-magic plugin config
+# set ...`. It is its own binary now and the CLI has dropped the `plugin`
+# subcommand entirely, so there is no longer any terminal path a person would
+# discover for turning the plugin on or adjusting its gate. Nothing installs
+# `ss-magic-plugin` onto a user's PATH either - it lives under
+# ${CLAUDE_PLUGIN_DATA}, a directory a person is not expected to know about.
+#
+# So the settings are made discoverable in the file people already edit: this
+# folds a `plugin` block of GATE DEFAULTS into an EXISTING
+# .superset/magic.json, where the knobs can be read and changed by hand.
+#
+# WHERE THIS IS CALLED FROM, AND WHY IT IS NOT ONE PLACE. The binary is
+# installed once per MACHINE, but the block has to be seeded once per
+# REPOSITORY - and a person opens many repositories on one machine. Calling
+# this only after a fresh install would therefore seed the first repository
+# and silently skip every one after it, because `already_installed` returns
+# above that point on every later session. That is the steady state, so the
+# bug would be the common case. It is called instead from both places where a
+# usable pinned binary is known to exist: the already-installed fast path just
+# below, and the end of a successful install.
+#
+# Calling it on every session is safe because the ONCE-ness lives in the
+# binary, not in the caller: it writes only when `.superset/magic.json` has no
+# `plugin` key at all. So a repeat call is a read and an exit, measured at
+# about 6 ms, and there is no marker file to keep in sync.
+#
+# What the call never does - all of it enforced inside the binary, none of it
+# here:
+#   * it never writes the `enabled` key, so installing the plugin cannot turn
+#     the plugin on. Enablement stays a deliberate human act, which is the
+#     property that stops a repository from arranging its own enablement;
+#   * it never creates .superset/magic.json, so a repository that does not use
+#     ss-magic is left completely untouched;
+#   * it never writes through a symlink that leaves the repository;
+#   * it never stages anything with git, so the change shows up as an ordinary
+#     unstaged edit the user reviews like any other;
+#   * it does nothing at all when a `plugin` key already exists, so a
+#     hand-tuned block is never rewritten.
+#
+# Both streams are discarded and the exit status is ignored: the bootstrap's
+# contract is unchanged (no `set -e`, silent on stdout, every path exits 0),
+# and nothing about seeding a config file is worth failing a session start
+# for. It runs in this script's own working directory, which the harness sets
+# to the user's repository - that is how the binary finds the file, and why
+# there is deliberately no `cd` anywhere in this script.
+seed_config() {
+    "$bin_path" seed-config >/dev/null 2>&1
+    return 0
+}
+
+if already_installed; then
+    seed_config
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Platform (R78)
@@ -224,8 +300,9 @@ triple="$arch_part-$os_part"
 
 # Two sessions can start at the same second on a machine where neither finds a
 # binary, and both would then download the same archive. The lock is taken on
-# the R80 root's install.lock - the exact file src/plugin/tmproot.rs locks from
-# Rust - by re-executing this script under a lock holder.
+# the R80 root's install.lock - the exact file that
+# crates/ss-magic-plugin/src/tmproot.rs locks from Rust - by re-executing this
+# script under a lock holder.
 #
 # `flock(1)` is the holder where it exists (Linux). macOS does not ship it, so
 # perl's flock() - the same flock(2) underneath, on the same file - stands in.
@@ -269,18 +346,22 @@ if [ -z "${SS_MAGIC_BOOTSTRAP_LOCKED:-}" ] && command -v ss_magic_resolve_root >
 fi
 
 # Re-check under the lock: the session we just waited behind may have installed
-# exactly what we were about to download.
-already_installed && exit 0
+# exactly what we were about to download. Seed here too - this session reached
+# a usable binary, it just did not install it itself.
+if already_installed; then
+    seed_config
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Fetch, verify, extract (R71, KTD17)
 # ---------------------------------------------------------------------------
 
-# The archive is fetched directly rather than by piping ss-magic-installer.sh
-# into a shell. The release publishes a .sha256 sibling for every .tar.gz but
-# none for the installer script, so the installer is the one executed artifact
-# no published digest covers. Fetching the archive makes the verified thing and
-# the executed thing the same thing.
+# The archive is fetched directly rather than by piping a cargo-dist installer
+# script into a shell. The release publishes a .sha256 sibling for every .tar.gz
+# but none for an installer script, so such a script would be the one executed
+# artifact no published digest covers. Fetching the archive makes the verified
+# thing and the executed thing the same thing.
 downloader=""
 if command -v curl >/dev/null 2>&1; then
     downloader=curl
@@ -324,8 +405,14 @@ mkdir -p "$data" 2>/dev/null
 stage=$(mktemp -d "$data/.ss-magic-stage.XXXXXX" 2>/dev/null) ||
     give_up "cannot write to $data; installed nothing."
 
-archive_name="ss-magic-$triple.tar.gz"
-archive_url="$RELEASE_DOWNLOAD_BASE/v$pin/$archive_name"
+# The plugin binary rides its OWN release line. One repository publishes two:
+# the `ss-magic` CLI on bare `vX.Y.Z` tags, and this binary on
+# `ss-magic-plugin-vX.Y.Z`. The tag and the asset name both carry the
+# `ss-magic-plugin` prefix, so a pin of 1.0.0 resolves to
+# .../download/ss-magic-plugin-v1.0.0/ss-magic-plugin-<triple>.tar.gz and can
+# never collide with the CLI's asset for the same version number.
+archive_name="ss-magic-plugin-$triple.tar.gz"
+archive_url="$RELEASE_DOWNLOAD_BASE/ss-magic-plugin-v$pin/$archive_name"
 archive_path="$stage/$archive_name"
 
 fetch "$archive_url" "$archive_path" "$ARCHIVE_MAX_TIME" ||
@@ -352,10 +439,10 @@ tar -xzf "$archive_path" -C "$stage/x" >/dev/null 2>&1 ||
 # cargo-dist's tarball layout is <bin>-<target>/<bin>. The flat form is accepted
 # as a fallback so a layout change degrades into a working install rather than a
 # silent no-op.
-staged_bin="$stage/x/ss-magic-$triple/ss-magic"
-[ -f "$staged_bin" ] || staged_bin="$stage/x/ss-magic"
+staged_bin="$stage/x/ss-magic-plugin-$triple/ss-magic-plugin"
+[ -f "$staged_bin" ] || staged_bin="$stage/x/ss-magic-plugin"
 [ -f "$staged_bin" ] ||
-    give_up "$archive_name did not contain an ss-magic binary; installed nothing."
+    give_up "$archive_name did not contain an ss-magic-plugin binary; installed nothing."
 chmod 0755 "$staged_bin" 2>/dev/null
 
 # The checksum already proves this is the published artifact for this triple;
@@ -364,7 +451,7 @@ chmod 0755 "$staged_bin" 2>/dev/null
 # would install successfully and quietly break every hook.
 staged_version=$("$staged_bin" --version 2>/dev/null | head -1 | awk '{print $NF}')
 [ "$staged_version" = "$pin" ] ||
-    give_up "the downloaded ss-magic did not run as $pin here; installed nothing."
+    give_up "the downloaded ss-magic-plugin did not run as $pin here; installed nothing."
 
 # ---------------------------------------------------------------------------
 # Install (R73)
@@ -384,6 +471,13 @@ mv -f "$staged_bin" "$bin_path" 2>/dev/null ||
 # the next session to retry rather than trust a tree that may be half-written.
 write_line "$state_file" "$pin"
 
+# Seed the configuration block now that a usable binary is in place. See
+# `seed_config` above for what it does and why it is called from more than one
+# site. It sits before the one-time disclosure so that message stays the last
+# thing a first install prints.
+seed_config
+
+
 # ---------------------------------------------------------------------------
 # One-time disclosure (R79)
 # ---------------------------------------------------------------------------
@@ -396,8 +490,8 @@ write_line "$state_file" "$pin"
 # into the model's context.
 if [ ! -f "$disclosed_marker" ]; then
     {
-        printf 'ss-magic plugin: installed ss-magic %s into %s\n' "$pin" "$bin_path"
-        printf '  from %s/v%s (archive verified against its published SHA-256).\n' \
+        printf 'ss-magic plugin: installed ss-magic-plugin %s into %s\n' "$pin" "$bin_path"
+        printf '  from %s/ss-magic-plugin-v%s (archive verified against its published SHA-256).\n' \
             "$RELEASE_PAGE_BASE" "$pin"
         printf '  It registers hooks that run for every session while the plugin is enabled:\n'
         printf '  SessionStart, PreToolUse, PreCompact, SubagentStop, SessionEnd.\n'

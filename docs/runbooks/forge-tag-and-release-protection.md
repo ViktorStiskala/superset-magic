@@ -12,8 +12,12 @@ The plugin reaches a machine as a **release asset pinned by SHA-256** in
 integrity control on the plugin, and it is only as strong as the immutability of the thing it names.
 Two forge-side controls close the gap:
 
+This repository publishes **two release lines** out of one workspace, so both tag shapes matter here:
+`v*` for the `ss-magic` sync CLI and `ss-magic-plugin-v*` for the Claude Code plugin. The plugin's zip
+and per-target archives ride the second shape; the CLI's installer and archives ride the first.
+
 - **R99 – a tag ruleset.** Without it, a released tag can be force-moved or deleted and recreated, so
-  "the plugin at v0.10.0" stops being a fixed set of bytes.
+  "the plugin at ss-magic-plugin-v1.0.0" stops being a fixed set of bytes.
 - **R100 – release immutability.** Without it, a release asset can be **replaced under its existing
   name with the tag untouched** – demonstrated, not theoretical. The marketplace url would then serve
   different bytes, the digest check would fail for every user, and the plugin would simply stop
@@ -34,25 +38,28 @@ Two pins move in opposite orders, and the settings below are what make the order
 flowchart TD
   subgraph before["Before the tag is pushed"]
     A["Build plugin/ with scripts/build-plugin-zip.py"] --> B["Commit the digest into marketplace.json"]
-    B --> C["Bump every version surface in the same commit (R95, R98)"]
+    B --> C["Bump every version surface on the line being released (R95, R98)"]
   end
   subgraph tagging["Pushing the tag"]
-    C --> D["Push vX.Y.Z"]
+    C --> D["Push ss-magic-plugin-vX.Y.Z (plugin) or vX.Y.Z (CLI)"]
     D --> E["CI plan phase re-derives the digest and fails on a mismatch"]
-    E --> F["cargo-dist publishes the assets in one gh release create"]
+    E --> F["cargo-dist publishes that line's assets in one gh release create"]
   end
   subgraph after["After the assets exist"]
     F --> G["Release immutability freezes the assets (R100)"]
-    F --> H["Tag ruleset refuses a move or delete of vX.Y.Z (R99)"]
-    F --> I["Only now may plugin/ss-magic.version advance to X.Y.Z"]
+    F --> H["Tag ruleset refuses a move or delete of the tag (R99)"]
+    F --> I["Only now may plugin/ss-magic-plugin.version advance to X.Y.Z"]
+    F --> J["Only now may README's pinned installer tag advance to vX.Y.Z"]
   end
 ```
 
 The marketplace digest is committed **before** the tag, because the builder can produce it from the
 working tree. Between that commit and the release publishing, the entry's `url` names an asset that
-does not exist yet; that is expected and self-correcting. The binary pin in `plugin/ss-magic.version`
-is the opposite: advancing it before the named release's assets are published makes the bootstrap's
-fetch 404, so nothing installs and every hook fails open with no visible error.
+does not exist yet; that is expected and self-correcting. The two pins on the right are the opposite:
+advancing `plugin/ss-magic-plugin.version` before the named plugin release's assets are published
+makes the bootstrap's fetch 404, so nothing installs and every hook fails open with no visible error,
+and advancing README's installer tag before the named CLI release exists 404s the documented install
+command for everyone who copies it.
 
 The obvious workaround for a mis-cut release – tag, rebuild, commit the new digest, move the tag – is
 exactly what the ruleset forbids. GitHub's own documentation is blunt about it: *"Git tags cannot be
@@ -66,7 +73,7 @@ Apply this exactly. Every field is load-bearing.
 |---|---|---|
 | `target` | `tag` | branches are covered by ordinary branch protection, separately |
 | `enforcement` | `active` | `evaluate` reports without blocking, which is not the point |
-| `conditions.ref_name.include` | `["~ALL"]` | **not** `refs/tags/v*`. The release workflow triggers on `**[0-9]+.[0-9]+.[0-9]+*`, so a `0.9.1` tag with no `v` prefix would otherwise be uncovered |
+| `conditions.ref_name.include` | `["~ALL"]` | the two shapes to protect are `refs/tags/v*` and `refs/tags/ss-magic-plugin-v*`, but listing them is **not** enough: the release workflow triggers on `**[0-9]+.[0-9]+.[0-9]+*`, so a `0.9.1` tag with no `v` prefix would still be uncovered. `~ALL` is the superset that covers both shapes and anything version-shaped that slips past them |
 | `rules` | `deletion`, `non_fast_forward`, `update` | delete, force-move, and update of an existing tag |
 | `creation` | **deliberately absent** | it blocks tag *creation* for the owner too, which breaks releases – a maintainer pushing the tag is what triggers the pipeline |
 | `bypass_actors` | `[]` | a bypass actor is a hole in the only control that makes a released tag mean something |
@@ -108,14 +115,17 @@ Expected: `enforcement: "active"`, `bypass: 0`, `include: ["~ALL"]`, and `rules`
 `deletion`, `non_fast_forward` and `update`.
 
 Then prove it against a real tag, as the repository owner – the point of the check is that the owner
-is not exempt:
+is not exempt. Run steps 1 and 2 against **both** shapes, since a ruleset scoped to one of them would
+pass a check that only ever exercises that one:
 
 ```bash
-# 1. Deleting a released tag must be refused.
+# 1. Deleting a released tag must be refused, on either line.
 git push origin :refs/tags/v0.9.0
+git push origin :refs/tags/ss-magic-plugin-v1.0.0
 
-# 2. Force-moving a released tag must be refused.
+# 2. Force-moving a released tag must be refused, on either line.
 git tag -f v0.9.0 HEAD && git push --force origin v0.9.0
+git tag -f ss-magic-plugin-v1.0.0 HEAD && git push --force origin ss-magic-plugin-v1.0.0
 
 # 3. Creating a NEW tag must still succeed, or the release pipeline is broken.
 git tag test-ruleset-creation && git push origin test-ruleset-creation
@@ -143,13 +153,29 @@ ever turned off, and why.
 
 This is compatible with the pipeline as it stands: cargo-dist attaches every asset in the same
 `gh release create` call that creates the release, and no later job touches it. The plugin zip rides
-that same call as a `[[dist.extra-artifacts]]` entry, so it is frozen with everything else.
+that same call as a `[[package.metadata.dist.extra-artifacts]]` entry declared on the **plugin
+crate**, so it is frozen with the rest of the plugin release's assets. (Declaring it at workspace
+level instead would attach it to every release, the CLI's included – that is why it lives on the
+crate.)
+
+One step after the release does not touch assets and is worth knowing about here, because it looks
+at first like something immutability would block: after a plugin release, the newest bare `v*`
+release has to be re-marked as the repository's latest. That is `gh release edit --latest`, which
+changes only the mark and never an asset, so immutability does not conflict with it. It is a MANUAL
+step today — no post-announce job exists in `.github/workflows/`, and automating it is planned but
+not implemented.
 
 ### Verifying it (AE84)
 
+Substitute a tag that actually exists on each line. At the time of writing the newest published CLI
+release is `v0.10.0` and no plugin release has been cut at all, so the second command is the one to
+run first; naming an unreleased tag here would fail for a reason that has nothing to do with the
+setting under test.
+
 ```bash
-# Replacing a published asset under its existing name must be refused.
-gh release upload v0.9.0 ss-magic-plugin-v0.9.0.zip --clobber
+# Replacing a published asset under its existing name must be refused, on either line.
+gh release upload <newest ss-magic-plugin-v* tag> ss-magic-plugin-v<X.Y.Z>.zip --clobber
+gh release upload v0.10.0 ss-magic-x86_64-unknown-linux-gnu.tar.gz --clobber
 ```
 
 Expect a refusal. A release published **before** immutability was enabled will accept this, which is

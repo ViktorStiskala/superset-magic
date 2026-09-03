@@ -168,52 +168,32 @@ fn help_mentions_no_backup() {
     );
 }
 
-// ── `plugin` verb tree (U6) ───────────────────────────────────────────────────
+// ── The removed `plugin` token ────────────────────────────────────────────────
 
 #[test]
-fn plugin_token_carries_the_rest_of_argv() {
+fn plugin_is_an_unknown_subcommand_like_any_other() {
+    // The plugin is its own binary now. There is deliberately no redirect and
+    // no compatibility shim: `ss-magic plugin` was never used in production
+    // (its only callers were the plugin's own two shell scripts, which now name
+    // `ss-magic-plugin` directly), so a special-cased error would be dead weight
+    // that has to be kept honest forever.
     assert_eq!(
-        parse(&argv(&["plugin", "hook", "pre-tool-use"])),
-        Parsed::Plugin(vec!["hook".to_string(), "pre-tool-use".to_string()])
+        parse(&argv(&["plugin"])),
+        Parsed::Error("plugin".to_string())
     );
-}
-
-#[test]
-fn plugin_with_no_further_args_is_still_a_plugin_invocation() {
-    // The "no verb" error belongs to `plugin::parse`, not here.
-    assert_eq!(parse(&argv(&["plugin"])), Parsed::Plugin(vec![]));
-}
-
-#[test]
-fn plugin_keeps_flags_in_its_tail() {
-    // Unlike `init`, plugin verbs take their own flags, so nothing is filtered.
     assert_eq!(
         parse(&argv(&["plugin", "status", "--json"])),
-        Parsed::Plugin(vec!["status".to_string(), "--json".to_string()])
+        Parsed::Error("plugin".to_string())
     );
 }
 
 #[test]
-fn plugin_never_falls_through_to_bare() {
-    // Bare is the one command that opens the TUI and is gated for auto-update;
-    // no plugin argv may reach it.
-    for tail in [
-        vec!["plugin"],
-        vec!["plugin", "hook", "session-start"],
-        vec!["plugin", "bogus"],
-        vec!["plugin", "--anything"],
-    ] {
-        let parsed = parse(&argv(&tail));
-        assert!(
-            matches!(parsed, Parsed::Plugin(_)),
-            "{tail:?} should parse to Plugin, got {parsed:?}"
-        );
-    }
-}
-
-#[test]
-fn help_mentions_plugin() {
-    assert!(usage().contains("plugin"), "usage should mention plugin");
+fn usage_does_not_advertise_a_plugin_subcommand() {
+    assert!(
+        !usage().contains("plugin"),
+        "usage still names a `plugin` subcommand this binary no longer has:\n{}",
+        usage()
+    );
 }
 
 // ── `--version` / `-V` short-circuit (U6, AE56) ───────────────────────────────
@@ -225,11 +205,11 @@ fn version_long_and_short_request_version() {
 }
 
 #[test]
-fn version_wins_from_any_position_before_the_plugin_token() {
+fn version_wins_from_any_position_in_argv() {
     // Before a subcommand, after a subcommand, and among other flags: all the
     // same answer. Without this, an unrecognized `--version` would be skipped
     // as an unknown flag and land on Command::Bare — a network update check
-    // plus a menu, inside a hook that has no terminal.
+    // plus a menu, inside a script that has no terminal.
     assert_eq!(parse(&argv(&["--version", "sync"])), Parsed::Version);
     assert_eq!(parse(&argv(&["sync", "--version"])), Parsed::Version);
     assert_eq!(parse(&argv(&["pack", "-V"])), Parsed::Version);
@@ -237,25 +217,19 @@ fn version_wins_from_any_position_before_the_plugin_token() {
 }
 
 #[test]
-fn version_after_the_plugin_token_belongs_to_the_plugin_verb() {
-    // Past `plugin` the argv is the verb tree's, and a `-V` there may be a
-    // verb's own flag or a value it was given.
+fn version_no_longer_stops_at_a_plugin_token() {
+    // The scan used to stop at `plugin` so a verb's own `-V` was not eaten.
+    // With the token gone there is no sub-argv to protect, and `plugin` is just
+    // another unknown word the scan runs past.
     assert_eq!(
         parse(&argv(&["plugin", "conclude", "--version"])),
-        Parsed::Plugin(vec![
-            "conclude".to_string(),
-            "--version".to_string()
-        ])
+        Parsed::Version
     );
+    assert_eq!(parse(&argv(&["plugin", "-V"])), Parsed::Version);
     assert_eq!(
-        parse(&argv(&["plugin", "-V"])),
-        Parsed::Plugin(vec!["-V".to_string()])
+        parse(&argv(&["--version", "plugin", "status"])),
+        Parsed::Version
     );
-}
-
-#[test]
-fn version_before_the_plugin_token_still_short_circuits() {
-    assert_eq!(parse(&argv(&["--version", "plugin", "status"])), Parsed::Version);
 }
 
 #[test]

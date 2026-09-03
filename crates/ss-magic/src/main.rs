@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 
 mod cli;
 mod pack;
-mod plugin;
 mod sync;
 mod tui;
 mod update;
@@ -46,13 +45,13 @@ use crate::cli::{Command, Parsed};
 /// each is a non-interactive "do work" command, so gating keeps their users
 /// self-updating.
 ///
-/// `ss-magic plugin` is absent from `Command` altogether — it parses to
-/// `Parsed::Plugin` and is dispatched before this helper is ever reached, so no
-/// plugin invocation can self-update. That is deliberate rather than an
-/// oversight: the marketplace ships the binary together with the skills, hooks
-/// and Markdown that describe its behavior, and a mid-session swap would leave
-/// the two disagreeing. Keep this an INCLUSION list; adding a plugin arm here,
-/// or inverting it to exclusions, would silently reintroduce the update.
+/// Keep this an INCLUSION list. Inverting it to exclusions would mean every
+/// future command self-updates unless someone remembers to opt it out, and the
+/// list is short enough that naming each member costs nothing. The plugin used
+/// to be the reason this mattered most — `ss-magic plugin …` had to reach its
+/// verb tree without ever passing through here — and it is now a separate
+/// binary that links no updater at all, so that concern is structural rather
+/// than a rule this list has to keep.
 pub fn should_run_update_gate(cmd: Command, guard_active: bool) -> bool {
     if guard_active {
         return false;
@@ -69,28 +68,22 @@ fn run() -> Result<ExitCode> {
     // help response happen before the gate so `--help` answers instantly
     // without a network call.
     //
-    // Style is initialized AFTER the parse, and skipped entirely for the plugin
-    // verb tree. The color decision lives in a `OnceLock`, so whichever call
-    // makes it first wins for the whole process — and a `plugin hook` verb must
-    // force color off, because it answers the harness with JSON on stdout and
-    // an ANSI escape would make that unparseable. `plugin::run` therefore makes
-    // the choice itself, once it knows whether it is serving the harness or a
-    // person. Nothing between the parse and that point prints anything. The
-    // `inquire` prompt theme is a second step on top of the decision
-    // (`tui::theme::install`), because the palette lives in core where no
-    // prompt library is linked; only the CLI drives prompts, so only the CLI
-    // installs the theme.
+    // Style is initialized AFTER the parse so `--help` and `--version` answer
+    // without touching the terminal-detection path any earlier than needed. The
+    // color decision lives in a `OnceLock`, so whichever call makes it first
+    // wins for the whole process. The `inquire` prompt theme is a second step
+    // on top of that decision (`tui::theme::install`), because the palette
+    // lives in core where no prompt library is linked; only this binary drives
+    // prompts, so only this binary installs the theme.
     let args: Vec<String> = env::args().skip(1).collect();
     let parsed = cli::parse(&args);
-    if !matches!(parsed, Parsed::Plugin(_)) {
-        tui::style::init();
-        tui::theme::install();
-    }
+    tui::style::init();
+    tui::theme::install();
 
     match parsed {
         // `--version`/`-V`: answer and stop. No network call, no dispatch —
-        // a hook shelling out to identify the binary must not trip an update
-        // or a menu.
+        // a script shelling out to identify the binary must not trip an update
+        // or open a menu it has no terminal for.
         Parsed::Version => {
             println!("{}", version_line());
             Ok(ExitCode::SUCCESS)
@@ -110,11 +103,6 @@ fn run() -> Result<ExitCode> {
         // Non-interactive init (AN1): seed the layout from CLI patterns. Not
         // gated — one-time setup shouldn't depend on a network round-trip.
         Parsed::Init(patterns) => init_noninteractive(&patterns),
-        // The plugin verb tree. Handled here, in a sibling arm of the update
-        // gate rather than inside it, so no plugin invocation ever self-updates
-        // or opens the TUI. It is also the one arm that reaches this match with
-        // style still uninitialized, per the note above.
-        Parsed::Plugin(plugin_args) => plugin::run(&plugin_args),
         Parsed::Command(cmd) => {
             // U8: run the daily-cache auto-update gate before any work for
             // `Bare` and `Sync`. On a "newer" verdict, `auto_update` swaps the

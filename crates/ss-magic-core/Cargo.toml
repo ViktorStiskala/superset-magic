@@ -8,6 +8,12 @@ license.workspace = true
 # not published, not tagged, and bumped only on an incompatible API change.
 publish = false
 
+# Never released on its own either: a tag of EITHER line would otherwise try to
+# build and publish core's (nonexistent) binaries alongside the one that tag
+# actually names.
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 anyhow = "1"
 directories = { version = "6.0.0", default-features = false }
