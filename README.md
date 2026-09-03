@@ -507,6 +507,8 @@ ss-magic plugin enable  [--local] # turn the hooks on for this repository
 ss-magic plugin disable [--local] # stop them acting (leaves the install alone)
 ss-magic plugin config get <plugin.DOTTED.KEY>      # e.g. plugin.gate.threshold_lines
 ss-magic plugin config set <plugin.DOTTED.KEY> <VALUE> [--local]
+ss-magic plugin compact-window --recommend [--json]
+                                  # size an auto-compaction window; writes nothing
 ss-magic plugin compact-window --set <TOKENS>
                                   # opt into an absolute auto-compaction window
 ss-magic plugin setup-github-ci [--check] [--force]
@@ -521,13 +523,49 @@ ss-magic plugin --help
 session the shipped skills invoke these through a `ss-magic-plugin` wrapper on
 the session's `PATH`, so `ss-magic-plugin checklist list` is the same command.
 
+### Sizing the auto-compact window
+
+Claude Code compacts a session once its context nears the model's window. The
+knob most people reach for, the `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` environment
+variable, is a percentage that can only lower that point and means a different
+absolute cap on every model. The better knob is the first-class
+`autoCompactWindow` setting, an absolute token count (100000-1000000), and
+`ss-magic plugin compact-window --recommend` is how you find a value for it:
+
+```plaintext
+ss-magic plugin compact-window --recommend
+```
+
+It reports whether the override is set and where it came from (your shell, your
+`~/.claude/settings.json`, the project's `.claude/settings.json` or
+`.claude/settings.local.json`, or a managed settings file), the window each
+project file configures, and a recommendation sized from this repository's own
+recorded sessions: 1.25x the largest context any of the newest twenty needed,
+rounded up to the next 10,000, with `high` confidence from three or more
+sessions and `low` from fewer. With nothing recorded yet it says so and prints
+the accepted range instead of a made-up number. `--json` gives the same report
+for scripts.
+
+Nothing here writes. `--recommend` prints the exact `compact-window --set <N>`
+command and stops; `--set` is the only write the verb makes, only ever to the
+gitignored `.claude/settings.local.json`, and never over a value already there.
+ss-magic never edits your `~/.claude/settings.json`, the tracked project file,
+or a managed settings file, and never removes the override for you: the report
+names the file, and the key is yours to delete. `ss-magic plugin status` shows
+the same picture in its `Compaction` section and lists the override as a
+problem while no window replaces it; `enable` prints a one-line tip when no
+window is configured; and a fresh session start, on a machine where the
+override is in the environment and the repository sets no window, gets one
+operator notice per machine on the `systemMessage` channel (never into the
+model's context, and never in a headless session).
+
 ### Hooks
 
 The plugin registers five hook events:
 
 | Event | What it does |
 | --- | --- |
-| `SessionStart` | Installs/refreshes the pinned binary, scaffolds the scratchpad, and injects the operating guidance. |
+| `SessionStart` | Installs/refreshes the pinned binary, scaffolds the scratchpad, injects the operating guidance, and – on a fresh start only, once per machine – points an operator at `compact-window --recommend` when a percentage override is set with no window configured. |
 | `PreToolUse` | The read gate, the checklist-file deny, and an advisory nudge to update the checklist before `git commit` / `git push` / `gh pr create`. |
 | `PreCompact` | Records that a compaction is about to happen. Never blocks or slows it. |
 | `SubagentStop` | Salvages a subagent's result text, and blocks the stop once if a declared artifact is missing. |

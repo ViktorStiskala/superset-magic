@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
 use crate::git;
-use crate::plugin::scratchpad;
+use crate::plugin::{compact_window, scratchpad};
 use crate::tui::style;
 use crate::workspace::superset_files::{self, MagicConfig};
 
@@ -384,6 +384,14 @@ fn run_toggle_core(cwd: &Path, local: bool, enabled: bool) -> Result<ExitCode> {
             magic_file_label(local)
         ))
     );
+    // R27 — one line pointing at `compact-window --recommend` when this
+    // worktree configures no auto-compact window. Advice only: the tip names
+    // the verb, and that verb writes nothing until `--set` is typed (R28).
+    if enabled {
+        if let Some(tip) = compact_window::enable_tip(&cwd_root) {
+            println!("{}", style::info(tip));
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 

@@ -64,6 +64,7 @@ fn envelope_for(cwd: &Path, payload: StopPayload) -> Envelope {
             cwd: cwd.to_string_lossy().into_owned(),
             hook_event_name: "SubagentStop".to_string(),
             prompt_id: None,
+        permission_mode: None,
         },
         payload: Payload::SubagentStop(payload),
         raw: serde_json::json!({}),

@@ -569,6 +569,42 @@ either toward the other.
   only for content that is committed (the generated CI workflow). Flag a
   world-readable state file or a 0600 committed artifact.
 
+### Compaction guidance is advice only; `--set` is the single write
+
+Four surfaces talk about the auto-compact window – `compact-window
+--recommend`, `status`'s `Compaction` section and its `problems` line,
+`enable`'s tip line, and the `SessionStart` operator notice – and every one of
+them is read-only. The ONLY thing in the crate that writes a settings file is
+`compact_window::run_core`, reached from an explicit `compact-window --set
+<TOKENS>`, and it writes ONLY the gitignored `.claude/settings.local.json`,
+never over a value already there. Nothing may edit the user's
+`~/.claude/settings.json` (or `${CLAUDE_CONFIG_DIR}/settings.json`), the
+git-tracked `.claude/settings.json`, or a platform managed-settings file, and
+nothing may remove `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` from anywhere – the report
+names the file and tells the person to delete the key by hand. Flag any new
+write to a settings file outside `run_core`, any write reachable from
+`--recommend` / `status` / `enable` / a hook, an "auto-apply the
+recommendation" path, or a removal of the override; also flag a test for the
+report that does not snapshot the tree before and after.
+
+Two smaller rules ride along. The recommendation arithmetic is INTEGER
+(`(max_peak * 5).div_ceil(4)`, then `div_ceil(10_000) * 10_000`, then a clamp
+to 100000-1000000): `1.25 x 80000` must stay exactly 100,000, and a float
+rewrite would round it to 110,000 – flag one. And the once-per-machine
+`SessionStart` notice writes its `compact-advice-shown` marker only when the
+notice actually went out (a silent path – wrong source, quiet mode, a window
+already configured – must not spend the budget) and is withheld outright when
+no cache directory can be resolved, because "once" is the promise; flag a
+marker written on a silent path or a notice emitted with nowhere to record it.
+
+`hook::quiet_mode(envelope, entrypoint)` is the one "is anybody watching"
+verdict: quiet on `permission_mode` `bypassPermissions` or `dontAsk`, or on a
+`CLAUDE_CODE_ENTRYPOINT` other than `cli`; ABSENT signals are NOT quiet, on
+purpose (the notices are one operator line each and bounded, so a wrong
+"quiet" hides them from every harness that omits a field). Flag an inverted
+default, a new headless heuristic added on suspicion, or an operator notice
+placed on `additionalContext` instead of `systemMessage`.
+
 ### Exactly-once claims must not be built on `unlink`
 
 **Never treat a successful delete as having won a claim.** Measured on this

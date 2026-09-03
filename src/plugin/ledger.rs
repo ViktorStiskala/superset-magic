@@ -291,6 +291,19 @@ pub struct Row {
     /// declared rather than hidden.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unpriced_models: Vec<String>,
+    /// The largest context any one request on the MAIN transcript carried:
+    /// `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`
+    /// of a single assistant message, maximized over the session (R26, the
+    /// figure the `compact-window --recommend` heuristic sizes a window from).
+    /// Kept as a running maximum across incremental scans, so a tail that
+    /// happens to hold only small requests never lowers it. Subagent
+    /// transcripts are excluded: each runs in its own context window, and the
+    /// auto-compact window this figure informs governs the main thread.
+    /// `None` on a row written before the field existed, or for a session
+    /// whose main transcript held no assistant message at all — and a `None`
+    /// is ignored by the recommendation rather than read as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_context_tokens: Option<u64>,
 }
 
 // ── The offsets store ─────────────────────────────────────────────────────────
@@ -371,6 +384,60 @@ pub fn read(store: &Path) -> Result<Vec<Row>> {
         .lines()
         .filter_map(|line| serde_json::from_str::<Row>(line).ok())
         .collect())
+}
+
+/// The newest `limit` rows attributable to the repository whose main checkout
+/// is `main_root`, restricted to rows that carry a
+/// [`Row::peak_context_tokens`] figure — the input to the `compact-window
+/// --recommend` heuristic (R25).
+///
+/// "Attributable" means the row's `root` — or any of its `also_roots` —
+/// discovers to the same main checkout, through the same `git::discover` walk
+/// the hook path uses (KTD11). That is what pools every worktree of one
+/// repository into one population, and what makes a deleted worktree drop
+/// out on its own: a root that is no longer a directory discovers to nothing.
+/// Each distinct root is resolved once, since a ledger holds many rows per
+/// worktree, and a root whose layout the walk declines falls back to the
+/// `rev-parse` probes exactly as the hook would — this is a human verb's
+/// path, so a subprocess is affordable here.
+///
+/// A row written before the figure existed carries `None` and is left out
+/// rather than read as zero; a row with no root at all cannot be attributed
+/// anywhere and is left out too. Newest first by the row's own `ts`.
+pub fn rows_for_repository(store: &Path, main_root: &Path, limit: usize) -> Result<Vec<Row>> {
+    // Discovery hands back canonical paths, so the comparison root has to be
+    // canonical as well or a symlinked spelling of the same checkout (macOS's
+    // `/var` for `/private/var`) would match nothing.
+    let main_root = main_root
+        .canonicalize()
+        .unwrap_or_else(|_| main_root.to_path_buf());
+    let mut resolved: HashMap<String, bool> = HashMap::new();
+    let mut belongs = |root: &String| -> bool {
+        *resolved
+            .entry(root.clone())
+            .or_insert_with(|| root_belongs_to(Path::new(root), &main_root))
+    };
+
+    let mut rows: Vec<Row> = read(store)?
+        .into_iter()
+        .filter(|row| row.peak_context_tokens.is_some())
+        .filter(|row| row.root.iter().chain(row.also_roots.iter()).any(&mut belongs))
+        .collect();
+    // Newest first; the session id breaks a tie so the order is stable.
+    rows.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.session_id.cmp(&b.session_id)));
+    rows.truncate(limit);
+    Ok(rows)
+}
+
+/// Whether `root` is a worktree of the repository whose main checkout is
+/// `main_root` (canonical). A root that is no longer a directory is nobody's:
+/// discovery would only decline on it and the fallback probe would then spawn
+/// `git` in a directory that does not exist, so it is answered here first.
+fn root_belongs_to(root: &Path, main_root: &Path) -> bool {
+    if !root.is_dir() {
+        return false;
+    }
+    git::discover::roots(root).main_root.as_deref() == Some(main_root)
 }
 
 // ── The transcript tree ───────────────────────────────────────────────────────
@@ -458,6 +525,15 @@ struct Scan {
     /// True when a stored mark failed validation and the whole tree had to be
     /// re-read from the start.
     full_rescan: bool,
+    /// The largest single-request context seen on the main transcript in THIS
+    /// pass (R26) — the tail only, on an incremental scan; `build_row` folds
+    /// it into the previous row's figure as a running maximum. `None` until
+    /// the first assistant message with a `usage` block is read.
+    peak_context: Option<u64>,
+    /// Whether the file currently being read is the main transcript. Set by
+    /// [`scan_tree`] before each file, read by [`read_usage`], which has no
+    /// other way to tell a main-thread request from a subagent's.
+    in_main: bool,
 }
 
 /// A line matching this had a `usage` block, which is the only thing worth
@@ -505,6 +581,7 @@ fn scan_tree(files: &[PathBuf], prior: &Offsets) -> Scan {
         scan.bytes += meta.len();
 
         let is_main = index == 0;
+        scan.in_main = is_main;
         let start = starts[index];
         let mut per_model: HashMap<String, Tokens> = HashMap::new();
         let end = match scan_file(path, start, &mut per_model, &mut scan) {
@@ -710,6 +787,19 @@ fn read_usage(value: &Value, per_model: &mut HashMap<String, Tokens>, scan: &mut
         cache_write_1h: write_1h,
     };
     per_model.entry(model.to_string()).or_default().add(&tokens);
+
+    // R26 — the context this one request carried is its whole prompt: fresh
+    // input, what was read back from the cache, and what was written into it.
+    // The flat `cache_creation_input_tokens` is the harness's own total for
+    // the last term; the nested split is only summed for a transcript that
+    // predates the flat key, so the figure never depends on which of the two
+    // shapes a line happened to use. Main thread only: a subagent's context is
+    // its own window, not the one auto-compaction watches.
+    if scan.in_main {
+        let cache_written = num(usage, "cache_creation_input_tokens").max(write_5m + write_1h);
+        let context = tokens.input + tokens.cache_read + cache_written;
+        scan.peak_context = Some(scan.peak_context.map_or(context, |peak| peak.max(context)));
+    }
 }
 
 /// Naive substring search over bytes. Only ever called on a 256-byte head, so
@@ -848,6 +938,8 @@ fn build_row(ingest: &Ingest<'_>, base: Option<&Row>, scan: &Scan) -> Row {
     let mut unpriced: BTreeSet<String> = scan.unpriced.clone();
     let mut used_table = scan.used_table;
 
+    let mut peak_context_tokens = scan.peak_context;
+
     if let Some(base) = base {
         tokens.add(&base.tokens);
         main_table_usd += base.main_table_usd;
@@ -860,6 +952,14 @@ fn build_row(ingest: &Ingest<'_>, base: Option<&Row>, scan: &Scan) -> Row {
         };
         unpriced.extend(base.unpriced_models.iter().cloned());
         used_table |= base.price_table.is_some();
+        // R26 — a running maximum: the tail this pass read is only part of
+        // the session, so the previous row's peak stands unless the tail beat
+        // it. (A full rescan arrives here with no base and starts over, which
+        // is right: its totals start over too.)
+        peak_context_tokens = match (peak_context_tokens, base.peak_context_tokens) {
+            (Some(fresh), Some(old)) => Some(fresh.max(old)),
+            (fresh, old) => fresh.or(old),
+        };
     }
 
     // The harness's figure already covers everything on the main thread, so
@@ -896,6 +996,7 @@ fn build_row(ingest: &Ingest<'_>, base: Option<&Row>, scan: &Scan) -> Row {
         sub_table_usd,
         price_table: used_table.then(|| PRICE_TABLE_VERSION.to_string()),
         unpriced_models: unpriced.into_iter().collect(),
+        peak_context_tokens,
     }
 }
 

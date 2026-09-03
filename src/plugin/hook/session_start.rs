@@ -11,13 +11,16 @@
 //! this module only turns its [`scratchpad::Report`] into guidance text and
 //! decides whether a version-drift notice rides along.
 
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::plugin::atomic;
+use crate::plugin::compact_window::{self, OVERRIDE_ENV};
 use crate::plugin::hook::event::{Payload, Response};
-use crate::plugin::hook::{HookContext, Outcome};
+use crate::plugin::hook::{self, HookContext, Outcome};
 use crate::plugin::scratchpad::{self, Refusal, Report};
 
 /// The checklist verb family (R89, R90), spelled out here only so the injected
@@ -75,8 +78,52 @@ const STATE_FILE_NOTES: [(&str, &str); 6] = [
     ("TASKS.md", "the task list and where each item stands"),
 ];
 
+/// The name of the once-per-machine marker for the compaction notice (R27),
+/// in the `ss-magic` cache directory beside the version caches.
+const COMPACT_ADVICE_MARKER: &str = "compact-advice-shown";
+
+/// What this handler reads from outside the envelope: the process
+/// environment and the machine-level cache directory.
+///
+/// Gathered into one value and passed in, rather than read where needed, so
+/// the handler is testable without a test writing a once-per-machine marker
+/// into the developer's own cache directory — which is exactly what running
+/// the handler against the real environment would do on a machine where the
+/// override is set, and this repository's own author's is one.
+pub(crate) struct Surroundings {
+    /// `${CLAUDE_PLUGIN_ROOT}`, for the version-drift notice.
+    pub plugin_root: Option<PathBuf>,
+    /// Whether `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is set (and non-empty) in the
+    /// hook's environment — the environment the harness itself runs with,
+    /// every settings file's `env` block included.
+    pub override_present: bool,
+    /// `CLAUDE_CODE_ENTRYPOINT`, for the quiet-mode decision.
+    pub entrypoint: Option<OsString>,
+    /// Where the once-per-machine marker lives. A closure so the directory is
+    /// resolved (and, on first use, created) only once the cheap checks have
+    /// decided a notice is actually due — never on a plain `resume`.
+    pub marker_dir: Box<dyn Fn() -> Option<PathBuf>>,
+}
+
+impl Surroundings {
+    /// The real process's view.
+    fn from_process() -> Self {
+        Self {
+            plugin_root: std::env::var_os("CLAUDE_PLUGIN_ROOT").map(PathBuf::from),
+            override_present: std::env::var_os(OVERRIDE_ENV).is_some_and(|v| !v.is_empty()),
+            entrypoint: std::env::var_os(hook::ENTRYPOINT_ENV),
+            marker_dir: Box::new(crate::update::check::cache_dir),
+        }
+    }
+}
+
 /// The `SessionStart` handler wired into [`crate::plugin::hook::route`].
 pub(crate) fn handle(ctx: &HookContext<'_>) -> Result<Outcome> {
+    handle_with(ctx, &Surroundings::from_process())
+}
+
+/// [`handle`] with the environment injected.
+pub(crate) fn handle_with(ctx: &HookContext<'_>, surroundings: &Surroundings) -> Result<Outcome> {
     let source = match &ctx.envelope.payload {
         Payload::SessionStart(session_start) => session_start.source.as_str(),
         // Unreachable through `hook::route` — decoding a `SessionStart` event
@@ -97,13 +144,29 @@ pub(crate) fn handle(ctx: &HookContext<'_>) -> Result<Outcome> {
 
     let report = scratchpad::ensure(ctx.cwd())?;
     let additional_context = build_guidance(repo_root, &report);
-    let system_message = version_drift_notice(plugin_root());
 
-    let detail = if source.is_empty() {
+    // Both operator notices ride `systemMessage` and never the model-facing
+    // channel: neither is something the model can act on.
+    let drift = version_drift_notice(surroundings.plugin_root.clone());
+    let advice = compaction_advice(
+        repo_root,
+        source,
+        hook::quiet_mode(ctx.envelope, surroundings.entrypoint.as_deref()),
+        surroundings.override_present,
+        &*surroundings.marker_dir,
+        ctx.now,
+    );
+    let system_message = join_system_messages([drift, advice.message]);
+
+    let mut detail = if source.is_empty() {
         report.heartbeat_note()
     } else {
         format!("{} (source: {source})", report.heartbeat_note())
     };
+    if let Some(note) = advice.detail {
+        detail.push_str("; ");
+        detail.push_str(&note);
+    }
 
     Ok(Outcome::new(Response::SessionStart {
         additional_context: Some(additional_context),
@@ -112,12 +175,102 @@ pub(crate) fn handle(ctx: &HookContext<'_>) -> Result<Outcome> {
     .with_detail(detail))
 }
 
-/// `${CLAUDE_PLUGIN_ROOT}`, if the harness set it. Read once here, separately
-/// from [`version_drift_notice`], so that function stays a plain
-/// path-in/string-out helper a test can drive without touching the process
-/// environment.
-fn plugin_root() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_PLUGIN_ROOT").map(PathBuf::from)
+/// What [`compaction_advice`] decided.
+struct CompactionAdvice {
+    /// The notice, when one is due.
+    message: Option<String>,
+    /// A short note for the heartbeat row saying what happened — `None` on
+    /// the ordinary paths where nothing was even considered.
+    detail: Option<String>,
+}
+
+/// The notice itself. Operator-facing, so it names the verb a person types in
+/// a terminal; it never asks the model to do anything.
+const COMPACT_ADVICE_TEXT: &str = "\
+ss-magic: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is set in this session's environment and this \
+repository configures no autoCompactWindow. The percentage override can only lower the \
+auto-compact window and means a different cap on every model; an absolute window fits \
+better. Run `ss-magic plugin compact-window --recommend` for a value sized from this \
+repository's own recorded sessions — nothing is written until you run `--set`, and \
+ss-magic never edits the file the override lives in. Shown once per machine.";
+
+/// R27's one-time nudge: on a fresh `startup`, when the override is in the
+/// hook's environment and the repository configures no `autoCompactWindow`,
+/// say so once per machine on the operator channel.
+///
+/// The checks run cheapest first and the marker directory is resolved last,
+/// so a plain `resume` — or any startup on a machine without the override —
+/// never touches the cache directory at all. A silent path never writes the
+/// marker: the once-per-machine budget is spent only by a notice that
+/// actually went out. Without a directory to record it in the notice is
+/// withheld rather than repeated every session, since the bound is the
+/// promise. Advice only, every branch: nothing here writes a setting (R28).
+fn compaction_advice(
+    repo_root: &Path,
+    source: &str,
+    quiet: Option<&str>,
+    override_present: bool,
+    marker_dir: &dyn Fn() -> Option<PathBuf>,
+    now: u64,
+) -> CompactionAdvice {
+    let silent = |detail: Option<String>| CompactionAdvice {
+        message: None,
+        detail,
+    };
+    // The ordinary paths: nothing was even considered, so nothing to record.
+    if source != "startup" || !override_present {
+        return silent(None);
+    }
+    if let Some(reason) = quiet {
+        return silent(Some(format!("compaction notice withheld (quiet mode: {reason})")));
+    }
+    if compact_window::window_configured(repo_root) {
+        return silent(Some(
+            "compaction notice not needed (a window is configured)".to_string(),
+        ));
+    }
+    let Some(dir) = marker_dir() else {
+        return silent(Some(
+            "compaction notice withheld (no cache directory to record it in)".to_string(),
+        ));
+    };
+    let marker = dir.join(COMPACT_ADVICE_MARKER);
+    if marker.exists() {
+        return silent(Some(
+            "compaction notice already shown on this machine".to_string(),
+        ));
+    }
+    // The marker's contents are for a person looking at the file: when it
+    // was shown. Its existence is what the check above reads.
+    let detail = match atomic::write_atomically(
+        &marker,
+        &format!("{}\n", scratchpad::format_rfc3339(now)),
+        ".compact-advice-",
+        ".tmp",
+        Some(COMPACT_ADVICE_MARKER),
+        Some(0o600),
+        false,
+    ) {
+        Ok(()) => "compaction notice shown".to_string(),
+        // Best-effort: the notice still goes out; the worst case is a repeat
+        // on a machine whose cache directory refuses writes.
+        Err(e) => format!("compaction notice shown (marker could not be written: {e:#})"),
+    };
+    CompactionAdvice {
+        message: Some(COMPACT_ADVICE_TEXT.to_string()),
+        detail: Some(detail),
+    }
+}
+
+/// Join whichever operator notices are present into one `systemMessage`,
+/// separated by a blank line; `None` when there is nothing to say.
+fn join_system_messages<const N: usize>(parts: [Option<String>; N]) -> Option<String> {
+    let present: Vec<String> = parts.into_iter().flatten().collect();
+    if present.is_empty() {
+        None
+    } else {
+        Some(present.join("\n\n"))
+    }
 }
 
 /// Compare this binary's own compiled-in version against the plugin's

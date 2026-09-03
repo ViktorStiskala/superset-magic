@@ -193,6 +193,16 @@ fn store_path() -> Option<PathBuf> {
     Some(dirs.data_dir().join(STORE_SUBDIR))
 }
 
+/// [`store_path`], but only when the directory already exists — for the
+/// read-only verbs (`status`, `compact-window --recommend`), which must not
+/// scaffold the store they are reporting on: creating it would make "no hook
+/// has ever run here" indistinguishable from "the store exists and is empty"
+/// on the very next run.
+pub fn existing_store_dir() -> Option<PathBuf> {
+    let dir = store_path()?;
+    dir.is_dir().then_some(dir)
+}
+
 /// [`store_path`], created owner-only if it is not there yet.
 ///
 /// `None` when there is no path to resolve, or when the directory cannot be

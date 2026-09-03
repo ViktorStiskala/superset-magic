@@ -1061,3 +1061,77 @@ fn the_entry_point_has_no_non_zero_exit() {
     assert!(!code.contains("ExitCode::FAILURE"), "a non-zero exit code");
     assert!(!code.contains("std::process::exit"), "a bare process exit");
 }
+
+// ── Quiet mode (KTD12) ────────────────────────────────────────────────────────
+
+/// Decode a `SessionStart` envelope carrying `extra`, for the quiet-mode table.
+fn session_start_envelope(extra: &str) -> Envelope {
+    event::decode(
+        &HookEvent::SessionStart,
+        &envelope("SessionStart", Path::new("/repo"), extra),
+    )
+    .unwrap()
+}
+
+/// The two permission modes that mean "nobody is answering prompts here" are
+/// quiet; every other mode — including one this build has never heard of —
+/// is not.
+#[test]
+fn bypass_permissions_and_dont_ask_are_quiet_and_every_other_mode_is_not() {
+    for mode in ["bypassPermissions", "dontAsk"] {
+        let envelope = session_start_envelope(&format!(r#""permission_mode":"{mode}""#));
+        assert!(
+            quiet_mode(&envelope, None).is_some(),
+            "`{mode}` must be quiet"
+        );
+    }
+    for mode in ["default", "acceptEdits", "plan", "auto", "some-future-mode"] {
+        let envelope = session_start_envelope(&format!(r#""permission_mode":"{mode}""#));
+        assert_eq!(
+            quiet_mode(&envelope, Some(OsStr::new("cli"))),
+            None,
+            "`{mode}` must not be quiet"
+        );
+    }
+}
+
+/// `CLAUDE_CODE_ENTRYPOINT` set to anything but `cli` names an embedding
+/// (an SDK, an IDE, a remote runner) where a `systemMessage` has no terminal
+/// to land in. `cli` itself, and an empty value, are the ordinary terminal.
+#[test]
+fn an_entrypoint_other_than_cli_is_quiet() {
+    let envelope = session_start_envelope(r#""permission_mode":"default""#);
+    for entrypoint in ["sdk-ts", "sdk-py", "claude-vscode", "remote"] {
+        assert!(
+            quiet_mode(&envelope, Some(OsStr::new(entrypoint))).is_some(),
+            "entrypoint `{entrypoint}` must be quiet"
+        );
+    }
+    assert_eq!(quiet_mode(&envelope, Some(OsStr::new("cli"))), None);
+    assert_eq!(quiet_mode(&envelope, Some(OsStr::new(""))), None);
+}
+
+/// Neither signal present is NOT quiet. This is the deliberate default: the
+/// notices it gates are one operator line each and shown once per machine,
+/// so a wrong "not quiet" costs a line while a wrong "quiet" hides the notice
+/// from every user whose harness omits the field.
+#[test]
+fn absent_signals_mean_not_quiet() {
+    let envelope = session_start_envelope(r#""source":"startup""#);
+    assert_eq!(envelope.common.permission_mode, None);
+    assert_eq!(quiet_mode(&envelope, None), None);
+}
+
+/// Each quiet verdict names its reason, so a heartbeat row can say WHY a
+/// notice was withheld rather than only that it was.
+#[test]
+fn a_quiet_verdict_names_its_reason() {
+    let bypass = session_start_envelope(r#""permission_mode":"bypassPermissions""#);
+    assert!(quiet_mode(&bypass, None)
+        .unwrap()
+        .contains("bypassPermissions"));
+    let plain = session_start_envelope(r#""permission_mode":"default""#);
+    assert!(quiet_mode(&plain, Some(OsStr::new("sdk-ts")))
+        .unwrap()
+        .contains("CLAUDE_CODE_ENTRYPOINT"));
+}

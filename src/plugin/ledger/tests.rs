@@ -1006,6 +1006,7 @@ fn row_for(session_id: &str, root: Option<&str>, cost_usd: f64) -> Row {
         sub_table_usd: 0.0,
         price_table: Some(PRICE_TABLE_VERSION.to_string()),
         unpriced_models: Vec::new(),
+        peak_context_tokens: None,
     }
 }
 
@@ -1125,4 +1126,158 @@ fn scanning_a_real_tree_reports_its_time() {
         scan.files,
         scan.bytes as f64 / (1024.0 * 1024.0),
     );
+}
+
+// ── The peak context figure (R26) ─────────────────────────────────────────────
+
+/// The context one request carries is its whole prompt: the fresh input, what
+/// was read back from the cache, and what was written into it.
+fn context_of(input: u64, cache_read: u64, cache_write: u64) -> Tokens {
+    Tokens {
+        input,
+        cache_read,
+        cache_write_5m: cache_write,
+        ..Tokens::default()
+    }
+}
+
+/// The figure is the largest single request, not a sum — a session that made
+/// three 100k requests needed a 100k context, not a 300k one — and it is read
+/// from the main transcript only: a subagent runs in its own window, and the
+/// auto-compact window this figure sizes governs the main thread.
+#[test]
+fn the_peak_context_is_the_largest_single_request_on_the_main_transcript() {
+    let store = store();
+    let tree = Tree::new(
+        "s-peak",
+        &[
+            assistant("claude-sonnet-5", "/tmp/p", "main", context_of(1_000, 99_000, 0)),
+            assistant("claude-sonnet-5", "/tmp/p", "main", context_of(2_000, 100_000, 48_000)),
+            assistant("claude-sonnet-5", "/tmp/p", "main", context_of(500, 119_500, 0)),
+        ],
+    );
+    tree.subagent(
+        "subagents/agent-a.jsonl",
+        &[assistant("claude-sonnet-5", "/tmp/p", "main", context_of(900_000, 0, 0))],
+    );
+
+    let row = written(record(store.path(), &ingest("s-peak", &tree)).unwrap());
+    assert_eq!(row.peak_context_tokens, Some(150_000));
+}
+
+/// An incremental scan sees only the tail, so the figure has to be carried
+/// forward as a running maximum: a tail of small requests must not lower it,
+/// and a tail with a larger one raises it.
+#[test]
+fn the_peak_is_a_running_maximum_across_incremental_scans() {
+    let store = store();
+    let tree = Tree::new(
+        "s-peak-grow",
+        &[assistant("claude-sonnet-5", "/tmp/p", "main", context_of(0, 150_000, 0))],
+    );
+    let first = written(record(store.path(), &ingest("s-peak-grow", &tree)).unwrap());
+    assert_eq!(first.peak_context_tokens, Some(150_000));
+
+    tree.append_main(&[assistant("claude-sonnet-5", "/tmp/p", "main", context_of(0, 90_000, 0))]);
+    let second = written(record(store.path(), &ingest("s-peak-grow", &tree)).unwrap());
+    assert_eq!(
+        second.peak_context_tokens,
+        Some(150_000),
+        "a tail of smaller requests must not lower the peak"
+    );
+
+    tree.append_main(&[assistant("claude-sonnet-5", "/tmp/p", "main", context_of(0, 200_000, 0))]);
+    let third = written(record(store.path(), &ingest("s-peak-grow", &tree)).unwrap());
+    assert_eq!(third.peak_context_tokens, Some(200_000));
+    assert_eq!(read(store.path()).unwrap().len(), 1);
+}
+
+/// A main transcript with no assistant message has no request to measure, so
+/// the row carries no figure — `None`, never a zero the recommendation would
+/// then size a window from.
+#[test]
+fn a_session_with_no_assistant_message_records_no_peak() {
+    let store = store();
+    let tree = Tree::new("s-nopeak", &[cost_state("s-nopeak", 1.0)]);
+    let row = written(record(store.path(), &ingest("s-nopeak", &tree)).unwrap());
+    assert_eq!(row.peak_context_tokens, None);
+}
+
+/// A row written before R26 has no `peak_context_tokens` key at all. It must
+/// still parse — one field must not hide a month of history — and read as
+/// `None`, which is what keeps it out of the recommendation.
+#[test]
+fn a_row_written_before_the_field_existed_reads_as_none() {
+    let store = store();
+    let legacy = serde_json::to_string(&row_for("s-legacy", Some("/tmp/p"), 1.0)).unwrap();
+    assert!(
+        !legacy.contains("peak_context_tokens"),
+        "a None must serialize to no key at all, matching what older rows look like: {legacy}"
+    );
+    fs::write(ledger_path(store.path()), format!("{legacy}\n")).unwrap();
+
+    let rows = read(store.path()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].peak_context_tokens, None);
+}
+
+// ── Attributing rows to a repository (R25) ────────────────────────────────────
+
+/// `row_for` with the two fields the attribution reads.
+fn row_at(session_id: &str, root: Option<&str>, ts: u64, peak: Option<u64>) -> Row {
+    let mut row = row_for(session_id, root, 0.0);
+    row.ts = ts;
+    row.at = format_rfc3339(ts);
+    row.peak_context_tokens = peak;
+    row
+}
+
+/// The rows that size a repository's window are the ones that worked in it —
+/// in ANY of its worktrees, since they share one main checkout — that carry
+/// the figure, newest first, capped. A row from another repository, a row
+/// whose worktree is gone, a row without the figure and a row with no root at
+/// all are each dropped for their own reason.
+#[test]
+fn rows_for_repository_pools_worktrees_and_drops_everything_else() {
+    use crate::tests::support::{init_main_repo, make_worktree};
+
+    let main = init_main_repo("main");
+    let main_root = main.path().canonicalize().unwrap();
+    let (_wt_dir, wt_root) = make_worktree(main.path());
+    let other = init_main_repo("main");
+    let other_root = other.path().canonicalize().unwrap();
+
+    let store = store();
+    ensure_store(store.path()).unwrap();
+    let main_s = main_root.to_string_lossy().into_owned();
+    let wt_s = wt_root.to_string_lossy().into_owned();
+    let other_s = other_root.to_string_lossy().into_owned();
+    let mut also = row_at("s-also", Some(&other_s), NOW + 5, Some(50_000));
+    also.also_roots = vec![wt_s.clone()];
+    for row in [
+        row_at("s-main", Some(&main_s), NOW + 1, Some(100_000)),
+        row_at("s-wt", Some(&wt_s), NOW + 3, Some(120_000)),
+        row_at("s-other", Some(&other_s), NOW + 4, Some(900_000)),
+        row_at("s-gone", Some("/nonexistent/worktree/for/this/test"), NOW + 6, Some(900_000)),
+        row_at("s-nopeak", Some(&main_s), NOW + 7, None),
+        row_at("s-noroot", None, NOW + 8, Some(900_000)),
+        also,
+    ] {
+        append_row(store.path(), &row).unwrap();
+    }
+
+    let rows = rows_for_repository(store.path(), &main_root, 20).unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
+    assert_eq!(ids, vec!["s-also", "s-wt", "s-main"], "newest first, this repository only");
+
+    // The same query from the worktree's main root names the same rows, and
+    // the cap keeps the newest.
+    let capped = rows_for_repository(store.path(), &main_root, 2).unwrap();
+    let ids: Vec<&str> = capped.iter().map(|r| r.session_id.as_str()).collect();
+    assert_eq!(ids, vec!["s-also", "s-wt"]);
+
+    // And the other repository sees only its own row.
+    let theirs = rows_for_repository(store.path(), &other_root, 20).unwrap();
+    let ids: Vec<&str> = theirs.iter().map(|r| r.session_id.as_str()).collect();
+    assert_eq!(ids, vec!["s-also", "s-other"]);
 }

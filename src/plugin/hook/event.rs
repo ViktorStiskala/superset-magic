@@ -76,6 +76,17 @@ pub struct Common {
     /// Present on most events; absent on some.
     #[serde(default)]
     pub prompt_id: Option<String>,
+    /// The session's permission mode as the harness spells it — `default`,
+    /// `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`, `auto`. Read by
+    /// [`crate::plugin::hook::quiet_mode`] to keep operator notices out of a
+    /// session nobody is watching. Both the 2.1.251 bundle the contract was
+    /// measured on and the 2.1.259 bundle installed at the time of writing
+    /// build the common envelope with a `permission_mode` key, but the value
+    /// is whatever the harness had at hand and `JSON.stringify` drops an
+    /// undefined one, so it is optional here and an absent value is never
+    /// read as any particular mode.
+    #[serde(default)]
+    pub permission_mode: Option<String>,
 }
 
 /// `SessionStart` — fires on all five sources, `compact` included.

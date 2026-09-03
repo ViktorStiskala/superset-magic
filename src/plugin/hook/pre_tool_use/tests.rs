@@ -104,6 +104,7 @@ fn envelope(cwd: &Path, tool_name: &str, tool_input: serde_json::Value) -> Envel
             cwd: cwd.to_string_lossy().into_owned(),
             hook_event_name: "PreToolUse".to_string(),
             prompt_id: None,
+        permission_mode: None,
         },
         payload: Payload::PreToolUse(PreToolUse {
             tool_name: tool_name.to_string(),

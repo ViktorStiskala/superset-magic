@@ -62,6 +62,7 @@
 //! only to the events that actually write into the state tree — see
 //! [`Route::writes_state`].
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -116,6 +117,58 @@ const REASON_HANDLER_ERROR: &str = "handler-error";
 const REASON_HANDLER_PANIC: &str = "handler-panic";
 /// The handler's response could not be serialized.
 const REASON_ENCODE_FAILED: &str = "encode-failed";
+
+// ── Quiet mode ────────────────────────────────────────────────────────────────
+
+/// The environment variable the harness sets to name what launched it —
+/// `cli` for the terminal, `sdk-ts`/`sdk-py` for the Agent SDK,
+/// `claude-vscode` for the IDE extension, `remote…` for hosted runners. It is
+/// exported to the harness's child processes: this binary's own tests saw it
+/// on the Bash tool's environment, and a hook is spawned the same way.
+pub(crate) const ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
+
+/// Whether this session is one nobody is watching, so an operator notice on
+/// `systemMessage` would go unread (KTD12, R31). `Some(reason)` means quiet.
+///
+/// Two signals, either of which is enough: the envelope's `permission_mode`
+/// is `bypassPermissions` or `dontAsk` (a session configured to never wait for
+/// a person is a session no person is sitting at), or [`ENTRYPOINT_ENV`] names
+/// an embedding other than the terminal (an SDK or IDE consumes the JSON and
+/// has no terminal for a `systemMessage` to land in).
+///
+/// **Absent signals mean NOT quiet — on purpose.** A harness that omits
+/// `permission_mode` (the field is emitted from whatever value the builder had,
+/// and `JSON.stringify` drops an undefined one) or does not export the
+/// variable is treated as the ordinary terminal. The notices this gates are
+/// one operator line each, shown once per machine (the compaction advice) or
+/// once per release (the plugin update suggestion), and `version_drift_notice`
+/// already emits on the same channel with no gate at all — so a wrong "not
+/// quiet" costs one line, while a wrong "quiet" would hide the notice from
+/// every user whose harness happens to omit a field. No further heuristic (a
+/// TTY probe, a `-p` guess) is layered on top: the two signals above are the
+/// ones the plan names, and adding spellings on suspicion is how a gate grows
+/// holes.
+///
+/// `entrypoint` is the [`ENTRYPOINT_ENV`] value, passed in rather than read
+/// here so the table is testable without touching the process-wide
+/// environment every other test's child inherits; the one production caller
+/// (`session_start`) reads it once alongside the rest of its surroundings.
+pub(crate) fn quiet_mode(envelope: &Envelope, entrypoint: Option<&OsStr>) -> Option<&'static str> {
+    match envelope.common.permission_mode.as_deref() {
+        Some("bypassPermissions") => return Some("permission_mode is bypassPermissions"),
+        Some("dontAsk") => return Some("permission_mode is dontAsk"),
+        // Any other mode, and no mode at all, is a session a person may be
+        // watching.
+        _ => {}
+    }
+    match entrypoint {
+        // An empty value is as good as unset: nothing set it deliberately.
+        Some(value) if !value.is_empty() && value != "cli" => {
+            Some("CLAUDE_CODE_ENTRYPOINT names an embedding other than cli")
+        }
+        _ => None,
+    }
+}
 
 // ── What a handler is given ───────────────────────────────────────────────────
 

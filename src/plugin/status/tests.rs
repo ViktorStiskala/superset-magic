@@ -64,6 +64,7 @@ fn bare_inputs(cwd: &Path) -> Inputs {
         plugin_root: Located::missing("no ${CLAUDE_PLUGIN_ROOT} in this test"),
         data_dir: Located::missing("no ${CLAUDE_PLUGIN_DATA} in this test"),
         all: false,
+        compaction: compact_window::Sources::default(),
     }
 }
 
@@ -1113,4 +1114,167 @@ fn the_unknown_text_always_says_something() {
         "unknown — the file was not there"
     );
     assert_eq!(unknown(None), "unknown — no reason recorded");
+}
+
+
+// ── Compaction (R27) ──────────────────────────────────────────────────────────
+
+/// Sources pointing at a fake home directory, with the process environment
+/// reporting nothing — the terminal case.
+fn compaction_sources(home: &Path) -> compact_window::Sources {
+    compact_window::Sources {
+        env_override: None,
+        user_settings: Some(home.join("settings.json")),
+        managed_settings: None,
+    }
+}
+
+/// A repository with the plugin on and the state tree ignored, and a fake
+/// home whose `settings.json` sets the override in its `env` block.
+fn repo_with_override() -> (TempDir, TempDir) {
+    let repo_dir = repo("main", true);
+    ignore_state_tree(repo_dir.path());
+    let home = tempfile::tempdir().unwrap();
+    fs::write(
+        home.path().join("settings.json"),
+        r#"{"env":{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"60"}}"#,
+    )
+    .unwrap();
+    (repo_dir, home)
+}
+
+/// The override set (here, in the user's global settings) with no window
+/// configured is a `problems` line naming where it was found and the verb
+/// that sizes a replacement — and the section's own rows carry the same.
+#[test]
+fn an_override_without_a_window_is_a_problem_naming_its_location() {
+    let (repo_dir, home) = repo_with_override();
+    let mut inputs = bare_inputs(repo_dir.path());
+    inputs.compaction = compaction_sources(home.path());
+
+    let status = collect(&inputs, &probes(listing(true)));
+
+    let c = &status.compaction;
+    assert_eq!(c.override_.value.as_deref(), Some("60"));
+    assert!(
+        c.override_
+            .source
+            .as_deref()
+            .unwrap()
+            .contains(&home.path().join("settings.json").display().to_string()),
+        "{:?}",
+        c.override_
+    );
+    assert_eq!(c.window_local.value, None);
+    assert_eq!(c.window_project.value, None);
+    let problem = status
+        .problems
+        .iter()
+        .find(|p| p.contains("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"))
+        .unwrap_or_else(|| panic!("no compaction problem in {:?}", status.problems));
+    assert!(problem.contains("compact-window --recommend"), "{problem}");
+    assert!(problem.contains("by hand"), "{problem}");
+}
+
+/// A configured window is the remedy, so with one in place the override is
+/// reported but is no longer a problem.
+#[test]
+fn an_override_with_a_window_configured_is_reported_but_not_a_problem() {
+    let (repo_dir, home) = repo_with_override();
+    fs::create_dir_all(repo_dir.path().join(".claude")).unwrap();
+    fs::write(
+        repo_dir.path().join(".claude/settings.local.json"),
+        r#"{"autoCompactWindow":200000}"#,
+    )
+    .unwrap();
+    let mut inputs = bare_inputs(repo_dir.path());
+    inputs.compaction = compaction_sources(home.path());
+
+    let status = collect(&inputs, &probes(listing(true)));
+
+    assert_eq!(status.compaction.override_.value.as_deref(), Some("60"));
+    assert_eq!(status.compaction.window_local.value.as_deref(), Some("200000"));
+    assert!(
+        !status
+            .problems
+            .iter()
+            .any(|p| p.contains("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")),
+        "a configured window must silence the problem: {:?}",
+        status.problems
+    );
+}
+
+/// No override anywhere is not a problem, and the row says where it looked
+/// rather than rendering blank.
+#[test]
+fn no_override_is_not_a_problem_and_the_row_says_where_it_looked() {
+    let repo_dir = repo("main", true);
+    ignore_state_tree(repo_dir.path());
+    let home = tempfile::tempdir().unwrap();
+    let mut inputs = bare_inputs(repo_dir.path());
+    inputs.compaction = compaction_sources(home.path());
+
+    let status = collect(&inputs, &probes(listing(true)));
+
+    assert_eq!(status.compaction.override_.value, None);
+    assert!(
+        status
+            .compaction
+            .override_
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("not set"),
+        "{:?}",
+        status.compaction.override_
+    );
+    assert!(!status
+        .problems
+        .iter()
+        .any(|p| p.contains("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")));
+}
+
+/// The recommendation rests on the ledger; with no store there is none, and
+/// the row says why. The section keeps the module's rule: a null always has
+/// a note beside it.
+#[test]
+fn compaction_json_carries_a_note_beside_every_null() {
+    let repo_dir = repo("main", true);
+    ignore_state_tree(repo_dir.path());
+    let home = tempfile::tempdir().unwrap();
+    let mut inputs = bare_inputs(repo_dir.path());
+    inputs.compaction = compaction_sources(home.path());
+
+    let status = collect(&inputs, &probes(listing(true)));
+    let json = json(&status);
+
+    for key in ["override", "window_local", "window_project", "recommendation"] {
+        let field = &json["compaction"][key];
+        assert!(field["value"].is_null(), "{key}: {field}");
+        assert!(field["note"].is_string(), "{key} rendered blank: {field}");
+    }
+    assert!(
+        json["compaction"]["recommendation"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("no application data directory"),
+        "{}",
+        json["compaction"]
+    );
+}
+
+/// The text form has a section for it, with the override row never blank.
+#[test]
+fn the_text_rendering_has_a_compaction_section() {
+    let (repo_dir, home) = repo_with_override();
+    let mut inputs = bare_inputs(repo_dir.path());
+    inputs.compaction = compaction_sources(home.path());
+    let status = collect(&inputs, &probes(listing(true)));
+
+    let mut out = String::new();
+    render_text(&mut out, &status);
+    assert!(out.contains("Compaction"), "{out}");
+    assert!(out.contains("pct override"), "{out}");
+    assert!(out.contains("set to 60"), "{out}");
+    assert!(out.contains("recommended window"), "{out}");
 }

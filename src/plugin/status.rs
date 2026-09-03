@@ -56,7 +56,8 @@ use serde::{Deserialize, Serialize};
 use crate::git;
 use crate::plugin::heartbeat::{self, Outcome};
 use crate::plugin::{
-    bypass, cache, checklist, config, expect_artifact, identity, scratchpad, tmproot,
+    bypass, cache, checklist, compact_window, config, expect_artifact, identity, scratchpad,
+    tmproot,
 };
 use crate::tui::style;
 
@@ -219,6 +220,7 @@ pub struct Status {
     pub enablement: Enablement,
     pub state_tree: StateTree,
     pub gate: Gate,
+    pub compaction: Compaction,
     pub bootstrap: Bootstrap,
     pub versions: Versions,
     pub hooks: Hooks,
@@ -342,6 +344,27 @@ pub struct Gate {
     /// The checkout these came from — this worktree's own, unlike `enabled`.
     pub source_root: Option<String>,
     pub note: Option<String>,
+}
+
+/// The auto-compact window picture (R27): whether the percentage override is
+/// in force and where it comes from, whether the repository configures an
+/// absolute window, and what `compact-window --recommend` would suggest.
+/// Read-only like everything else here — the recommendation is computed from
+/// the ledger, never written anywhere.
+#[derive(Debug, Clone, Serialize)]
+pub struct Compaction {
+    /// `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`: its value and where it was found when
+    /// set; `None` with a note naming the places searched when not.
+    #[serde(rename = "override")]
+    pub override_: Field,
+    /// `autoCompactWindow` in `.claude/settings.local.json` — the file
+    /// `--set` writes and the harness prefers.
+    pub window_local: Field,
+    /// `autoCompactWindow` in the tracked `.claude/settings.json`.
+    pub window_project: Field,
+    /// The recommended window with its basis as the source, or why there is
+    /// none.
+    pub recommendation: Field,
 }
 
 /// The `SessionStart` bootstrap's state: what is pinned, what is installed, and
@@ -475,6 +498,9 @@ pub struct Inputs {
     pub data_dir: Located,
     /// Whether to report every heartbeat row rather than only this worktree's.
     pub all: bool,
+    /// Where the compaction section looks for the override beyond the
+    /// project's own files, and what the process environment says.
+    pub compaction: compact_window::Sources,
 }
 
 /// The two things `status` learns by talking to something outside itself.
@@ -858,6 +884,12 @@ pub fn collect(inputs: &Inputs, probes: &Probes) -> Status {
     };
 
     let state_tree = collect_state_tree(repo_root.as_deref(), &identity, &mut problems);
+    let compaction = collect_compaction(
+        inputs,
+        repo_root.as_deref().unwrap_or(&inputs.cwd),
+        main_root.as_deref(),
+        &mut problems,
+    );
     let bootstrap = collect_bootstrap(inputs, probes, &mut problems);
     let versions = collect_versions(inputs, &bootstrap, &harness_regs, &mut problems);
     let hooks = collect_hooks(inputs, repo_root.as_deref());
@@ -883,10 +915,97 @@ pub fn collect(inputs: &Inputs, probes: &Probes) -> Status {
         enablement,
         state_tree,
         gate,
+        compaction,
         bootstrap,
         versions,
         hooks,
         problems,
+    }
+}
+
+/// The compaction picture, and the one problem it can raise: the percentage
+/// override in force with no absolute window to stand in for it (R27).
+fn collect_compaction(
+    inputs: &Inputs,
+    root: &Path,
+    main_root: Option<&Path>,
+    problems: &mut Vec<String>,
+) -> Compaction {
+    // The same report `compact-window --recommend` prints, over the same
+    // store the heartbeat rows come from (the ledger sits beside them).
+    let report = compact_window::recommend_report(
+        root,
+        main_root,
+        inputs.store.as_deref(),
+        &inputs.compaction,
+    );
+
+    let override_ = if report.override_.set {
+        let mut values: Vec<&str> = Vec::new();
+        for found in &report.override_.locations {
+            if !values.contains(&found.value.as_str()) {
+                values.push(&found.value);
+            }
+        }
+        let locations: Vec<&str> = report
+            .override_
+            .locations
+            .iter()
+            .map(|l| l.location.as_str())
+            .collect();
+        Field::found(values.join(", "), locations.join("; "))
+    } else {
+        Field::missing(report.override_.note.clone())
+    };
+
+    let window = |setting: &compact_window::WindowSetting| match &setting.value {
+        Some(serde_json::Value::String(text)) => Field::found(text.clone(), setting.file.clone()),
+        Some(value) => Field::found(value.to_string(), setting.file.clone()),
+        None => Field::missing(format!(
+            "{} in {}",
+            setting.note.as_deref().unwrap_or("not set"),
+            setting.file
+        )),
+    };
+    let window_local = window(&report.windows.local);
+    let window_project = window(&report.windows.project);
+
+    let recommendation = match report.recommendation.tokens {
+        Some(tokens) => Field::found(
+            format!(
+                "{tokens} tokens (confidence {})",
+                report.recommendation.confidence.unwrap_or("unknown")
+            ),
+            report.recommendation.basis.clone(),
+        ),
+        None => Field::missing(
+            report
+                .recommendation
+                .note
+                .clone()
+                .unwrap_or_else(|| "no recommendation".to_string()),
+        ),
+    };
+
+    // R27 — the one problem this section raises. Advice only: the remedy is
+    // named, never applied (R28).
+    if report.override_.set && !report.windows.configured {
+        problems.push(format!(
+            "`{}` is set ({}) and this repository configures no `autoCompactWindow` — the \
+             percentage override can only lower the auto-compact window and means a \
+             different cap on every model. Remove the key by hand (ss-magic never edits \
+             a settings file) and size an absolute window with `ss-magic plugin \
+             compact-window --recommend`.",
+            compact_window::OVERRIDE_ENV,
+            override_.source.as_deref().unwrap_or("location unknown")
+        ));
+    }
+
+    Compaction {
+        override_,
+        window_local,
+        window_project,
+        recommendation,
     }
 }
 
@@ -1694,6 +1813,7 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
         plugin_root: locate_plugin_root(&harness),
         data_dir: locate_data_dir(),
         all,
+        compaction: compact_window::Sources::from_process(),
     };
     let probes = Probes {
         harness,
@@ -1710,11 +1830,10 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
 /// `heartbeat::store_dir` creates it, which is right for a hook about to append
 /// and wrong for a diagnostic: creating the store would make "no hook has ever
 /// run here" indistinguishable from "the store exists and is empty" on the very
-/// next run.
+/// next run. Shared with `compact-window --recommend`, which reads the cost
+/// ledger from the same directory under the same rule.
 fn heartbeat_store_if_present() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "ss-magic")?;
-    let dir = dirs.data_dir().join(heartbeat::STORE_SUBDIR);
-    dir.is_dir().then_some(dir)
+    heartbeat::existing_store_dir()
 }
 
 /// Render a report, as JSON or for a person.
@@ -1924,6 +2043,46 @@ fn render_text(out: &mut String, status: &Status) {
     );
     if let Some(note) = &status.gate.note {
         row(out, "", style::warn(note));
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "{}", style::header("Compaction"));
+    let c = &status.compaction;
+    // "not set" is a finding, not a gap, so the override row does not go
+    // through `row_opt`'s "unknown —" spelling.
+    match (&c.override_.value, &c.override_.source, &c.override_.note) {
+        (Some(v), source, _) => row(
+            out,
+            "pct override",
+            style::warn(format!(
+                "set to {v}   ({})",
+                source.as_deref().unwrap_or("location unknown")
+            )),
+        ),
+        (None, _, note) => row(
+            out,
+            "pct override",
+            style::ok(note.as_deref().unwrap_or("not set")),
+        ),
+    }
+    for (label, field) in [
+        ("window (local)", &c.window_local),
+        ("window (project)", &c.window_project),
+    ] {
+        match (&field.value, &field.source, &field.note) {
+            (Some(v), Some(source), _) => row(out, label, format!("{v}   ({source})")),
+            (Some(v), None, _) => row(out, label, v),
+            (None, _, note) => row(out, label, style::info(note.as_deref().unwrap_or("not set"))),
+        }
+    }
+    match (&c.recommendation.value, &c.recommendation.source, &c.recommendation.note) {
+        (Some(v), Some(source), _) => row(out, "recommended window", format!("{v}   ({source})")),
+        (Some(v), None, _) => row(out, "recommended window", v),
+        (None, _, note) => row(
+            out,
+            "recommended window",
+            style::info(note.as_deref().unwrap_or("none")),
+        ),
     }
     let _ = writeln!(out);
 

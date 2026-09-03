@@ -694,7 +694,16 @@ the tree:
   `discovery: fallback (<reason>)`, so the fallback rate is readable from
   `status`. `HookContext` carries the discovered `main_root` beside
   `repo_root`. The ignored-tree gate still asks git – it is fail-closed and
-  runs only past the enablement gate.
+  runs only past the enablement gate. `quiet_mode(envelope, entrypoint)`
+  (KTD12, R31) is the shared "is anybody watching" verdict every operator
+  notice consults: quiet when the envelope's `permission_mode` is
+  `bypassPermissions` or `dontAsk`, or when `CLAUDE_CODE_ENTRYPOINT`
+  (`ENTRYPOINT_ENV`) names an embedding other than `cli`; ABSENT signals mean
+  NOT quiet, deliberately – the notices are one operator line each and bounded
+  once-per-machine or once-per-release, so a wrong "not quiet" costs a line
+  while a wrong "quiet" hides the notice from every harness that omits a
+  field. No further heuristic is layered on; the entrypoint is injected so the
+  table is testable without touching the process environment.
 - `hook/event.rs` – the pure wire format. Decoding is permissive (unknown keys
   ignored, only `cwd` required) but routing is not: the argv token picks the
   `Payload` variant, never the envelope's own `hook_event_name`. Two structural
@@ -702,7 +711,11 @@ the tree:
   has only a `Deny` variant (a hook can never GRANT a capability), and there is
   no `updatedInput` rewrite channel anywhere in `Response`. `PreCompact` and
   `SessionEnd` have no `Response` variant at all, so their silence is enforced
-  by the compiler. `encode` emits the harness's field names –
+  by the compiler. `Common.permission_mode` is typed `Option<String>`: both the
+  2.1.251 bundle the contract was measured on and the installed 2.1.259 build
+  the common envelope with a `permission_mode` key, but its value is whatever
+  the harness had and `JSON.stringify` drops an undefined one, so absence is
+  never read as any particular mode. `encode` emits the harness's field names –
   `hookSpecificOutput`, `hookEventName`, `additionalContext`,
   `permissionDecision`, `permissionDecisionReason`, `systemMessage`, and a
   top-level `{decision: "block", reason}` for a `SubagentStop` block.
@@ -712,7 +725,22 @@ the tree:
   file exists that does not. `version_drift_notice` compares the running binary
   against the plugin root's pin and reports drift on `systemMessage`, the
   operator channel, never the model-facing one; it is best-effort and silent on
-  every failure.
+  every failure. `compaction_advice` (R27) shares that channel: on a
+  `startup` source only, when `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is in the
+  hook's environment (the harness copies every settings file's `env` block
+  into its own), the session is not `quiet_mode`, and neither project settings
+  file configures an `autoCompactWindow`, it emits one notice per machine,
+  recorded by a `compact-advice-shown` marker in the `ss-magic` cache dir –
+  written through `atomic::write_atomically`, only by a notice that actually
+  went out, and resolved LAST so a plain `resume` never touches the cache dir;
+  with no directory to record it in, the notice is withheld rather than
+  repeated. The two notices join into one `systemMessage` a blank line apart
+  (`join_system_messages`). Everything the handler reads from outside the
+  envelope – plugin root, override, entrypoint, marker dir – arrives in one
+  `Surroundings` value (`handle` = `handle_with(ctx,
+  &Surroundings::from_process())`), so no test can write a once-per-machine
+  marker into the developer's own cache directory, which running the handler
+  against the real environment would do on a machine where the override is set.
 - `hook/pre_tool_use.rs` – three jobs on one event, in a fixed decision order.
   (1) The **checklist deny**: a Read / Edit / Write / NotebookEdit of a checklist
   file (matched by the `docs/actions/<stem>.checklist.json` convention or by the
@@ -804,7 +832,9 @@ the tree:
   enablement gate costs no subprocess on the fast path – `None` falls back to
   `cwd_root`'s own overlay exactly as `resolve` does outside a repository.
   Writes are load-modify-write on exactly one file, preserving every unknown
-  key.
+  key. `enable` prints `compact_window::enable_tip` after its success line
+  (R27) – one line naming `compact-window --recommend`, only when neither
+  project settings file configures a window, and never a write.
 - `plugin/cache.rs` – the conclusion cache behind `conclude` / `conclusions` /
   `gc`. `identify` keys an entry on `(realpath, size, stamp)` – NEVER the read's
   offset or limit, so a conclusion about a file answers every later read of it.
@@ -833,7 +863,19 @@ the tree:
   max, and add table pricing for the main thread only when no harness figure
   exists, or the cost double-counts); and cache-write tokens are split 5 m
   (1.25x) versus 1 h (2x), because reading only the flat total undercounts.
-  `Basis` records which of the two priced a row.
+  `Basis` records which of the two priced a row. Each row also carries
+  `peak_context_tokens` (R26): the largest `input + cache_read +
+  cache_creation` of any ONE assistant message on the MAIN transcript –
+  subagents run in their own windows – kept as a running maximum across
+  incremental scans (`build_row` folds `max(prior, tail)`, a full rescan
+  starts over with its totals); `None` on a row written before the field
+  existed or for a session with no assistant message, and a `None` is ignored
+  rather than read as zero. `rows_for_repository(store, main_root, limit)` is
+  the recommendation's population: rows whose `root` (or any `also_roots`)
+  `git::discover`s to the same main checkout, so every worktree of one
+  repository pools together and a deleted worktree simply drops out (a root
+  that is no longer a directory is answered before discovery would spawn a
+  fallback probe in it), newest first.
 - `plugin/status.rs` – the one place that answers "why is the plugin not doing
   anything", across every silent-failure path: config disabled, harness
   registration missing or disabled, state tree not gitignored, binary not
@@ -844,7 +886,14 @@ the tree:
   `acting` is `None` rather than a guess when the harness layer is unknown.
   `DECLARED_EVENTS` lists the five events the manifest actually registers and
   deliberately excludes `file-changed`. The harness and binary probes are
-  time-bounded and degrade to a note.
+  time-bounded and degrade to a note. The `compaction` section (R27) is
+  `compact_window::recommend_report` rendered as four `Field`s – the override
+  and where it was found, the two windows, the recommendation with its basis –
+  and adds ONE `problems` line, only when the override is set AND no window is
+  configured; `Inputs.compaction` carries the `Sources` so the tests point it
+  at a fake home. The heartbeat store it reads is the non-creating
+  `heartbeat::existing_store_dir` (shared with `--recommend`), so a diagnostic
+  never scaffolds the store it reports on.
 - `plugin/spill_index.rs` – a strictly read-only listing of the harness's own
   oversized-tool-output files for this worktree, which otherwise have
   unguessable names and no index. An empty result always carries a note
@@ -856,12 +905,34 @@ the tree:
   without writing. `PinStale` is proved by re-rendering the template at the
   version found in the file and requiring an exact byte match. Written 0644 –
   committed content, unlike the 0600 state tree.
-- `plugin/compact_window.rs` – `compact-window --set <TOKENS>` writes an
-  absolute `autoCompactWindow` into the per-machine, gitignored
+- `plugin/compact_window.rs` – two halves, and the split IS the safety
+  story (R28). `compact-window --set <TOKENS>` writes an absolute
+  `autoCompactWindow` into the per-machine, gitignored
   `.claude/settings.local.json`, never the tracked `.claude/settings.json`. It
-  is strictly opt-in (no `--set` prints usage and does nothing), never clobbers
-  an existing value, load-modify-writes so unrelated harness keys survive, and
-  refuses rather than rebuilding a malformed file.
+  is strictly opt-in (no flag at all prints usage and does nothing), never
+  clobbers an existing value, load-modify-writes so unrelated harness keys
+  survive, and refuses rather than rebuilding a malformed file – and it is the
+  ONLY write in the module. `compact-window --recommend [--json]` (R24) is
+  read-only: it reports whether `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is set and
+  WHERE (the process environment, then the `env` block of the user's
+  `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`, the project's two files, and
+  the platform's managed-settings file – `Sources` carries those paths so tests
+  run against tempdirs), the window each project file configures, and a
+  recommendation with the exact `--set` command; it writes nothing and exits 0,
+  which a test proves by snapshotting the repository tree, a fake home and the
+  store before and after. The recommendation (R25, KTD11) is
+  `recommend(peaks)`: over the newest `RECOMMEND_ROWS` (20) ledger rows
+  attributable to this repository that carry `peak_context_tokens`,
+  `clamp(ceil_to_10000(1.25 × max_peak), 100000, 1000000)` in INTEGER
+  arithmetic (`(max*5).div_ceil(4)`, so `1.25 × 80000` stays exactly 100,000
+  instead of a float rounding it up to 110,000); three or more rows are `high`
+  confidence, one or two `low`, none gives no number and the generic range
+  guidance instead – never a made-up figure. `recommend_report` is the shared
+  read-only report `status`'s compaction section is built from;
+  `window_configured` / `enable_tip` are the two small helpers the other
+  advisory surfaces key on. Every advisory surface says the override is the
+  person's to remove by hand; nothing in the crate ever edits the user's
+  settings, a managed settings file, or the tracked project file.
 
 ### The operator checklist (`plugin/checklist/`)
 

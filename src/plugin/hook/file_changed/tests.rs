@@ -161,6 +161,7 @@ fn envelope_for(cwd: &Path, changed: Option<&str>, verb: &str) -> Envelope {
             cwd: cwd.to_string_lossy().into_owned(),
             hook_event_name: "FileChanged".to_string(),
             prompt_id: None,
+        permission_mode: None,
         },
         payload: Payload::FileChanged(FileChangedPayload {
             file_path: changed.map(str::to_string),

@@ -56,6 +56,7 @@ fn envelope_for(cwd: &Path, trigger: &str, custom_instructions: Option<&str>) ->
             cwd: cwd.to_string_lossy().into_owned(),
             hook_event_name: "PreCompact".to_string(),
             prompt_id: None,
+        permission_mode: None,
         },
         payload: Payload::PreCompact(PreCompactPayload {
             trigger: trigger.to_string(),

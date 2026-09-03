@@ -341,3 +341,21 @@ fn every_encoded_response_is_a_single_line() {
         assert!(!line.contains('\n'), "{line}");
     }
 }
+
+/// `permission_mode` rides the common envelope on every event. It is typed
+/// as optional and absent reads as `None` — never as a default mode — because
+/// the harness's builder emits whatever value it had and `JSON.stringify`
+/// drops an undefined one.
+#[test]
+fn permission_mode_decodes_when_present_and_is_none_when_absent() {
+    let with = envelope_json(
+        "SessionStart",
+        r#""source":"startup","permission_mode":"bypassPermissions""#,
+    );
+    let env = decode(&HookEvent::SessionStart, &with).unwrap();
+    assert_eq!(env.common.permission_mode.as_deref(), Some("bypassPermissions"));
+
+    let without = envelope_json("SessionStart", r#""source":"startup""#);
+    let env = decode(&HookEvent::SessionStart, &without).unwrap();
+    assert_eq!(env.common.permission_mode, None);
+}

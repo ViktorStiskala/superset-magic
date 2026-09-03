@@ -72,6 +72,7 @@ fn envelope_for(cwd: &Path, source: &str, session_id: &str) -> Envelope {
             cwd: cwd.to_string_lossy().into_owned(),
             hook_event_name: "SessionStart".to_string(),
             prompt_id: None,
+        permission_mode: None,
         },
         payload: Payload::SessionStart(SessionStart {
             source: source.to_string(),
@@ -105,6 +106,24 @@ fn ctx_for<'a>(
     }
 }
 
+/// Surroundings that trigger nothing: no plugin root, no override, no
+/// entrypoint, and no marker directory at all — so a test of the guidance
+/// text can never write a once-per-machine marker into the developer's own
+/// cache directory.
+fn inert() -> Surroundings {
+    Surroundings {
+        plugin_root: None,
+        override_present: false,
+        entrypoint: None,
+        marker_dir: Box::new(|| None),
+    }
+}
+
+/// [`handle`] against inert surroundings — what every guidance test drives.
+fn handle_inert(ctx: &HookContext<'_>) -> Result<Outcome> {
+    handle_with(ctx, &inert())
+}
+
 fn session_start_response(outcome: &Outcome) -> (&Option<String>, &Option<String>) {
     match &outcome.response {
         Response::SessionStart {
@@ -136,7 +155,7 @@ fn every_known_source_produces_guidance() {
     for source in ["startup", "resume", "clear", "compact", "fork"] {
         let envelope = envelope_for(&root, source, "sess-1");
         let ctx = ctx_for(&event, &envelope, Some(root.clone()), &config);
-        let outcome = handle(&ctx).unwrap();
+        let outcome = handle_inert(&ctx).unwrap();
         let (additional_context, _) = session_start_response(&outcome);
         assert!(
             additional_context.is_some(),
@@ -157,7 +176,7 @@ fn an_unrecognized_source_is_handled_like_any_other() {
     let envelope = envelope_for(&root, "some-future-source", "sess-1");
     let ctx = ctx_for(&event, &envelope, Some(root.clone()), &config);
 
-    let outcome = handle(&ctx).unwrap();
+    let outcome = handle_inert(&ctx).unwrap();
     let (additional_context, _) = session_start_response(&outcome);
     assert!(additional_context.is_some());
     assert!(outcome
@@ -178,7 +197,7 @@ fn an_empty_session_id_does_not_prevent_guidance() {
     let envelope = envelope_for(&root, "startup", "");
     let ctx = ctx_for(&event, &envelope, Some(root.clone()), &config);
 
-    let outcome = handle(&ctx).unwrap();
+    let outcome = handle_inert(&ctx).unwrap();
     let (additional_context, _) = session_start_response(&outcome);
     assert!(additional_context.is_some());
 }
@@ -193,7 +212,7 @@ fn outside_a_git_repository_emits_nothing() {
     let envelope = envelope_for(dir.path(), "startup", "sess-1");
     let ctx = ctx_for(&event, &envelope, None, &config);
 
-    let outcome = handle(&ctx).unwrap();
+    let outcome = handle_inert(&ctx).unwrap();
     assert_eq!(outcome.response, Response::Silent);
     assert!(outcome.detail.is_some(), "the heartbeat still needs a reason");
     assert!(
@@ -217,7 +236,7 @@ fn additional_context_stays_well_under_the_ten_thousand_character_budget() {
     let envelope = envelope_for(&root, "startup", "sess-1");
     let ctx = ctx_for(&event, &envelope, Some(root.clone()), &config);
 
-    let outcome = handle(&ctx).unwrap();
+    let outcome = handle_inert(&ctx).unwrap();
     let (additional_context, _) = session_start_response(&outcome);
     let text = additional_context.clone().expect("guidance must be injected");
 
@@ -376,7 +395,7 @@ fn compact_reinjects_guidance_without_touching_existing_files() {
 
     let first = envelope_for(&root, "startup", "sess-1");
     let ctx = ctx_for(&event, &first, Some(root.clone()), &config);
-    handle(&ctx).unwrap();
+    handle_inert(&ctx).unwrap();
 
     let report = scratchpad::ensure(&root).unwrap();
     let status_path = report.session_dir.join("STATUS.md");
@@ -385,7 +404,7 @@ fn compact_reinjects_guidance_without_touching_existing_files() {
 
     let second = envelope_for(&root, "compact", "sess-1");
     let ctx2 = ctx_for(&event, &second, Some(root.clone()), &config);
-    let outcome = handle(&ctx2).unwrap();
+    let outcome = handle_inert(&ctx2).unwrap();
 
     assert_eq!(
         fs::read_to_string(&status_path).unwrap(),
@@ -412,7 +431,7 @@ fn a_refused_scratchpad_does_not_claim_files_exist() {
     let envelope = envelope_for(&root, "startup", "sess-1");
     let ctx = ctx_for(&event, &envelope, Some(root.clone()), &config);
 
-    let outcome = handle(&ctx).unwrap();
+    let outcome = handle_inert(&ctx).unwrap();
     let (additional_context, _) = session_start_response(&outcome);
     let text = additional_context.as_ref().expect("a refusal still gets an explanation");
 
@@ -505,4 +524,182 @@ fn the_injected_guidance_names_the_wrapper_not_a_bare_ss_magic() {
             .any(|l| l.trim().starts_with("ss-magic plugin")),
         "the guidance must not name a bare `ss-magic`"
     );
+}
+
+
+// ── The compaction notice (R27) ───────────────────────────────────────────────
+
+/// A marker directory closure over a tempdir.
+fn marker_in(dir: &Path) -> Box<dyn Fn() -> Option<PathBuf>> {
+    let dir = dir.to_path_buf();
+    Box::new(move || Some(dir.clone()))
+}
+
+/// The ordinary case: a fresh `startup`, the override in the environment, no
+/// window configured. The notice goes out once and the marker records it;
+/// the very next startup on the same machine is silent.
+#[test]
+fn the_compaction_notice_fires_once_per_machine_on_startup() {
+    let (_dir, root) = ignored_repo();
+    let cache = tempfile::tempdir().unwrap();
+
+    let first = compaction_advice(&root, "startup", None, true, &marker_in(cache.path()), NOW);
+    let message = first.message.expect("the first startup gets the notice");
+    assert!(message.contains(OVERRIDE_ENV), "{message}");
+    assert!(message.contains("compact-window --recommend"), "{message}");
+    assert!(message.contains("never edits"), "{message}");
+    assert!(message.contains("once"), "{message}");
+    assert!(
+        cache.path().join(COMPACT_ADVICE_MARKER).is_file(),
+        "the marker must be written when the notice goes out"
+    );
+    assert!(first.detail.as_deref().unwrap().contains("shown"));
+
+    let second = compaction_advice(&root, "startup", None, true, &marker_in(cache.path()), NOW + 1);
+    assert_eq!(second.message, None, "once per machine");
+    assert!(
+        second.detail.as_deref().unwrap().contains("already shown"),
+        "{:?}",
+        second.detail
+    );
+}
+
+/// Only `startup` carries it: a resume, clear, compact or fork is the same
+/// person mid-session, and none of them may nag.
+#[test]
+fn the_compaction_notice_is_absent_on_every_source_but_startup() {
+    let (_dir, root) = ignored_repo();
+    let cache = tempfile::tempdir().unwrap();
+    for source in ["resume", "clear", "compact", "fork", "", "some-future-source"] {
+        let advice = compaction_advice(&root, source, None, true, &marker_in(cache.path()), NOW);
+        assert_eq!(advice.message, None, "source `{source}` must be silent");
+    }
+    assert!(
+        !cache.path().join(COMPACT_ADVICE_MARKER).exists(),
+        "a silent path must not consume the once-per-machine budget"
+    );
+}
+
+/// A quiet session (nobody watching) gets nothing and keeps its budget.
+#[test]
+fn the_compaction_notice_is_absent_under_quiet_mode() {
+    let (_dir, root) = ignored_repo();
+    let cache = tempfile::tempdir().unwrap();
+    let advice = compaction_advice(
+        &root,
+        "startup",
+        Some("permission_mode is bypassPermissions"),
+        true,
+        &marker_in(cache.path()),
+        NOW,
+    );
+    assert_eq!(advice.message, None);
+    assert!(advice.detail.as_deref().unwrap().contains("quiet"), "{:?}", advice.detail);
+    assert!(!cache.path().join(COMPACT_ADVICE_MARKER).exists());
+}
+
+/// A configured window IS the remedy, so there is nothing to advise.
+#[test]
+fn the_compaction_notice_is_absent_when_a_window_is_configured() {
+    let (_dir, root) = ignored_repo();
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    fs::write(
+        root.join(".claude/settings.local.json"),
+        r#"{"autoCompactWindow":200000}"#,
+    )
+    .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let advice = compaction_advice(&root, "startup", None, true, &marker_in(cache.path()), NOW);
+    assert_eq!(advice.message, None);
+    assert!(!cache.path().join(COMPACT_ADVICE_MARKER).exists());
+}
+
+/// Without the override there is nothing to advise about, whatever else is
+/// configured.
+#[test]
+fn the_compaction_notice_is_absent_when_the_override_is_not_in_the_environment() {
+    let (_dir, root) = ignored_repo();
+    let cache = tempfile::tempdir().unwrap();
+    let advice = compaction_advice(&root, "startup", None, false, &marker_in(cache.path()), NOW);
+    assert_eq!(advice.message, None);
+    assert!(!cache.path().join(COMPACT_ADVICE_MARKER).exists());
+}
+
+/// With nowhere to record that it was shown, "once per machine" cannot be
+/// kept — so the notice is withheld rather than repeated every session.
+#[test]
+fn the_compaction_notice_is_absent_when_no_marker_directory_can_be_resolved() {
+    let (_dir, root) = ignored_repo();
+    let advice = compaction_advice(&root, "startup", None, true, &|| None, NOW);
+    assert_eq!(advice.message, None);
+}
+
+/// The two operator notices share one `systemMessage`, a blank line apart.
+#[test]
+fn system_messages_join_with_a_blank_line() {
+    assert_eq!(
+        join_system_messages([Some("a".to_string()), Some("b".to_string())]),
+        Some("a\n\nb".to_string())
+    );
+    assert_eq!(
+        join_system_messages([None, Some("b".to_string())]),
+        Some("b".to_string())
+    );
+    assert_eq!(join_system_messages([None, None]), None);
+}
+
+/// Through the handler: the notice lands beside the version-drift notice on
+/// `systemMessage`, and never in `additionalContext` — the model has nothing
+/// to do with it.
+#[test]
+fn the_handler_puts_the_notice_on_system_message_beside_version_drift() {
+    let (_dir, root) = ignored_repo();
+    let plugin = tempfile::tempdir().unwrap();
+    fs::write(plugin.path().join("ss-magic.version"), "0.0.1\n").unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let surroundings = Surroundings {
+        plugin_root: Some(plugin.path().to_path_buf()),
+        override_present: true,
+        entrypoint: Some("cli".into()),
+        marker_dir: marker_in(cache.path()),
+    };
+    let event = HookEvent::SessionStart;
+    let config = PluginConfig::default();
+    let envelope = envelope_for(&root, "startup", "sess-1");
+    let ctx = ctx_for(&event, &envelope, Some(root.clone()), &config);
+
+    let outcome = handle_with(&ctx, &surroundings).unwrap();
+    let (additional_context, system_message) = session_start_response(&outcome);
+    let system_message = system_message.as_deref().expect("both notices are due");
+    assert!(system_message.contains("pins v0.0.1"), "{system_message}");
+    assert!(system_message.contains(OVERRIDE_ENV), "{system_message}");
+    assert!(system_message.contains("\n\n"), "{system_message}");
+    assert!(
+        !additional_context.as_deref().unwrap().contains(OVERRIDE_ENV),
+        "the notice must not enter the model's context"
+    );
+    assert!(outcome.detail.as_deref().unwrap().contains("compaction notice"));
+}
+
+/// The same handler under quiet surroundings: the drift notice (ungated, as
+/// before) still goes out, the compaction notice does not.
+#[test]
+fn the_handler_withholds_the_notice_under_quiet_mode() {
+    let (_dir, root) = ignored_repo();
+    let cache = tempfile::tempdir().unwrap();
+    let surroundings = Surroundings {
+        plugin_root: None,
+        override_present: true,
+        entrypoint: Some("sdk-ts".into()),
+        marker_dir: marker_in(cache.path()),
+    };
+    let event = HookEvent::SessionStart;
+    let config = PluginConfig::default();
+    let envelope = envelope_for(&root, "startup", "sess-1");
+    let ctx = ctx_for(&event, &envelope, Some(root.clone()), &config);
+
+    let outcome = handle_with(&ctx, &surroundings).unwrap();
+    let (_, system_message) = session_start_response(&outcome);
+    assert_eq!(*system_message, None);
+    assert!(!cache.path().join(COMPACT_ADVICE_MARKER).exists());
 }

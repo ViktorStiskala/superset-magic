@@ -70,6 +70,7 @@ fn envelope_for(session_id: &str, transcript_path: &str, cwd: &str, reason: &str
             cwd: cwd.to_string(),
             hook_event_name: "SessionEnd".to_string(),
             prompt_id: None,
+        permission_mode: None,
         },
         payload: Payload::SessionEnd(SessionEndPayload {
             reason: reason.to_string(),
