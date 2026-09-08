@@ -1,0 +1,74 @@
+# Keep the repository-wide "latest" mark on the CLI release line (R12).
+#
+# One repository publishes two release lines: `ss-magic` on bare `vX.Y.Z` tags
+# and `ss-magic-plugin` on `ss-magic-plugin-vX.Y.Z` tags. cargo-dist publishes
+# each with a plain `gh release create`, which marks whatever it just created as
+# the repository's latest release. Every `ss-magic` binary released before the
+# per-line update check (0.11.0) polls `releases/latest` and parses only a bare
+# `vX.Y.Z`, so a plugin release left holding the mark makes those installs
+# report "already up to date" until the next CLI release.
+#
+# This workflow runs as cargo-dist's post-announce job (registered in
+# dist-workspace.toml as `post-announce-jobs = ["./mark-latest"]`, so the
+# generated release.yml calls it after `announce` with the plan manifest) and
+# hands the mark back to the newest published `v*` release. A `v*` tag is a
+# no-op: the CLI release holds the mark itself and is never touched. The logic
+# lives in scripts/mark-latest.sh, which scripts/test-mark-latest.sh drives
+# against a fake `gh` in CI, so the selection (drafts and prereleases dropped,
+# anchored `v` + triple filter, numeric order) is tested rather than trusted.
+#
+# It is also dispatchable by hand: if the post-announce job ever cannot edit
+# the release, run it from the Actions tab with the plugin tag – or run the
+# documented one-liner in CONTRIBUTING.md.
+#
+# The token needs `contents: write` to edit a release. release.yml grants that
+# at workflow level and this reusable workflow asks for no more. The script
+# reads the mark back after editing and fails the job if it did not take, so a
+# token that cannot edit shows up red rather than as a silently kept plugin
+# mark.
+
+name: Mark newest CLI release as latest
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: cargo-dist's plan manifest (JSON); its announcement_tag is the release just published
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag just released. A plugin tag re-marks the newest v* release; a v* tag is a no-op.
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  mark-latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Re-mark the newest v* release as latest
+        env:
+          PLAN: ${{ inputs.plan }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${DISPATCH_TAG:-}"
+          if [ -z "$tag" ] && [ -n "${PLAN:-}" ]; then
+            tag=$(printf '%s' "$PLAN" | jq -r '.announcement_tag // empty')
+          fi
+          if [ -z "$tag" ]; then
+            echo "no announced tag in the plan manifest or the dispatch input; nothing to do." >&2
+            exit 0
+          fi
+          MARK_LATEST_TAG="$tag" MARK_LATEST_REPO="$GITHUB_REPOSITORY" bash scripts/mark-latest.sh

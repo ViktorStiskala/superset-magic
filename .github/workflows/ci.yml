@@ -249,6 +249,16 @@ jobs:
           fi
           echo "ok: README names no releases/latest/download/ URL"
 
+      # After a plugin release, the post-announce job hands the repository-wide
+      # "latest" mark back to the newest CLI release (R12) – every ss-magic
+      # binary released before the per-line update check polls releases/latest
+      # and parses only a bare vX.Y.Z. The selection runs in a shell script
+      # against a fake `gh`, over the same tag list the Rust filter is tested
+      # with: drafts and prereleases dropped, anchored `v` + triple, numeric
+      # order, and the plugin tag never chosen.
+      - name: Latest-mark selection (scripts/mark-latest.sh)
+        run: bash scripts/test-mark-latest.sh
+
       # The bootstrap runs at every fresh session on every machine with the
       # plugin enabled, so its failure paths matter more than its success path:
       # offline, a corrupted download, a hostile version pin, an unwritable data

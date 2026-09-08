@@ -1311,7 +1311,9 @@ the release assertions), `scripts/test-bootstrap.sh` (the bootstrap's
 failure-path suite), `assets/workflow/checklist.yml` (embedded by the plugin crate's `setup_ci.rs`;
 it installs `ss-magic-plugin` from an `ss-magic-plugin-v…` release and its env
 var is `SS_MAGIC_PLUGIN_VERSION`), `.gitattributes` (line-ending pinning for
-the digest), and
+the digest), `scripts/mark-latest.sh` + `scripts/test-mark-latest.sh` +
+`.github/workflows/mark-latest.yml` (the post-announce latest-mark step, see
+Build), and
 `docs/runbooks/forge-tag-and-release-protection.md` (tag/release immutability
 settings a human must apply by hand – currently NOT applied).
 
@@ -1460,8 +1462,8 @@ binary is the sole file-copy implementation.)
   `^ss-magic-plugin-v[0-9]+\.[0-9]+\.[0-9]+$`, since a prefixed CLI tag such as
   `ss-magic-v0.11.1` would publish a release the updater's anchored filter and
   every installed binary ignore.
-- **`cargo test --workspace` is no longer the whole suite.** FOUR checks cover
-  ground `cargo test` cannot reach, and CI runs all four:
+- **`cargo test --workspace` is no longer the whole suite.** FIVE checks cover
+  ground `cargo test` cannot reach, and CI runs all five:
   `python3 scripts/build-plugin-zip.py --selftest` (the builder's own
   reproducibility and refusal tests); `python3 scripts/build-plugin-zip.py
   --check`, which now prints SEVEN assertion lines – `R101 marketplace sha256
@@ -1482,7 +1484,14 @@ binary is the sole file-copy implementation.)
   streams empty and the binary un-invoked when it cannot resolve one; PLUS a
   manifest invariant asserted over EVERY `hooks.json` entry rather than the
   bootstrap group alone. Written for bash 3.2, so no associative arrays, no
-  `mapfile`, no `${var^^}`).
+  `mapfile`, no `${var^^}`); and `/bin/bash scripts/test-mark-latest.sh` (the
+  latest-mark selection behind the post-announce job, against a fake `gh` over
+  the AE1 tag list: the plugin tag, a draft, a prerelease and a wrongly-prefixed
+  CLI tag are never chosen, `v0.11.10` beats `v0.11.3` numerically, a `v*` tag
+  never invokes `gh`, a dry run edits nothing, and a mark that did not take is
+  exit 1 – also bash 3.2, where a `case` arm cannot sit inside `$( … )` and a
+  `read` loop must handle an unterminated last line or drop the newest
+  release when it is listed last).
 - The plugin's packaged tree is **content-pinned**. Any change under `plugin/`
   moves the zip's digest, so it must be followed by `python3
   scripts/build-plugin-zip.py --update-manifest` and then `--check`, and by a
@@ -1496,6 +1505,31 @@ binary is the sole file-copy implementation.)
   the digest, is the harness's update signal: changing the zip and its `sha256`
   without bumping the version leaves every installed user silently on the
   cached copy.
+- After a PLUGIN release, the repository-wide `releases/latest` mark must name
+  a bare `v*` release again (R12): `gh release create` marks whatever it just
+  published as latest, and every `ss-magic` binary released before the
+  per-line check (0.11.0) polls that mark and parses only a bare `vX.Y.Z`, so
+  a plugin release left holding it makes those installs report "up to date"
+  until the next CLI release. cargo-dist's post-announce job does it:
+  `dist-workspace.toml` sets `post-announce-jobs = ["./mark-latest"]`, so the
+  generated `release.yml` gains `custom-mark-latest` (needs `plan` and
+  `announce`, `uses: ./.github/workflows/mark-latest.yml` with the plan
+  manifest as `plan`, `secrets: inherit`), whose one step reads
+  `announcement_tag` from the plan and runs `scripts/mark-latest.sh`. The
+  script exits 0 at once for a bare `v*` tag; otherwise it lists releases
+  (`--limit 200` – the default 30 would truncate), DROPS drafts and
+  prereleases, keeps only exact `v` + triple tags, picks the numerically
+  greatest (`v0.11.10` over `v0.11.3`, sorted on the bare triple – a
+  mid-field sort key was not numeric on BSD sort), runs `gh release edit
+  <tag> --latest`, and reads `releases/latest` back, FAILING the job if it
+  does not name that tag so a token that cannot edit shows up red.
+  `MARK_LATEST_DRY_RUN=1` prints the chosen tag instead. The workflow is also
+  `workflow_dispatch`-able with the tag as input (the documented fallback);
+  it asks for `contents: write`, which `release.yml` grants at workflow level.
+  `scripts/test-mark-latest.sh` drives the script against a fake `gh` over
+  the AE1 tag list (bash 3.2, run by CI's `plugin` job); `dist generate
+  --check` must stay green after any `dist-workspace.toml` change, and the
+  `release.yml` is REGENERATED, never hand-edited.
 - Version bumps follow the GROUP, never the repository. Bump
   `crates/ss-magic/Cargo.toml` and the matching `ss-magic` entry in `Cargo.lock`
   on any change that alters CLI behavior – a fix, a new/changed command or flag,

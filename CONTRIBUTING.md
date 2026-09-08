@@ -150,9 +150,12 @@ Outside the crates, the plugin ships as a packaged tree: `plugin/` (its manifest
 hooks, bootstrap script, hook shim, wrapper, shared shell libs, version pin and
 skills), `.claude-plugin/marketplace.json` (which pins that tree's zip by
 SHA-256), `scripts/build-plugin-zip.py` (the reproducible builder and the
-release assertions), `scripts/test-bootstrap.sh`, and
-`assets/workflow/checklist.yml` (embedded into the plugin binary by its
-`setup_ci.rs`).
+release assertions), `scripts/test-bootstrap.sh`, `scripts/mark-latest.sh` (the
+post-announce step that keeps the repository's "latest" mark on the CLI line,
+with `scripts/test-mark-latest.sh` driving it against a fake `gh`),
+`.github/workflows/mark-latest.yml` (the reusable workflow cargo-dist calls it
+from), and `assets/workflow/checklist.yml` (embedded into the plugin binary by
+its `setup_ci.rs`).
 
 `assets/magic.sh` is the canonical wrapper script, embedded into the binary
 via `include_str!` — edit it there, never in a repo's generated `.superset/`
@@ -185,7 +188,7 @@ A few boundaries to preserve:
 
 ## Tests
 
-`cargo test` is no longer the whole suite. Run all four the way CI does, from
+`cargo test` is no longer the whole suite. Run all five the way CI does, from
 the repository root:
 
 ```sh
@@ -193,9 +196,10 @@ cargo test --workspace --locked                  # the Rust suite, all three cra
 python3 scripts/build-plugin-zip.py --selftest   # the plugin builder's own tests
 python3 scripts/build-plugin-zip.py --check      # the release assertions
 /bin/bash scripts/test-bootstrap.sh              # the bootstrap's failure paths
+/bin/bash scripts/test-mark-latest.sh            # the latest-mark selection
 ```
 
-The last three cover code `cargo test` cannot reach:
+The last four cover code `cargo test` cannot reach:
 
 - `--selftest` exercises the builder's reproducibility guarantees (sorted
   entries, fixed 1980-01-01 timestamps, normalized modes, stored not deflated)
@@ -296,7 +300,8 @@ CI (`.github/workflows/ci.yml`) runs the Rust suite on Ubuntu and macOS for
 every PR commit and every push to `main`, plus a `plugin` job carrying the
 builder selftest, the release assertions, the `cargo tree` dependency-absence
 proof, a check that a content change under `plugin/` came with a version bump
-(its baseline considers both tag shapes), the bootstrap failure-path suite, a
+(its baseline considers both tag shapes), the bootstrap failure-path suite, the
+latest-mark selection suite, a
 build of the exact asset cargo-dist will publish, and three document greps: no
 skill body may name `CLAUDE_PLUGIN_DATA`, no document may spell the retired
 `ss-magic` `plugin` subcommand form, and `README.md` may name no
@@ -448,18 +453,29 @@ newest `v*` release is still marked latest:
 
 ```sh
 gh api repos/ViktorStiskala/superset-magic/releases/latest --jq .tag_name
-# Today this WILL print the plugin tag, and putting the mark back is a manual
-# step you have to take:
-gh release edit <newest bare v tag> --latest
 ```
 
-This is not optional housekeeping. `gh release create` marks whatever it just
+That must print a bare `v*` tag. `gh release create` marks whatever it just
 published as the repository's latest release, and every `ss-magic` binary
 released before the per-line update check polls `releases/latest` and parses
-only a bare `vX.Y.Z`. A plugin release left holding the mark makes those
-installs report "already up to date" until the next CLI release. Automating it
-as a cargo-dist `post-announce-jobs` step is planned but **not implemented** —
-until it is, the command above is the whole mechanism.
+only a bare `vX.Y.Z`; a plugin release left holding the mark makes those
+installs report "already up to date" until the next CLI release. So the release
+workflow's post-announce job (`custom-mark-latest`, from
+`dist-workspace.toml`'s `post-announce-jobs = ["./mark-latest"]`, running
+`.github/workflows/mark-latest.yml` → `scripts/mark-latest.sh`) hands the mark
+back: for a plugin tag it lists the releases, drops drafts and prereleases,
+picks the numerically greatest bare `v*` tag, runs `gh release edit <tag>
+--latest`, and reads `releases/latest` back – failing the job loudly if the
+mark did not take. For a `v*` tag it exits 0 without touching anything.
+
+If the command above prints the plugin tag anyway – the job was red, or the
+token could not edit the release – put the mark back by hand, either from the
+Actions tab (`Mark newest CLI release as latest` → Run workflow, with the
+plugin tag as input) or with the one-liner the job itself prints on failure:
+
+```sh
+gh release edit <newest bare v tag> --latest
+```
 
 **Plugin tags are cut only from commits already on the default branch.**
 `/plugin` resolves the available version from `.claude-plugin/marketplace.json`

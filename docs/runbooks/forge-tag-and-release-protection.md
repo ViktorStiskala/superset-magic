@@ -161,9 +161,11 @@ crate.)
 One step after the release does not touch assets and is worth knowing about here, because it looks
 at first like something immutability would block: after a plugin release, the newest bare `v*`
 release has to be re-marked as the repository's latest. That is `gh release edit --latest`, which
-changes only the mark and never an asset, so immutability does not conflict with it. It is a MANUAL
-step today — no post-announce job exists in `.github/workflows/`, and automating it is planned but
-not implemented.
+changes only the mark and never an asset, so immutability does not conflict with it. The release
+workflow does it automatically: cargo-dist's post-announce job `custom-mark-latest` calls
+`.github/workflows/mark-latest.yml`, which runs `scripts/mark-latest.sh` and fails loudly if the
+mark did not take. The same workflow is `workflow_dispatch`-able as the manual fallback, and
+`CONTRIBUTING.md` documents the one-line `gh release edit` alternative.
 
 ### Verifying it (AE84)
 

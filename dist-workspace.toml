@@ -22,6 +22,15 @@ install-updater = false
 # plan-phase job. build-local-artifacts depends on it, so red tests mean no
 # artifacts are ever built (and hence nothing can be published).
 plan-jobs = ["./ci"]
+# After a release is announced, give the repository-wide "latest" mark back to
+# the newest CLI release if a plugin release just took it (R12). `gh release
+# create` marks whatever it published as latest, and every `ss-magic` binary
+# released before the per-line update check polls `releases/latest` and parses
+# only a bare `vX.Y.Z` – a plugin release left holding the mark makes those
+# installs report "already up to date" until the next CLI release. The job is
+# .github/workflows/mark-latest.yml, driving scripts/mark-latest.sh; a `v*` tag
+# exits 0 at once, so the CLI's own releases never touch the mark.
+post-announce-jobs = ["./mark-latest"]
 # Attest the per-target release archives (Sigstore/SLSA provenance via
 # actions/attest). Default phase (build-local-artifacts) is deliberate:
 # it signs same-job build output before it transits Actions artifact

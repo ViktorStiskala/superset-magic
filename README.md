@@ -111,10 +111,12 @@ arm64). Windows is not in the release matrix yet.
 This repository publishes **two release lines** out of one workspace: the
 `ss-magic` CLI on bare `vX.Y.Z` tags, and the
 [Claude Code plugin](#the-claude-code-plugin) on `ss-magic-plugin-vX.Y.Z` tags.
-GitHub's "latest" mark is repository-wide, so it can point at a plugin release –
-which publishes no installer script at all, and would 404 the command above.
-A pinned URL is also simply reproducible: what you copy today installs the same
-bytes tomorrow.
+GitHub's "latest" mark is repository-wide, so right after a plugin release it
+points at that release – which publishes no installer script at all, and would
+404 the command above. (The release workflow hands the mark back to the newest
+CLI release in a post-announce step, so the window is minutes, but a pinned
+URL never depends on it.) A pinned URL is also simply reproducible: what you
+copy today installs the same bytes tomorrow.
 
 The pinned tag is allowed to lag the newest CLI version, and usually does by one
 release. The release procedure is bump → merge → tag, so a README forced to name
