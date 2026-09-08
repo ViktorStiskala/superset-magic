@@ -9,7 +9,11 @@
 //! handler is a thin caller: [`scratchpad::ensure`] (U8) owns every rule
 //! about what gets created, rewritten or refused in `.superset/.magic/`;
 //! this module only turns its [`scratchpad::Report`] into guidance text and
-//! decides whether a version-drift notice rides along.
+//! decides which operator notices ride along on `systemMessage`: the
+//! version-drift notice, the compaction advice (R27) and the plugin release
+//! suggestion (R29). The last one reads a cache file and never the network:
+//! when the cache is stale this handler spawns a detached refresh and
+//! returns without waiting (R30), so session start is never delayed by it.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -17,11 +21,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use ss_magic_core::release::{self, PLUGIN_LINE};
+
 use crate::atomic;
 use crate::compact_window::{self, OVERRIDE_ENV};
 use crate::hook::event::{Payload, Response};
 use crate::hook::{self, HookContext, Outcome};
+use crate::release_check::{self, Decision, Recorded};
 use crate::scratchpad::{self, Refusal, Report};
+use crate::tmproot;
 
 /// The checklist verb family (R89, R90), spelled out here only so the injected
 /// guidance can name them. The schema and the verbs themselves belong to
@@ -83,15 +91,18 @@ const STATE_FILE_NOTES: [(&str, &str); 6] = [
 const COMPACT_ADVICE_MARKER: &str = "compact-advice-shown";
 
 /// What this handler reads from outside the envelope: the process
-/// environment and the machine-level cache directory.
+/// environment, the machine-level cache directory, the lock root, and the
+/// ability to spawn a process.
 ///
 /// Gathered into one value and passed in, rather than read where needed, so
 /// the handler is testable without a test writing a once-per-machine marker
 /// into the developer's own cache directory — which is exactly what running
 /// the handler against the real environment would do on a machine where the
-/// override is set, and this repository's own author's is one.
+/// override is set, and this repository's own author's is one — and without
+/// a test ever spawning a real release refresh against the network.
 pub(crate) struct Surroundings {
-    /// `${CLAUDE_PLUGIN_ROOT}`, for the version-drift notice.
+    /// `${CLAUDE_PLUGIN_ROOT}`, for the version-drift notice and the release
+    /// suggestion's pin.
     pub plugin_root: Option<PathBuf>,
     /// Whether `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is set (and non-empty) in the
     /// hook's environment — the environment the harness itself runs with,
@@ -99,10 +110,20 @@ pub(crate) struct Surroundings {
     pub override_present: bool,
     /// `CLAUDE_CODE_ENTRYPOINT`, for the quiet-mode decision.
     pub entrypoint: Option<OsString>,
-    /// Where the once-per-machine marker lives. A closure so the directory is
-    /// resolved (and, on first use, created) only once the cheap checks have
-    /// decided a notice is actually due — never on a plain `resume`.
-    pub marker_dir: Box<dyn Fn() -> Option<PathBuf>>,
+    /// The `ss-magic` cache directory, where both the compaction notice's
+    /// once-per-machine marker and the plugin release cache live. A closure
+    /// so the directory is resolved (and, on first use, created) only once
+    /// the cheap checks have decided there is something to read or record —
+    /// never on a plain `resume`.
+    pub cache_dir: Box<dyn Fn() -> Option<PathBuf>>,
+    /// The R80 temporary root the release cache's lock lives in, or `None`
+    /// when no private root validates — in which case the suggestion is
+    /// withheld rather than written unlocked.
+    pub lock_root: Box<dyn Fn() -> Option<PathBuf>>,
+    /// Spawn the detached `release-check --refresh --quiet`, returning its
+    /// pid. Injected so a test observes the spawn without a process ever
+    /// starting.
+    pub spawn_refresh: Box<dyn Fn() -> std::result::Result<u32, String>>,
 }
 
 impl Surroundings {
@@ -112,7 +133,9 @@ impl Surroundings {
             plugin_root: std::env::var_os("CLAUDE_PLUGIN_ROOT").map(PathBuf::from),
             override_present: std::env::var_os(OVERRIDE_ENV).is_some_and(|v| !v.is_empty()),
             entrypoint: std::env::var_os(hook::ENTRYPOINT_ENV),
-            marker_dir: Box::new(ss_magic_core::release::cache_dir),
+            cache_dir: Box::new(release::cache_dir),
+            lock_root: Box::new(|| tmproot::resolve_root().ok()),
+            spawn_refresh: Box::new(release_check::spawn_refresh),
         }
     }
 }
@@ -145,25 +168,27 @@ pub(crate) fn handle_with(ctx: &HookContext<'_>, surroundings: &Surroundings) ->
     let report = scratchpad::ensure(ctx.cwd())?;
     let additional_context = build_guidance(repo_root, &report);
 
-    // Both operator notices ride `systemMessage` and never the model-facing
-    // channel: neither is something the model can act on.
-    let drift = version_drift_notice(surroundings.plugin_root.clone());
+    // All three operator notices ride `systemMessage` and never the
+    // model-facing channel: none is something the model can act on.
+    let quiet = hook::quiet_mode(ctx.envelope, surroundings.entrypoint.as_deref());
+    let drift = version_drift_notice(surroundings.plugin_root.as_deref());
     let advice = compaction_advice(
         repo_root,
         source,
-        hook::quiet_mode(ctx.envelope, surroundings.entrypoint.as_deref()),
+        quiet,
         surroundings.override_present,
-        &*surroundings.marker_dir,
+        &*surroundings.cache_dir,
         ctx.now,
     );
-    let system_message = join_system_messages([drift, advice.message]);
+    let suggestion = release_suggestion(surroundings, source, quiet, ctx.now);
+    let system_message = join_system_messages([drift, advice.message, suggestion.message]);
 
     let mut detail = if source.is_empty() {
         report.heartbeat_note()
     } else {
         format!("{} (source: {source})", report.heartbeat_note())
     };
-    if let Some(note) = advice.detail {
+    for note in advice.detail.into_iter().chain(suggestion.details) {
         detail.push_str("; ");
         detail.push_str(&note);
     }
@@ -286,12 +311,10 @@ fn join_system_messages<const N: usize>(parts: [Option<String>; N]) -> Option<St
 /// (this binary invoked outside a plugin install, e.g. by hand or in a
 /// non-plugin test), an unreadable pin file, or one with nothing usable in it
 /// all mean "nothing to report", never a reason to fail the hook.
-fn version_drift_notice(plugin_root: Option<PathBuf>) -> Option<String> {
-    let root = plugin_root?;
-    let pin = std::fs::read_to_string(root.join(crate::status::PIN_FILE)).ok()?;
-    let pinned = pin.trim();
+fn version_drift_notice(plugin_root: Option<&Path>) -> Option<String> {
+    let pinned = read_pin(plugin_root)?;
     let running = env!("CARGO_PKG_VERSION");
-    if pinned.is_empty() || pinned == running {
+    if pinned == running {
         return None;
     }
     Some(format!(
@@ -300,6 +323,119 @@ fn version_drift_notice(plugin_root: Option<PathBuf>) -> Option<String> {
          (SessionStart's `startup` source) — resume, clear, compact and fork all keep \
          whichever binary is already on disk. Start a brand-new session once the two agree."
     ))
+}
+
+/// The plugin's declared pin at `<plugin_root>/<PIN_FILE>`, trimmed; `None`
+/// when there is no plugin root (this binary invoked outside a plugin
+/// install), the file is unreadable, or it holds nothing usable. Shared by
+/// the version-drift notice and the release suggestion so the two can never
+/// read a different pin.
+fn read_pin(plugin_root: Option<&Path>) -> Option<String> {
+    let root = plugin_root?;
+    let pin = std::fs::read_to_string(root.join(crate::status::PIN_FILE)).ok()?;
+    let pinned = pin.trim();
+    (!pinned.is_empty()).then(|| pinned.to_string())
+}
+
+/// What [`release_suggestion`] decided.
+struct ReleaseAdvice {
+    /// The notice, when one is due.
+    message: Option<String>,
+    /// Short notes for the heartbeat row — what happened to the suggestion,
+    /// and whether a refresh was spawned. Empty on the ordinary paths where
+    /// nothing was even considered.
+    details: Vec<String>,
+}
+
+/// R29–R31's once-per-release nudge, and R30's background refresh.
+///
+/// On a fresh `startup` only: read the plugin line's release cache (never the
+/// network), decide through the pure `release_check::suggestion`, and if a
+/// newer release is due, record it under the shared non-blocking lock BEFORE
+/// announcing it — the record is what makes the notice once-per-tag, so a
+/// notice that could not be recorded is withheld rather than sent. Quiet
+/// mode is decided before anything is written, so a headless session never
+/// spends the once-per-tag budget on a notice nobody saw.
+///
+/// Then, still only on `startup`, only when someone is watching, and only
+/// when this binary runs as an installed plugin (a pin exists): if the cache
+/// is missing or older than 24 h, spawn the detached refresh and return
+/// without waiting. The spawn runs LAST, after the lock above is released,
+/// so the refresh never contends with this very invocation's marker write.
+/// Every failure here is a heartbeat note; none is a failure of the hook.
+fn release_suggestion(
+    surroundings: &Surroundings,
+    source: &str,
+    quiet: Option<&'static str>,
+    now: u64,
+) -> ReleaseAdvice {
+    let mut advice = ReleaseAdvice {
+        message: None,
+        details: Vec::new(),
+    };
+    if source != "startup" {
+        return advice;
+    }
+    let pinned = read_pin(surroundings.plugin_root.as_deref());
+    let Some(dir) = (surroundings.cache_dir)() else {
+        advice
+            .details
+            .push("release suggestion withheld (no cache directory)".to_string());
+        return advice;
+    };
+    let cache_file = dir.join(PLUGIN_LINE.cache_file);
+    let cache = release::read_cache(&cache_file);
+
+    match release_check::suggestion(pinned.as_deref(), cache.as_ref(), source, quiet) {
+        Decision::Suggest { tag, pinned } => match (surroundings.lock_root)() {
+            None => advice.details.push(format!(
+                "release suggestion withheld ({tag}: no private lock root to record it under)"
+            )),
+            Some(lock_root) => {
+                match release_check::record_suggested(&lock_root, &cache_file, &tag) {
+                    Ok(Recorded::Written) => {
+                        advice.message = Some(release_check::notice(&tag, &pinned));
+                        advice
+                            .details
+                            .push(format!("release suggestion shown ({tag})"));
+                    }
+                    Ok(Recorded::AlreadyRecorded) => advice
+                        .details
+                        .push(format!("release suggestion already shown ({tag})")),
+                    Ok(Recorded::Superseded) => advice.details.push(format!(
+                        "release suggestion deferred ({tag} is no longer the cached newest)"
+                    )),
+                    Ok(Recorded::Busy) => advice.details.push(format!(
+                        "release suggestion deferred ({tag}: the release cache is busy)"
+                    )),
+                    Err(e) => advice.details.push(format!(
+                        "release suggestion withheld ({tag}: could not record it: {e:#})"
+                    )),
+                }
+            }
+        },
+        Decision::Silent(silence) => {
+            if let Some(note) = silence.detail() {
+                advice.details.push(note);
+            }
+        }
+    }
+
+    // R30: the refresh, gated on the same quiet verdict as the notice, and on
+    // there being a pin at all — with nothing to compare against, a fetch
+    // would be network traffic on the operator's behalf for no notice.
+    let stale = cache.as_ref().is_none_or(|c| !c.is_fresh(now));
+    if quiet.is_none() && pinned.is_some() && stale {
+        match (surroundings.spawn_refresh)() {
+            Ok(pid) => advice
+                .details
+                .push(format!("release refresh spawned (pid {pid})")),
+            Err(e) => advice
+                .details
+                .push(format!("release refresh not spawned ({e})")),
+        }
+    }
+    advice
 }
 
 /// How many entries [`render_refusal`] lists inline for a

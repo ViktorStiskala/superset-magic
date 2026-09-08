@@ -601,6 +601,9 @@ ss-magic-plugin compact-window --recommend [--json]
                                   # size an auto-compaction window; writes nothing
 ss-magic-plugin compact-window --set <TOKENS>
                                   # opt into an absolute auto-compaction window
+ss-magic-plugin release-check [--refresh] [--json]
+                                  # newest known plugin release vs. the pin;
+                                  # --refresh re-reads GitHub's list once
 ss-magic-plugin setup-github-ci [--check] [--force]
                                   # write the checklist PR-comment workflow
 ss-magic-plugin checklist <SUBVERB>
@@ -611,10 +614,11 @@ ss-magic-plugin --version         # prints `ss-magic-plugin <version>`; the
                                   # bootstrap gates every install on it
 ```
 
-`status`, `cost` and `spill-index` also take `--json`. `enable` / `disable` /
-`config set` are still the precise way to flip `plugin.enabled` or a gate knob
-when you have a session open; editing `.superset/magic.json` by hand does the
-same thing and is the path that needs no session at all.
+`status`, `cost`, `spill-index` and `release-check` also take `--json`.
+`enable` / `disable` / `config set` are still the precise way to flip
+`plugin.enabled` or a gate knob when you have a session open; editing
+`.superset/magic.json` by hand does the same thing and is the path that needs
+no session at all.
 
 ### Sizing the auto-compact window
 
@@ -653,13 +657,45 @@ override is in the environment and the repository sets no window, gets one
 operator notice per machine on the `systemMessage` channel (never into the
 model's context, and never in a headless session).
 
+### Keeping the plugin current
+
+The plugin never updates itself – updating it is a `/plugin` action, and the
+new binary lands at the next fresh session start, when the bootstrap installs
+the version the updated plugin pins (`/reload-plugins` alone re-registers the
+plugin but keeps the old binary until then). What the plugin does do is tell
+you, once per release, that a newer one exists: on a fresh session start it
+reads a small cache of GitHub's release list and, when the newest
+`ss-magic-plugin-vX.Y.Z` release is newer than the one the loaded plugin pins,
+prints one operator notice on the `systemMessage` channel naming the release
+and the `/plugin` flow. It never enters the model's context, is never shown in
+a headless session (`bypassPermissions`, `dontAsk`, or an SDK/IDE entrypoint),
+and is never repeated for the same release on the same machine.
+
+That cache is refreshed in the background, never in the hook's own time: when
+it is missing or older than 24 hours, the session-start hook spawns a detached
+`ss-magic-plugin release-check --refresh` and returns immediately, so session
+start never waits on the network – and a headless session spawns nothing at
+all. You can ask Claude to run the same verb by hand:
+
+```plaintext
+ss-magic-plugin release-check            # what the cache knows, vs. the pin
+ss-magic-plugin release-check --refresh  # re-read GitHub's list once (5 s budget)
+```
+
+It reports the newest known release and when the list was last checked, the
+version the plugin pins and where that pin was read from, the binary answering,
+whether an update is available, and whether the notice was already shown.
+`--refresh` exits 0 whether or not GitHub could be reached; a failed fetch
+keeps the previous answer. `ss-magic-plugin status` shows the same "newest
+release" row in its `Versions` section.
+
 ### Hooks
 
 The plugin registers five hook events:
 
 | Event | What it does |
 | --- | --- |
-| `SessionStart` | Installs/refreshes the pinned binary and, once, seeds the `plugin` block into an existing `.superset/magic.json`; scaffolds the scratchpad, injects the operating guidance, and – on a fresh start only, once per machine – points an operator at `compact-window --recommend` when a percentage override is set with no window configured. |
+| `SessionStart` | Installs/refreshes the pinned binary and, once, seeds the `plugin` block into an existing `.superset/magic.json`; scaffolds the scratchpad, injects the operating guidance, and – on a fresh start only – carries two operator notices: once per machine, a pointer at `compact-window --recommend` when a percentage override is set with no window configured; and once per release, that a newer plugin release exists (read from a cache file; when that cache is stale the hook spawns a background `release-check --refresh` and returns without waiting on it). |
 | `PreToolUse` | The read gate, the checklist-file deny, and an advisory nudge to update the checklist before `git commit` / `git push` / `gh pr create`. |
 | `PreCompact` | Records that a compaction is about to happen. Never blocks or slows it. |
 | `SubagentStop` | Salvages a subagent's result text, and blocks the stop once if a declared artifact is missing. |
@@ -796,12 +832,14 @@ all expand the same overlaid pattern list with the same rules:
 
 ## Self-update
 
-This section is about the `ss-magic` CLI only. The plugin's binary never checks
-for or installs an update at all: it is pinned alongside the skills, hooks and
+This section is about the `ss-magic` CLI only. The plugin's binary never
+installs an update at all: it is pinned alongside the skills, hooks and
 Markdown the marketplace ships with it, so a silent mid-session swap would leave
 the two describing different behavior. It links no updater, so that is a
 property of the binary rather than a rule about it, and updating the plugin
-through `/plugin` is what replaces its binary.
+through `/plugin` is what replaces its binary. The plugin does *check*, on the
+plugin's own `ss-magic-plugin-vX.Y.Z` release line and only to tell you once
+that a newer release exists – see "Keeping the plugin current" above.
 
 Every invocation of `ss-magic` (bare), `sync`, `reverse-sync`, and `pack` runs
 a cheap, daily-cached check for a newer GitHub release. `init`, `--help` and

@@ -618,15 +618,31 @@ The modules, by purpose:
   drops drafts and prereleases, keeps only the tags that pass its `Line`'s
   anchored filter (`parse_line_tag`: `tag.strip_prefix(line.tag_prefix)` then
   exactly three ASCII-digit components and nothing else – `CLI_LINE` is `v`,
-  `PLUGIN_LINE` is `ss-magic-plugin-v`; the latter is declared here but
-  `#[allow(dead_code)]` until U6's `release-check` verb consumes it), and
-  `select_newest` takes the GREATEST triple, never the first entry, because
+  `PLUGIN_LINE` is `ss-magic-plugin-v`; the latter is consumed by the plugin
+  crate alone, through its `release-check` verb and `SessionStart` suggestion),
+  and `select_newest` takes the GREATEST triple, never the first entry, because
   the list is in creation order. A line with no release among the newest 100
   reads as "no update" – conservative by design. The on-disk
-  `Cache { checked_at, tag_name, etag }` shape is unchanged so an older
-  binary's cache file still parses; `tag_name` now holds the SELECTED tag, and
-  a cached tag of the other line reads as `UpToDate`. `resolve_newest_uncached`
-  is the cache-free resolver behind `ss-magic update`. `update/mod.rs`'s
+  `Cache { checked_at, tag_name, etag }` shape is a superset of the old one so
+  an older binary's cache file still parses; `tag_name` now holds the SELECTED
+  tag, and a cached tag of the other line reads as `UpToDate`. `Cache` also
+  carries `suggested: Option<String>` (skipped when `None`, so the CLI's
+  `version-check.json` is byte-identical to before): the plugin line's
+  once-per-release marker, the tag the `SessionStart` hook has already
+  announced. `refresh_cache(prior, client, line, now) -> Refresh { cache,
+  outcome }` is the ONE derivation of "the next record from the prior one plus
+  a fetch": always fetches with the prior ETag, bumps `checked_at` on every
+  outcome, keeps the prior tag on `NotModified`/`Failed`, and carries
+  `suggested` forward whenever the selected tag equals the prior tag, clearing
+  it only for a DIFFERENT tag – so a daily refresh cannot re-arm a notice
+  already shown. `run_check` calls it once the cache is stale; the plugin's
+  `release-check --refresh` calls it on every invocation (there is no freshness
+  short-circuit in the verb). `read_cache` and `now_secs` are public for the
+  hook, which reads the plugin cache directly and must never construct a
+  client. `UreqReleaseClient::for_product(product, version)` sets the
+  user agent (`new` is the CLI's `ss-magic/<version>` shorthand).
+  `resolve_newest_uncached` is the cache-free resolver behind `ss-magic
+  update`. `update/mod.rs`'s
   `update_command_with` decides in a fixed order before any download: no tag
   resolved → `UpdateReport::Unavailable` ("could not check", deliberately
   distinct from "already latest", and the backend is never constructed); a
@@ -692,13 +708,20 @@ tree moved wholesale. Three facts shape every module in it:
   `config set`), so a repository cannot arrange its own enablement by getting a
   hook to fire. Note the exact shape of that claim: the bootstrap DOES invoke
   one config-writing verb, `seed-config`, and it is safe because it has no code
-  path to the `enabled` key at all.
+  path to the `enabled` key at all; and the `SessionStart` handler spawns
+  `release-check --refresh --quiet`, which writes only the plugin release cache
+  in the OS cache directory and reads no configuration.
 - **No update gate, no TUI, no install verb.** The marketplace is the only
   delivery path, and the binary is pinned alongside the skills, hooks and
   Markdown shipped with it; a mid-session self-update would leave the two
   describing different behavior. Since the split this is STRUCTURAL rather than
   a routing rule: the crate links neither `self_update` nor `inquire`/`ratatui`,
-  and `--check` plus `cargo tree -i` assert that mechanically.
+  and `--check` plus `cargo tree -i` assert that mechanically. What the plugin
+  DOES do about releases is advise (R29–R33): `release-check` reports the
+  newest known plugin release against the pin and, with `--refresh`, rewrites
+  its cache from one bounded fetch; `SessionStart` reads that cache and tells
+  the operator once per release, on `systemMessage`, that `/plugin` has a newer
+  one. Nothing in the crate downloads a binary.
 - **Fail-open, but fail-CLOSED on anything that could leak.** A hook that
   errors, panics or times out must look exactly like a hook that decided to do
   nothing. The gates that protect secrets invert that: an unknown answer is the
@@ -727,12 +750,16 @@ tree moved wholesale. Three facts shape every module in it:
   `"$staged_bin" --version | head -1 | awk '{print $NF}'` equalling the pin, and
   `status.rs` probes the same flag for drift, so the version must stay LAST on
   line one and the flag must never answer with usage text.
-  `HumanVerb` gained `SeedConfig` (`seed-config`), and the two predicates over it
-  now say different things: `writes_config` is `Enable | Disable | Config |
-  SeedConfig`, while `can_set_enabled` is `Enable | Disable | Config`. Only the
-  second carries the safety property – `writes_config` used to double as
-  "nothing reachable from a hook may be one of these" and no longer can, since
-  `SeedConfig` is invoked by the `SessionStart` bootstrap. Do NOT re-derive
+  `HumanVerb` gained `SeedConfig` (`seed-config`) and `ReleaseCheck`
+  (`release-check`), and the two predicates over it say different things:
+  `writes_config` is `Enable | Disable | Config | SeedConfig`, while
+  `can_set_enabled` is `Enable | Disable | Config`. Only the second carries the
+  safety property – `writes_config` used to double as "nothing reachable from a
+  hook may be one of these" and no longer can, since `SeedConfig` is invoked by
+  the `SessionStart` bootstrap and `ReleaseCheck` is spawned by the
+  `SessionStart` handler itself (`release-check --refresh --quiet`, detached).
+  The test `no_hook_invoked_verb_can_set_enabled` lists exactly those two as
+  hook-invoked and asserts neither can set `enabled`. Do NOT re-derive
   "hook-reachable" from `writes_config`.
 
 ### State: where the plugin keeps things, and why there
@@ -912,13 +939,39 @@ tree moved wholesale. Three facts shape every module in it:
   written through `atomic::write_atomically`, only by a notice that actually
   went out, and resolved LAST so a plain `resume` never touches the cache dir;
   with no directory to record it in, the notice is withheld rather than
-  repeated. The two notices join into one `systemMessage` a blank line apart
-  (`join_system_messages`). Everything the handler reads from outside the
-  envelope – plugin root, override, entrypoint, marker dir – arrives in one
-  `Surroundings` value (`handle` = `handle_with(ctx,
-  &Surroundings::from_process())`), so no test can write a once-per-machine
-  marker into the developer's own cache directory, which running the handler
-  against the real environment would do on a machine where the override is set.
+  repeated. `release_suggestion` (R29–R31, KTD12) is the third notice on the
+  same channel and reads a FILE, never the network: on `startup` only, it
+  reads the plugin line's release cache (`release_check::cache_file`), decides
+  through the pure `release_check::suggestion(pinned, cache, source, quiet)`
+  – not startup, no pin, no cache, no plugin tag, not newer, already
+  suggested, then quiet mode LAST so a headless session with something to say
+  records `release suggestion suppressed (quiet mode: …)` while one with
+  nothing to say records "not newer" – and, when a newer release is due,
+  RECORDS it before announcing it: `release_check::record_suggested` takes the
+  shared non-blocking `release-check.lock` under the R80 root, re-reads the
+  cache, and writes `suggested = tag`; contention (`Busy`), a tag the cache no
+  longer names (`Superseded`), no lock root, or a write failure all WITHHOLD
+  the notice for this session rather than announce without a record, because
+  the record is what makes it once-per-tag. Quiet mode is decided before the
+  write, so a headless session never spends the budget. Then (R30), still
+  only on `startup`, only when someone is watching, and only when a pin
+  exists: if the cache is missing or older than 24 h it spawns
+  `current_exe() release-check --refresh --quiet` detached
+  (`release_check::spawn_detached`: own process group, every stream on
+  `/dev/null`, child dropped) and returns without waiting – AFTER the lock
+  above is released, so the refresh never contends with this invocation's own
+  marker write. A source-scan test in `hook/tests.rs` asserts no `hook/`
+  module names `UreqReleaseClient`, `ureq`, `fetch_releases`, `refresh_cache`,
+  `refresh_with`, `for_product` or `resolve_newest_uncached`. The three notices
+  join into one `systemMessage` a blank line apart (`join_system_messages`).
+  Everything the handler reads from outside the envelope – plugin root,
+  override, entrypoint, the cache dir (compaction marker AND release cache),
+  the lock root, and the spawner – arrives in one `Surroundings` value
+  (`handle` = `handle_with(ctx, &Surroundings::from_process())`), so no test
+  can write a once-per-machine marker into the developer's own cache
+  directory, which running the handler against the real environment would do
+  on a machine where the override is set, and no test ever spawns a real
+  refresh.
 - `hook/pre_tool_use.rs` – three jobs on one event, in a fixed decision order.
   (1) The **checklist deny**: a Read / Edit / Write / NotebookEdit of a checklist
   file (matched by the `docs/actions/<stem>.checklist.json` convention or by the
@@ -1110,13 +1163,54 @@ tree moved wholesale. Three facts shape every module in it:
   and where it was found, the two windows, the recommendation with its basis –
   and adds ONE `problems` line, only when the override is set AND no window is
   configured; `Inputs.compaction` carries the `Sources` so the tests point it
-  at a fake home. The heartbeat store it reads is the non-creating
+  at a fake home. The `Versions` section gains `newest_release` (a `Field`:
+  the plugin release cache's tag with "checked <when>, fresh/stale" as the
+  source, or a note when the cache is absent, holds no plugin tag, or no cache
+  dir resolves) and `update_available: Option<bool>` against the pin – read
+  from `Inputs.release_cache` at `Inputs.now`, never refreshed by `status`, and
+  never a `problems` line (an available update is information, not a fault).
+  The heartbeat store it reads is the non-creating
   `heartbeat::existing_store_dir` (shared with `--recommend`), so a diagnostic
   never scaffolds the store it reports on.
 - `spill_index.rs` – a strictly read-only listing of the harness's own
   oversized-tool-output files for this worktree, which otherwise have
   unguessable names and no index. An empty result always carries a note
   distinguishing "nothing found" from "could not locate the directory".
+- `release_check.rs` – the plugin line's release cache and the
+  `release-check [--refresh] [--json] [--quiet]` verb (R32, R33), plus the
+  pure pieces the `SessionStart` suggestion is built from. The cache is core's
+  `PLUGIN_LINE.cache_file` (`plugin-release-check.json`) in the shared
+  `ss-magic` cache dir, written ONLY through `write_cache` →
+  `atomic::write_atomically` at 0600, because it has two writers (the refresh
+  and the hook's `suggested` marker) and a lock-free reader (the hook).
+  `LOCK_NAME` (`release-check.lock`, under the R80 tmproot) is the ONE lock
+  both writers take with `tmproot::try_with_lock` – never the blocking
+  variant, since a hook must not wait on a 5 s fetch and a refresh skipped
+  this session runs next session. `refresh_with(client, lock_root,
+  cache_file, now)` reads the prior record INSIDE the lock (so a marker the
+  hook just wrote is what gets carried forward), runs core's `refresh_cache`,
+  writes, and reports `Ran(outcome)` or `Busy`; `record_suggested(lock_root,
+  cache_file, tag)` re-reads under the same lock and answers `Written`,
+  `AlreadyRecorded`, `Superseded` (the cache's tag moved) or `Busy`.
+  `spawn_detached(exe, args)` is the R30 spawn (own process group, stdio
+  null, child dropped, pid returned) and `spawn_refresh` points it at
+  `current_exe()` with `REFRESH_ARGV` (`release-check --refresh --quiet`),
+  the one argv both the hook and the verb's parser agree on. The verb is the
+  ONLY place in the crate an HTTP client is constructed
+  (`UreqReleaseClient::for_product("ss-magic-plugin", …)`), and only under
+  `--refresh`; `--quiet` prints nothing (what the hook spawns), and the exit
+  is 0 on every path that produced a report, a failed fetch included (R33) –
+  only an unknown argument exits 2. The report names the newest known tag,
+  the cache's age and freshness, the pin (`${CLAUDE_PLUGIN_ROOT}` first, then
+  the harness registration's `installPath`, the same way `status` finds it –
+  the harness probe runs only when the variable is absent), the running
+  version, whether an update is available, whether the notice was already
+  shown, and what `--refresh` did; every null carries a note. `REMEDY` is the
+  operator's remedy text shared by the notice and the report, and it ends in
+  "start a new session" rather than `/reload-plugins` alone, because a reload
+  re-registers the plugin but keeps the old binary until a fresh session's
+  bootstrap swaps it (R29's literal wording named the reload; see the plan's
+  amendment note). Nothing here installs anything.
 - `setup_ci.rs` – writes `.github/workflows/ss-magic-checklist.yml` from
   the embedded `assets/workflow/checklist.yml`, pinning the running binary's
   version. `classify` returns `State::{Absent, Identical, PinStale, Differs}`

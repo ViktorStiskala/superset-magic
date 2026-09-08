@@ -318,6 +318,7 @@ fn ae4_fresh_cache_holding_a_plugin_tag_is_up_to_date_without_network() {
             checked_at: now_secs(),
             tag_name: "ss-magic-plugin-v1.0.0".to_string(),
             etag: None,
+            suggested: None,
         },
     );
     let client = StubClient::ok_with_tags(&["v9.9.9"], None);
@@ -339,6 +340,7 @@ fn stale_cache_plus_failure_returns_up_to_date_and_refreshes_time() {
             checked_at: now_secs() - 7 * 24 * 60 * 60,
             tag_name: "v9.9.9".to_string(),
             etag: Some("\"prior\"".to_string()),
+            suggested: None,
         },
     );
 
@@ -369,6 +371,7 @@ fn fresh_cache_skips_network_and_returns_cached_verdict() {
             checked_at: now_secs(), // fresh
             tag_name: "v2.0.0".to_string(),
             etag: None,
+            suggested: None,
         },
     );
 
@@ -399,6 +402,7 @@ fn fresh_cache_with_no_newer_tag_returns_up_to_date_without_network() {
             checked_at: now_secs(),
             tag_name: "v1.0.0".to_string(),
             etag: None,
+            suggested: None,
         },
     );
     let client = StubClient::new(FetchOutcome::Failed);
@@ -461,6 +465,7 @@ fn http_200_empty_list_reports_up_to_date_and_stores_no_tag() {
             checked_at: now_secs() - 7 * 24 * 60 * 60,
             tag_name: "v9.9.9".to_string(),
             etag: None,
+            suggested: None,
         },
     );
     let client = StubClient::ok_with_tags(&[], Some("\"empty\""));
@@ -487,6 +492,7 @@ fn http_304_keeps_tag_and_retains_etag() {
             checked_at: now_secs() - 7 * 24 * 60 * 60,
             tag_name: "v1.0.0".to_string(),
             etag: Some("\"etag-1\"".to_string()),
+            suggested: None,
         },
     );
     let client = StubClient::new(FetchOutcome::NotModified);
@@ -514,6 +520,7 @@ fn http_304_with_newer_prior_tag_reports_newer() {
             checked_at: now_secs() - 7 * 24 * 60 * 60,
             tag_name: "v2.0.0".to_string(),
             etag: Some("\"etag-2\"".to_string()),
+            suggested: None,
         },
     );
     let client = StubClient::new(FetchOutcome::NotModified);
@@ -652,4 +659,180 @@ fn release_never_reads_its_own_crate_version() {
          env!(\"CARGO_PKG_VERSION\"), which here resolves to ss-magic-core's \
          own version rather than the CLI release line's"
     );
+}
+
+// ── refresh_cache (U6, KTD12) ────────────────────────────────────────────────
+
+/// A prior plugin-line cache that has already announced its tag.
+fn announced(tag: &str) -> Cache {
+    Cache {
+        checked_at: 1_000,
+        tag_name: tag.to_string(),
+        etag: Some("\"prior\"".to_string()),
+        suggested: Some(tag.to_string()),
+    }
+}
+
+/// A `Failed` fetch learns nothing: the prior tag, ETag and `suggested` marker
+/// all survive, and only `checked_at` moves – so a flaky endpoint is not
+/// hammered and the once-per-release notice is not re-armed by an outage.
+#[test]
+fn refresh_with_a_failed_client_bumps_checked_at_and_keeps_the_prior_record() {
+    let client = StubClient::new(FetchOutcome::Failed);
+    let prior = announced("ss-magic-plugin-v1.1.0");
+    let refreshed = refresh_cache(Some(prior.clone()), &client, &PLUGIN_LINE, 5_000);
+
+    assert_eq!(refreshed.outcome, RefreshOutcome::Failed);
+    assert_eq!(refreshed.cache.checked_at, 5_000);
+    assert_eq!(refreshed.cache.tag_name, prior.tag_name);
+    assert_eq!(refreshed.cache.etag, prior.etag);
+    assert_eq!(refreshed.cache.suggested, prior.suggested);
+    assert_eq!(
+        client.seen_etag.take().as_deref(),
+        Some("\"prior\""),
+        "the prior ETag is always sent"
+    );
+}
+
+/// `304 Not Modified` is the same record with a newer `checked_at`.
+#[test]
+fn refresh_not_modified_keeps_tag_etag_and_suggested() {
+    let client = StubClient::new(FetchOutcome::NotModified);
+    let prior = announced("ss-magic-plugin-v1.1.0");
+    let refreshed = refresh_cache(Some(prior.clone()), &client, &PLUGIN_LINE, 5_000);
+
+    assert_eq!(refreshed.outcome, RefreshOutcome::NotModified);
+    assert_eq!(
+        refreshed.cache,
+        Cache {
+            checked_at: 5_000,
+            ..prior
+        }
+    );
+}
+
+/// A successful fetch that re-selects the SAME tag carries the marker
+/// forward: the daily refresh must not re-announce a release already shown.
+#[test]
+fn refresh_that_reselects_the_same_tag_carries_suggested_forward() {
+    let client = StubClient::ok_with_tags(
+        &["v0.11.1", "ss-magic-plugin-v1.1.0", "ss-magic-plugin-v1.0.0"],
+        Some("\"fresh\""),
+    );
+    let refreshed = refresh_cache(
+        Some(announced("ss-magic-plugin-v1.1.0")),
+        &client,
+        &PLUGIN_LINE,
+        5_000,
+    );
+
+    assert_eq!(refreshed.outcome, RefreshOutcome::Fetched);
+    assert_eq!(refreshed.cache.tag_name, "ss-magic-plugin-v1.1.0");
+    assert_eq!(refreshed.cache.etag.as_deref(), Some("\"fresh\""));
+    assert_eq!(
+        refreshed.cache.suggested.as_deref(),
+        Some("ss-magic-plugin-v1.1.0")
+    );
+}
+
+/// A successful fetch that selects a DIFFERENT tag clears the marker, so the
+/// new release gets its own once-per-release notice.
+#[test]
+fn refresh_that_selects_a_different_tag_clears_suggested() {
+    let client = StubClient::ok_with_tags(
+        &["ss-magic-plugin-v1.2.0", "ss-magic-plugin-v1.1.0"],
+        None,
+    );
+    let refreshed = refresh_cache(
+        Some(announced("ss-magic-plugin-v1.1.0")),
+        &client,
+        &PLUGIN_LINE,
+        5_000,
+    );
+
+    assert_eq!(refreshed.cache.tag_name, "ss-magic-plugin-v1.2.0");
+    assert_eq!(refreshed.cache.suggested, None);
+}
+
+/// A list with no tag of this line at all selects the empty tag – which is a
+/// different tag from a non-empty prior one, so the marker clears with it.
+#[test]
+fn refresh_that_finds_no_tag_of_this_line_stores_an_empty_tag_and_clears_suggested() {
+    let client = StubClient::ok_with_tags(&["v0.11.1", "v0.11.0"], None);
+    let refreshed = refresh_cache(
+        Some(announced("ss-magic-plugin-v1.1.0")),
+        &client,
+        &PLUGIN_LINE,
+        5_000,
+    );
+    assert_eq!(refreshed.cache.tag_name, "");
+    assert_eq!(refreshed.cache.suggested, None);
+}
+
+/// No prior cache at all: the refresh starts from the default record and
+/// sends no ETag.
+#[test]
+fn refresh_from_no_prior_cache_sends_no_etag() {
+    let client = StubClient::ok_with_tags(&["ss-magic-plugin-v1.0.0"], Some("\"e\""));
+    let refreshed = refresh_cache(None, &client, &PLUGIN_LINE, 5_000);
+    assert_eq!(client.seen_etag.take(), None);
+    assert_eq!(
+        refreshed.cache,
+        Cache {
+            checked_at: 5_000,
+            tag_name: "ss-magic-plugin-v1.0.0".to_string(),
+            etag: Some("\"e\"".to_string()),
+            suggested: None,
+        }
+    );
+}
+
+/// The CLI's cache file must not change shape: `suggested` is skipped when
+/// `None`, so `version-check.json` serializes exactly as it did before the
+/// field existed – and a file carrying the key still reads back.
+#[test]
+fn suggested_is_absent_from_the_serialized_cache_unless_set() {
+    let plain = Cache {
+        checked_at: 1,
+        tag_name: "v1.0.0".to_string(),
+        etag: None,
+        suggested: None,
+    };
+    let json = serde_json::to_string(&plain).unwrap();
+    assert!(!json.contains("suggested"), "{json}");
+
+    let marked = Cache {
+        suggested: Some("v1.0.0".to_string()),
+        ..plain.clone()
+    };
+    let json = serde_json::to_string(&marked).unwrap();
+    assert!(json.contains("\"suggested\":\"v1.0.0\""), "{json}");
+    assert_eq!(serde_json::from_str::<Cache>(&json).unwrap(), marked);
+
+    // A pre-U6 file (no key) reads as `None`.
+    let legacy = r#"{"checked_at":1,"tag_name":"v1.0.0","etag":null}"#;
+    assert_eq!(serde_json::from_str::<Cache>(legacy).unwrap(), plain);
+}
+
+/// `Cache::is_fresh` treats an unset `checked_at` as never fresh.
+#[test]
+fn a_zero_checked_at_is_never_fresh() {
+    let cache = Cache::default();
+    assert!(!cache.is_fresh(0));
+    assert!(!cache.is_fresh(10));
+    let checked = Cache {
+        checked_at: 1_000,
+        ..Cache::default()
+    };
+    assert!(checked.is_fresh(1_000 + FRESH_FOR.as_secs() - 1));
+    assert!(!checked.is_fresh(1_000 + FRESH_FOR.as_secs()));
+}
+
+/// The plugin identifies itself as its own product in the user agent.
+#[test]
+fn for_product_names_the_calling_binary() {
+    let client = UreqReleaseClient::for_product("ss-magic-plugin", "1.0.0");
+    assert_eq!(client.user_agent, "ss-magic-plugin/1.0.0");
+    let cli = UreqReleaseClient::new("0.11.1");
+    assert_eq!(cli.user_agent, "ss-magic/0.11.1");
 }

@@ -4,17 +4,19 @@
 //! handler does once it is reached: the guidance text, the version-drift
 //! notice, and the R15 outside-a-repository case.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use tempfile::TempDir;
 
 use super::*;
-use crate::git;
 use crate::config::PluginConfig;
+use crate::git;
 use crate::hook::event::{Common, Envelope, Payload, SessionStart};
 use crate::HookEvent;
+use ss_magic_core::release::Cache;
 use ss_magic_core::testutil::{git_run, init_main_repo, neutralize_global_excludes};
 
 const NOW: u64 = 1_788_091_200; // 2026-08-30 12:00:00 UTC, arbitrary and fixed.
@@ -107,16 +109,31 @@ fn ctx_for<'a>(
 }
 
 /// Surroundings that trigger nothing: no plugin root, no override, no
-/// entrypoint, and no marker directory at all — so a test of the guidance
-/// text can never write a once-per-machine marker into the developer's own
-/// cache directory.
+/// entrypoint, no cache directory, no lock root, and a spawner that panics if
+/// reached — so a test of the guidance text can never write a once-per-machine
+/// marker into the developer's own cache directory, nor start a process.
 fn inert() -> Surroundings {
     Surroundings {
         plugin_root: None,
         override_present: false,
         entrypoint: None,
-        marker_dir: Box::new(|| None),
+        cache_dir: Box::new(|| None),
+        lock_root: Box::new(|| None),
+        spawn_refresh: Box::new(|| panic!("inert surroundings must never spawn")),
     }
+}
+
+/// A spawner that records how many times it was asked, and succeeds.
+fn counting_spawner() -> (Rc<Cell<u32>>, Box<dyn Fn() -> std::result::Result<u32, String>>) {
+    let count = Rc::new(Cell::new(0));
+    let seen = Rc::clone(&count);
+    (
+        count,
+        Box::new(move || {
+            seen.set(seen.get() + 1);
+            Ok(4242)
+        }),
+    )
 }
 
 /// [`handle`] against inert surroundings — what every guidance test drives.
@@ -465,7 +482,7 @@ fn version_drift_notice_flags_a_mismatch_and_names_both_versions() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("ss-magic-plugin.version"), "0.0.1\n").unwrap();
 
-    let notice = version_drift_notice(Some(dir.path().to_path_buf()))
+    let notice = version_drift_notice(Some(dir.path()))
         .expect("a differing pin must produce a notice");
     assert!(notice.contains("0.0.1"), "{notice}");
     assert!(notice.contains(env!("CARGO_PKG_VERSION")), "{notice}");
@@ -480,7 +497,7 @@ fn version_drift_notice_is_silent_on_a_match() {
     )
     .unwrap();
 
-    assert_eq!(version_drift_notice(Some(dir.path().to_path_buf())), None);
+    assert_eq!(version_drift_notice(Some(dir.path())), None);
 }
 
 #[test]
@@ -491,7 +508,7 @@ fn version_drift_notice_is_silent_with_no_plugin_root() {
 #[test]
 fn version_drift_notice_is_silent_when_the_pin_file_is_absent() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(version_drift_notice(Some(dir.path().to_path_buf())), None);
+    assert_eq!(version_drift_notice(Some(dir.path())), None);
 }
 
 /// The injected guidance must name the wrapper, `ss-magic-plugin`, and never a
@@ -532,7 +549,7 @@ fn the_injected_guidance_names_the_wrapper_not_a_bare_ss_magic() {
 
 // ── The compaction notice (R27) ───────────────────────────────────────────────
 
-/// A marker directory closure over a tempdir.
+/// A directory closure over a tempdir — the cache directory or the lock root.
 fn marker_in(dir: &Path) -> Box<dyn Fn() -> Option<PathBuf>> {
     let dir = dir.to_path_buf();
     Box::new(move || Some(dir.clone()))
@@ -664,7 +681,11 @@ fn the_handler_puts_the_notice_on_system_message_beside_version_drift() {
         plugin_root: Some(plugin.path().to_path_buf()),
         override_present: true,
         entrypoint: Some("cli".into()),
-        marker_dir: marker_in(cache.path()),
+        cache_dir: marker_in(cache.path()),
+        lock_root: Box::new(|| None),
+        // The cache directory holds no release cache, so the handler spawns a
+        // refresh; a real spawn is not wanted here.
+        spawn_refresh: Box::new(|| Ok(1)),
     };
     let event = HookEvent::SessionStart;
     let config = PluginConfig::default();
@@ -694,7 +715,9 @@ fn the_handler_withholds_the_notice_under_quiet_mode() {
         plugin_root: None,
         override_present: true,
         entrypoint: Some("sdk-ts".into()),
-        marker_dir: marker_in(cache.path()),
+        cache_dir: marker_in(cache.path()),
+        lock_root: Box::new(|| None),
+        spawn_refresh: Box::new(|| panic!("a quiet session must not spawn a refresh")),
     };
     let event = HookEvent::SessionStart;
     let config = PluginConfig::default();
@@ -705,4 +728,335 @@ fn the_handler_withholds_the_notice_under_quiet_mode() {
     let (_, system_message) = session_start_response(&outcome);
     assert_eq!(*system_message, None);
     assert!(!cache.path().join(COMPACT_ADVICE_MARKER).exists());
+}
+
+// ── The plugin release suggestion (R29–R31, AE10–AE12) ────────────────────────
+
+const NEWER: &str = "ss-magic-plugin-v1.1.0";
+
+/// A plugin root pinning `pin`.
+fn plugin_root_pinning(pin: &str) -> TempDir {
+    let plugin = tempfile::tempdir().unwrap();
+    fs::write(
+        plugin.path().join(crate::status::PIN_FILE),
+        format!("{pin}\n"),
+    )
+    .unwrap();
+    plugin
+}
+
+/// A cache directory whose plugin release cache holds `tag`, checked `age`
+/// seconds before `NOW`.
+fn cache_dir_with(tag: &str, age: u64) -> TempDir {
+    let cache = tempfile::tempdir().unwrap();
+    crate::release_check::write_cache(
+        &cache.path().join(PLUGIN_LINE.cache_file),
+        &Cache {
+            checked_at: NOW - age,
+            tag_name: tag.to_string(),
+            etag: None,
+            suggested: None,
+        },
+    )
+    .unwrap();
+    cache
+}
+
+fn read_release_cache(cache: &TempDir) -> Cache {
+    release::read_cache(&cache.path().join(PLUGIN_LINE.cache_file)).unwrap()
+}
+
+/// Surroundings for a watched terminal session on an installed plugin
+/// pinning 1.0.0, with the given cache directory and a recording spawner.
+fn watched(
+    plugin: &TempDir,
+    cache: &TempDir,
+    lock: &TempDir,
+) -> (Surroundings, Rc<Cell<u32>>) {
+    let (count, spawner) = counting_spawner();
+    (
+        Surroundings {
+            plugin_root: Some(plugin.path().to_path_buf()),
+            override_present: false,
+            entrypoint: Some("cli".into()),
+            cache_dir: marker_in(cache.path()),
+            lock_root: marker_in(lock.path()),
+            spawn_refresh: spawner,
+        },
+        count,
+    )
+}
+
+fn run_startup(root: &Path, surroundings: &Surroundings, session: &str) -> Outcome {
+    let event = HookEvent::SessionStart;
+    let config = PluginConfig::default();
+    let envelope = envelope_for(root, "startup", session);
+    let ctx = ctx_for(&event, &envelope, Some(root.to_path_buf()), &config);
+    handle_with(&ctx, surroundings).unwrap()
+}
+
+/// AE10: pin 1.0.0, cache newest 1.1.0, nothing suggested yet, `startup`,
+/// `permission_mode` default. The first run announces on `systemMessage`
+/// with the `/plugin` flow; the second is silent because `suggested` now
+/// equals that tag; `additionalContext` never mentions it.
+#[test]
+fn ae10_plugin_update_is_suggested_once() {
+    let (_dir, root) = ignored_repo();
+    let plugin = plugin_root_pinning("1.0.0");
+    let cache = cache_dir_with(NEWER, 60);
+    let lock = tempfile::tempdir().unwrap();
+    let (surroundings, _spawns) = watched(&plugin, &cache, &lock);
+
+    let first = run_startup(&root, &surroundings, "sess-1");
+    let (additional_context, system_message) = session_start_response(&first);
+    let message = system_message.as_deref().expect("the first startup announces");
+    assert!(message.contains(NEWER), "{message}");
+    assert!(message.contains("pins 1.0.0"), "{message}");
+    assert!(message.contains("/plugin"), "{message}");
+    assert!(message.contains("new session"), "{message}");
+    assert!(
+        !additional_context.as_deref().unwrap().contains(NEWER),
+        "the suggestion must never enter the model's context"
+    );
+    assert!(first.detail.as_deref().unwrap().contains("release suggestion shown"));
+    assert_eq!(read_release_cache(&cache).suggested.as_deref(), Some(NEWER));
+
+    let second = run_startup(&root, &surroundings, "sess-2");
+    let (additional_context, system_message) = session_start_response(&second);
+    assert_eq!(*system_message, None, "once per release");
+    assert!(!additional_context.as_deref().unwrap().contains(NEWER));
+    assert!(
+        second.detail.as_deref().unwrap().contains("already shown"),
+        "{:?}",
+        second.detail
+    );
+}
+
+/// AE11: the same cache under `bypassPermissions` (or an SDK entrypoint):
+/// no `systemMessage`, the heartbeat detail says why, nothing is written,
+/// and — R30 — no refresh is spawned either.
+#[test]
+fn ae11_a_headless_session_stays_silent_and_spawns_nothing() {
+    let (_dir, root) = ignored_repo();
+    let plugin = plugin_root_pinning("1.0.0");
+    // Stale, so a watched session WOULD spawn a refresh here.
+    let cache = cache_dir_with(NEWER, 2 * 24 * 60 * 60);
+    let lock = tempfile::tempdir().unwrap();
+
+    // Via the envelope's permission mode.
+    let (surroundings, spawns) = watched(&plugin, &cache, &lock);
+    let event = HookEvent::SessionStart;
+    let config = PluginConfig::default();
+    let mut envelope = envelope_for(&root, "startup", "sess-1");
+    envelope.common.permission_mode = Some("bypassPermissions".to_string());
+    let ctx = ctx_for(&event, &envelope, Some(root.clone()), &config);
+    let outcome = handle_with(&ctx, &surroundings).unwrap();
+    let (_, system_message) = session_start_response(&outcome);
+    assert_eq!(*system_message, None);
+    let detail = outcome.detail.as_deref().unwrap();
+    assert!(
+        detail.contains("release suggestion suppressed (quiet mode"),
+        "{detail}"
+    );
+    assert_eq!(spawns.get(), 0, "no refresh for a session nobody watches");
+    assert_eq!(read_release_cache(&cache).suggested, None, "budget not spent");
+
+    // Via the entrypoint.
+    let (mut surroundings, spawns) = watched(&plugin, &cache, &lock);
+    surroundings.entrypoint = Some("sdk-ts".into());
+    let outcome = run_startup(&root, &surroundings, "sess-2");
+    let (_, system_message) = session_start_response(&outcome);
+    assert_eq!(*system_message, None);
+    assert_eq!(spawns.get(), 0);
+
+    // And the very next watched startup gets the notice: quiet mode did not
+    // consume the once-per-tag budget.
+    let (surroundings, _) = watched(&plugin, &cache, &lock);
+    let outcome = run_startup(&root, &surroundings, "sess-3");
+    let (_, system_message) = session_start_response(&outcome);
+    assert!(system_message.as_deref().unwrap().contains(NEWER));
+}
+
+/// AE12: no cache at all. The handler returns (nothing here waits on a
+/// network — the source scan in `hook/tests.rs` proves no client exists on
+/// this path), the detached refresh was asked for exactly once, and the
+/// startup after the refresh has cached a newer tag announces it.
+#[test]
+fn ae12_session_start_spawns_a_detached_refresh_and_does_not_wait() {
+    let (_dir, root) = ignored_repo();
+    let plugin = plugin_root_pinning("1.0.0");
+    let cache = tempfile::tempdir().unwrap();
+    let lock = tempfile::tempdir().unwrap();
+    let (surroundings, spawns) = watched(&plugin, &cache, &lock);
+
+    let outcome = run_startup(&root, &surroundings, "sess-1");
+    let (_, system_message) = session_start_response(&outcome);
+    assert_eq!(*system_message, None, "nothing to suggest before the first refresh");
+    assert_eq!(spawns.get(), 1, "one detached refresh");
+    assert!(
+        outcome.detail.as_deref().unwrap().contains("release refresh spawned"),
+        "{:?}",
+        outcome.detail
+    );
+
+    // "The next startup reads whatever that process cached": simulate the
+    // refresh having landed.
+    crate::release_check::write_cache(
+        &cache.path().join(PLUGIN_LINE.cache_file),
+        &Cache {
+            checked_at: NOW,
+            tag_name: NEWER.to_string(),
+            etag: None,
+            suggested: None,
+        },
+    )
+    .unwrap();
+    let outcome = run_startup(&root, &surroundings, "sess-2");
+    let (_, system_message) = session_start_response(&outcome);
+    assert!(system_message.as_deref().unwrap().contains(NEWER));
+    assert_eq!(spawns.get(), 1, "a fresh cache spawns nothing more");
+}
+
+/// The refresh is spawned only when the cache is missing or older than 24 h,
+/// only on `startup`, and only when a pin exists to compare against.
+#[test]
+fn the_refresh_is_spawned_only_when_stale_on_startup_with_a_pin() {
+    let (_dir, root) = ignored_repo();
+    let plugin = plugin_root_pinning("1.0.0");
+    let lock = tempfile::tempdir().unwrap();
+
+    // Fresh cache: no spawn.
+    let fresh = cache_dir_with("ss-magic-plugin-v1.0.0", 60);
+    let (surroundings, spawns) = watched(&plugin, &fresh, &lock);
+    run_startup(&root, &surroundings, "sess-1");
+    assert_eq!(spawns.get(), 0, "fresh cache");
+
+    // Stale cache: spawn.
+    let stale = cache_dir_with("ss-magic-plugin-v1.0.0", 25 * 60 * 60);
+    let (surroundings, spawns) = watched(&plugin, &stale, &lock);
+    run_startup(&root, &surroundings, "sess-2");
+    assert_eq!(spawns.get(), 1, "stale cache");
+
+    // Stale cache, but not a startup: no spawn, and no notice either.
+    let (surroundings, spawns) = watched(&plugin, &stale, &lock);
+    for source in ["resume", "clear", "compact", "fork"] {
+        let event = HookEvent::SessionStart;
+        let config = PluginConfig::default();
+        let envelope = envelope_for(&root, source, "sess-3");
+        let ctx = ctx_for(&event, &envelope, Some(root.clone()), &config);
+        let outcome = handle_with(&ctx, &surroundings).unwrap();
+        let (_, system_message) = session_start_response(&outcome);
+        assert_eq!(*system_message, None, "source `{source}`");
+        assert!(
+            !outcome.detail.as_deref().unwrap().contains("release"),
+            "source `{source}` records nothing about releases: {:?}",
+            outcome.detail
+        );
+    }
+    assert_eq!(spawns.get(), 0, "non-startup sources");
+
+    // No pin (not an installed plugin): no spawn.
+    let (mut surroundings, spawns) = watched(&plugin, &stale, &lock);
+    surroundings.plugin_root = None;
+    run_startup(&root, &surroundings, "sess-4");
+    assert_eq!(spawns.get(), 0, "no pin");
+}
+
+/// A spawner that fails is a heartbeat note, never a failure of the hook.
+#[test]
+fn a_failed_spawn_is_recorded_not_raised() {
+    let (_dir, root) = ignored_repo();
+    let plugin = plugin_root_pinning("1.0.0");
+    let cache = tempfile::tempdir().unwrap();
+    let lock = tempfile::tempdir().unwrap();
+    let (mut surroundings, _) = watched(&plugin, &cache, &lock);
+    surroundings.spawn_refresh = Box::new(|| Err("spawn: boom".to_string()));
+    let outcome = run_startup(&root, &surroundings, "sess-1");
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("release refresh not spawned (spawn: boom)"),
+        "{:?}",
+        outcome.detail
+    );
+}
+
+/// The three notices share one `systemMessage`, and the suggestion changes
+/// nothing about `additionalContext` — byte-for-byte the U3 output.
+#[test]
+fn the_suggestion_rides_system_message_and_leaves_additional_context_unchanged() {
+    let (_dir, root) = ignored_repo();
+    let plugin = plugin_root_pinning("0.0.1"); // also triggers the drift notice
+    let cache = cache_dir_with(NEWER, 60);
+    let lock = tempfile::tempdir().unwrap();
+    let (surroundings, _) = watched(&plugin, &cache, &lock);
+
+    let event = HookEvent::SessionStart;
+    let config = PluginConfig::default();
+    let envelope = envelope_for(&root, "startup", "sess-1");
+    let ctx = ctx_for(&event, &envelope, Some(root.clone()), &config);
+
+    let baseline = handle_inert(&ctx).unwrap();
+    let with_notices = handle_with(&ctx, &surroundings).unwrap();
+    let (baseline_context, baseline_message) = session_start_response(&baseline);
+    let (context, message) = session_start_response(&with_notices);
+
+    assert_eq!(*baseline_message, None);
+    assert_eq!(context, baseline_context, "additionalContext is unchanged");
+    let message = message.as_deref().unwrap();
+    assert!(message.contains("pins v0.0.1"), "drift notice: {message}");
+    assert!(message.contains(NEWER), "suggestion: {message}");
+    assert!(message.contains("\n\n"), "a blank line apart: {message}");
+}
+
+/// Contention on the release cache's lock withholds the notice for this
+/// session rather than announcing without recording — the record is what
+/// keeps the promise, so no record means no notice.
+#[test]
+fn the_suggestion_is_withheld_while_the_release_cache_is_locked() {
+    let (_dir, root) = ignored_repo();
+    let plugin = plugin_root_pinning("1.0.0");
+    let cache = cache_dir_with(NEWER, 60);
+    let lock = tempfile::tempdir().unwrap();
+    let (surroundings, _) = watched(&plugin, &cache, &lock);
+
+    let outcome = crate::tmproot::with_lock(lock.path(), crate::release_check::LOCK_NAME, || {
+        run_startup(&root, &surroundings, "sess-1")
+    })
+    .unwrap();
+    let (_, system_message) = session_start_response(&outcome);
+    assert_eq!(*system_message, None);
+    assert!(
+        outcome.detail.as_deref().unwrap().contains("release suggestion deferred"),
+        "{:?}",
+        outcome.detail
+    );
+    assert_eq!(read_release_cache(&cache).suggested, None);
+
+    // Once the lock is free, the next startup announces.
+    let outcome = run_startup(&root, &surroundings, "sess-2");
+    let (_, system_message) = session_start_response(&outcome);
+    assert!(system_message.as_deref().unwrap().contains(NEWER));
+}
+
+/// Without a private lock root there is nowhere safe to record the notice,
+/// so it is withheld rather than written unlocked.
+#[test]
+fn the_suggestion_is_withheld_without_a_lock_root() {
+    let (_dir, root) = ignored_repo();
+    let plugin = plugin_root_pinning("1.0.0");
+    let cache = cache_dir_with(NEWER, 60);
+    let lock = tempfile::tempdir().unwrap();
+    let (mut surroundings, _) = watched(&plugin, &cache, &lock);
+    surroundings.lock_root = Box::new(|| None);
+    let outcome = run_startup(&root, &surroundings, "sess-1");
+    let (_, system_message) = session_start_response(&outcome);
+    assert_eq!(*system_message, None);
+    assert!(
+        outcome.detail.as_deref().unwrap().contains("no private lock root"),
+        "{:?}",
+        outcome.detail
+    );
 }

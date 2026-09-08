@@ -1022,6 +1022,38 @@ fn no_per_event_module_writes_to_a_standard_stream() {
     }
 }
 
+/// R30/KTD12: the hook path constructs no HTTP client. `SessionStart` reads
+/// the plugin release cache and spawns a detached `release-check --refresh`
+/// when it is stale; the fetch itself lives only in `release_check.rs`, and
+/// this scan is what keeps it there. `mod.rs` is included: the wrapper must
+/// not grow a fetch either.
+#[test]
+fn no_hook_module_constructs_an_http_client() {
+    let mut sources = per_event_sources();
+    let mod_rs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/hook/mod.rs");
+    sources.push((
+        "src/hook/mod.rs".to_string(),
+        fs::read_to_string(mod_rs).unwrap(),
+    ));
+
+    for (path, body) in sources {
+        for forbidden in [
+            "UreqReleaseClient",
+            "ureq",
+            "fetch_releases",
+            "refresh_cache",
+            "resolve_newest_uncached",
+            "for_product",
+            "refresh_with",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{path} names `{forbidden}`; a hook reads the release cache and never fetches"
+            );
+        }
+    }
+}
+
 /// R40: no hook verb ever writes a `.gitignore`. A hook that could edit one
 /// would be a hook that dirties the user's working tree behind their back, and
 /// the wrapper's ignored-tree gate exists precisely because the rule is

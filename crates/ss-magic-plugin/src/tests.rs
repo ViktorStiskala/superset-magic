@@ -36,6 +36,7 @@ const VERBS: &[(&str, HumanVerb)] = &[
     ("config", HumanVerb::Config),
     ("seed-config", HumanVerb::SeedConfig),
     ("compact-window", HumanVerb::CompactWindow),
+    ("release-check", HumanVerb::ReleaseCheck),
     ("setup-github-ci", HumanVerb::SetupGithubCi),
     ("checklist", HumanVerb::Checklist),
 ];
@@ -314,17 +315,21 @@ fn config_writing_verbs_are_reachable_only_as_human_verbs() {
 /// `writes_config` used to carry this by standing in for "no hook invokes one
 /// of these". It cannot any more: `seed-config` writes configuration AND runs
 /// from `hooks/bootstrap.sh`, a `SessionStart` hook. So the property is pinned
-/// here directly, against the ONE verb any hook invokes.
+/// here directly, against the verbs a hook invokes.
 ///
 /// `seed-config` is safe not because it is trusted to behave but because
 /// `config::seed_block` has no code path that emits an `enabled` key at all —
-/// asserted exhaustively in `config::tests`.
+/// asserted exhaustively in `config::tests`. `release-check` writes only the
+/// plugin release cache in the OS cache directory and reads no configuration
+/// at all.
 #[test]
-fn the_only_hook_invoked_verb_cannot_set_enabled() {
+fn no_hook_invoked_verb_can_set_enabled() {
     // The complete list of verbs any shipped hook or hook-adjacent script
-    // invokes. `hooks/bootstrap.sh` calls exactly this one; every other hook
-    // entry runs `hook <event>`, which never reaches a human verb at all.
-    const INVOKED_BY_A_HOOK: &[HumanVerb] = &[HumanVerb::SeedConfig];
+    // invokes. `hooks/bootstrap.sh` calls `seed-config`; the `SessionStart`
+    // handler itself spawns `release-check --refresh --quiet` detached when
+    // the release cache is stale. Every other hook entry runs `hook <event>`,
+    // which never reaches a human verb at all.
+    const INVOKED_BY_A_HOOK: &[HumanVerb] = &[HumanVerb::SeedConfig, HumanVerb::ReleaseCheck];
 
     for verb in INVOKED_BY_A_HOOK {
         assert!(
@@ -342,6 +347,12 @@ fn the_only_hook_invoked_verb_cannot_set_enabled() {
             );
         }
     }
+    // And the spawned argv is exactly the verb this list names.
+    assert_eq!(
+        HumanVerb::from_token(crate::release_check::REFRESH_ARGV[0]),
+        Some(HumanVerb::ReleaseCheck)
+    );
+    assert!(!HumanVerb::ReleaseCheck.writes_config());
 }
 
 /// Every verb-shaped token the crate-root doc comment names in backticks must

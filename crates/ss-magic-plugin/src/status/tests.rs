@@ -65,6 +65,8 @@ fn bare_inputs(cwd: &Path) -> Inputs {
         data_dir: Located::missing("no ${CLAUDE_PLUGIN_DATA} in this test"),
         all: false,
         compaction: compact_window::Sources::default(),
+        release_cache: None,
+        now: 1_788_091_200, // 2026-08-30 12:00:00 UTC, arbitrary and fixed.
     }
 }
 
@@ -1277,4 +1279,118 @@ fn the_text_rendering_has_a_compaction_section() {
     assert!(out.contains("pct override"), "{out}");
     assert!(out.contains("set to 60"), "{out}");
     assert!(out.contains("recommended window"), "{out}");
+}
+
+// ── The newest-release row (U6, R33) ──────────────────────────────────────────
+
+/// A release cache holding `tag`, checked `age` seconds before the fixture's
+/// `now`.
+fn release_cache_with(dir: &Path, tag: &str, age: u64) -> PathBuf {
+    let path = dir.join("plugin-release-check.json");
+    crate::release_check::write_cache(
+        &path,
+        &ss_magic_core::release::Cache {
+            checked_at: 1_788_091_200 - age,
+            tag_name: tag.to_string(),
+            etag: None,
+            suggested: None,
+        },
+    )
+    .unwrap();
+    path
+}
+
+/// A pin under a plugin root, so `versions.pin` resolves.
+fn plugin_root_pinning(dir: &Path, pin: &str) -> Located {
+    let root = dir.join("plugin-root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join(PIN_FILE), format!("{pin}\n")).unwrap();
+    Located::found(root, "test")
+}
+
+/// With a cache newer than the pin: the row names the tag, says it was
+/// checked and is fresh, and `update_available` is true — with no problem
+/// line, since an available update is information, not a fault.
+#[test]
+fn newest_release_row_reports_an_available_update_without_a_problem() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut inputs = bare_inputs(dir.path());
+    inputs.plugin_root = plugin_root_pinning(dir.path(), "1.0.0");
+    inputs.release_cache = Some(release_cache_with(dir.path(), "ss-magic-plugin-v1.1.0", 60));
+    let status = collect(&inputs, &probes(listing(true)));
+
+    let newest = &status.versions.newest_release;
+    assert_eq!(newest.value.as_deref(), Some("ss-magic-plugin-v1.1.0"));
+    assert!(newest.source.as_deref().unwrap().contains("fresh"), "{newest:?}");
+    assert_eq!(status.versions.update_available, Some(true));
+    assert!(
+        !status.problems.iter().any(|p| p.contains("ss-magic-plugin-v1.1.0")),
+        "{:?}",
+        status.problems
+    );
+
+    let mut out = String::new();
+    render_text(&mut out, &status);
+    assert!(out.contains("newest release"), "{out}");
+    assert!(out.contains("update through /plugin"), "{out}");
+}
+
+/// A stale cache says so; a cache equal to the pin is "not newer"; an absent
+/// cache and a missing cache directory are notes beside a null, never a
+/// problem line.
+#[test]
+fn newest_release_row_degrades_to_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut inputs = bare_inputs(dir.path());
+    inputs.plugin_root = plugin_root_pinning(dir.path(), "1.0.0");
+
+    inputs.release_cache = Some(release_cache_with(
+        dir.path(),
+        "ss-magic-plugin-v1.0.0",
+        2 * 24 * 60 * 60,
+    ));
+    let status = collect(&inputs, &probes(listing(true)));
+    assert_eq!(status.versions.update_available, Some(false));
+    assert!(
+        status
+            .versions
+            .newest_release
+            .source
+            .as_deref()
+            .unwrap()
+            .contains("stale"),
+        "{:?}",
+        status.versions.newest_release
+    );
+
+    inputs.release_cache = Some(dir.path().join("absent.json"));
+    let status = collect(&inputs, &probes(listing(true)));
+    assert_eq!(status.versions.newest_release.value, None);
+    assert!(
+        status
+            .versions
+            .newest_release
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("release-check --refresh")
+    );
+    assert_eq!(status.versions.update_available, None);
+
+    inputs.release_cache = None;
+    let status = collect(&inputs, &probes(listing(true)));
+    assert!(status
+        .versions
+        .newest_release
+        .note
+        .as_deref()
+        .unwrap()
+        .contains("no cache directory"));
+
+    // The JSON keeps the module's rule: a null value has a non-null note.
+    let json = serde_json::to_value(&status).unwrap();
+    let field = &json["versions"]["newest_release"];
+    assert!(field["value"].is_null());
+    assert!(!field["note"].is_null());
+    assert!(json["versions"]["update_available"].is_null());
 }

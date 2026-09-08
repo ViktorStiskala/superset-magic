@@ -130,7 +130,10 @@ table:
 - `config.rs`, `scratchpad.rs`, `cache.rs`, `bypass.rs`, `expect_artifact.rs`,
   `claim.rs`, `tmproot.rs`, `heartbeat.rs`, `ledger.rs`, `identity.rs`,
   `compact_window.rs`, `setup_ci.rs`, `status.rs`, `spill_index.rs`,
-  `pathnorm.rs`, `atomic.rs` – the state, reporting and path modules.
+  `release_check.rs`, `pathnorm.rs`, `atomic.rs` – the state, reporting and
+  path modules. `release_check.rs` is the one place the plugin constructs an
+  HTTP client (only under `release-check --refresh`); the hooks read its cache
+  and never fetch.
 
 Two rules shape the whole crate: a hook answers the harness with JSON on stdout
 and must always exit 0, while a human verb reports on stderr and exits non-zero.

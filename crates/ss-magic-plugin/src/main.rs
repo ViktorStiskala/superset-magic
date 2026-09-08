@@ -92,6 +92,7 @@ pub(crate) mod hook;
 pub(crate) mod identity;
 pub(crate) mod ledger;
 pub(crate) mod pathnorm;
+pub(crate) mod release_check;
 pub(crate) mod scratchpad;
 pub(crate) mod setup_ci;
 pub(crate) mod spill_index;
@@ -198,6 +199,10 @@ pub enum HumanVerb {
     SeedConfig,
     /// Inspect or adjust the compaction window.
     CompactWindow,
+    /// Report the newest known plugin release against the pin, optionally
+    /// refreshing the cache with one bounded fetch. Writes only that cache
+    /// file – never configuration, never a binary.
+    ReleaseCheck,
     /// Write the GitHub Actions workflow into the consuming repository.
     SetupGithubCi,
     /// The operator-checklist verb family (`init`, `add-item`, `set`, `done`,
@@ -225,6 +230,7 @@ impl HumanVerb {
             "config" => Self::Config,
             "seed-config" => Self::SeedConfig,
             "compact-window" => Self::CompactWindow,
+            "release-check" => Self::ReleaseCheck,
             "setup-github-ci" => Self::SetupGithubCi,
             "checklist" => Self::Checklist,
             _ => return None,
@@ -254,6 +260,7 @@ impl HumanVerb {
             Self::Config => "config",
             Self::SeedConfig => "seed-config",
             Self::CompactWindow => "compact-window",
+            Self::ReleaseCheck => "release-check",
             Self::SetupGithubCi => "setup-github-ci",
             Self::Checklist => "checklist",
         }
@@ -353,6 +360,7 @@ carries the wrapper on PATH; none of them is meant to be typed in a terminal:
   config                Read or write plugin configuration keys
   seed-config           Fold the gate defaults into an existing magic.json
   compact-window        Inspect or adjust the compaction window
+  release-check         Newest known plugin release vs. the pin; --refresh re-reads
   setup-github-ci       Write the GitHub Actions workflow into this repository
   checklist             Operator-checklist verbs (the only write path for it)
 
@@ -360,8 +368,9 @@ Options:
   -V, --version         Print `ss-magic-plugin <version>` and exit
   -h, --help            Print this text and exit
 
-This binary never checks for or installs an update, and never opens an
-interactive menu — it links neither an updater nor a terminal-UI library.";
+This binary never installs an update and never opens an interactive menu — it
+links neither an updater nor a terminal-UI library. `release-check` only reports
+that a newer plugin release exists; updating it is done through /plugin.";
 
 /// Render the plugin usage text. A function so the help and error paths share
 /// one source of truth.
@@ -526,6 +535,7 @@ fn run_human(verb: HumanVerb, args: &[String]) -> Result<ExitCode> {
         HumanVerb::Config => config::run_config(args),
         HumanVerb::SeedConfig => config::run_seed_config(args),
         HumanVerb::CompactWindow => compact_window::run(args),
+        HumanVerb::ReleaseCheck => release_check::run(args),
     }
 }
 

@@ -678,6 +678,57 @@ purpose (the notices are one operator line each and bounded, so a wrong
 default, a new headless heuristic added on suspicion, or an operator notice
 placed on `additionalContext` instead of `systemMessage`.
 
+### The plugin release suggestion reads a file, records before it announces, and never fetches from a hook
+
+`SessionStart` tells the operator, once per release, that a newer
+`ss-magic-plugin-vX.Y.Z` release exists – and nothing more. Four rules, each a
+test in `release_check/tests.rs` or `hook/session_start/tests.rs`:
+
+- **No HTTP client on the hook path.** The hook reads the plugin release
+  cache (`plugin-release-check.json` in the `ss-magic` cache dir) through
+  core's `release::read_cache` and, when the cache is missing or older than
+  24 h, spawns `release-check --refresh --quiet` DETACHED (own process group,
+  every stream on `/dev/null`, child dropped) and returns without waiting.
+  The only client construction in the crate is `release_check::run_refresh`,
+  reached from an explicit `--refresh`. A source-scan test asserts no `hook/`
+  module names `UreqReleaseClient`, `ureq`, `fetch_releases`, `refresh_cache`,
+  `refresh_with`, `for_product` or `resolve_newest_uncached`. Flag a fetch,
+  a client, or a blocking wait on the child anywhere under `hook/`.
+- **Record, then announce – under the shared non-blocking lock.** The
+  once-per-tag promise lives in the cache record's `suggested` field. The
+  hook writes it through `release_check::record_suggested` (a
+  `tmproot::try_with_lock` on `release-check.lock`, re-reading the cache
+  inside the lock) and announces ONLY when that write returned `Written`.
+  Contention (`Busy`), a tag the cache no longer names (`Superseded`), no
+  lock root, or a write error each WITHHOLD the notice for that session; the
+  next startup decides again. Flag a notice emitted before or without the
+  record, a blocking `with_lock` here or in the refresh (a hook must not
+  wait on a 5 s fetch), or a write to the cache outside
+  `release_check::write_cache` (the atomic 0600 writer – the file has two
+  writers and a lock-free reader).
+- **Quiet mode is decided BEFORE the write, and gates the spawn too.** A
+  headless session (`hook::quiet_mode`) neither announces nor spends the
+  once-per-tag budget nor forks a refresh on the operator's behalf. In the
+  pure decision `release_check::suggestion` quiet is tested LAST, so a
+  headless session with something to say records `release suggestion
+  suppressed (quiet mode: …)` while one with nothing to say records "not
+  newer". Flag a `suggested` write on a quiet path, a spawn on a quiet path,
+  a spawn on any source but `startup`, or a spawn when no pin exists.
+- **The refresh derivation is core's, and it carries the marker.** Both the
+  verb's refresh and the CLI's `run_check` go through
+  `release::refresh_cache`, which keeps the prior tag on `NotModified` /
+  `Failed`, bumps `checked_at` on every outcome, and carries `suggested`
+  forward when the re-selected tag equals the prior tag, clearing it only
+  for a DIFFERENT tag. Flag a second derivation, a refresh that rebuilds the
+  record wholesale (it would re-arm the notice every 24 h), or a verb
+  freshness short-circuit (`--refresh` means fetch).
+
+The notice's remedy ends in "start a new session": `/reload-plugins` alone
+re-registers the plugin but keeps the old binary until a fresh session's
+bootstrap swaps it. Flag a remedy that names the reload as sufficient, and
+flag any path from `release-check` to a download or an install – it reports,
+and `/plugin` updates.
+
 ### Exactly-once claims must not be built on `unlink`
 
 **Never treat a successful delete as having won a claim.** Measured on this
@@ -1069,9 +1120,11 @@ It is now structural: `ss-magic-plugin` is its own binary linking neither
 menu to construct. The binary is pinned alongside the skills, hooks and Markdown
 the marketplace ships with it, so a silent mid-session swap would leave the two
 describing different behavior; updating the plugin through the marketplace is
-what replaces the binary. Flag any dependency or code path that would restore
-either capability, and flag a "convenience" re-export that lets plugin code call
-into the CLI crate.
+what replaces the binary. The plugin does CHECK – `release-check` and the
+`SessionStart` suggestion, see the section above – but a check writes one cache
+file and prints one line. Flag any dependency or code path that would restore
+either capability, any path from the check to a download, and a "convenience"
+re-export that lets plugin code call into the CLI crate.
 
 ### The shipped manifest declares FIVE hook events
 
@@ -1128,7 +1181,8 @@ embedded source of truth).
 
 Only `ss-magic` self-updates. The per-line release CHECK lives in core
 (`release.rs`); the apply path lives in the CLI crate (`update/`), and nothing in
-the plugin crate reaches either.
+the plugin crate reaches the latter. The plugin crate reaches the check for its
+own line only (`PLUGIN_LINE`), through `release_check.rs`.
 
 - The daily-cached release check (core's `release.rs`) lists `/releases` (first
   page) and filters PER RELEASE LINE with an anchored, exact tag filter
@@ -1144,6 +1198,13 @@ the plugin crate reaches either.
   fall through SILENTLY on any offline / non-200 / timeout / non-JSON-array
   result – a failed update check must never block or slow a normal invocation.
   Flag an update-check change that surfaces a hard error or removes the timeout.
+  `refresh_cache(prior, client, line, now)` is the ONE derivation of the next
+  cache record (used by `run_check` once the cache is stale and by the plugin's
+  `release-check --refresh` on every call); `Cache.suggested` is the plugin
+  line's once-per-release marker, skipped from the JSON when `None` so the
+  CLI's `version-check.json` keeps its old shape. Flag a second derivation, a
+  `Cache` rebuilt wholesale on refresh (it drops the marker), or a `suggested`
+  written by the CLI.
 - Every `self_update` call is pinned: `apply_update`, `apply_update_unlocked`
   and `run_self_update` (`update/apply.rs`) take a mandatory `&str` tag and
   always set `target_version_tag`. Flag a signature that regrows

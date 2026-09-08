@@ -31,7 +31,12 @@
 //! `check` wires the real ureq client + the real OS cache path + [`CLI_LINE`]
 //! on top of `run_check`. [`resolve_newest_uncached`] is the cache-free
 //! variant the forced `ss-magic update` path uses to pin the tag it hands to
-//! the download backend (R18).
+//! the download backend (R18). [`refresh_cache`] is the one derivation of
+//! "the next cache from the prior one plus a fetch" – `run_check` calls it
+//! once the cache is stale, and the plugin's `release-check --refresh` verb
+//! calls it on every invocation, so the ETag round-trip, the keep-the-prior-
+//! tag-on-failure rule and the carrying of the plugin's `suggested` marker are
+//! written once and tested once (KTD12).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -81,7 +86,8 @@ pub const CLI_LINE: Line = Line {
 /// The Claude Code plugin: `ss-magic-plugin-vX.Y.Z` tags (cargo-dist's
 /// native `<package>-v<version>` form for the `ss-magic-plugin` package), in
 /// its own cache file so the two lines never overwrite each other's answer.
-#[allow(dead_code)] // consumed by U6: the plugin's `release-check` verb and its SessionStart suggestion
+/// Consumed by the plugin crate alone – its `release-check` verb refreshes
+/// this line's cache and its `SessionStart` hook reads it (R29–R33).
 pub const PLUGIN_LINE: Line = Line {
     tag_prefix: "ss-magic-plugin-v",
     cache_file: "plugin-release-check.json",
@@ -147,11 +153,21 @@ pub trait ReleaseClient {
 /// `checked_at` is unix epoch seconds of the last check (success OR silent
 /// failure – every network attempt refreshes it so we don't hammer a flaky
 /// endpoint). `tag_name`/`etag` carry the last successfully observed values.
-/// The shape is deliberately unchanged from the `releases/latest` era so a
+/// The shape is deliberately a superset of the `releases/latest` era's so a
 /// cache file written by an older binary still parses; `tag_name` now holds
 /// the tag SELECTED by this line's filter rather than whatever GitHub marked
 /// latest.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `suggested` is the plugin line's once-per-release marker (R29): the tag
+/// whose availability the `SessionStart` hook has already announced on the
+/// operator channel. The CLI never sets it and its cache file never carries
+/// the key (it is skipped when `None`), so `version-check.json` is
+/// byte-for-byte the shape it always was. It lives in the cache rather than
+/// in a marker file of its own because the two are one unit of state: a
+/// refresh that selects a DIFFERENT tag must clear it, and a refresh that
+/// re-selects the same tag must keep it, which only the code that rewrites
+/// the cache can guarantee – see [`refresh_cache`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cache {
     /// Unix epoch seconds of the last check attempt.
     #[serde(default)]
@@ -163,11 +179,24 @@ pub struct Cache {
     /// Last `ETag` seen, sent as `If-None-Match` next time.
     #[serde(default)]
     pub etag: Option<String>,
+    /// The tag already suggested to the operator, when one has been (plugin
+    /// line only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested: Option<String>,
+}
+
+impl Cache {
+    /// True when this record was checked within [`FRESH_FOR`] of `now`. A
+    /// `checked_at` of 0 – the default for a record that never recorded a
+    /// check – is never fresh, so a hand-made or partial file re-checks.
+    pub fn is_fresh(&self, now: u64) -> bool {
+        self.checked_at != 0 && is_fresh(self.checked_at, now)
+    }
 }
 
 /// Current unix time in seconds, saturating to 0 if the clock is before the
 /// epoch (impossible in practice; keeps the function total).
-fn now_secs() -> u64 {
+pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -176,8 +205,10 @@ fn now_secs() -> u64 {
 
 /// Read the cache file, treating any error (missing, unreadable, malformed
 /// JSON) as "no usable cache" → `None`. A `None` here is what drives the
-/// "stale, recreate" path.
-fn read_cache(path: &Path) -> Option<Cache> {
+/// "stale, recreate" path. Public because the plugin's hook reads its line's
+/// cache directly – it must never construct a client, so it cannot go through
+/// [`run_check`] (R30).
+pub fn read_cache(path: &Path) -> Option<Cache> {
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str::<Cache>(&raw).ok()
 }
@@ -289,6 +320,93 @@ pub fn is_newer(line: &Line, tag: &str, current: &str) -> bool {
     }
 }
 
+/// How one [`refresh_cache`] call went, beside the cache it produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// `200 OK`: the list was re-read and this line's newest tag re-selected
+    /// (possibly to the same value as before, possibly to none).
+    Fetched,
+    /// `304 Not Modified`: the prior tag is still current.
+    NotModified,
+    /// Offline, timeout, non-200, or a malformed body: nothing was learned and
+    /// the prior tag was kept, but `checked_at` still moved so a flaky
+    /// endpoint is not hammered.
+    Failed,
+}
+
+/// What [`refresh_cache`] hands back: the record to persist, and what kind of
+/// answer produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refresh {
+    pub cache: Cache,
+    pub outcome: RefreshOutcome,
+}
+
+/// Derive the next cache record from the prior one plus one fetch – the ONE
+/// place that rule is written, shared by [`run_check`] and the plugin's
+/// `release-check --refresh` verb.
+///
+/// Always fetches (there is no freshness short-circuit here; [`run_check`]
+/// applies that before calling in), sending the prior `ETag` as
+/// `If-None-Match`. Then:
+///
+/// - `Ok` → the list is authoritative: this line's newest tag is re-selected
+///   (an empty string when the list holds none, replacing any prior tag), the
+///   new `ETag` is stored, and `checked_at` moves to `now`.
+/// - `NotModified` → the prior tag and `ETag` are kept; `checked_at` moves.
+/// - `Failed` → the prior tag and `ETag` are kept (the failed call is not
+///   trusted to have said anything); `checked_at` moves.
+///
+/// `suggested` – the plugin line's once-per-release marker – is carried
+/// forward whenever the selected tag equals the prior tag, and cleared only
+/// when a DIFFERENT tag is selected. That is what makes "at most once per
+/// newest tag" hold across the daily refresh: rebuilding the record wholesale
+/// (as the pre-U6 `run_check` did) would have forgotten the marker every 24 h
+/// and re-announced the same release each day. A `Failed` or `NotModified`
+/// refresh keeps the prior tag, so it keeps the marker too.
+pub fn refresh_cache<C: ReleaseClient>(
+    prior: Option<Cache>,
+    client: &C,
+    line: &Line,
+    now: u64,
+) -> Refresh {
+    let prior = prior.unwrap_or_default();
+    let (cache, outcome) = match client.fetch_releases(prior.etag.as_deref()) {
+        FetchOutcome::Ok { releases, etag } => {
+            let tag_name = select_newest(line, &releases).unwrap_or_default();
+            let suggested = if tag_name == prior.tag_name {
+                prior.suggested
+            } else {
+                None
+            };
+            (
+                Cache {
+                    checked_at: now,
+                    tag_name,
+                    etag,
+                    suggested,
+                },
+                RefreshOutcome::Fetched,
+            )
+        }
+        FetchOutcome::NotModified => (
+            Cache {
+                checked_at: now,
+                ..prior
+            },
+            RefreshOutcome::NotModified,
+        ),
+        FetchOutcome::Failed => (
+            Cache {
+                checked_at: now,
+                ..prior
+            },
+            RefreshOutcome::Failed,
+        ),
+    };
+    Refresh { cache, outcome }
+}
+
 /// Testable core of the daily-cached check.
 ///
 /// `cache_file` is the injected cache path; `client` is the injected HTTP
@@ -298,14 +416,10 @@ pub fn is_newer(line: &Line, tag: &str, current: &str) -> bool {
 /// Flow:
 /// 1. Read the cache (missing/malformed → treated as stale).
 /// 2. If FRESH (< 24h) → use the cached tag, NO network call.
-/// 3. Else fetch via `client` (sending the cached ETag as `If-None-Match`):
-///    - `Ok` → select this line's newest tag from the list, store it (empty
-///      when the list holds none) + etag, refresh `checked_at`, verdict from
-///      the selected tag.
-///    - `NotModified` → keep the stored tag, refresh `checked_at` (+ etag),
-///      verdict from the retained tag.
-///    - `Failed` → refresh `checked_at` ONLY, verdict `UpToDate` (silent).
-/// 4. Compare the resolved tag to `current_version` through the line filter.
+/// 3. Else [`refresh_cache`] via `client`, persist the result.
+/// 4. A `Failed` refresh is always `UpToDate` – even if a stale prior tag
+///    happened to be newer, it could not be confirmed now. Otherwise compare
+///    the resolved tag to `current_version` through the line filter.
 pub fn run_check<C: ReleaseClient>(
     cache_file: &Path,
     client: &C,
@@ -317,45 +431,18 @@ pub fn run_check<C: ReleaseClient>(
 
     // FRESH cache → no network. Verdict purely from the stored tag.
     if let Some(cache) = &cached {
-        if cache.checked_at != 0 && is_fresh(cache.checked_at, now) {
+        if cache.is_fresh(now) {
             return verdict_from_tag(line, &cache.tag_name, current_version);
         }
     }
 
     // STALE (or missing/malformed) → hit the network behind the seam.
-    let prior = cached.unwrap_or_default();
-    let outcome = client.fetch_releases(prior.etag.as_deref());
-    let failed = matches!(outcome, FetchOutcome::Failed);
-
-    let next = match outcome {
-        FetchOutcome::Ok { releases, etag } => Cache {
-            checked_at: now,
-            // A successful fetch is authoritative: a list with no tag of this
-            // line stores an empty tag (no update), replacing any prior one.
-            tag_name: select_newest(line, &releases).unwrap_or_default(),
-            etag,
-        },
-        FetchOutcome::NotModified => Cache {
-            checked_at: now,
-            // Keep the last-selected tag; retain the etag we sent.
-            tag_name: prior.tag_name,
-            etag: prior.etag,
-        },
-        FetchOutcome::Failed => Cache {
-            // Offline-safe fall-through: bump the timestamp ONLY, keep
-            // whatever tag/etag we already had (don't trust the failed call).
-            checked_at: now,
-            tag_name: prior.tag_name,
-            etag: prior.etag,
-        },
-    };
+    let Refresh { cache: next, outcome } = refresh_cache(cached, client, line, now);
 
     // Persist the refreshed cache, then decide.
     write_cache(cache_file, &next);
 
-    if failed {
-        // A failure is always "no update", even if a stale prior tag happened
-        // to be newer (we couldn't confirm it now).
+    if outcome == RefreshOutcome::Failed {
         return UpdateCheck::UpToDate;
     }
 
@@ -398,10 +485,12 @@ pub fn cache_dir() -> Option<PathBuf> {
 /// [`Line`].
 pub struct UreqReleaseClient {
     url: String,
-    user_agent_version: String,
+    user_agent: String,
 }
 
 impl UreqReleaseClient {
+    /// The sync CLI's client: `User-Agent: ss-magic/<version>`.
+    ///
     /// `user_agent_version` is the CALLING BINARY's version, and there is
     /// deliberately no `Default` that would fill it in from here.
     ///
@@ -414,11 +503,18 @@ impl UreqReleaseClient {
     /// the version a required argument is what stops that from recurring:
     /// there is no construction path that can pick the wrong one.
     pub fn new(user_agent_version: &str) -> Self {
+        Self::for_product("ss-magic", user_agent_version)
+    }
+
+    /// A client identifying itself as `<product>/<version>` – the plugin's
+    /// `release-check` passes its own binary name, so the two lines are
+    /// distinguishable in GitHub's request logs.
+    pub fn for_product(product: &str, version: &str) -> Self {
         Self {
             url: format!(
                 "https://api.github.com/repos/{REPO_SLUG}/releases?per_page={RELEASES_PER_PAGE}"
             ),
-            user_agent_version: user_agent_version.to_string(),
+            user_agent: format!("{product}/{version}"),
         }
     }
 }
@@ -428,7 +524,7 @@ impl ReleaseClient for UreqReleaseClient {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(HTTP_TIMEOUT))
             .http_status_as_error(false)
-            .user_agent(format!("ss-magic/{}", self.user_agent_version))
+            .user_agent(self.user_agent.clone())
             .build();
         let agent: ureq::Agent = config.into();
 

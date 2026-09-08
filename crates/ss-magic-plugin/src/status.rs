@@ -56,9 +56,10 @@ use serde::{Deserialize, Serialize};
 use crate::git;
 use crate::heartbeat::{self, Outcome};
 use crate::{
-    bypass, cache, checklist, compact_window, config, expect_artifact, identity, scratchpad,
-    tmproot,
+    bypass, cache, checklist, compact_window, config, expect_artifact, identity, release_check,
+    scratchpad, tmproot,
 };
+use ss_magic_core::release;
 use ss_magic_core::style;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -449,6 +450,15 @@ pub struct Versions {
     /// `aligned`, `binary-behind`, `binary-ahead`, `differ`, or `unknown`.
     pub drift: &'static str,
     pub detail: String,
+    /// The newest `ss-magic-plugin` release the plugin release cache knows of,
+    /// with when it was last checked as the source; a note when the cache is
+    /// absent, stale-shaped or holds no plugin tag. Read-only: `status` never
+    /// refreshes the cache — `release-check --refresh` does that, and the
+    /// `SessionStart` hook spawns it in the background when the cache is stale.
+    pub newest_release: Field,
+    /// Whether that release is newer than the pin; `None` when either side is
+    /// unknown (the two rows above say which).
+    pub update_available: Option<bool>,
 }
 
 /// What the hooks have actually been doing, from the heartbeat log.
@@ -516,6 +526,11 @@ pub struct Inputs {
     /// Where the compaction section looks for the override beyond the
     /// project's own files, and what the process environment says.
     pub compaction: compact_window::Sources,
+    /// The plugin line's release cache file, or `None` when no cache
+    /// directory resolves. Injected so the tests point it at a tempdir.
+    pub release_cache: Option<PathBuf>,
+    /// Seconds since the Unix epoch, for the cache's age.
+    pub now: u64,
 }
 
 /// The two things `status` learns by talking to something outside itself.
@@ -1591,6 +1606,8 @@ fn collect_versions(
         problems.push(format!("version gap: {detail}."));
     }
 
+    let (newest_release, update_available) = collect_newest_release(inputs, pin.as_deref());
+
     Versions {
         manifest,
         pin,
@@ -1598,7 +1615,60 @@ fn collect_versions(
         running: inputs.tool_version.clone(),
         drift,
         detail,
+        newest_release,
+        update_available,
     }
+}
+
+/// The newest known plugin release, from the release cache alone (R33's
+/// report, folded into `status`). Reads one file and asks the network
+/// nothing; a missing or unusable cache is a note, never a problem line —
+/// an available update is information, not something wrong.
+fn collect_newest_release(inputs: &Inputs, pin: Option<&str>) -> (Field, Option<bool>) {
+    let Some(path) = inputs.release_cache.as_deref() else {
+        return (
+            Field::missing("no cache directory resolves on this platform"),
+            None,
+        );
+    };
+    let Some(cache) = release::read_cache(path) else {
+        return (
+            Field::missing(format!(
+                "{} is absent or unreadable — a fresh session start refreshes it in the \
+                 background, or run `ss-magic-plugin release-check --refresh`",
+                path.display()
+            )),
+            None,
+        );
+    };
+    if release::parse_line_tag(&release::PLUGIN_LINE, &cache.tag_name).is_none() {
+        let note = if cache.tag_name.is_empty() {
+            "the last fetch found no ss-magic-plugin release".to_string()
+        } else {
+            format!(
+                "the cached tag `{}` is not an ss-magic-plugin release tag",
+                cache.tag_name
+            )
+        };
+        return (Field::missing(note), None);
+    }
+    let checked = if cache.checked_at == 0 {
+        "never checked".to_string()
+    } else {
+        format!(
+            "release cache checked {}, {}",
+            scratchpad::format_rfc3339(cache.checked_at),
+            if cache.is_fresh(inputs.now) {
+                "fresh"
+            } else {
+                "stale — refreshed at the next fresh session start"
+            }
+        )
+    };
+    let field = Field::found(cache.tag_name.clone(), checked);
+    let available =
+        pin.map(|pinned| release::is_newer(&release::PLUGIN_LINE, &cache.tag_name, pinned));
+    (field, available)
 }
 
 /// `1.2.3` → `(1, 2, 3)`. `None` for anything that is not exactly three
@@ -1829,6 +1899,8 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
         data_dir: locate_data_dir(),
         all,
         compaction: compact_window::Sources::from_process(),
+        release_cache: release_check::cache_file(),
+        now: release::now_secs(),
     };
     let probes = Probes {
         harness,
@@ -2169,6 +2241,37 @@ fn render_text(out: &mut String, status: &Status) {
         "drift",
         format!("{} — {}", status.versions.drift, status.versions.detail),
     );
+    let newest = &status.versions.newest_release;
+    match (&newest.value, &newest.source, &newest.note) {
+        (Some(tag), source, _) => {
+            let verdict = match status.versions.update_available {
+                Some(true) => " — newer than the pin; update through /plugin",
+                Some(false) => " — not newer than the pin",
+                None => "",
+            };
+            let value = format!(
+                "{tag}{verdict}   ({})",
+                source.as_deref().unwrap_or("release cache")
+            );
+            row(
+                out,
+                "newest release",
+                if status.versions.update_available == Some(true) {
+                    style::warn(value)
+                } else {
+                    value
+                },
+            );
+        }
+        (None, _, note) => row(
+            out,
+            "newest release",
+            style::info(format!(
+                "unknown — {}",
+                note.as_deref().unwrap_or("no reason recorded")
+            )),
+        ),
+    }
     let _ = writeln!(out);
 
     let _ = writeln!(
