@@ -1362,8 +1362,11 @@ the digest), `scripts/mark-latest.sh` + `scripts/test-mark-latest.sh` +
 `.github/workflows/mark-latest.yml` (the post-announce latest-mark step, see
 Build), `scripts/lib/test-harness.sh` (the assertion helpers both shell suites
 source), and
-`docs/runbooks/forge-tag-and-release-protection.md` (tag/release immutability
-settings a human must apply by hand – currently NOT applied).
+`docs/runbooks/forge-tag-and-release-protection.md` (the tag ruleset and
+release immutability on the forge – applied 2026-08-31 and verified against the
+live repository 2026-09-08; the ruleset also carries `required_signatures`,
+which checks the tagged COMMIT's signature, not the tag object's, and two
+disposable non-version tags from the proofs exist permanently).
 
 Four shell pieces are worth knowing about, because all are load-bearing and
 none is Rust. `plugin/hooks/bootstrap.sh` installs the pinned binary into

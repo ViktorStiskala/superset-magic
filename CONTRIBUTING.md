@@ -436,6 +436,18 @@ one running them.
 
 ### Release procedure, per line
 
+**Both lines.** The repository's tag ruleset (recorded in
+[docs/runbooks/forge-tag-and-release-protection.md](./docs/runbooks/forge-tag-and-release-protection.md))
+refuses a tag push whose COMMIT does not carry a signature GitHub verifies, and
+refuses every later move or delete of a tag that landed. Tagging `main`'s tip
+satisfies the first rule as long as the commits there are signed – the
+maintainer's SSH-signed commits and GitHub's own merge commits both are – while
+a tag on a locally made, unsigned commit is refused before the pipeline runs.
+The tag object itself need not be signed (measured: an unsigned lightweight tag
+on a signed commit was accepted), so `git tag -s` is good practice rather than
+a requirement. The second rule is why a mis-cut release is fixed by a new patch
+release, never by moving the tag.
+
 **CLI (`ss-magic`).** Bump `crates/ss-magic/Cargo.toml`, run `cargo build` so
 `Cargo.lock` follows, run `--check`, merge. Then `git tag v<X.Y.Z>` on `main`
 and push the tag. Finally, advance `README.md`'s pinned installer tag to

@@ -1483,7 +1483,11 @@ the manifest does not declare. README must also stay explicit that no plugin
 verb is typed in a terminal: every one is `ss-magic-plugin <verb>`, reached
 through Claude Code, and turning the plugin on for a repository is documented as
 editing `"enabled": true` into the seeded `plugin` block, not as a command.
-`docs/runbooks/forge-tag-and-release-protection.md` must cover both tag shapes.
+`docs/runbooks/forge-tag-and-release-protection.md` must cover both tag shapes
+and keep recording the settings as they are on the forge (its ruleset JSON is
+the restore recipe, so a rule added or removed there must be mirrored) – flag a
+release-procedure change that assumes a tag can be moved or deleted, or a tag
+on an unsigned commit, since the live ruleset refuses all three.
 This `.cursor/BUGBOT.md` must likewise be re-synchronised whenever the
 conventions above change, and must stay self-contained – restate a convention
 inline rather than pointing at another document.
