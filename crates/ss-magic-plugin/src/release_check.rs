@@ -423,23 +423,35 @@ fn locate_pin() -> PinReport {
             note: located.note,
         };
     };
-    let pin_file = root.join(status::PIN_FILE);
-    match std::fs::read_to_string(&pin_file) {
-        Ok(text) if !text.trim().is_empty() => PinReport {
-            version: Some(text.trim().to_string()),
-            source: Some(pin_file.display().to_string()),
+    match status::read_pin_file(&root) {
+        Ok((version, path)) => PinReport {
+            version: Some(version),
+            source: Some(path.display().to_string()),
             note: None,
         },
-        Ok(_) => PinReport {
+        Err(note) => PinReport {
             version: None,
             source: None,
-            note: Some(format!("{} is empty", pin_file.display())),
+            note: Some(note),
         },
-        Err(e) => PinReport {
-            version: None,
-            source: None,
-            note: Some(format!("could not read {}: {e}", pin_file.display())),
-        },
+    }
+}
+
+/// The cache's newest tag when it is a plugin-line tag, or the note saying
+/// why it is not: an empty tag means the last fetch found no plugin release,
+/// anything else failing the anchored filter is a tag of some other line
+/// (the CLI's, say) that has no business being in this cache. Shared with
+/// `status`'s "newest release" row so the two reports say the same thing.
+pub fn cached_plugin_tag(cache: &Cache) -> std::result::Result<&str, String> {
+    if release::parse_line_tag(&PLUGIN_LINE, &cache.tag_name).is_some() {
+        Ok(&cache.tag_name)
+    } else if cache.tag_name.is_empty() {
+        Err("the last fetch found no ss-magic-plugin release".to_string())
+    } else {
+        Err(format!(
+            "the cached tag `{}` is not an ss-magic-plugin release tag",
+            cache.tag_name
+        ))
     }
 }
 
@@ -477,24 +489,18 @@ pub fn report(
                 )),
             },
             Some(record) => {
-                let has_tag = release::parse_line_tag(&PLUGIN_LINE, &record.tag_name).is_some();
+                let (newest_tag, note) = match cached_plugin_tag(&record) {
+                    Ok(tag) => (Some(tag.to_string()), None),
+                    Err(note) => (None, Some(note)),
+                };
                 CacheReport {
                     present: true,
                     checked_at: (record.checked_at != 0).then(|| format_rfc3339(record.checked_at)),
                     age_secs: (record.checked_at != 0).then(|| now.saturating_sub(record.checked_at)),
                     fresh: Some(record.is_fresh(now)),
-                    newest_tag: has_tag.then(|| record.tag_name.clone()),
+                    newest_tag,
                     suggested: record.suggested.clone(),
-                    note: if has_tag {
-                        None
-                    } else if record.tag_name.is_empty() {
-                        Some("the last fetch found no ss-magic-plugin release".to_string())
-                    } else {
-                        Some(format!(
-                            "the cached tag `{}` is not an ss-magic-plugin release tag",
-                            record.tag_name
-                        ))
-                    },
+                    note,
                 }
             }
         },

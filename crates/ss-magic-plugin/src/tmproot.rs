@@ -74,6 +74,9 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use crate::hashing;
+// The raw `geteuid`, shared with core's `git::discover` (which explains why it
+// is not a shelled-out `id -u`).
+use ss_magic_core::git::discover::effective_uid;
 
 /// The namespace directory both this module and `bootstrap.sh` (U23) create
 /// directly under a machine temp base. Fixed cross-language contract text —
@@ -211,24 +214,6 @@ fn validate_component(path: &Path, euid: u32) -> bool {
     meta.is_dir() && meta.uid() == euid && (meta.mode() & 0o777) == DIR_MODE
 }
 
-/// This process's effective uid, via a direct call to the platform's own
-/// `geteuid`. Not shelled out to `id -u`: this sits on the validation path
-/// for every lock attempt, and a subprocess there is both slower and one
-/// more thing that can fail (`id` missing or behaving unexpectedly) for a
-/// fact the process already knows about itself. `geteuid` takes no
-/// arguments, cannot fail, and has no side effects, and every platform this
-/// binary targets (Linux, macOS) already links the libc that defines it as
-/// part of the Rust standard library's own runtime — so this needs no new
-/// crate dependency, just the raw C declaration.
-fn effective_uid() -> u32 {
-    // SAFETY: `geteuid()` is a pure, argument-free POSIX call with no
-    // preconditions and no failure mode.
-    unsafe { geteuid() }
-}
-
-extern "C" {
-    fn geteuid() -> u32;
-}
 
 /// Open (creating if absent) the lock file at `path` for `fd_lock`. Mirrors
 /// `update/apply.rs::open_lock_file`; the file's contents are never read —
@@ -265,8 +250,9 @@ pub fn with_lock<T>(root: &Path, name: &str, f: impl FnOnce() -> T) -> io::Resul
 /// another holder has `root.join(name)` locked right now, rather than
 /// waiting. The one-shot-claim half of KTD5's fd-lock pattern (mirroring
 /// `update/apply.rs`'s `try_write`), for a caller that would rather skip
-/// than block — [`with_lock`] is the one AE61 and R81 actually call for.
-#[allow(dead_code)]
+/// than block — [`with_lock`] is the one AE61 and R81 actually call for,
+/// and this is what the plugin release cache's two writers take
+/// (`release_check`), since a hook must never wait on a fetch.
 pub fn try_with_lock<T>(root: &Path, name: &str, f: impl FnOnce() -> T) -> io::Result<Option<T>> {
     let file = open_lock_file(&root.join(name))?;
     let mut lock = fd_lock::RwLock::new(file);

@@ -632,10 +632,17 @@ fn same_device(a: &Path, b: &Path) -> io::Result<bool> {
     Ok(fs::metadata(a)?.dev() == fs::metadata(b)?.dev())
 }
 
-/// This process's effective uid. The same raw `geteuid` the plugin's temp
-/// root validation uses, for the same reason: it is a fact the process knows
-/// about itself, and a subprocess to learn it would defeat this module.
-fn effective_uid() -> u32 {
+/// This process's effective uid, from the raw `geteuid` – shared with the
+/// plugin's temp-root validation (`tmproot`), which checks every managed
+/// component is owned by exactly this uid. Not shelled out to `id -u`: both
+/// callers sit on paths that run on every hook invocation, and a subprocess
+/// there is slower and one more thing that can fail (`id` missing or
+/// behaving unexpectedly) for a fact the process already knows about itself.
+/// `geteuid` takes no arguments, cannot fail, and has no side effects, and
+/// every platform these binaries target (Linux, macOS) already links the
+/// libc that defines it as part of the Rust standard library's own runtime –
+/// so this needs no new crate dependency, just the raw C declaration.
+pub fn effective_uid() -> u32 {
     // SAFETY: `geteuid()` is a pure, argument-free POSIX call with no
     // preconditions and no failure mode.
     unsafe { geteuid() }

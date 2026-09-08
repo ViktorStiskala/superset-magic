@@ -25,25 +25,8 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT="$REPO_ROOT/scripts/mark-latest.sh"
 VERBOSE=${1:-}
 
-passed=0
-failed=0
-current_case="(none)"
-
-pass() { passed=$((passed + 1)); [ "$VERBOSE" = "-v" ] && printf '  ok   %s\n' "$1"; return 0; }
-fail() { failed=$((failed + 1)); printf '  FAIL %s: %s\n' "$current_case" "$1" >&2; return 0; }
-
-assert_eq() { # expected actual label
-    if [ "$1" = "$2" ]; then pass "$3"; else fail "$3 (expected [$1], got [$2])"; fi
-}
-assert_contains_fixed() { # haystack-file needle label
-    if grep -qF -- "$2" "$1" 2>/dev/null; then pass "$3"; else fail "$3 (no [$2] in $1)"; fi
-}
-assert_lacks_fixed() { # haystack-file needle label
-    if grep -qF -- "$2" "$1" 2>/dev/null; then fail "$3 (found [$2] in $1)"; else pass "$3"; fi
-}
-assert_empty_file() { # file label
-    if [ -s "$1" ]; then fail "$2 (not empty: $(cat "$1"))"; else pass "$2"; fi
-}
+# pass/fail, the counters, and every assert_* helper.
+. "$REPO_ROOT/scripts/lib/test-harness.sh"
 
 SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/ss-magic-mark-latest-tests.XXXXXX") || exit 1
 trap 'rm -rf "$SANDBOX"' EXIT

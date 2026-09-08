@@ -356,7 +356,7 @@ pub struct Sources {
 impl Sources {
     /// The real process's view.
     pub fn from_process() -> Self {
-        let non_empty = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        let non_empty = crate::status::non_empty_env;
         let config_dir = non_empty("CLAUDE_CONFIG_DIR")
             .map(PathBuf::from)
             .or_else(|| non_empty("HOME").map(|home| PathBuf::from(home).join(".claude")));

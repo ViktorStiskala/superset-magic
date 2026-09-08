@@ -100,6 +100,26 @@ const MANIFEST_NAME: &str = "ss-magic";
 /// least keeps a single copy.
 pub(crate) const PIN_FILE: &str = "ss-magic-plugin.version";
 
+/// Read the plugin's pin file under `plugin_root`: `Ok((version, path))` with
+/// the trimmed contents, or `Err(note)` saying why there is no usable pin (the
+/// file is empty, or could not be read). The one reader shared by this
+/// report's `Bootstrap` section, the `SessionStart` notices and
+/// `release-check`, so the three can never disagree about what the pin says.
+pub(crate) fn read_pin_file(plugin_root: &Path) -> std::result::Result<(String, PathBuf), String> {
+    let path = plugin_root.join(PIN_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let value = text.trim().to_string();
+            if value.is_empty() {
+                Err(format!("{} is empty", path.display()))
+            } else {
+                Ok((value, path))
+            }
+        }
+        Err(e) => Err(format!("could not read {}: {e}", path.display())),
+    }
+}
+
 /// The bootstrapped binary, relative to `${CLAUDE_PLUGIN_DATA}`.
 const BINARY_REL: &str = "bin/ss-magic-plugin";
 
@@ -847,8 +867,10 @@ pub fn locate_plugin_root(harness: &HarnessListing) -> Located {
     )
 }
 
-/// A non-empty environment variable, or `None`.
-fn non_empty_env(name: &str) -> Option<String> {
+/// A non-empty environment variable, or `None`. Shared with
+/// `compact_window::Sources::from_process`, which resolves the harness's
+/// config directory the same way.
+pub(crate) fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
@@ -1302,20 +1324,10 @@ fn collect_bootstrap(inputs: &Inputs, probes: &Probes, problems: &mut Vec<String
     let data_dir = inputs.data_dir.as_field();
 
     let pin = match &inputs.plugin_root.path {
-        Some(root) => {
-            let path = root.join(PIN_FILE);
-            match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    let value = text.trim().to_string();
-                    if value.is_empty() {
-                        Field::missing(format!("{} is empty", path.display()))
-                    } else {
-                        Field::found(value, path.display().to_string())
-                    }
-                }
-                Err(e) => Field::missing(format!("could not read {}: {e}", path.display())),
-            }
-        }
+        Some(root) => match read_pin_file(root) {
+            Ok((value, path)) => Field::found(value, path.display().to_string()),
+            Err(note) => Field::missing(note),
+        },
         None => Field::missing(format!(
             "the installed plugin tree could not be located, so {PIN_FILE} could not \
              be read — {}",
@@ -1641,15 +1653,7 @@ fn collect_newest_release(inputs: &Inputs, pin: Option<&str>) -> (Field, Option<
             None,
         );
     };
-    if release::parse_line_tag(&release::PLUGIN_LINE, &cache.tag_name).is_none() {
-        let note = if cache.tag_name.is_empty() {
-            "the last fetch found no ss-magic-plugin release".to_string()
-        } else {
-            format!(
-                "the cached tag `{}` is not an ss-magic-plugin release tag",
-                cache.tag_name
-            )
-        };
+    if let Err(note) = release_check::cached_plugin_tag(&cache) {
         return (Field::missing(note), None);
     }
     let checked = if cache.checked_at == 0 {

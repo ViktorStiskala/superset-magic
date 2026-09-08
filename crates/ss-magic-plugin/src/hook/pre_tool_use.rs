@@ -1110,8 +1110,8 @@ fn hit_preamble(shown: &str, size: u64, threshold_lines: u32) -> String {
 /// is read by the model, which runs the command through Bash, where
 /// `${CLAUDE_PLUGIN_DATA}` is not exported and the bootstrapped binary cannot be
 /// named directly. A bare `ss-magic` would also resolve against whatever the
-/// user happens to have installed. The human verbs' own usage strings keep the
-/// bare spelling on purpose: a person runs those in a terminal.
+/// user happens to have installed. The human verbs' `Usage:` strings spell it
+/// the same way: nobody runs a verb in a terminal, so there is no exception.
 fn hit_epilogue(shown: &str) -> String {
     format!(
         "\nIf that does not answer your question, dispatch an Explore agent to read \
@@ -1133,8 +1133,8 @@ fn hit_epilogue(shown: &str) -> String {
 /// is read by the model, which runs the command through Bash, where
 /// `${CLAUDE_PLUGIN_DATA}` is not exported and the bootstrapped binary cannot be
 /// named directly. A bare `ss-magic` would also resolve against whatever the
-/// user happens to have installed. The human verbs' own usage strings keep the
-/// bare spelling on purpose: a person runs those in a terminal.
+/// user happens to have installed. The human verbs' `Usage:` strings spell it
+/// the same way: nobody runs a verb in a terminal, so there is no exception.
 fn miss_reason(shown: &str, size: u64, threshold_lines: u32, entry: &str) -> String {
     format!(
         "ss-magic-plugin blocked this Read to keep it out of your context window.\n\

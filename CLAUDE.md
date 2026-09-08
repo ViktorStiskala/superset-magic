@@ -1313,7 +1313,8 @@ it installs `ss-magic-plugin` from an `ss-magic-plugin-v…` release and its env
 var is `SS_MAGIC_PLUGIN_VERSION`), `.gitattributes` (line-ending pinning for
 the digest), `scripts/mark-latest.sh` + `scripts/test-mark-latest.sh` +
 `.github/workflows/mark-latest.yml` (the post-announce latest-mark step, see
-Build), and
+Build), `scripts/lib/test-harness.sh` (the assertion helpers both shell suites
+source), and
 `docs/runbooks/forge-tag-and-release-protection.md` (tag/release immutability
 settings a human must apply by hand – currently NOT applied).
 
@@ -1484,7 +1485,9 @@ binary is the sole file-copy implementation.)
   streams empty and the binary un-invoked when it cannot resolve one; PLUS a
   manifest invariant asserted over EVERY `hooks.json` entry rather than the
   bootstrap group alone. Written for bash 3.2, so no associative arrays, no
-  `mapfile`, no `${var^^}`); and `/bin/bash scripts/test-mark-latest.sh` (the
+  `mapfile`, no `${var^^}`; its `pass`/`fail` counters and every `assert_*`
+  helper live in `scripts/lib/test-harness.sh`, sourced by both shell suites
+  so the two cannot drift); and `/bin/bash scripts/test-mark-latest.sh` (the
   latest-mark selection behind the post-announce job, against a fake `gh` over
   the AE1 tag list: the plugin tag, a draft, a prerelease and a wrongly-prefixed
   CLI tag are never chosen, `v0.11.10` beats `v0.11.3` numerically, a `v*` tag

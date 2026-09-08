@@ -331,10 +331,9 @@ fn version_drift_notice(plugin_root: Option<&Path>) -> Option<String> {
 /// the version-drift notice and the release suggestion so the two can never
 /// read a different pin.
 fn read_pin(plugin_root: Option<&Path>) -> Option<String> {
-    let root = plugin_root?;
-    let pin = std::fs::read_to_string(root.join(crate::status::PIN_FILE)).ok()?;
-    let pinned = pin.trim();
-    (!pinned.is_empty()).then(|| pinned.to_string())
+    crate::status::read_pin_file(plugin_root?)
+        .ok()
+        .map(|(version, _)| version)
 }
 
 /// What [`release_suggestion`] decided.

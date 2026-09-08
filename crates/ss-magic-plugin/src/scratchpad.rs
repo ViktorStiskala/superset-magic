@@ -45,7 +45,6 @@ use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -634,14 +633,11 @@ fn write_pointer(
 ///
 /// Shared crate-wide: bypass claims, the conclusion cache, the cost ledger,
 /// artifact expectations, checklist documents, and the hook dispatcher each
-/// used to define this same function locally — one copy here instead of six
-/// byte-identical ones.
-pub(crate) fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+/// used to define this same function locally — one copy instead of six
+/// byte-identical ones. That one copy is core's (`release::now_secs`, which
+/// the release cache stamps `checked_at` with), re-exported here under the
+/// name the rest of this crate imports.
+pub(crate) use ss_magic_core::release::now_secs;
 
 /// The current UTC time as RFC 3339, to the second.
 fn now_rfc3339() -> String {

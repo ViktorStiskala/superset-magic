@@ -232,6 +232,8 @@ The last four cover code `cargo test` cannot reach:
   unwritable data directory, unsupported platform, concurrent sessions) using a
   `curl` shim, asserting for each that it exits 0, prints nothing on stdout, and
   leaves any pre-existing binary untouched. Pass `-v` for per-assertion output.
+  Its assertion helpers are `scripts/lib/test-harness.sh`, shared with
+  `test-mark-latest.sh`; a new shell suite sources the same file.
 - The same script also covers `plugin/hooks/run-hook.sh`, the shim every event
   hook is spawned through. Those cases run it the way the harness does and
   assert it exits 0 with both streams empty and the binary un-invoked whenever

@@ -449,7 +449,7 @@ fn pipeline(
     };
 
     let cwd = PathBuf::from(&envelope.common.cwd);
-    let base = || base().with_cwd(Some(envelope.common.cwd.clone()));
+    let base = || base_row(event, &envelope.common.cwd, now);
 
     // A `cwd` that is not a directory means the worktree moved or was deleted
     // between the harness spawning us and us running. Reported as its own class
@@ -475,6 +475,14 @@ fn pipeline(
     }
 }
 
+/// The no-op row every early return past the envelope decode starts from:
+/// this event, this instant, the envelope's `cwd`. Shared by [`pipeline`]
+/// (once it has an envelope) and [`gate_and_dispatch`], so the two halves of
+/// the wrapper cannot drift on what a heartbeat row records.
+fn base_row(event: &HookEvent, cwd: &str, now: u64) -> Row {
+    Row::new(event.as_str(), now, RowOutcome::NoOp).with_cwd(Some(cwd.to_string()))
+}
+
 /// The half of [`pipeline`] that runs once the envelope is decoded and the
 /// roots are known: the two gates, the dispatch, the encode. Split out so the
 /// discovery note can be applied to every row it produces in one place.
@@ -487,9 +495,7 @@ fn gate_and_dispatch(
     io: &mut HookIo<'_>,
     now: u64,
 ) -> Row {
-    let base = || {
-        Row::new(event.as_str(), now, RowOutcome::NoOp).with_cwd(Some(envelope.common.cwd.clone()))
-    };
+    let base = || base_row(event, &envelope.common.cwd, now);
 
     // Outside a git repository there is no root to resolve against, so the
     // config resolution falls back to `cwd` itself and degrades to its safe
