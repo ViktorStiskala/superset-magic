@@ -37,29 +37,34 @@ Two pins move in opposite orders, and the settings below are what make the order
 ```mermaid
 flowchart TD
   subgraph before["Before the tag is pushed"]
-    A["Build plugin/ with scripts/build-plugin-zip.py"] --> B["Commit the digest into marketplace.json"]
-    B --> C["Bump every version surface on the line being released (R95, R98)"]
+    A["Bump every version surface on the line being released (R95, R98) – on the plugin line that includes plugin/ss-magic-plugin.version"] --> B["Build plugin/ with scripts/build-plugin-zip.py"]
+    B --> C["Commit the digest into marketplace.json in the same commit as the bump"]
   end
   subgraph tagging["Pushing the tag"]
     C --> D["Push ss-magic-plugin-vX.Y.Z (plugin) or vX.Y.Z (CLI)"]
-    D --> E["CI plan phase re-derives the digest and fails on a mismatch"]
+    D --> E["CI plan phase re-derives the digest, runs --check, and fails on a mismatch"]
     E --> F["cargo-dist publishes that line's assets in one gh release create"]
   end
   subgraph after["After the assets exist"]
     F --> G["Release immutability freezes the assets (R100)"]
     F --> H["Tag ruleset refuses a move or delete of the tag (R99)"]
-    F --> I["Only now may plugin/ss-magic-plugin.version advance to X.Y.Z"]
-    F --> J["Only now may README's pinned installer tag advance to vX.Y.Z"]
+    F --> I["Only now may README's pinned installer tag advance to vX.Y.Z"]
   end
 ```
 
 The marketplace digest is committed **before** the tag, because the builder can produce it from the
-working tree. Between that commit and the release publishing, the entry's `url` names an asset that
-does not exist yet; that is expected and self-correcting. The two pins on the right are the opposite:
-advancing `plugin/ss-magic-plugin.version` before the named plugin release's assets are published
-makes the bootstrap's fetch 404, so nothing installs and every hook fails open with no visible error,
-and advancing README's installer tag before the named CLI release exists 404s the documented install
-command for everyone who copies it.
+working tree – and `plugin/ss-magic-plugin.version` moves with it, never after it. The pin is one of
+the files under `plugin/` the digest is computed over, and `--check` (which the CI plan phase runs)
+requires it to EQUAL the plugin crate's version, so a tag pushed from a tree whose pin still lags is
+refused before any asset is built; advancing it after the release would move the digest instead and
+leave the frozen zip pinning the previous binary forever. Between the bump commit and the release
+publishing, the marketplace entry's `url` names an asset that does not exist yet and the pin names a
+release that does not exist yet; both are expected and self-correcting, because an installed bootstrap
+only ever reads the pin shipped inside the released zip, which cannot exist before the release does.
+README's installer tag is the opposite: a person copies it straight off `main`, so advancing it before
+the named CLI release exists 404s the documented install command for everyone who copies it – which
+is why `--check` compares that one surface `<=` the crate version rather than `==`, and why it is the
+one pin that moves in a follow-up commit.
 
 The obvious workaround for a mis-cut release – tag, rebuild, commit the new digest, move the tag – is
 exactly what the ruleset forbids. GitHub's own documentation is blunt about it: *"Git tags cannot be
@@ -116,16 +121,24 @@ Expected: `enforcement: "active"`, `bypass: 0`, `include: ["~ALL"]`, and `rules`
 
 Then prove it against a real tag, as the repository owner – the point of the check is that the owner
 is not exempt. Run steps 1 and 2 against **both** shapes, since a ruleset scoped to one of them would
-pass a check that only ever exercises that one:
+pass a check that only ever exercises that one – but only ever against a tag that has actually been
+published on that line. At the time of writing every published tag is on the CLI line (the newest is
+`v0.11.0`) and no plugin release has been cut at all, so the `ss-magic-plugin-v*` half of steps 1 and
+2 waits for the first plugin release: run the `v*` half now and come back for the other. Do not fill
+in the crate's version and run it anyway. Deleting a tag that origin does not have fails with `remote ref
+does not exist`, which says nothing about the ruleset; and force-pushing one is a *creation*, which
+the ruleset deliberately permits, which the release workflow picks up as a real plugin release cut
+from whatever `HEAD` was (its trigger is `**[0-9]+.[0-9]+.[0-9]+*`), and which the ruleset then makes
+permanent.
 
 ```bash
 # 1. Deleting a released tag must be refused, on either line.
 git push origin :refs/tags/v0.9.0
-git push origin :refs/tags/ss-magic-plugin-v1.0.0
+git push origin :refs/tags/<newest ss-magic-plugin-v* tag>
 
 # 2. Force-moving a released tag must be refused, on either line.
 git tag -f v0.9.0 HEAD && git push --force origin v0.9.0
-git tag -f ss-magic-plugin-v1.0.0 HEAD && git push --force origin ss-magic-plugin-v1.0.0
+git tag -f <newest ss-magic-plugin-v* tag> HEAD && git push --force origin <newest ss-magic-plugin-v* tag>
 
 # 3. Creating a NEW tag must still succeed, or the release pipeline is broken.
 git tag test-ruleset-creation && git push origin test-ruleset-creation
@@ -170,14 +183,14 @@ mark did not take. The same workflow is `workflow_dispatch`-able as the manual f
 ### Verifying it (AE84)
 
 Substitute a tag that actually exists on each line. At the time of writing the newest published CLI
-release is `v0.10.0` and no plugin release has been cut at all, so the second command is the one to
+release is `v0.11.0` and no plugin release has been cut at all, so the second command is the one to
 run first; naming an unreleased tag here would fail for a reason that has nothing to do with the
 setting under test.
 
 ```bash
 # Replacing a published asset under its existing name must be refused, on either line.
 gh release upload <newest ss-magic-plugin-v* tag> ss-magic-plugin-v<X.Y.Z>.zip --clobber
-gh release upload v0.10.0 ss-magic-x86_64-unknown-linux-gnu.tar.gz --clobber
+gh release upload v0.11.0 ss-magic-x86_64-unknown-linux-gnu.tar.gz --clobber
 ```
 
 Expect a refusal. A release published **before** immutability was enabled will accept this, which is

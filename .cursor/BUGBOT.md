@@ -1301,7 +1301,7 @@ out of step or a stale digest, or a bump applied to the wrong group's surfaces.
 
 ## Test Requirements
 
-- **`cargo test --workspace` is not the whole suite.** Four checks cover ground
+- **`cargo test --workspace` is not the whole suite.** Five checks cover ground
   it cannot reach, and CI runs all of them:
   `python3 scripts/build-plugin-zip.py --selftest` (the zip builder's
   reproducibility guarantees and its refusals);
