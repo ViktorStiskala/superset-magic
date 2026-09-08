@@ -990,3 +990,143 @@ fn the_seed_follows_a_symlink_that_stays_inside_the_repository() {
             .unwrap();
     assert!(doc.get("plugin").is_some());
 }
+
+// ── Containment for the human verbs ─────────────────────────────────────────
+
+/// `enable`, `disable` and `config set` refuse to write through a symlink that
+/// leaves the repository, the same bound the seed keeps – for both layers, and
+/// for a link on the file or on the `.superset` directory. The window is
+/// narrower than the seed's (a person asked for the write, in a checkout they
+/// chose to work in) but the write is the same one: a repository committing
+/// `.superset/magic.json` as a link to a JSON file the person owns would have
+/// that file re-serialized with a `plugin` key folded in. Here the refusal is
+/// an ERROR rather than a quiet outcome, because somebody is watching.
+///
+/// The third shape – `.superset` linked outside with no file behind it yet –
+/// is the one a "does the file resolve inside?" check alone would pass: the
+/// file does not exist, so there is nothing to resolve, and the write would
+/// CREATE it in the outside directory.
+#[test]
+fn the_verbs_refuse_a_target_outside_the_repository() {
+    let shapes = [
+        ("the file is a symlink", false, true),
+        (".superset is a symlink", true, true),
+        (".superset is a symlink and the file does not exist yet", true, false),
+    ];
+    for local in [false, true] {
+        for (label, link_dir, file_exists) in shapes {
+            let outside = tempfile::TempDir::new().unwrap();
+            let repo = tempfile::TempDir::new().unwrap();
+            let name = if local { "magic.local.json" } else { "magic.json" };
+            let target = outside.path().join(name);
+            if file_exists {
+                fs::write(&target, r#"{"someone_elses": "file"}"#).unwrap();
+            }
+            if link_dir {
+                std::os::unix::fs::symlink(outside.path(), repo.path().join(".superset")).unwrap();
+            } else {
+                fs::create_dir_all(repo.path().join(".superset")).unwrap();
+                std::os::unix::fs::symlink(&target, repo.path().join(".superset").join(name))
+                    .unwrap();
+            }
+            let before: Vec<(String, Vec<u8>)> = snapshot_dir(outside.path());
+
+            let case = format!("{label}, local={local}");
+            let err = run_toggle_core(repo.path(), local, true).unwrap_err();
+            assert!(format!("{err:#}").contains("outside the repository"), "{case}: {err:#}");
+            let err = run_toggle_core(repo.path(), local, false).unwrap_err();
+            assert!(format!("{err:#}").contains("outside the repository"), "{case}: {err:#}");
+            let err = run_config_set_core(
+                repo.path(),
+                "plugin.gate.threshold_lines",
+                &["plugin", "gate", "threshold_lines"],
+                Value::from(500),
+                local,
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("outside the repository"), "{case}: {err:#}");
+
+            assert_eq!(
+                snapshot_dir(outside.path()),
+                before,
+                "{case}: something was written outside the repository"
+            );
+        }
+    }
+}
+
+/// Every entry of `dir` with its bytes, sorted – "nothing outside changed" as
+/// one comparable value, covering a created file as well as an edited one.
+fn snapshot_dir(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut entries: Vec<(String, Vec<u8>)> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// The mirror: a symlink that stays INSIDE the repository is written through,
+/// onto its target, and the link itself survives. Without this a blanket
+/// "refuse every symlink" would pass the test above and break a repository
+/// that merely keeps its contract files elsewhere in the same tree.
+#[test]
+fn the_verbs_follow_a_symlink_that_stays_inside_the_repository() {
+    let repo = tempfile::TempDir::new().unwrap();
+    fs::create_dir_all(repo.path().join("elsewhere")).unwrap();
+    fs::write(repo.path().join("elsewhere/magic.json"), r#"{"files": []}"#).unwrap();
+    fs::create_dir_all(repo.path().join(".superset")).unwrap();
+    std::os::unix::fs::symlink(
+        repo.path().join("elsewhere/magic.json"),
+        repo.path().join(".superset/magic.json"),
+    )
+    .unwrap();
+
+    let code = run_toggle_core(repo.path(), false, true).unwrap();
+    assert_eq!(exit_code_to_u8(code), 0);
+
+    let doc: Value =
+        serde_json::from_slice(&fs::read(repo.path().join("elsewhere/magic.json")).unwrap())
+            .unwrap();
+    assert_eq!(doc["plugin"]["enabled"], Value::Bool(true));
+    assert!(
+        fs::symlink_metadata(repo.path().join(".superset/magic.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link was replaced instead of written through"
+    );
+}
+
+/// `landing` is decided by the deepest component that EXISTS, and a
+/// repository that itself sits behind a link (macOS's `/tmp`) still counts as
+/// inside, because both sides are canonicalized.
+#[test]
+fn landing_is_decided_by_the_deepest_existing_component() {
+    let repo = tempfile::TempDir::new().unwrap();
+    assert_eq!(landing(repo.path(), false).unwrap(), Landing::Fresh, "nothing exists yet");
+
+    fs::create_dir_all(repo.path().join(".superset")).unwrap();
+    assert_eq!(landing(repo.path(), false).unwrap(), Landing::Fresh, "a real .superset, no file");
+
+    fs::write(repo.path().join(".superset/magic.json"), "{}").unwrap();
+    assert_eq!(landing(repo.path(), false).unwrap(), Landing::Existing);
+    assert_eq!(landing(repo.path(), true).unwrap(), Landing::Fresh, "the other layer is absent");
+
+    let via_link = tempfile::TempDir::new().unwrap();
+    std::os::unix::fs::symlink(repo.path(), via_link.path().join("repo")).unwrap();
+    assert_eq!(
+        landing(&via_link.path().join("repo"), false).unwrap(),
+        Landing::Existing,
+        "a repository reached through a link is still inside itself"
+    );
+
+    let gone = repo.path().join("does-not-exist");
+    assert!(landing(&gone, false).is_err(), "an unresolvable root is refused, not passed");
+}

@@ -798,6 +798,25 @@ through `git`/`git_optional`, a per-line `.trim()` applied to such output, or a
   a write that dies half-way leaves the previous tracked file, never a prefix.
   Flag a config write that bypasses the lock, a seed that waits on it, or a
   return to a truncating `fs::write` on either file.
+- **Every writer refuses a target that resolves outside the repository, and
+  the check lives in the one writer.** `write_plugin_key` – the load-modify-write
+  behind `enable`, `disable`, `config set` AND the seed – decides `landing()`
+  before it reads: canonicalize the repository root and the deepest EXISTING
+  component of `.superset/<file>` (the file, else the `.superset` directory,
+  else nothing, since a fresh create under the root cannot be redirected) and
+  require the second inside the first. `Outside` is a hard error for the human
+  verbs and the `OutsideRepository` outcome for the seed; a link that stays
+  inside the repository is written through onto its target, and a repository
+  that itself sits behind a link (macOS's `/tmp`) still passes. The hazard is a
+  repository committing `.superset/magic.json`, or `.superset` itself, as a
+  link to a JSON file the person owns: a verb run in that checkout would load
+  that file, fold a `plugin` key in and write it back through the link. Flag a
+  new writer that reaches `write_magic_json`/`write_magic_local_json` without
+  going through `write_plugin_key`, a check that canonicalizes only the leaf
+  (it misses a linked `.superset` with no file behind it yet, where the write
+  would CREATE the file outside), only the root, or compares un-canonicalized
+  paths, and a version that refuses every symlink (it would break in-repo
+  links, which are tested to work).
 
 ### The `seed-config` bootstrap write has SIX bounds, each a test
 
@@ -835,16 +854,18 @@ argument. Each is asserted by a test, not left to convention:
    a merge conflict than an invitation to rebuild it. Flag a create-if-missing
    or a rebuild-from-defaults path.
 5. **It never writes through a symlink that leaves the repository.**
-   `seed_config_at` canonicalizes both the repository root and
-   `.superset/magic.json` and requires the second to sit inside the first, so a
-   link on the file OR on the `.superset` directory is refused
-   (`SeedOutcome::OutsideRepository`). This is the bound the split created: the
-   same write used to need a person to type a config verb, and now fires
-   unattended from a `SessionStart` hook against a path the repository controls
-   – `serde_json` reads through a symlink and `fs::write` writes through one, so
-   without the check any JSON object file the user can write is in range. Flag a
-   check that canonicalizes only the leaf, or only the root, or compares
-   un-canonicalized paths.
+   `seed_config_at` asks the shared `landing()` decision (see the config write
+   path above) before it reads, and maps `Outside` to
+   `SeedOutcome::OutsideRepository` – a link on the file OR on the `.superset`
+   directory. `write_plugin_key` would refuse the same target on its own; the
+   seed decides a step earlier only so the answer is an OUTCOME rather than a
+   failed write, because it runs unattended. This is the bound the split
+   created: the same write used to need a person to type a config verb, and now
+   fires unattended from a `SessionStart` hook against a path the repository
+   controls – `serde_json` reads through a symlink and the rename-based writer
+   lands on the link's resolved target, so without the check any JSON object
+   file the user can write is in range. Flag a seed that skips `landing()`, or
+   one that turns `Outside` into an error.
 6. **It preserves every other key.** The write goes through the same typed
    load-modify-write as the rest (`MagicConfig`'s flattened `extras`), never a
    hand-rolled JSON splice. Flag a text-level edit of `magic.json`. Note it

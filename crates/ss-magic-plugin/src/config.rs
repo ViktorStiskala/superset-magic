@@ -32,7 +32,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{Map, Value};
 
 use crate::git;
@@ -463,31 +463,18 @@ fn seed_block() -> Value {
 /// against the cwd root's own overlay, so seeding anywhere else would put the
 /// defaults where this worktree's gate never reads them.
 pub fn seed_config_at(root: &Path) -> Result<SeedOutcome> {
-    // Containment, before anything reads or writes the file.
-    //
-    // This is the one writer in the module a REPOSITORY can aim: it runs
-    // unattended from `hooks/bootstrap.sh` at session start, in whatever
-    // checkout the person happened to open, and `.superset/magic.json` is a
-    // path that checkout controls. Pointed at a symlink — on the file, or on
-    // the `.superset` directory above it — the load-modify-write below would
-    // read some other file, fold a `plugin` block into it and write it back
-    // THROUGH the link, because `fs::write` follows one. Any JSON object the
-    // user can write is in range, which is far too much reach for a config
-    // seed.
-    //
-    // `canonicalize` on both sides is what closes it: it resolves every
-    // symlink and every `..` in one step, so a link anywhere along the path is
-    // caught, and canonicalizing the ROOT too keeps the comparison honest on a
-    // platform where the repository itself sits behind a link (macOS's
-    // `/tmp` -> `/private/tmp` is the everyday case). A path that cannot be
-    // canonicalized does not exist, which is the `NotAWorkspace` answer the
-    // load below would give anyway.
-    let magic = root.join(".superset").join("magic.json");
-    let (Ok(real_root), Ok(real_magic)) = (root.canonicalize(), magic.canonicalize()) else {
-        return Ok(SeedOutcome::NotAWorkspace);
-    };
-    if !real_magic.starts_with(&real_root) {
-        return Ok(SeedOutcome::OutsideRepository);
+    // Containment first, and as an OUTCOME rather than an error, because the
+    // seed runs unattended from `hooks/bootstrap.sh` in whatever checkout the
+    // person opened and must report, never fail. `write_plugin_key` refuses
+    // an outside target on its own as well; this earlier decision exists so
+    // the seed can answer `OutsideRepository` instead of surfacing that
+    // refusal as a failed write. The shared decision also folds "the file is
+    // not there" into `NotAWorkspace`: a file that does not exist is what the
+    // load below would report anyway, and the seed never creates one.
+    match landing(root, false) {
+        Ok(Landing::Existing) => {}
+        Ok(Landing::Outside) => return Ok(SeedOutcome::OutsideRepository),
+        Ok(Landing::Fresh) | Err(_) => return Ok(SeedOutcome::NotAWorkspace),
     }
 
     // One guard for all three "nothing to fold into" cases, because
@@ -822,8 +809,28 @@ fn turns_plugin_on(segments: &[&str], value: &Value) -> bool {
 /// path inside `extras`, and writes the whole `MagicConfig` back. A malformed
 /// existing file is a hard error (propagated, not swallowed) rather than
 /// being silently rebuilt from nothing.
+///
+/// It also refuses, as an error, a target that resolves OUTSIDE the
+/// repository through a symlink ([`Landing::Outside`]). This sits inside the
+/// one writer rather than in each verb so that no caller – `enable`,
+/// `disable`, `config set`, the seed, or a verb added later – can reach the
+/// file without passing it. The hazard it closes is a repository that commits
+/// `.superset/magic.json` (or the `.superset` directory) as a link to a JSON
+/// file the person owns, say a harness settings file: a verb they run in that
+/// checkout would load THAT file, fold a `plugin` key into it, and write it
+/// back through the link. A link that stays inside the repository is fine and
+/// is written through, onto its resolved target.
 fn write_plugin_key(target_root: &Path, local: bool, path: &[&str], value: Value) -> Result<()> {
     debug_assert_eq!(path.first(), Some(&PLUGIN_KEY), "path must be plugin-rooted");
+
+    if landing(target_root, local)? == Landing::Outside {
+        bail!(
+            "refusing to write {}: it resolves outside the repository at {} through a \
+             symlink (on the file, or on .superset). Nothing was written.",
+            magic_file_label(local),
+            target_root.display()
+        );
+    }
 
     let existing = if local {
         superset_files::load_magic_local_json(target_root)
@@ -841,6 +848,52 @@ fn write_plugin_key(target_root: &Path, local: bool, path: &[&str], value: Value
         superset_files::write_magic_json(target_root, &cfg)
     }
     .with_context(|| format!("writing {}", magic_file_label(local)))
+}
+
+/// Where a write to `.superset/magic.json` (or `magic.local.json`) under a
+/// root would actually land, decided by [`landing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Landing {
+    /// The file exists and resolves inside the repository – possibly through
+    /// a symlink that stays in the tree, which every writer follows.
+    Existing,
+    /// The file does not exist yet. It would be created under a `.superset`
+    /// that resolves inside the repository, or beneath the root when
+    /// `.superset` does not exist either; nothing on the path can redirect it.
+    Fresh,
+    /// The file, or the `.superset` directory above it, resolves OUTSIDE the
+    /// repository through a symlink. No writer may proceed.
+    Outside,
+}
+
+/// Decide where the configuration file at `target_root` really is before a
+/// writer follows the path to it.
+///
+/// `canonicalize` on both sides is what makes the comparison meaningful: it
+/// resolves every symlink and every `..` in one step, so a link anywhere along
+/// the path is caught, and canonicalizing the ROOT too keeps the check honest
+/// on a platform where the repository itself sits behind a link (macOS's
+/// `/tmp` -> `/private/tmp` is the everyday case). The deepest EXISTING
+/// component decides: an existing file must itself resolve inside; a missing
+/// file is created in whatever `.superset` resolves to, so the directory
+/// decides; when neither exists, both are created beneath the root that was
+/// just resolved. A root that cannot be resolved is an error rather than a
+/// pass – the unknown answer must be the refusing one.
+fn landing(target_root: &Path, local: bool) -> Result<Landing> {
+    let real_root = target_root
+        .canonicalize()
+        .with_context(|| format!("resolving the repository root {}", target_root.display()))?;
+    let (existing, resolved) = match target_root.join(magic_file_label(local)).canonicalize() {
+        Ok(real_file) => (true, real_file),
+        Err(_) => match target_root.join(".superset").canonicalize() {
+            Ok(real_dir) => (false, real_dir),
+            Err(_) => return Ok(Landing::Fresh),
+        },
+    };
+    if !resolved.starts_with(&real_root) {
+        return Ok(Landing::Outside);
+    }
+    Ok(if existing { Landing::Existing } else { Landing::Fresh })
 }
 
 /// Set the value at `path` (a non-empty list of dotted-key segments, e.g.

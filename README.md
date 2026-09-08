@@ -623,7 +623,10 @@ ss-magic-plugin --version         # prints `ss-magic-plugin <version>`; the
 `enable` / `disable` / `config set` are still the precise way to flip
 `plugin.enabled` or a gate knob when you have a session open; editing
 `.superset/magic.json` by hand does the same thing and is the path that needs
-no session at all.
+no session at all. All three keep the seed's one bound: if `.superset/magic.json`
+(or `.superset` itself) is a symlink that leaves the repository, they refuse
+with an error and write nothing, so a checkout cannot point them at a file of
+yours outside it. A link that stays inside the repository is followed.
 
 ### Sizing the auto-compact window
 

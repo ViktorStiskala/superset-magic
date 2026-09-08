@@ -1080,7 +1080,23 @@ tree moved wholesale. Three facts shape every module in it:
   enablement gate costs no subprocess on the fast path – `None` falls back to
   `cwd_root`'s own overlay exactly as `resolve` does outside a repository.
   Writes are load-modify-write on exactly one file, preserving every unknown
-  key, and every writer in the crate takes the one `magic-json.lock` under the
+  key, and every one of them goes through `write_plugin_key`, which REFUSES a
+  target that resolves outside the repository through a symlink – on the file
+  or on the `.superset` directory – as an error, before it reads anything.
+  The decision is `landing(target_root, local)`: canonicalize the root and the
+  deepest EXISTING component of `.superset/<file>` (the file, else `.superset`,
+  else nothing – a fresh create under the root cannot be redirected) and
+  require the second inside the first, so a repository behind a link such as
+  macOS's `/tmp` still passes and an in-repo link is written through onto its
+  target. It sits inside the one writer rather than in each verb so that
+  `enable`, `disable`, `config set`, the seed and any verb added later cannot
+  reach the file without it; the seed calls `landing` a step earlier as well,
+  only so it can answer `SeedOutcome::OutsideRepository` instead of surfacing
+  a failed write. The hazard is a repository committing `.superset/magic.json`
+  as a link to a JSON file the person owns (a harness settings file, say): a
+  verb run in that checkout would load THAT file, fold a `plugin` key in and
+  write it back through the link. Every writer in the crate also takes the one
+  `magic-json.lock` under the
   R80 temp root around its load-modify-write (`write_locked`): the human verbs
   BLOCK on it (a person asked for the write), while `seed-config` uses the
   non-blocking `try_with_lock` and defers to the next session on contention,
@@ -1110,10 +1126,10 @@ tree moved wholesale. Three facts shape every module in it:
   never creates the file (absent OR unparseable both read as
   `SeedOutcome::NotAWorkspace` – an unparseable `magic.json` is far more likely
   a merge conflict than an invitation to rebuild it); it never writes through a
-  symlink that leaves the repository (`SeedOutcome::OutsideRepository`, decided
-  by canonicalizing BOTH the root and `.superset/magic.json` and requiring the
-  second inside the first, so a link on the file or on the `.superset` directory
-  is caught, and a repository behind a link such as macOS's `/tmp` still seeds);
+  symlink that leaves the repository (`SeedOutcome::OutsideRepository`, the
+  shared `landing` decision described above under the write path – `Existing`
+  seeds, `Outside` is this outcome, `Fresh` is `NotAWorkspace` because the seed
+  never creates the file);
   and it writes through the same typed load-modify-write, so `MagicConfig`'s
   flattened `extras` preserve every other key – values, not byte order, since it
   re-serializes rather than patching. All four `SeedOutcome` variants are normal
