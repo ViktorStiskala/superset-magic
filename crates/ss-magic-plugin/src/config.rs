@@ -36,9 +36,41 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
 use crate::git;
-use crate::{compact_window, scratchpad};
+use crate::{compact_window, scratchpad, tmproot};
 use ss_magic_core::style;
 use ss_magic_core::superset_files::{self, MagicConfig};
+
+/// The one lock every writer of `magic.json` / `magic.local.json` in this
+/// crate takes, under the private per-machine temp root (R80) so it exists
+/// before any repository state does. It serializes the load-modify-write:
+/// `seed-config` runs unattended from every session start, and a seed that
+/// loaded the file before `enable` wrote `plugin.enabled` would otherwise
+/// write the loaded copy back without the key – enablement silently lost.
+/// One machine-wide name rather than one per repository, because contention
+/// is rare (a few milliseconds per write) and the root is shared anyway.
+const CONFIG_LOCK_NAME: &str = "magic-json.lock";
+
+/// Run `write` under [`CONFIG_LOCK_NAME`], WAITING for a holder to finish.
+/// For the human verbs (`enable`, `disable`, `config set`): a person asked
+/// for the write, so it must happen, and a wait of milliseconds is fine.
+/// Without a usable temp root the write still happens, unlocked and with a
+/// warning – a human verb must not be refused over a temporary directory.
+fn write_locked<T>(write: impl FnOnce() -> Result<T>) -> Result<T> {
+    match tmproot::resolve_root() {
+        Ok(lock_root) => tmproot::with_lock(&lock_root, CONFIG_LOCK_NAME, write)
+            .context("taking the config lock")?,
+        Err(reason) => {
+            eprintln!(
+                "{}",
+                style::warn(format!(
+                    "no private temp root to lock the config write ({reason}); \
+                     writing without the lock"
+                ))
+            );
+            write()
+        }
+    }
+}
 
 // ── Bounds and defaults (R53) ───────────────────────────────────────────────
 
@@ -512,7 +544,31 @@ pub fn run_seed_config(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
 
-    match seed_config_at(&root)? {
+    // Non-blocking, unlike the human verbs: this runs from a session-start
+    // hook, so it must never wait, and a seed skipped this session costs
+    // nothing – the next session's bootstrap calls it again, and the block
+    // is only ever written when there is no `plugin` key at all.
+    let Ok(lock_root) = tmproot::resolve_root() else {
+        println!(
+            "{}",
+            style::info("no private temp root to lock the config write; seeding deferred.")
+        );
+        return Ok(ExitCode::SUCCESS);
+    };
+    let outcome = tmproot::try_with_lock(&lock_root, CONFIG_LOCK_NAME, || seed_config_at(&root))
+        .context("taking the config lock")?;
+    let Some(outcome) = outcome else {
+        println!(
+            "{}",
+            style::info(
+                "another ss-magic-plugin process is writing this repository's config; \
+                 seeding deferred to the next session."
+            )
+        );
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    match outcome? {
         SeedOutcome::Seeded => println!(
             "{}",
             style::ok(
@@ -585,7 +641,9 @@ fn run_toggle_core(cwd: &Path, local: bool, enabled: bool) -> Result<ExitCode> {
         cwd_root.clone()
     };
 
-    write_plugin_key(&target_root, local, &[PLUGIN_KEY, "enabled"], Value::Bool(enabled))?;
+    write_locked(|| {
+        write_plugin_key(&target_root, local, &[PLUGIN_KEY, "enabled"], Value::Bool(enabled))
+    })?;
 
     if enabled {
         scratchpad::ensure_state_ignored(&cwd_root).context("gitignoring .superset/.magic/")?;
@@ -697,7 +755,7 @@ fn run_config_set_core(
         cwd_root.clone()
     };
 
-    write_plugin_key(&target_root, local, segments, value)?;
+    write_locked(|| write_plugin_key(&target_root, local, segments, value))?;
 
     if turns_on {
         scratchpad::ensure_state_ignored(&cwd_root).context("gitignoring .superset/.magic/")?;

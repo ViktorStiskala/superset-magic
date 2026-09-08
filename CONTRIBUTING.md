@@ -79,39 +79,40 @@ interactive layer, and grouped by purpose under each crate's `src/`.
 In `ss-magic-core`:
 
 - `git/` — git plumbing (read-only probes and mutating primitives; all git/gh
-  interaction shells out via `std::process::Command` — **no `git2`**), the
+  interaction shells out via `std::process::Command` – **no `git2`**), the
   `.gitignore` helpers, and `discover`, the filesystem-only root discovery the
-  plugin's hook path uses.
-- `sync/` — pattern validation, the working-tree scan, the glob/exclude/copy
+  plugin crate uses (its hook path, and the two read-only verbs that attribute
+  ledger rows to a repository).
+- `sync/` – pattern validation, the working-tree scan, the glob/exclude/copy
   engine shared by forward sync, reverse sync, and pack, and the
   `EXCLUDED_TREES` rule every enumeration applies.
-- `superset_files.rs` — `.superset/` contract I/O.
-- `style.rs` — the palette and the process-wide color decision (no `inquire`).
-- `reponame.rs` — the `<repo>` name stem the pack archive and the plugin's
+- `superset_files.rs` – `.superset/` contract I/O.
+- `style.rs` – the palette and the process-wide color decision (no `inquire`).
+- `reponame.rs` – the `<repo>` name stem the pack archive and the plugin's
   session identity both derive from.
-- `state_tree.rs` — the `.superset/.magic` constant and the one writer of its
+- `state_tree.rs` – the `.superset/.magic` constant and the one writer of its
   gitignore rule (called eagerly by `init`/`migrate`, lazily by the plugin's
   `enable` verb).
-- `release.rs` — the per-line, daily-cached GitHub release check.
-- `hashing.rs` — FNV-1a for cache keys and a hand-rolled SHA-256 the plugin's
+- `release.rs` – the per-line, daily-cached GitHub release check.
+- `hashing.rs` – FNV-1a for cache keys and a hand-rolled SHA-256 the plugin's
   shell bootstrap has to reproduce with `shasum`.
-- `testutil.rs` — shared test fixtures, compiled only for tests (see below).
+- `testutil.rs` – shared test fixtures, compiled only for tests (see below).
 
 In `ss-magic`:
 
-- `sync/` — `merge.rs` owns the reverse-sync push/pull/merge decision model and
+- `sync/` – `merge.rs` owns the reverse-sync push/pull/merge decision model and
   per-hunk merge assembly (`similar`-based diffing); `reverse_sync.rs` owns the
   backup-first, TOCTOU-guarded apply seam that writes a cockpit decision to
   disk; `mod.rs` re-exports core's pure half so `crate::sync::apply` still
   resolves.
-- `tui/` — the interactive layer: `inquire` menus and pickers, `theme.rs`
+- `tui/` – the interactive layer: `inquire` menus and pickers, `theme.rs`
   (installs the `inquire` render config from core's color decision), the
   pure diff/decision models (`diffmodel`, also built on `similar`), and the
   full-screen `ratatui` reverse-sync merge cockpit (`cockpit`, on the
   `crossterm` backend). `tui/mod.rs` re-exports core's `style`.
-- `workspace/` — the init/migration lifecycle (`migrate.rs`); re-exports core's
+- `workspace/` – the init/migration lifecycle (`migrate.rs`); re-exports core's
   `superset_files`.
-- `update/` — the self-update apply path and the `update` verb, on top of
+- `update/` – the self-update apply path and the `update` verb, on top of
   core's `release`.
 - `pack.rs`, `cli.rs`, `main.rs` – the pack engine (re-exporting core's
   `repo_name_stem`), the hand-rolled arg parser (**no `clap`** – this is also
@@ -152,7 +153,8 @@ skills), `.claude-plugin/marketplace.json` (which pins that tree's zip by
 SHA-256), `scripts/build-plugin-zip.py` (the reproducible builder and the
 release assertions), `scripts/test-bootstrap.sh`, `scripts/mark-latest.sh` (the
 post-announce step that keeps the repository's "latest" mark on the CLI line,
-with `scripts/test-mark-latest.sh` driving it against a fake `gh`),
+with `scripts/test-mark-latest.sh` driving it against a fake `gh` – on Linux in
+CI's `plugin` job and under `/bin/bash` 3.2 on its macOS `test` leg),
 `.github/workflows/mark-latest.yml` (the reusable workflow cargo-dist calls it
 from), and `assets/workflow/checklist.yml` (embedded into the plugin binary by
 its `setup_ci.rs`).
@@ -237,11 +239,11 @@ The last four cover code `cargo test` cannot reach:
 - The same script also covers `plugin/hooks/run-hook.sh`, the shim every event
   hook is spawned through. Those cases run it the way the harness does and
   assert it exits 0 with both streams empty and the binary un-invoked whenever
-  it cannot resolve one — with no binary installed, with the data directory set
+  it cannot resolve one – with no binary installed, with the data directory set
   but empty, with the handoff removed, with a directory in the binary's place,
   and with no event argument, and with a binary that is present and executable
   but not a loadable executable (the ENOEXEC case, where bash reinterprets the
-  file as a shell script rather than reporting a failure) — plus the two success
+  file as a shell script rather than reporting a failure) – plus the two success
   paths, which must exec with exactly `hook <event>` and no leading `plugin`
   token. A separate assertion checks every `hooks.json`
   entry names `bash` and a script under `${CLAUDE_PLUGIN_ROOT}` that exists in
@@ -320,7 +322,7 @@ release cannot ship with a red suite.
 - Make sure `cargo test --workspace --locked` passes locally; add or update tests for
   behavior-bearing changes (bug fixes should include a test that reproduces
   the issue).
-- Make sure the three non-Rust suites above pass too, if your change touches
+- Make sure the four non-Rust suites above pass too, if your change touches
   `plugin/`, `scripts/`, or anything they assert about, and re-run the
   `cargo tree` absence proof if you touched either manifest.
 - **Bump the version of the crate you changed**, on every surface belonging to

@@ -539,7 +539,10 @@ controls. It never creates the file
 (or is mid-merge-conflict), and installing a plugin must not introduce a tracked
 file either way. And the write goes through the same typed load-modify-write the
 rest of the tool uses, so every other key in the file survives – including one
-a newer build or a hand edit put there. The file is rewritten in the tool's own
+a newer build or a hand edit put there – under the same per-machine lock every
+other configuration write takes, and committed by rename, so two sessions
+starting at once cannot interleave and a write that dies half-way leaves the
+previous file rather than a truncated one. The file is rewritten in the tool's own
 canonical form rather than patched in place, so a hand-ordered file comes back
 alphabetized; on a `magic.json` that `ss-magic init` wrote, which is every file
 that has one, the diff is exactly the added block.

@@ -65,8 +65,13 @@ use ss_magic_core::style;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Version of the `--json` shape. Bumped when a key changes meaning or goes
-/// away, so a caller pinned to an older reading can tell.
-pub const SCHEMA_VERSION: u32 = 1;
+/// away, so a caller pinned to an older reading can tell. `2` is the
+/// workspace-split shape: `versions.cli` became `versions.running` (the
+/// plugin's own version, on its own release line), and `versions` gained
+/// `newest_release` and `update_available` beside the new top-level
+/// `compaction` section. A reader of shape `1` looking for `versions.cli`
+/// finds nothing, which is why the number moved.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The events the shipped `hooks/hooks.json` actually registers.
 ///
@@ -1670,22 +1675,24 @@ fn collect_newest_release(inputs: &Inputs, pin: Option<&str>) -> (Field, Option<
         )
     };
     let field = Field::found(cache.tag_name.clone(), checked);
-    let available =
-        pin.map(|pinned| release::is_newer(&release::PLUGIN_LINE, &cache.tag_name, pinned));
+    // `None` rather than `false` for a pin that is not a plain triple: the
+    // question "is a newer release available than what is pinned" has no
+    // answer then, and `release-check` reports the same input as unknown.
+    // `is_newer` alone would answer `false`, which a caller reads as "up to
+    // date" – the wrong direction for a pin file somebody hand-edited.
+    let available = pin
+        .filter(|pinned| parse_semver(pinned).is_some())
+        .map(|pinned| release::is_newer(&release::PLUGIN_LINE, &cache.tag_name, pinned));
     (field, available)
 }
 
-/// `1.2.3` → `(1, 2, 3)`. `None` for anything that is not exactly three
-/// numbers.
+/// `1.2.3` → `(1, 2, 3)`. `None` for anything that is not exactly three runs
+/// of ASCII digits – the same rule the release check applies to a tag's
+/// version, shared with it so the two can never disagree about which pins
+/// are comparable (a `+` inside a component parses as a number but is not a
+/// version).
 fn parse_semver(text: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = text.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((major, minor, patch))
+    release::parse_bare_triple(text)
 }
 
 /// Per-event history from the heartbeat log.
@@ -1903,7 +1910,10 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
         data_dir: locate_data_dir(),
         all,
         compaction: compact_window::Sources::from_process(),
-        release_cache: release_check::cache_file(),
+        // The non-creating resolver: `status` promises to create nothing,
+        // and the creating `cache_file()` would scaffold the OS cache
+        // directory as a side effect of merely asking where the cache is.
+        release_cache: release_check::existing_cache_file(),
         now: release::now_secs(),
     };
     let probes = Probes {

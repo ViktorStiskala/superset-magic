@@ -77,8 +77,14 @@
 //! - `GIT_OBJECT_DIRECTORY` (not among R21's five) replaces the `objects/`
 //!   git looks for, so it joins the declining variables.
 //! - git refuses a repository owned by another user ("dubious ownership")
-//!   unless `safe.directory` allows it; the walk declines for any directory
-//!   it consults that is not owned by this process's effective uid.
+//!   unless `safe.directory` allows it. git's check covers the worktree, its
+//!   `.git` entry and – for a gitfile – the gitfile's target directory; the
+//!   walk declines when any of those three is not owned by this process's
+//!   effective uid, and ALSO requires every directory it lists (`objects/`,
+//!   `refs/`) to be owned by it. It does not separately check the common
+//!   directory or the main checkout root a gitfile leads to, because git
+//!   does not either: adding those declines would only cost the fast path
+//!   in a layout where git itself proceeds.
 //!
 //! Two of git's discovery rules are matched only by measurement, not by
 //! reasoning from a spec: the exact `HEAD` content rule ([`head_content_is_valid`],
@@ -259,6 +265,7 @@ pub fn roots(cwd: &Path) -> Resolved {
 // ── One ancestor ──────────────────────────────────────────────────────────────
 
 /// What inspecting `D/.git` concluded.
+#[derive(Debug)]
 enum Step {
     Found(Roots),
     Decline(&'static str),
@@ -292,7 +299,8 @@ fn inspect_dot_git(dir: &Path, euid: u32) -> Step {
     }
     // git's "dubious ownership" refusal covers the worktree and the git
     // directory (and, for a gitfile, the gitfile itself); the walk declines
-    // wherever git might refuse.
+    // wherever git might refuse. A gitfile's target is checked in
+    // `from_gitfile`; the common directory it names is not, matching git.
     if !owned_by(dir, euid) || meta.uid() != euid {
         return Step::Decline("repository is not owned by this user");
     }

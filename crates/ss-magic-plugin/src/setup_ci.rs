@@ -93,7 +93,7 @@ const USAGE: &str = "\
 Usage: ss-magic-plugin setup-github-ci [--check] [--force]
 
 Write the GitHub Actions workflow that renders this repository's operator
-checklist into a pull-request comment, pinning the ss-magic it installs.
+checklist into a pull-request comment, pinning the ss-magic-plugin it installs.
 
   --check   Report what would happen and write nothing.
   --force   Overwrite a workflow that was changed locally. Without it, that

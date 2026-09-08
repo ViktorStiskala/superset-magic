@@ -249,7 +249,7 @@ pub fn parse_line_tag(line: &Line, tag: &str) -> Option<(u64, u64, u64)> {
 /// prefix. Each component must be non-empty and all ASCII digits – checked
 /// explicitly, because `u64::from_str` accepts a leading `+` and would let
 /// `v1.+2.3` through.
-fn parse_bare_triple(s: &str) -> Option<(u64, u64, u64)> {
+pub fn parse_bare_triple(s: &str) -> Option<(u64, u64, u64)> {
     let mut parts = s.split('.');
     let major = ascii_digits(parts.next()?)?;
     let minor = ascii_digits(parts.next()?)?;
@@ -469,10 +469,25 @@ fn verdict_from_tag(line: &Line, tag: &str, current: &str) -> UpdateCheck {
 /// the whole check as a silent no-op). Both lines' cache files live here,
 /// under their own [`Line::cache_file`] names.
 pub fn cache_dir() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "ss-magic")?;
-    let dir = dirs.cache_dir().to_path_buf();
+    let dir = cache_dir_path()?;
     let _ = std::fs::create_dir_all(&dir);
     Some(dir)
+}
+
+/// Where the cache directory IS, without creating it: `Some` only when the
+/// platform resolves one and it already exists. The read-only diagnostics
+/// (`ss-magic-plugin status`) use this one, because a verb that promises
+/// "nothing is created" must not scaffold the directory it reports on –
+/// [`cache_dir`] creates as a side effect, which is right for the writers
+/// and wrong for a report.
+pub fn existing_cache_dir() -> Option<PathBuf> {
+    cache_dir_path().filter(|dir| dir.is_dir())
+}
+
+/// The platform's cache directory for `ss-magic`, resolved but untouched.
+fn cache_dir_path() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "ss-magic")?;
+    Some(dirs.cache_dir().to_path_buf())
 }
 
 /// The real HTTP client: GitHub's `/releases` list over ureq + rustls.

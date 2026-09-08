@@ -239,7 +239,11 @@ fn run_core(root: &Path, window: u64) -> Result<ExitCode> {
         }
     };
 
-    if let Some(existing) = settings.get(WINDOW_KEY) {
+    // An explicit `null` is "not set" here exactly as it is for `read_window`
+    // and `window_configured`: every other surface (`--recommend`, `status`,
+    // `enable`'s tip) tells a person with `"autoCompactWindow": null` to run
+    // this verb, so this verb must not answer "already null, leaving it".
+    if let Some(existing) = settings.get(WINDOW_KEY).filter(|v| !v.is_null()) {
         println!(
             "{}",
             style::ok(format!(

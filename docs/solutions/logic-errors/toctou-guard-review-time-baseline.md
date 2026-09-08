@@ -127,7 +127,7 @@ pub fn meta_of(path: &Path) -> Result<Option<FileMeta>> {
 this is the load-bearing ordering fix, not the struct shapes:
 
 ```rust
-// src/sync/reverse_sync.rs, in run()
+// crates/ss-magic/src/sync/reverse_sync.rs, in run()
 let mut baseline: HashMap<PathBuf, Baseline> = HashMap::new();
 for c in &reconcile {
     let (wt, main) = review_baseline(worktree_root, main_root, &c.rel, c.status);
@@ -136,7 +136,7 @@ for c in &reconcile {
 
 // `review_baseline` never aborts the reconcile for one bad file: a side that
 // fails to stat degrades to `None` via `baseline_side` rather than propagating.
-// That is fail-closed — an unreadable-then-present side reads as `None` vs a
+// That is fail-closed – an unreadable-then-present side reads as `None` vs a
 // present target, which is `Guard::Changed`, which SKIPS. It also pins the
 // reviewed-ABSENT side to `None` symmetrically, so a copy that materializes
 // between classify and apply is skipped rather than silently clobbered.
@@ -174,7 +174,7 @@ fn check_target(target: &Path, baseline: Option<&FileMeta>) -> Guard {
 `metas_match` compares length first and returns early on a mismatch, then
 compares mtimes. On a filesystem that reports no mtime it falls back to the
 content hash captured alongside the length, so a bare length equality never
-passes as "unchanged" — two different files of the same size would otherwise
+passes as "unchanged" – two different files of the same size would otherwise
 be indistinguishable, which is the failure this guard exists to prevent.
 
 **4. The baseline is threaded into `apply_decision` via `Baseline` and `ApplyContext`**
@@ -188,7 +188,7 @@ pub struct ApplyContext<'a> {
     pub backups_root: &'a Path,
     pub ts: &'a str,
     /// Whether to take a pre-overwrite backup of the losing bytes. `--no-backup`
-    /// skips ONLY the backup copy — the `Guard::Changed` skip below and the
+    /// skips ONLY the backup copy – the `Guard::Changed` skip below and the
     /// secret-safety gitignore step are unaffected.
     pub backup: bool,
 }
@@ -198,7 +198,7 @@ pub struct Baseline {
     pub wt: Option<FileMeta>,
     /// The main side's metadata at review time (`None` if it didn't exist).
     pub main: Option<FileMeta>,
-    /// Whether the push SOURCE is git-untracked — the secret-safety gate.
+    /// Whether the push SOURCE is git-untracked – the secret-safety gate.
     /// Fail-closed: `true` when tracked-ness cannot be determined.
     pub source_untracked: bool,
 }

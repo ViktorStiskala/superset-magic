@@ -309,7 +309,9 @@ pub enum Invocation {
         /// Whatever followed the event token.
         args: Vec<String>,
     },
-    /// `plugin <verb> [ARGS...]` — driven by argv, answers on stdout/stderr.
+    /// `ss-magic-plugin <verb> [ARGS...]` — driven by argv, answers on
+    /// stdout/stderr. The verb is the binary's first token; nothing is
+    /// prepended by the wrapper any more.
     Human {
         /// Which verb was named.
         verb: HumanVerb,

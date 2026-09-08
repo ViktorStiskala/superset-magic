@@ -91,6 +91,14 @@ pub fn cache_file() -> Option<PathBuf> {
     release::cache_dir().map(|dir| dir.join(PLUGIN_LINE.cache_file))
 }
 
+/// The same path as [`cache_file`], but only when the cache directory already
+/// exists – resolving it creates nothing. `status` reads through this one so
+/// its "nothing is created" promise holds even on a machine that has never
+/// run a refresh.
+pub fn existing_cache_file() -> Option<PathBuf> {
+    release::existing_cache_dir().map(|dir| dir.join(PLUGIN_LINE.cache_file))
+}
+
 /// Replace the cache file atomically. Core's own writer is a plain
 /// `fs::write`, fine for a file one process owns; this one has two writers
 /// (the refresh and the hook's marker) and a lock-free reader (the hook),

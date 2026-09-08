@@ -194,9 +194,14 @@ FAKEBIN
 # log (the fake binary answers and exits before writing), so a log holding
 # exactly `seed-config` means exactly one post-install invocation happened.
 RC=0
+# run_bootstrap ; honours $RUN_CWD (the working directory the bootstrap runs
+# in; default: the current one). A parameter rather than `( cd … && run_bootstrap )`
+# at the call site, because RC is set inside this function and a subshell
+# would take the assignment with it – the assertion after such a call would
+# then read the PREVIOUS run's status and pass vacuously.
 run_bootstrap() {
     : >"$sb/out"; : >"$sb/err"
-    env -i \
+    ( cd "${RUN_CWD:-.}" && env -i \
         PATH="$sb/shim:/usr/bin:/bin:/usr/sbin:/sbin" \
         HOME="$sb/home" \
         TMPDIR="$sb/tmp" \
@@ -207,7 +212,7 @@ run_bootstrap() {
         FAKE_CURL_MODE="${FAKE_CURL_MODE:-serve}" \
         FAKE_CURL_DELAY="${FAKE_CURL_DELAY:-0}" \
         SS_MAGIC_FAKE_LOG="$sb/fakebin.log" \
-        bash "$sb/plugin/hooks/bootstrap.sh" >"$sb/out" 2>"$sb/err"
+        bash "$sb/plugin/hooks/bootstrap.sh" >"$sb/out" 2>"$sb/err" )
     RC=$?
 }
 
@@ -567,7 +572,7 @@ current_case="R3a a SECOND repository on the same machine is seeded"
 second_repo="$sb/second-repo"
 mkdir -p "$second_repo"
 : >"$sb/fakebin.log"
-( cd "$second_repo" && run_bootstrap )
+RUN_CWD="$second_repo" run_bootstrap
 assert_never_fails_session "R3a second repo"
 assert_contains_fixed "$sb/fakebin.log" "seed-config" \
     "R3a: a second repository on an already-provisioned machine is seeded"

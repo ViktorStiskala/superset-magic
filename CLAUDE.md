@@ -203,7 +203,7 @@ The modules, by purpose:
   `tracked_files`, defensively dropping any absolute / `..`-bearing entry in one
   place) and mutating primitives (`stage_paths`, `nothing_to_commit`, `commit`,
   `push`, `push_upstream`, `create_branch`, `pr_create`,
-  `timestamp_branch_suffix`, `gh_available` — `nothing_to_commit` runs
+  `timestamp_branch_suffix`, `gh_available` – `nothing_to_commit` runs
   `git diff --cached --quiet` so `workspace/migrate.rs`'s final-action arms can
   skip an empty commit instead of failing on one). All `git`/`gh` invocations shell out via a shared `git_raw`
   helper that surfaces stderr verbatim; `git` and `git_optional` are thin
@@ -244,10 +244,13 @@ The modules, by purpose:
   follow; and directories not owned by this euid decline (git's "dubious
   ownership"). The equivalence matrix in `git/discover/tests.rs` runs every
   scenario against real `git` output and asserts `roots()` equals today's
-  answer in ALL of them. Wired into the plugin crate's `hook/mod.rs` only; every CLI
+  answer in ALL of them. Wired into the plugin crate only: the hook pipeline
+  (`hook/mod.rs`, where spawning nothing is the point) and the two read-only
+  verbs that attribute ledger rows to a repository, `compact-window
+  --recommend` and the `cost` ledger's `rows_for_repository`. Every CLI
   command keeps the subprocess probes (R22).
 - `superset_files.rs` (core; the CLI reaches it as
-  `crate::workspace::superset_files`) — `.superset/{config.json, magic.sh,
+  `crate::workspace::superset_files`) – `.superset/{config.json, magic.sh,
   magic.json, magic.local.json}` I/O (plus the legacy `setup_config.json`
   reader).
   `load_config` reads Superset-owned `config.json`;
@@ -260,7 +263,12 @@ The modules, by purpose:
   load-modify-writes exactly one file). `write_magic_json(root, &MagicConfig)`
   and `write_magic_local_json` take the whole typed config – `MagicConfig`
   carries a `#[serde(flatten)] extras` map, so an unknown key a newer build or a
-  hand edit put in the file survives a rewrite instead of being dropped;
+  hand edit put in the file survives a rewrite instead of being dropped – and
+  both commit through a staged sibling plus `rename` (`write_atomically`,
+  writing THROUGH a symlink onto its resolved target), never a truncating
+  `fs::write`: `magic.json` is a tracked file with an unattended writer now
+  (the plugin's `seed-config` runs from every session start), so a write that
+  dies half-way must leave the previous file, not a prefix;
   `merge_files_into_magic_config` folds a new `files` list into an existing
   config for the same reason. `write_magic_sh`,
   `bootstrap_magic_local_json`, and `default_magic_files` round out the
@@ -315,7 +323,7 @@ The modules, by purpose:
   header). One `OnceLock<bool>` captures the color decision (NO_COLOR +
   supports-color); `init()` makes it from the terminal, `init_no_color()`
   forces it off, `enabled()` reads it. It knows nothing about `inquire`.
-- `tui/theme.rs` (CLI) — the `inquire` half of the old `style`: `install()`
+- `tui/theme.rs` (CLI) – the `inquire` half of the old `style`: `install()`
   reads `style::enabled()` and installs the matching global `RenderConfig`
   (`render_config(false)` is `RenderConfig::empty()`, so with color off the
   theme adds nothing). `main.rs` calls `style::init()` then
@@ -607,7 +615,7 @@ The modules, by purpose:
   target root; `parse_covering_line` is its parser. The private `is_ignored_opt`
   (trailing-slash query for `Dir`), `closest_gitignore_dir`, and
   `anchored_literal` back `ensure_path_ignored`.
-- `update/` — every-invocation self-update. Core's `release.rs` (the former
+- `update/` – every-invocation self-update. Core's `release.rs` (the former
   `update/check.rs`, moved verbatim; `update/mod.rs` and `update/apply.rs`
   import it as `ss_magic_core::release`) does the daily-cached,
   PER-RELEASE-LINE GitHub check (ureq, ETag, 5 s timeout, silent
@@ -936,8 +944,11 @@ tree moved wholesale. Three facts shape every module in it:
   into its own), the session is not `quiet_mode`, and neither project settings
   file configures an `autoCompactWindow`, it emits one notice per machine,
   recorded by a `compact-advice-shown` marker in the `ss-magic` cache dir –
-  written through `atomic::write_atomically`, only by a notice that actually
-  went out, and resolved LAST so a plain `resume` never touches the cache dir;
+  CLAIMED with `create_new` (owner-only), so two sessions starting at the same
+  moment on a fresh machine race for one creation and exactly one announces,
+  `AlreadyExists` being the "already shown" answer; written only by a notice
+  that actually went out, and resolved LAST so a plain `resume` never touches
+  the cache dir;
   with no directory to record it in, the notice is withheld rather than
   repeated. `release_suggestion` (R29–R31, KTD12) is the third notice on the
   same channel and reads a FILE, never the network: on `startup` only, it
@@ -1069,7 +1080,14 @@ tree moved wholesale. Three facts shape every module in it:
   enablement gate costs no subprocess on the fast path – `None` falls back to
   `cwd_root`'s own overlay exactly as `resolve` does outside a repository.
   Writes are load-modify-write on exactly one file, preserving every unknown
-  key. `enable` prints `compact_window::enable_tip` after its success line
+  key, and every writer in the crate takes the one `magic-json.lock` under the
+  R80 temp root around its load-modify-write (`write_locked`): the human verbs
+  BLOCK on it (a person asked for the write), while `seed-config` uses the
+  non-blocking `try_with_lock` and defers to the next session on contention,
+  because it runs from a hook. Without the lock a seed that loaded the file an
+  instant before `enable` wrote `plugin.enabled` would write its loaded copy
+  back and silently drop the key. `enable` prints `compact_window::enable_tip`
+  after its success line
   (R27) – one line naming `compact-window --recommend`, only when neither
   project settings file configures a window, and never a write.
   It also owns `seed-config` (R3a), the bootstrap's one-time gate-defaults
@@ -1168,7 +1186,16 @@ tree moved wholesale. Three facts shape every module in it:
   source, or a note when the cache is absent, holds no plugin tag, or no cache
   dir resolves) and `update_available: Option<bool>` against the pin – read
   from `Inputs.release_cache` at `Inputs.now`, never refreshed by `status`, and
-  never a `problems` line (an available update is information, not a fault).
+  never a `problems` line (an available update is information, not a fault);
+  a pin that is not a plain triple makes it `None` (unknown), never `false`,
+  the same answer `release-check` gives. The cache path comes from the
+  NON-creating `release_check::existing_cache_file` (core's
+  `release::existing_cache_dir`), because `status` promises to create nothing
+  and the writers' `cache_dir()` scaffolds the OS cache directory as a side
+  effect. `SCHEMA_VERSION` is `2` since the split: `versions.cli` became
+  `versions.running` and `versions` gained `newest_release` /
+  `update_available` beside the top-level `compaction` section, so a reader
+  of shape `1` can tell it is looking at a different report.
   The heartbeat store it reads is the non-creating
   `heartbeat::existing_store_dir` (shared with `--recommend`), so a diagnostic
   never scaffolds the store it reports on.
@@ -1230,9 +1257,13 @@ tree moved wholesale. Three facts shape every module in it:
   `autoCompactWindow` into the per-machine, gitignored
   `.claude/settings.local.json`, never the tracked `.claude/settings.json`. It
   is strictly opt-in (no flag at all prints usage and does nothing), never
-  clobbers an existing value, load-modify-writes so unrelated harness keys
-  survive, and refuses rather than rebuilding a malformed file – and it is the
-  ONLY write in the module. `compact-window --recommend [--json]` (R24) is
+  clobbers an existing value (an explicit `null` is NOT a value – it reads as
+  unset here exactly as `read_window` reads it, so the verb every other
+  surface points a `null`-window user at actually writes), load-modify-writes
+  so unrelated harness keys survive, and refuses rather than rebuilding a
+  malformed file – and it is the ONLY settings write in the module (it also
+  appends the `.claude/settings.local.json` ignore rule to the repository's
+  `.gitignore`, the same rule every per-machine file gets). `compact-window --recommend [--json]` (R24) is
   read-only: it reports whether `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is set and
   WHERE (the process environment, then the `env` block of the user's
   `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`, the project's two files, and
@@ -1351,7 +1382,7 @@ pre-split `${CLAUDE_PLUGIN_DATA}/bin/ss-magic`: nothing spawns it once
 `hooks.json` and the wrapper both name `bin/ss-magic-plugin`, so it is inert, and
 a bootstrap that deletes files is a new failure mode on a path that must never
 fail a session. `plugin/hooks/run-hook.sh` is the shim the five EVENT
-hooks are spawned through — every entry in `hooks.json` except the `SessionStart`
+hooks are spawned through – every entry in `hooks.json` except the `SessionStart`
 bootstrap, which must keep naming `bootstrap.sh` directly, because the shim does
 nothing when the binary is absent and the bootstrap is the thing that installs
 it; routing it through the shim would leave the plugin inert forever rather than
@@ -1414,8 +1445,9 @@ binary is the sole file-copy implementation.)
   `git_raw` helper in core's `git/mod.rs` – in every crate, the plugin included.
   `git::discover` is the ONE filesystem-only
   reduction of two read-only probes (`--show-toplevel` and
-  `--git-common-dir`), wired into the plugin crate's hook pipeline alone (it now
-  reaches core across a crate boundary, which does not widen the rule), and it
+  `--git-common-dir`), wired into the plugin crate alone – the hook pipeline
+  plus the two ledger-attribution verbs named in Architecture (it reaches core
+  across a crate boundary, which does not widen the rule), and it
   must never grow ref, index, or write handling – anything beyond "where are
   the two roots" is a subprocess. No git-binding crate (`git2`, `gix`) is
   added.
@@ -1530,7 +1562,9 @@ binary is the sole file-copy implementation.)
   `workflow_dispatch`-able with the tag as input (the documented fallback);
   it asks for `contents: write`, which `release.yml` grants at workflow level.
   `scripts/test-mark-latest.sh` drives the script against a fake `gh` over
-  the AE1 tag list (bash 3.2, run by CI's `plugin` job); `dist generate
+  the AE1 tag list (bash 3.2, run by CI's `plugin` job under Linux and again
+  on the macOS leg of the `test` job under `/bin/bash` 3.2 itself, like the
+  bootstrap suite); `dist generate
   --check` must stay green after any `dist-workspace.toml` change, and the
   `release.yml` is REGENERATED, never hand-edited.
 - Version bumps follow the GROUP, never the repository. Bump

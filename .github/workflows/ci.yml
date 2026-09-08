@@ -64,6 +64,14 @@ jobs:
         if: runner.os == 'macOS'
         run: /bin/bash scripts/test-bootstrap.sh
 
+      # The latest-mark script is bash 3.2 too (a `case` arm cannot sit inside
+      # `$( … )` there, and `read` must handle an unterminated last line); the
+      # plugin job runs its suite under Linux's bash 5, which would let a bash-4
+      # construct pass unnoticed. This leg is the proof for the older shell.
+      - name: Latest-mark selection tests (bash 3.2)
+        if: runner.os == 'macOS'
+        run: /bin/bash scripts/test-mark-latest.sh
+
   plugin:
     name: plugin package
     runs-on: ubuntu-latest
@@ -174,10 +182,13 @@ jobs:
           # against each other as versions at all -- every `ss-magic-plugin-v*`
           # tag would sort ahead of every `v*` one regardless of when it was made.
           for tag in $(git tag --list --sort=-creatordate --merged HEAD); do
-            case "$tag" in
-              v[0-9]*.[0-9]*.[0-9]*|ss-magic-plugin-v[0-9]*.[0-9]*.[0-9]*) ;;
-              *) continue ;;
-            esac
+            # Anchored, like every other tag filter in the repository: a shell
+            # glob such as `v[0-9]*.[0-9]*.[0-9]*` also matches `v1.2.3-rc1` or
+            # `v1.2.3.4`, and a tag of that shape was never a published
+            # release, so it must not become the baseline the bump check
+            # compares against.
+            printf '%s\n' "$tag" |
+              grep -Eq '^(v|ss-magic-plugin-v)[0-9]+\.[0-9]+\.[0-9]+$' || continue
             # On a tag build HEAD *is* the release tag; compare against the
             # previous one, not against itself.
             if [ "$(git rev-parse "$tag^{commit}")" != "$head_commit" ]; then

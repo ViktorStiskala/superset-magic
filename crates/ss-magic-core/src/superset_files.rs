@@ -143,8 +143,7 @@ pub fn write_magic_json(root: &Path, cfg: &MagicConfig) -> Result<()> {
     ensure_superset_dir(root)?;
     let path = superset_dir(root).join(MAGIC_JSON);
     let body = format!("{}\n", serde_json::to_string_pretty(cfg)?);
-    fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    write_atomically(&path, &body)
 }
 
 /// Rewrite `.superset/magic.local.json` from `cfg` (including whatever it
@@ -160,8 +159,57 @@ pub fn write_magic_local_json(root: &Path, cfg: &MagicConfig) -> Result<()> {
     ensure_superset_dir(root)?;
     let path = superset_dir(root).join(MAGIC_LOCAL_JSON);
     let body = format!("{}\n", serde_json::to_string_pretty(cfg)?);
-    fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    write_atomically(&path, &body)
+}
+
+/// Replace `path` with `body` in one step: write a private sibling file, then
+/// rename it over the target.
+///
+/// Both `magic.json` writers used to be a plain `fs::write`, which truncates
+/// the file first and fills it afterwards. That was fine while one person
+/// ran one command at a time, but `magic.json` now has an unattended writer
+/// too: the plugin's `seed-config` runs from every session start, so a
+/// session that dies mid-write (a hook timeout, a closed terminal) could
+/// leave the TRACKED file that also holds the sync patterns truncated, and
+/// two writers could interleave their bytes. A rename is atomic on the
+/// filesystems git itself relies on, so a reader sees either the previous
+/// file or the whole new one, never a prefix. The sibling carries the
+/// process id and a per-process counter so concurrent writers stage
+/// different files; whichever renames last wins whole, which is the same
+/// outcome a sequential pair of writes has.
+fn write_atomically(path: &Path, body: &str) -> Result<()> {
+    // Write THROUGH a symlink, as `fs::write` did: rename onto the link's
+    // resolved target, not onto the link itself, which would silently turn
+    // the link into a plain file and leave its target stale. The plugin's
+    // seed has already decided whether that target is acceptable (it refuses
+    // one that leaves the repository); a target that does not exist yet
+    // resolves to the path as given.
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let path = target.as_path();
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
+    // Unique per writer, not merely per process: two threads of one process
+    // (the concurrent-write test is exactly that) must stage different files.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staged = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+    let write = fs::write(&staged, body)
+        .with_context(|| format!("writing {}", staged.display()))
+        .and_then(|()| {
+            fs::rename(&staged, path)
+                .with_context(|| format!("moving {} over {}", staged.display(), path.display()))
+        });
+    if write.is_err() {
+        // Best-effort: a failed write must not leave its staging file behind
+        // as an untracked stranger in the user's `.superset/`.
+        let _ = fs::remove_file(&staged);
+    }
+    write
 }
 
 /// Build a fresh `MagicConfig` with `new_files`, carrying forward the

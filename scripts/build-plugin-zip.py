@@ -647,6 +647,10 @@ def _declared_dependency_names(text: str) -> set[str]:
     """
     names: set[str] = set()
     table: list[str] = []
+    # True inside `[dependencies]` itself (each line names a crate) and inside
+    # a per-crate sub-table `[dependencies.foo]` (whose body may rename it via
+    # `package = "..."`); false everywhere else.
+    in_dep_table = False
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -659,12 +663,21 @@ def _declared_dependency_names(text: str) -> set[str]:
             for i, seg in enumerate(table):
                 if seg in _DEP_TABLES and i + 1 < len(table):
                     names.add(table[i + 1].replace("-", "_"))
+            in_dep_table = any(seg in _DEP_TABLES for seg in table)
             continue
-        if not table or table[-1] not in _DEP_TABLES:
+        if not in_dep_table:
             continue
-        m = re.match(r'^"?([A-Za-z0-9_.\-]+)"?\s*=', line)
-        if m:
-            names.add(m.group(1).replace("-", "_"))
+        if table[-1] in _DEP_TABLES:
+            # `foo = ...`, `foo.workspace = true`, `"foo" = ...`: the key up to
+            # the first dot is the crate name (`foo.workspace` is a key path
+            # into the `foo` table, not a crate called `foo.workspace`).
+            m = re.match(r'^"?([A-Za-z0-9_\-]+)"?(?:\.[A-Za-z0-9_.\-]+)?\s*=', line)
+            if m:
+                names.add(m.group(1).replace("-", "_"))
+        # A rename applies in an inline table (`foo = { package = "bar" }`)
+        # and in the body of a dotted sub-table (`[dependencies.foo]` then
+        # `package = "bar"`); the real crate is what gets linked, whatever it
+        # is called locally.
         renamed = re.search(r'\bpackage\s*=\s*"([^"]+)"', line)
         if renamed:
             names.add(renamed.group(1).replace("-", "_"))
@@ -1196,6 +1209,10 @@ def selftest() -> int:
             ("inquire", 'inquire = "0.9"\n'),
             ("ratatui", 'ratatui = "0.30.2"\n'),
             ("a renamed self_update", 'tui = { package = "self_update", version = "0.44" }\n'),
+            # A dotted sub-table rename: the crate name is in the body, not the header.
+            ("a dotted-table rename", '\n[dependencies.tui]\npackage = "self_update"\nversion = "0.44"\n'),
+            # A workspace-inherited dependency: the key path is `ratatui.workspace`.
+            ("a workspace key", 'ratatui.workspace = true\n'),
         ):
             target = Path(f) / f"dep-{label.replace(' ', '-')}"
             target.mkdir()

@@ -24,8 +24,9 @@ license = "MIT OR Apache-2.0"
 
 # The two profiles below apply to every member. They moved here from the
 # single-crate manifest unchanged: `opt-level = "z"` is a measured decision
-# (KTD9 of the workspace-split plan – a size-optimized hook binary costs
-# ~0.13 ms against a 47 percent smaller file), so do not tune it per crate.
+# (KTD9 of the workspace-split plan – `opt-level = 3` was measured at
+# ~0.13 ms faster for a hook binary 47 percent LARGER), so do not tune it per
+# crate.
 [profile.release]
 opt-level = "z"
 lto = true

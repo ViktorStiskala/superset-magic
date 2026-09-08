@@ -193,6 +193,48 @@ fn gitfile_target(wt: &Path) -> String {
         .to_string()
 }
 
+// ── Ownership declines ────────────────────────────────────────────────────────
+//
+// A real second uid is not available to a single-user test run, so these
+// drive the private steps with an euid that is deliberately NOT this
+// process's: every directory then reads as owned by somebody else, which is
+// exactly the "dubious ownership" shape git refuses.
+
+/// An euid that owns nothing in the tempdir.
+fn somebody_else() -> u32 {
+    effective_uid().wrapping_add(1)
+}
+
+/// A plain repository whose `.git` directory is (as far as the walk can tell)
+/// owned by another user declines instead of answering.
+#[test]
+fn a_repository_owned_by_another_user_declines() {
+    let (_dir, root) = repo();
+    let step = inspect_dot_git(&root, somebody_else());
+    assert!(
+        matches!(step, Step::Decline("repository is not owned by this user")),
+        "{step:?}"
+    );
+    // The same layout with the real euid is the Found the matrix pins.
+    assert!(matches!(inspect_dot_git(&root, effective_uid()), Step::Found(_)));
+}
+
+/// A linked worktree whose gitfile target is owned by another user declines
+/// at the target check, before the commondir is ever read.
+#[test]
+fn a_gitfile_target_owned_by_another_user_declines() {
+    let (_dir, _main, wt) = pair();
+    let step = from_gitfile(&wt, &wt.join(".git"), somebody_else());
+    assert!(
+        matches!(step, Step::Decline("repository is not owned by this user")),
+        "{step:?}"
+    );
+    assert!(matches!(
+        from_gitfile(&wt, &wt.join(".git"), effective_uid()),
+        Step::Found(_)
+    ));
+}
+
 // ── Decidable layouts (R20, AE5) ──────────────────────────────────────────────
 
 #[test]

@@ -703,6 +703,10 @@ fn semver_parsing_rejects_anything_that_is_not_three_numbers() {
     assert_eq!(parse_semver("1.2"), None);
     assert_eq!(parse_semver("1.2.3.4"), None);
     assert_eq!(parse_semver("1.2.3-rc1"), None);
+    // The rule is shared with the release check: a component is a run of
+    // ASCII digits, so a sign that `u64::from_str` would accept is rejected.
+    assert_eq!(parse_semver("1.+2.3"), None);
+    assert_eq!(parse_semver("+1.2.3"), None);
 }
 
 #[test]
@@ -1362,6 +1366,14 @@ fn newest_release_row_degrades_to_a_note() {
         "{:?}",
         status.versions.newest_release
     );
+
+    // A pin that is not a plain triple cannot be compared: the answer is
+    // unknown (`null`), not `false`, matching `release-check`'s report.
+    inputs.plugin_root = plugin_root_pinning(dir.path(), "1.0.0-rc1");
+    let status = collect(&inputs, &probes(listing(true)));
+    assert_eq!(status.versions.newest_release.value.as_deref(), Some("ss-magic-plugin-v1.0.0"));
+    assert_eq!(status.versions.update_available, None);
+    inputs.plugin_root = plugin_root_pinning(dir.path(), "1.0.0");
 
     inputs.release_cache = Some(dir.path().join("absent.json"));
     let status = collect(&inputs, &probes(listing(true)));

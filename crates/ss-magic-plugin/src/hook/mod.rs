@@ -199,9 +199,15 @@ pub struct HookContext<'a> {
     /// as discovery (or the fallback probe) named it, and therefore the root
     /// `plugin.enabled` was read from. `None` when neither could name one, in
     /// which case `enabled` came from [`Self::config_root`]'s own overlay.
-    /// Populated by the pipeline so no handler has to re-derive it; the first
-    /// handler to read it arrives with the compaction guidance (U3), and the
-    /// pipeline tests already assert it.
+    ///
+    /// No handler reads it today: the compaction advice and the release
+    /// suggestion both key on [`Self::repo_root`], and the enablement gate
+    /// consumed the discovered root before this context was built. It is
+    /// carried anyway because it is the one record of WHICH root the gate
+    /// read `enabled` from – the pipeline tests pin that a linked worktree's
+    /// context names the main checkout here – and a future handler that needs
+    /// the main root must take it from here rather than re-discover it and
+    /// risk disagreeing with the gate.
     #[allow(dead_code)]
     pub main_root: Option<PathBuf>,
     /// The plugin configuration in force for this repository.

@@ -94,8 +94,11 @@ no associative arrays, no `mapfile`, no `${var^^}`).
 - **Core's `git/discover.rs` is the ONE filesystem-only reduction of git
   behavior, and it is bounded.** It answers exactly two read-only probes –
   `git rev-parse --show-toplevel` and `--git-common-dir` – by walking the
-  filesystem, for the plugin's hook pipeline only; the CLI's own commands keep
-  the subprocess probes. Flag: (1) any new caller outside the plugin crate's `hook/`;
+  filesystem, for the plugin crate only: the hook pipeline (where spawning
+  nothing is the point), plus the two read-only verbs that attribute ledger
+  rows to a repository – `compact-window --recommend` and the `cost` ledger's
+  `rows_for_repository`. The CLI's own commands keep the subprocess probes.
+  Flag: (1) any caller in the `ss-magic` CLI crate or in core itself;
   (2) anything in `discover.rs` that reads refs, the index, or writes –
   resolving `HEAD` to a branch, reading `packed-refs`, parsing more of the
   config than the format check (`core.bare`, `core.worktree`,
@@ -669,6 +672,13 @@ notice actually went out (a silent path – wrong source, quiet mode, a window
 already configured – must not spend the budget) and is withheld outright when
 no cache directory can be resolved, because "once" is the promise; flag a
 marker written on a silent path or a notice emitted with nowhere to record it.
+The marker is CLAIMED with `create_new`, not checked with `exists()` and then
+written: two sessions starting at the same moment must produce one notice, and
+`AlreadyExists` is the "already shown" answer. Flag an `exists()`-then-write
+sequence on any once-only marker. `compact-window --set` treats an explicit
+`"autoCompactWindow": null` as unset, the same reading `read_window` and
+`window_configured` use, so the verb that `--recommend` points a `null`-window
+user at actually writes; flag a guard that matches `Value::Null` as configured.
 
 `hook::quiet_mode(envelope, entrypoint)` is the one "is anybody watching"
 verdict: quiet on `permission_mode` `bypassPermissions` or `dontAsk`, or on a
@@ -776,6 +786,18 @@ through `git`/`git_optional`, a per-line `.trim()` applied to such output, or a
   survives. `config set` is scoped to keys rooted at `"plugin"`. Flag a write
   that rebuilds the file from known fields only, that touches both layers, or
   that reaches outside the `plugin` key.
+- **Every writer takes the one `magic-json.lock` under the per-machine temp
+  root, and the files are replaced by rename.** `seed-config` runs unattended
+  from every session start, so a seed that loaded `magic.json` an instant
+  before `enable` wrote `plugin.enabled` would otherwise write its loaded copy
+  back without the key. The human verbs (`enable`, `disable`, `config set`)
+  BLOCK on the lock; `seed-config` uses the non-blocking variant and defers to
+  the next session on contention, because a hook must never wait. Both
+  `write_magic_json` and `write_magic_local_json` stage a sibling file and
+  `rename` it over the target (through a symlink, onto its resolved target), so
+  a write that dies half-way leaves the previous tracked file, never a prefix.
+  Flag a config write that bypasses the lock, a seed that waits on it, or a
+  return to a truncating `fs::write` on either file.
 
 ### The `seed-config` bootstrap write has SIX bounds, each a test
 
@@ -1112,6 +1134,19 @@ binary's own diagnostics.
   runs a verb in a terminal at all. Flag a bare `ss-magic` in any string this
   crate prints or returns.
 
+### `status --json` versions its shape
+
+`status.rs` carries `SCHEMA_VERSION`, emitted as the top-level `schema` key of
+`--json`, and it is bumped whenever a key changes meaning or goes away – `2`
+since the workspace split, where `versions.cli` became `versions.running` and
+`versions` gained `newest_release` / `update_available` beside the new
+`compaction` section. Flag a renamed or removed key that leaves the number
+alone, and flag `update_available` answering `false` for a pin that is not a
+plain `MAJOR.MINOR.PATCH` (the answer is unknown, `null`, exactly as
+`release-check` reports it). `status` resolves the release cache through the
+NON-creating `existing_cache_file`; flag a diagnostic path that creates the
+cache directory it reports on.
+
 ### The plugin never self-updates and never opens a TUI, by construction
 
 This used to be maintained by keeping the plugin out of the CLI's update gate.
@@ -1321,7 +1356,9 @@ out of step or a stale digest, or a bump applied to the wrong group's surfaces.
   `/bin/bash scripts/test-mark-latest.sh` (the post-announce latest-mark
   selection against a fake `gh`: drafts and prereleases dropped, anchored `v` +
   triple, numeric order, the plugin tag never chosen, a `v*` tag a no-op, a
-  mark that did not take exit 1). Flag a change
+  mark that did not take exit 1). Both shell suites also run on the macOS leg
+  of the `test` job under `/bin/bash` 3.2, the only proof that they hold on
+  the older shell they are written for. Flag a change
   to `plugin/`, `scripts/`, either binary's manifest, or the release assertions
   that leaves any of these unrun or unmentioned, and flag a `--check` assertion
   quietly dropped from the list.
@@ -1381,10 +1418,11 @@ out of step or a stale digest, or a bump applied to the wrong group's surfaces.
   a content change under `plugin/` came with a version bump (its baseline
   considers BOTH tag shapes), the bootstrap failure-path suite, a build of the
   exact asset cargo-dist will publish, and three document greps: no skill body
-  names `CLAUDE_PLUGIN_DATA`; no document (`plugin/skills/`, `README.md`,
-  `CONTRIBUTING.md`, `CONCEPTS.md`, this file) spells the retired `ss-magic` +
-  `plugin` subcommand form; and `README.md` names no `releases/latest/download/`
-  URL. The plan phase additionally refuses a release tag matching neither
+  names `CLAUDE_PLUGIN_DATA`; no document (`plugin/skills/`, `docs/solutions/`,
+  `README.md`, `CONTRIBUTING.md`, `CONCEPTS.md`, `CLAUDE.md`, this file) spells
+  the retired `ss-magic` + `plugin` subcommand form – `docs/plans/` is
+  deliberately out of scope, a plan being a historical record; and `README.md`
+  names no `releases/latest/download/` URL. The plan phase additionally refuses a release tag matching neither
   `^v[0-9]+\.[0-9]+\.[0-9]+$` nor `^ss-magic-plugin-v[0-9]+\.[0-9]+\.[0-9]+$` – a
   prefixed CLI tag such as `ss-magic-v0.11.1` would publish a release the
   updater's anchored filter and every installed binary ignore, stranding the line

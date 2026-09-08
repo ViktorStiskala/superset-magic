@@ -17,13 +17,15 @@
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::fs::OpenOptions;
+use std::io::{self, Write as _};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
 use ss_magic_core::release::{self, PLUGIN_LINE};
 
-use crate::atomic;
 use crate::compact_window::{self, OVERRIDE_ENV};
 use crate::hook::event::{Payload, Response};
 use crate::hook::{self, HookContext, Outcome};
@@ -40,9 +42,10 @@ use crate::tmproot;
 /// These are spelled `ss-magic-plugin`, the wrapper on the Bash tool's PATH —
 /// **not** a bare `ss-magic`. The model runs these through the Bash tool, where
 /// `${CLAUDE_PLUGIN_DATA}` is not exported and so the bootstrapped binary
-/// cannot be named directly; the wrapper resolves it and injects the `plugin`
-/// verb. A bare `ss-magic` would also resolve against whatever the user happens
-/// to have on PATH, which is exactly why R75 gives the wrapper a distinct name.
+/// cannot be named directly; the wrapper resolves the pinned binary and
+/// forwards argv verbatim (the binary's own argv starts at the verb). A bare
+/// `ss-magic` would also resolve against whatever the user happens to have on
+/// PATH, which is exactly why R75 gives the wrapper a distinct name.
 const CHECKLIST_VERBS: &str = "\
     ss-magic-plugin checklist init <slug>
     ss-magic-plugin checklist add-item <section> <id>
@@ -229,7 +232,12 @@ ss-magic never edits the file the override lives in. Shown once per machine.";
 /// marker: the once-per-machine budget is spent only by a notice that
 /// actually went out. Without a directory to record it in the notice is
 /// withheld rather than repeated every session, since the bound is the
-/// promise. Advice only, every branch: nothing here writes a setting (R28).
+/// promise. The marker is CLAIMED, not checked-then-written: it is created
+/// with `create_new`, so when two sessions start at the same moment on a
+/// machine that has never shown the notice, exactly one creation succeeds
+/// and exactly one notice goes out – the same first-writer-wins rule the
+/// scratchpad's state files use. Advice only, every branch: nothing here
+/// writes a setting (R28).
 fn compaction_advice(
     repo_root: &Path,
     source: &str,
@@ -260,23 +268,19 @@ fn compaction_advice(
         ));
     };
     let marker = dir.join(COMPACT_ADVICE_MARKER);
-    if marker.exists() {
-        return silent(Some(
-            "compaction notice already shown on this machine".to_string(),
-        ));
-    }
-    // The marker's contents are for a person looking at the file: when it
-    // was shown. Its existence is what the check above reads.
-    let detail = match atomic::write_atomically(
-        &marker,
-        &format!("{}\n", scratchpad::format_rfc3339(now)),
-        ".compact-advice-",
-        ".tmp",
-        Some(COMPACT_ADVICE_MARKER),
-        Some(0o600),
-        false,
-    ) {
+    // Claim the marker exclusively. `create_new` fails with `AlreadyExists`
+    // when any other session – earlier, or racing right now – created it
+    // first, and that failure IS the "already shown" answer; an `exists()`
+    // check followed by a write would let two simultaneous startups both see
+    // "absent" and both announce. The marker's contents are for a person
+    // looking at the file: when it was shown. Its existence is the record.
+    let detail = match claim_marker(&marker, now) {
         Ok(()) => "compaction notice shown".to_string(),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return silent(Some(
+                "compaction notice already shown on this machine".to_string(),
+            ));
+        }
         // Best-effort: the notice still goes out; the worst case is a repeat
         // on a machine whose cache directory refuses writes.
         Err(e) => format!("compaction notice shown (marker could not be written: {e:#})"),
@@ -285,6 +289,18 @@ fn compaction_advice(
         message: Some(COMPACT_ADVICE_TEXT.to_string()),
         detail: Some(detail),
     }
+}
+
+/// Create `marker` exclusively (owner-only, like every other file the plugin
+/// keeps in the cache directory) and stamp it with when the notice went out.
+/// `AlreadyExists` means another session got there first.
+fn claim_marker(marker: &Path, now: u64) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(marker)?;
+    file.write_all(format!("{}\n", scratchpad::format_rfc3339(now)).as_bytes())
 }
 
 /// Join whichever operator notices are present into one `systemMessage`,

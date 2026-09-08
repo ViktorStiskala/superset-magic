@@ -2,6 +2,64 @@ use super::*;
 use std::fs;
 use tempfile::TempDir;
 
+/// The writers stage a sibling file and rename it over the target, so a
+/// finished write leaves exactly the target behind – no `.magic.json.<pid>.tmp`
+/// stranger for `git status` to show.
+#[test]
+fn magic_json_writers_leave_no_staging_file_behind() {
+    let dir = TempDir::new().unwrap();
+    let cfg = MagicConfig {
+        files: vec![".env".to_string()],
+        ..Default::default()
+    };
+    write_magic_json(dir.path(), &cfg).unwrap();
+    write_magic_local_json(dir.path(), &cfg).unwrap();
+    let names: Vec<String> = fs::read_dir(dir.path().join(".superset"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().all(|n| n == MAGIC_JSON || n == MAGIC_LOCAL_JSON),
+        "unexpected entries in .superset: {names:?}"
+    );
+    assert_eq!(load_magic_json(dir.path()).unwrap().unwrap().files, cfg.files);
+}
+
+/// Eight writers racing on one `magic.json` never leave a torn file: every
+/// observed state is one whole document some writer produced. This is the
+/// property the rename buys over a truncating `fs::write`, and it is asserted
+/// concurrently on purpose – a sequential test cannot tell the two apart.
+#[test]
+fn concurrent_magic_json_writes_never_tear_the_file() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                for round in 0..25 {
+                    let cfg = MagicConfig {
+                        files: (0..40).map(|k| format!("writer-{i}-round-{round}-file-{k}")).collect(),
+                        ..Default::default()
+                    };
+                    write_magic_json(&root, &cfg).unwrap();
+                    let seen = load_magic_json(&root).unwrap().unwrap();
+                    assert_eq!(seen.files.len(), 40, "a reader saw a partial document");
+                    let head = seen.files[0].clone();
+                    assert!(
+                        seen.files.iter().all(|f| f.starts_with(&head[..head.rfind("-file-").unwrap()])),
+                        "a reader saw two writers' bytes mixed: {:?}",
+                        seen.files
+                    );
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
 const OPTIONS: [&str; 4] = [".env", "**/.env", ".env.local", "**/.dev.vars"];
 
 fn fresh() -> TempDir {

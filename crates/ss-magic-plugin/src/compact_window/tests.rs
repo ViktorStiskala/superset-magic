@@ -122,6 +122,29 @@ fn fresh_repo_gains_file_value_and_ignore_rule_in_one_step() {
     );
 }
 
+/// An explicit `"autoCompactWindow": null` is "not set" for `--set` exactly as
+/// it is for `read_window`/`window_configured`: the verb writes the value
+/// instead of reporting a null as already configured, so following
+/// `--recommend`'s own advice is never a silent no-op.
+#[test]
+fn an_explicit_null_window_is_not_configured_and_set_writes_over_it() {
+    let dir = fixture();
+    fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    fs::write(
+        dir.path().join(SETTINGS_LOCAL_REL),
+        "{\n  \"autoCompactWindow\": null,\n  \"permissions\": {}\n}\n",
+    )
+    .unwrap();
+    assert!(!window_configured(dir.path()), "a null window must read as unconfigured");
+
+    let code = run_core(dir.path(), 200_000).unwrap();
+    assert_eq!(exit_code_to_u8(code), 0);
+    let settings = read_local_settings(dir.path());
+    assert_eq!(settings[WINDOW_KEY], json!(200_000));
+    assert!(settings["permissions"].is_object(), "unrelated keys survive: {settings}");
+    assert!(window_configured(dir.path()));
+}
+
 /// Covers AE15: a pre-existing window value survives the verb, with a report
 /// instead of a write — the file's bytes (not just the value) are untouched.
 #[test]
