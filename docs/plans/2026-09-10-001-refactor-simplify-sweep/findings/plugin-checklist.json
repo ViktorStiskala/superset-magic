@@ -1,0 +1,291 @@
+{
+  "partition": "plugin-checklist",
+  "findings": [
+    {
+      "id": "plugin-checklist-F1",
+      "category": "duplication",
+      "title": "render::slugify is a byte-for-byte copy of core's reponame::sanitize_segment",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/render.rs:455-470",
+        "crates/ss-magic-core/src/reponame.rs:87-101"
+      ],
+      "evidence": "render.rs:456-469  let mut out = String::with_capacity(text.len());\n    let mut pending_hyphen = false;\n    for ch in text.chars() {\n        if ch.is_ascii_alphanumeric() {\n            if pending_hyphen && !out.is_empty() { out.push('-'); }\n            pending_hyphen = false; out.push(ch.to_ascii_lowercase());",
+      "problem": "`slugify` and `ss_magic_core::reponame::sanitize_segment` are the same algorithm character for character (lowercase ASCII alphanumerics, every other run collapsed to one interior hyphen, never a leading one, no trailing trim), down to the same loop shape and the same `pending_*` flag name spelled two ways. The core function is already `pub`, and the plugin crate already depends on core and already calls `reponame::repo_name_stem` from `identity.rs`, so this is a second copy of a helper that exists one crate away. (`identity::slugify` is a genuinely different third function - it strips diacritics, trims and truncates - and is not part of this finding.)",
+      "proposal": "Delete the body of `render::slugify` and make it a one-line wrapper: `fn slugify(text: &str) -> String { ss_magic_core::reponame::sanitize_segment(text) }`, keeping the existing doc comment (the anchor-injection rationale) on the wrapper and adding a test in `checklist/render/tests.rs` pinning the property the renderer actually depends on (`slugify` yields only `[a-z0-9-]`), so a later widening of core's sanitizer for filename purposes cannot silently widen the anchor alphabet.",
+      "behavior_preservation": "Both functions map identical inputs to identical outputs for every `&str`: same predicate (`is_ascii_alphanumeric`), same `to_ascii_lowercase`, same `pending && !out.is_empty()` guard before pushing `-`, same absence of a trailing trim. Callers of `slugify` (`anchor_for`) see the same strings, so anchors and the table of contents are byte-identical.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-checklist-F2",
+      "category": "duplication",
+      "title": "Five copies of the \"path relative to root, else absolute\" display helper in the plugin crate",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:1374-1379",
+        "crates/ss-magic-plugin/src/hook/session_start.rs:496-500",
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:1066-1069",
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:132-136",
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:551-553"
+      ],
+      "evidence": "verbs.rs:1374  fn display_rel(root: &Path, path: &Path) -> String {\n    path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()\n}\nsession_start.rs:496  fn display_rel(root: &Path, path: &Path) -> String {\n    path.strip_prefix(root).map(|p| p.to_string_lossy().into_owned())\n        .unwrap_or_else(|_| path.to_string_lossy().into_owned())",
+      "problem": "The same four-line helper is written five times under four names - `display_rel` twice (verbs.rs and session_start.rs, the identical name for the identical function), `display_path` in pre_tool_use.rs, `rel_to_repo` in pre_compact.rs, and inline inside `rel_to_state` in subagent_stop.rs. Two of them additionally carry near-identical doc comments explaining the same fallback. Nothing shares a definition, so the crate has four names for one concept and five places a change would have to land.",
+      "proposal": "Add one `pub(crate) fn display_rel(root: &Path, path: &Path) -> String` to the plugin crate's `pathnorm.rs` (it is already the crate's path-vocabulary module and is imported by the hook modules), carrying the merged doc comment. Replace all five bodies with a call; keep `rel_to_repo` / `rel_to_state` as thin named wrappers where their doc comment carries a domain meaning (\"the form `git::tracked_files` reports paths in\", and subagent_stop's grandparent-of-state-root derivation).",
+      "behavior_preservation": "All five bodies compute the same value: `strip_prefix` succeeds -> lossy string of the relative path; fails -> lossy string of the original. `unwrap_or(path)` and `unwrap_or_else(|_| path...)` differ only in where the lossy conversion happens, not in the resulting bytes. No error, ordering or side effect is involved - the helpers are pure.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-checklist-F3",
+      "category": "duplication",
+      "title": "The human-verb exit tail (usage_error / fail / exit code 2) is hand-written in five modules",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:1438-1459",
+        "crates/ss-magic-plugin/src/cache.rs:1006-1010",
+        "crates/ss-magic-plugin/src/config.rs:938-942",
+        "crates/ss-magic-plugin/src/compact_window.rs:837-850",
+        "crates/ss-magic-plugin/src/ledger.rs:1250-1254"
+      ],
+      "evidence": "verbs.rs:1438  fn usage_error(message: &str) -> ExitCode {\n    eprintln!(\"{}\", style::err(format!(\"error: {message}\")));\n    eprintln!(\"{USAGE}\");\n    refused()\n}\nconfig.rs:938  fn usage_error(usage: &str, message: &str) -> ExitCode {   // args swapped\ncache.rs:1006 fn usage_error(message: &str, usage: &str) -> Result<ExitCode> {",
+      "problem": "Five modules each define a private `usage_error` with the same two `eprintln!`s and the same exit code, in three different argument orders and two different return types; `fail` is written twice (verbs.rs:1456 and compact_window.rs:848) with byte-identical bodies; and the exit code itself - a documented contract, \"2 means the command as typed cannot be carried out\" - appears as the bare literal `ExitCode::from(2)` at roughly twenty-five sites across the crate. Only `checklist::verbs::refused` names it, and `config.rs:936` documents the contract by pointing a prose comment at that private function it cannot call.",
+      "proposal": "Add a small crate module (e.g. `crates/ss-magic-plugin/src/verbexit.rs`) with `pub(crate) fn refused() -> ExitCode { ExitCode::from(2) }`, `pub(crate) fn usage_error(message: &str, usage: &str) -> ExitCode` and `pub(crate) fn fail(message: &str) -> ExitCode`, carrying the exit-code contract comment that currently lives in `verbs.rs:1444-1448`. Each of the five modules deletes its copy and calls these, wrapping in `Ok(...)` where its own signature returns `Result<ExitCode>`; `config.rs` adapts to the single argument order.",
+      "behavior_preservation": "Every copy prints the same two lines through the same `style::err` and returns the same exit code, so stdout/stderr bytes and exit statuses are unchanged. The only edit at a call site is argument order in `config.rs`, which is checked by the compiler because both parameters are `&str` at distinct positions in the same call - verify each `config.rs` call site individually rather than by search-and-replace.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-checklist-F4",
+      "category": "const-location",
+      "title": "session_start.rs re-declares the checklist pointer's file name instead of importing POINTER_NAME (and its comment is stale)",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:99-101",
+        "crates/ss-magic-plugin/src/hook/session_start.rs:60-62",
+        "crates/ss-magic-plugin/src/hook/session_start.rs:589"
+      ],
+      "evidence": "verbs.rs:99  /// The pointer's name inside the state root. `SessionStart` names this exact\n/// path in the guidance it injects, so it is not free to move.\npub const POINTER_NAME: &str = \"checklist.json\";\nsession_start.rs:60  /// The pointer's file name inside the state root (R89) - not yet written by\n/// anything in this codebase (U27 owns that write path). Named here only so\nconst CHECKLIST_POINTER_NAME: &str = \"checklist.json\";",
+      "problem": "Two owners of one string. `verbs.rs`'s own doc says `SessionStart` names this exact path \"so it is not free to move\", yet `SessionStart` reads its own private copy, so moving the pointer would leave the injected guidance naming a file nothing writes. The re-declaration also keeps `checklist::POINTER_NAME` unreferenced outside the family - confirmed by `RUSTFLAGS=\"--force-warn unused_imports\" cargo check`, which reports `unused imports: POINTER_NAME and Pointer` at `checklist/mod.rs:67`, a warning the module-wide allow hides. The comment on the private copy is also stale: `verbs.rs::write_pointer` now writes that file, so \"not yet written by anything in this codebase\" is no longer true.",
+      "proposal": "Delete `CHECKLIST_POINTER_NAME` from `session_start.rs` and use `crate::checklist::POINTER_NAME` in the guidance format string at line 589 (the module already reaches other crate modules the same way). Keep the sentence about where the pointer resolves; drop the \"not yet written\" clause.",
+      "behavior_preservation": "Both constants hold the literal `\"checklist.json\"`, so the rendered guidance text is byte-identical. Nothing else reads either constant.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-checklist-F5",
+      "category": "const-location",
+      "title": "DOCUMENT_ID and the validator's \"document\" location are two literals a prose comment asks to stay equal",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:863-866",
+        "crates/ss-magic-plugin/src/checklist/validate.rs:91-92"
+      ],
+      "evidence": "verbs.rs:863  /// The id that addresses the document header itself. Spelled the same as the\n/// `location` the validator reports header findings under, so a finding names\n/// the id that fixes it.\nconst DOCUMENT_ID: &str = \"document\";\nvalidate.rs:92      let at = \"document\";",
+      "problem": "The coupling that makes `verify`'s output actionable - a header finding reported at location `document` must name the same id `checklist set document <key>` accepts - is documented in prose and enforced by nothing. `DOCUMENT_ID` is private to `verbs.rs`, so `validate.rs` cannot reference it even though the two must never diverge, and no test pins the pair (grep of the family's `tests.rs` files finds only bare `\"document\"` literals).",
+      "proposal": "Move the constant up to the family's shared vocabulary module: `pub const DOCUMENT_ID: &str = \"document\";` in `checklist/schema.rs` (beside `SCHEMA_ID`), re-exported from `checklist/mod.rs` alongside the other schema items. `verbs.rs` imports it in place of its private copy; `validate.rs:92` becomes `let at = DOCUMENT_ID;`.",
+      "behavior_preservation": "Same literal in both places, so every finding location string, every `set` dispatch and every error message is byte-identical. `check_new_id`'s refusal message (`\"`{DOCUMENT_ID}` addresses the checklist header itself...\"`) interpolates the same value.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-checklist-F6",
+      "category": "hardcoded-value",
+      "title": "The wire tokens of ItemKind and Priority are re-spelled in verbs.rs instead of living beside as_str",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:967-988",
+        "crates/ss-magic-plugin/src/checklist/schema.rs:196-201",
+        "crates/ss-magic-plugin/src/checklist/schema.rs:228-234"
+      ],
+      "evidence": "verbs.rs:968  item.kind = match required_text(key, value)?.as_str() {\n                \"check\" => ItemKind::Check,\n                \"record\" => ItemKind::Record,\n                \"decision\" => ItemKind::Decision,\nschema.rs:197  pub fn as_str(&self) -> &'static str {\n        match self { Self::Check => \"check\", Self::Record => \"record\", Self::Decision => \"decision\",",
+      "problem": "`schema.rs` declares itself the owner of \"the token as it appears on the wire\" for both enums (`ItemKind::as_str`, `Priority::as_str`, plus serde's `rename_all = \"kebab-case\"`), but the only place that reads a token back - `set_item_field` - hardcodes all six literals a second time. The two halves of one vocabulary sit 700 lines apart with nothing tying them together, and `Priority::as_str` is meanwhile dead (see F7), so a renamed variant would change what is written and validated while `set` kept accepting the old spelling.",
+      "proposal": "Add the inverse beside each `as_str` in `schema.rs`: `pub fn from_token(raw: &str) -> Option<Self>` on `ItemKind` and on `Priority`, matching exactly the three literals `as_str` emits. `set_item_field` becomes `item.kind = ItemKind::from_token(required_text(key, value)?.as_str()).ok_or_else(|| ...)?` with its existing `bail!` text unchanged in the `None` arm, and the priority arm keeps its `None => None` clearing branch and calls `Priority::from_token` for the `Some(other)` case.",
+      "behavior_preservation": "The accepted token set is unchanged (same six literals), the null-clearing branch for `priority` stays in `verbs.rs`, and both `bail!` messages are kept verbatim, so accepted inputs, rejected inputs, error text and exit codes are identical.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-checklist-F7",
+      "category": "dead-code",
+      "title": "Priority::as_str, Document::section and Document::items are reachable from nothing, including tests",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/schema.rs:228-234",
+        "crates/ss-magic-plugin/src/checklist/schema.rs:474-486"
+      ],
+      "evidence": "schema.rs:475  pub fn section(&self, id: &str) -> Option<&Section> {\n        self.sections.iter().find(|s| s.id == id)\n    }\nschema.rs:481  pub fn items(&self) -> impl Iterator<Item = (&str, &Item)> {\n        self.sections.iter().flat_map(|s| s.items.iter().map(move |i| (s.id.as_str(), i)))",
+      "problem": "`RUSTFLAGS=\"--force-warn dead-code\" cargo check -p ss-magic-plugin` reports exactly three never-used items in this family - `Priority::as_str` (228), `Item::expected_declared` (404) and `Document::{section, items}` (475) - and a grep across all six `tests.rs` files finds callers only for `expected_declared`. So `Priority::as_str`, `Document::section` and `Document::items` are called by no production code and by no test; the module-wide `#![allow(dead_code)]` at `mod.rs:47` is what keeps them invisible. `mod.rs`'s comment defends the allow as covering \"the constants and `Pointer` ... and a handful of model accessors\", which is the counter-argument to acting on this - it is recorded here as a fact, not as a claim that the comment is wrong.",
+      "proposal": "Either give `Priority::as_str` a caller by adopting it in F6's `from_token` pair (which makes the enum's token vocabulary round-trip and keeps it exercised by F6's tests), or delete all three items. If they are kept as deliberate vocabulary, narrow the blanket allow at `mod.rs:47` to per-item `#[allow(dead_code)]` attributes on exactly these members, so the next genuinely dead function is not hidden too.",
+      "behavior_preservation": "Nothing calls them, so removing or annotating them changes no output, error, side effect or ordering; the change is confined to compilation.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-checklist-F8",
+      "category": "copy-paste-variant",
+      "title": "Four copies of \"blank field renders a placeholder, else prose_inline\" in render.rs",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/render.rs:151-155",
+        "crates/ss-magic-plugin/src/checklist/render.rs:257-261",
+        "crates/ss-magic-plugin/src/checklist/render.rs:283-287",
+        "crates/ss-magic-plugin/src/checklist/render.rs:299-303"
+      ],
+      "evidence": "render.rs:151  let title = if doc.title.trim().is_empty() { \"Untitled checklist\".to_string() } else { prose_inline(&doc.title) };\nrender.rs:283  let title = if plan.section.title.trim().is_empty() { \"(untitled section)\".to_string() } else { prose_inline(&plan.section.title) };\nrender.rs:299  let title = if item.title.trim().is_empty() { \"(untitled item)\".to_string() } else { prose_inline(&item.title) };",
+      "problem": "The same five-line shape appears four times, differing only in the field and the placeholder string, and the placeholders themselves are inconsistent in style between the four sites and `validate.rs`'s `display_id` (`<no id>`). The repetition is what lets the styles drift: a fifth blank-field site added tomorrow gets whatever bracket convention its author picks.",
+      "proposal": "Add one private helper in `render.rs`: `fn prose_or(text: &str, placeholder: &str) -> String { if text.trim().is_empty() { placeholder.to_string() } else { prose_inline(text) } }`, and call it at all four sites with the placeholders exactly as they are today. Leave `validate.rs::display_id` alone - it returns a borrowed `&str` for a finding location, not rendered prose, and folding it in would allocate.",
+      "behavior_preservation": "Each call passes its current placeholder literal, and the helper applies the same `trim().is_empty()` test and the same `prose_inline` on the else branch, so every rendered byte is unchanged. `\"(no date)\"` at line 256 is deliberately not folded in: it is an `Option::unwrap_or_else` over `format_ts`, a different condition.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-checklist-F9",
+      "category": "copy-paste-variant",
+      "title": "The reference-list block is written twice in render.rs",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/render.rs:270-277",
+        "crates/ss-magic-plugin/src/checklist/render.rs:338-345"
+      ],
+      "evidence": "render.rs:270  if !entry.refs.is_empty() {\n        let links: Vec<String> = entry.refs.iter().map(|r| md_link(&r.label, &r.url)).collect();\n        let _ = writeln!(out, \"  - References: {}\", links.join(\", \"));\n    }\nrender.rs:338  if !item.refs.is_empty() {  // identical body over item.refs",
+      "problem": "`render_changelog_entry` and `render_item` contain the identical six-line block over their own `refs` field - same emptiness guard, same `md_link` map, same `\", \"` join, same `\"  - References: \"` label and indentation. The label and the indent are rendered output a reader compares across the two blocks, so a change to one and not the other is a silent formatting split.",
+      "proposal": "Extract `fn render_refs(out: &mut String, refs: &[Reference])` in `render.rs` holding that exact block, and call it from both sites (both already have `out: &mut String` in scope). `Reference` is already imported into the module via `super::schema`.",
+      "behavior_preservation": "The extracted body is the current body verbatim, called at the same point in each function's write order, so the emitted Markdown and the position of the References line within each entry/item are unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-checklist-F10",
+      "category": "duplication",
+      "title": "The error-count expression is inlined twice in verbs.rs while validate.rs owns has_errors",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:661-666",
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:763-767",
+        "crates/ss-magic-plugin/src/checklist/validate.rs:64-67"
+      ],
+      "evidence": "verbs.rs:661  findings.iter().filter(|f| f.severity == Severity::Error).count()\nverbs.rs:764  let errors = findings.iter().filter(|f| f.severity == Severity::Error).count();\nvalidate.rs:65  pub fn has_errors(findings: &[Finding]) -> bool {\n    findings.iter().any(|f| f.severity == Severity::Error)",
+      "problem": "`validate.rs` already owns the \"which findings are errors\" predicate as `has_errors`, and it is the module that would have to change if `Severity` grew a third variant. Both places that need a COUNT rather than a boolean reach into `Finding`'s fields from `verbs.rs` instead, so the severity comparison lives in three files and `Severity` is compared by pattern at a call site rather than behind the module's own predicate.",
+      "proposal": "Add `pub fn error_count(findings: &[Finding]) -> usize { findings.iter().filter(|f| f.severity == Severity::Error).count() }` to `validate.rs` beside `has_errors`, re-export it from `checklist/mod.rs` next to `has_errors`, and call it at both `verbs.rs` sites.",
+      "behavior_preservation": "Identical expression moved verbatim; both call sites keep their surrounding `if` and their message text, so the printed counts and the warn/no-warn decision are unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-checklist-F11",
+      "category": "copy-paste-variant",
+      "title": "validate.rs's error and warning constructors share one body",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/validate.rs:410-424"
+      ],
+      "evidence": "validate.rs:410  fn error(findings: &mut Vec<Finding>, at: &str, message: String) {\n    findings.push(Finding { severity: Severity::Error, location: at.to_string(), message });\n}\nfn warning(findings: &mut Vec<Finding>, at: &str, message: String) {\n    findings.push(Finding { severity: Severity::Warning, location: at.to_string(), message });",
+      "problem": "Two functions whose bodies differ only in the `severity` field they set. It is small, but the `Finding` struct literal - including the `at.to_string()` allocation - is written twice, so a new field on `Finding` has to be added in two places.",
+      "proposal": "Keep both names (they are what makes the eleven check functions readable) and give them one body: `fn push_finding(findings: &mut Vec<Finding>, severity: Severity, at: &str, message: String)` holding the struct literal, with `error` and `warning` becoming one-line calls into it. Do not replace the two names with a severity argument at the call sites - the eleven check functions read better as `error(...)` / `warning(...)`.",
+      "behavior_preservation": "The same `Finding` values are pushed in the same order onto the same vector; nothing else observes the constructors.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-checklist-F12",
+      "category": "duplication",
+      "title": "Hinnant's calendar arithmetic is hand-written three times across the workspace with no shared owner",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/schema.rs:667-680",
+        "crates/ss-magic-plugin/src/scratchpad.rs:647-671",
+        "crates/ss-magic/src/sync/reverse_sync.rs:704-724"
+      ],
+      "evidence": "schema.rs:667  /// Days from the Unix epoch to a civil date - Howard Hinnant's algorithm, the\n/// exact inverse of the civil-from-days conversion the plugin's UTC formatter runs\n    era * 146_097 + doe - 719_468\nscratchpad.rs:661  let z = days as i64 + 719_468; let era = z.div_euclid(146_097);\nreverse_sync.rs:713  let z = days as i64 + 719_468; let era = z.div_euclid(146_097);",
+      "problem": "Three hand-rolled copies of the same calendar model live in three crates: `days_from_civil` here, and the civil-from-days direction twice - once in the plugin's `format_rfc3339` and once, near-identically, in the CLI's `format_timestamp` (which differs only in its output format string). The constants `719_468` and `146_097` are typed out in all three. `scratchpad.rs`'s comment explains why the two formatters are not shared (\"different formats for different audiences\"), which is an argument about the format string, not about the arithmetic underneath it. No crate owns the calendar; `ss-magic-core` is where a helper used by both binaries belongs.",
+      "proposal": "Add `crates/ss-magic-core/src/civil.rs` with the two pure conversions and nothing else - `pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64` and `pub fn civil_from_days(days: i64) -> (i64, u32, u32)` - plus the leap/`days_in_month` helpers, moved verbatim from the three sites. `schema.rs::days_from_civil` becomes a call; `scratchpad::format_rfc3339` and `reverse_sync::format_timestamp` each keep their own `format!` line and take the `(y, m, d)` triple from core. Move the existing round-trip tests along with them.",
+      "behavior_preservation": "The three bodies are the same algorithm on the same integer types (`i64` era/`div_euclid`/`rem_euclid`, the same `146_097`/`719_468`/`153`/`5` constants), so the extracted functions return identical values; each caller keeps its own formatting, so `format_rfc3339`'s `...Z` output and `format_timestamp`'s `YYYYmmdd-HHMMSS` backup directory names are byte-identical. Confidence is 75 because I read all three bodies but did not diff the CLI copy's `u64`/`i64` casts against core's proposed signature line by line.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-checklist-F13",
+      "category": "duplication",
+      "title": "The ignored_repo test fixture is re-implemented in seven plugin test modules",
+      "locations": [
+        "crates/ss-magic-plugin/src/checklist/verbs/tests.rs:30-42",
+        "crates/ss-magic-plugin/src/cache/tests.rs:28-39",
+        "crates/ss-magic-plugin/src/bypass/tests.rs:154-161",
+        "crates/ss-magic-plugin/src/expect_artifact/tests.rs:30-41",
+        "crates/ss-magic-plugin/src/hook/session_start/tests.rs:28",
+        "crates/ss-magic-plugin/src/hook/pre_compact/tests.rs:28",
+        "crates/ss-magic-plugin/src/hook/subagent_stop/tests.rs:32"
+      ],
+      "evidence": "verbs/tests.rs:30  fn ignored_repo() -> (TempDir, PathBuf) {\n    let dir = init_main_repo(\"main\");\n    fs::write(dir.path().join(\".gitignore\"), \"target/\\n.superset/.magic/\\n\").unwrap();\n    git_run(&[\"add\", \".gitignore\"], dir.path());\n    git_run(&[\"commit\", \"-q\", \"-m\", \"gitignore\"], dir.path());\n    let root = dir.path().canonicalize().unwrap();",
+      "problem": "Seven modules each define `ignored_repo` - \"a repository whose state tree git already ignores\" - as the same four steps over `testutil::init_main_repo` and `testutil::git_run`, including the same `\"target/\\n.superset/.magic/\\n\"` body. The copies have already drifted in the last line: most `canonicalize()` the temp dir, `expect_artifact/tests.rs:39` calls `git::cwd_repo_root` instead. This is the precondition every state-writing plugin test needs, so it is a fixture with one meaning and seven definitions.",
+      "proposal": "Add `pub fn ignored_repo() -> (TempDir, PathBuf)` to `crates/ss-magic-core/src/testutil.rs` (already the shared, `testutil`-feature-gated helper module the plugin's dev-dependencies enable), spelling the gitignore body as the `canonicalize()` variant the six identical copies use, and have each module import it. Leave `expect_artifact`'s copy in place, or convert it deliberately after checking that `canonicalize()` and `git::cwd_repo_root` agree for its tests; leave `scratchpad/tests.rs`'s `repo_with_gitignore` wrapper, which is parameterized on the ignore body.",
+      "behavior_preservation": "Test-only change; the six identical copies produce the same repository state, so the tests that consume them are unaffected. Reported at 75 because I verified four of the seven bodies in full and the remaining three only by their identical signature line, and because the sweep's own scoping counts test helpers mainly when `testutil` already provides them - it provides the pieces here, not this composite.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 2 (standard-library or runtime primitives): the hand-rolled ISO-8601 reader, the FNV/SHA hashing and the date arithmetic are deliberate no-date-crate/no-hash-crate decisions (structure pins); nothing else in the partition hand-rolls a std primitive.",
+    "Rubric 1 item 3 (platform, framework or downstream guarantees): serde's derives already own the wire shape here; nothing hand-maintains a guarantee serde or the harness provides.",
+    "Rubric 2 item 1 (redundant state): the SectionPlan/ItemPlan anchor plan is computed once and threaded, not cached alongside a second source of truth.",
+    "Rubric 2 item 2 (parameter sprawl): run_core's (cwd, sub, now) and render's (doc, path, repo_url, budget) are injected-environment seams, explicitly not sprawl per the structure pins.",
+    "Rubric 2 item 4 (leaky abstractions): checklist/mod.rs keeps every submodule private and exposes only the vocabulary; no caller reaches past it.",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable - no component-tree UI framework in this partition.",
+    "Rubric 2 item 7 (nested conditionals 3+ deep): the deepest nesting is set_item_field's match-inside-match at two levels.",
+    "Rubric 2 item 8 (unnecessary comments): the comments here state non-obvious invariants (why Ord is absent on Timestamp, why kind defaults to Check, why the lock is best-effort) and each plan id is accompanied by its explanation; the one stale comment found is folded into F4.",
+    "Rubric 2 item 10 (context-dependent vocabulary): the family's terms - document, section, item, changelog entry, pointer, canonical order - are used consistently.",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): none; the schema's extras maps are forward-compatibility for released files, not superseded scaffolding.",
+    "Rubric 3 item 1 (unnecessary work): the document is read once per verb and validated once per path; render builds its anchor map in a single pass.",
+    "Rubric 3 item 2 (missed concurrency): a single small JSON document under one advisory lock; parallelism would add contention, not save time.",
+    "Rubric 3 item 3 (hot-path bloat): the only hot-path entry, matches_convention (called from PreToolUse on every tool target), is lexical and allocation-free.",
+    "Rubric 3 item 4 (recurring no-op updates): not applicable - no polling, event or reducer surface.",
+    "Rubric 3 item 5 (unnecessary existence checks): read_document's exists/is_file pre-check and run_init's under-lock path.exists() are deliberate (absent-vs-directory, and a create-if-absent decision that must be inside the lock); replacing either would change behavior.",
+    "Rubric 3 item 6 (memory): every structure is bounded by the document; the list verb is byte-budgeted by LIST_BYTE_BUDGET.",
+    "Rubric 3 item 7 (overly broad operations): resolve_active reads only docs/actions/, and render's budget truncation is the documented behavior.",
+    "Recon lead L4 (contained_join should route through pathnorm::normalize): rejected. contained_join refuses any ParentDir component outright, which is strictly stricter than normalize's cancellation (normalize would accept a/../b); routing it through pathnorm would thin a trust-boundary check on pointer-file contents.",
+    "Recon lead L6 (with_lock guard shared with config.rs/release_check.rs): rejected. checklist's with_lock locks a file in the repository state tree and falls through silently; config.rs resolves the tmproot and prints a warning on failure; release_check uses the non-blocking variant. Consolidating would change the emitted diagnostics.",
+    "Recon lead L12 (dedupe clones its key): one small allocation per anchor on a document-sized map; avoiding it needs a double hash lookup, which is not clearly better.",
+    "Recon lead L14 (the module-wide allow hides dead surface): verified with --force-warn - the unused_imports half masks only mod.rs's own re-exports, which mod.rs's comment defends as the format's vocabulary; the dead_code half is reported narrowly as F7 instead."
+  ]
+}

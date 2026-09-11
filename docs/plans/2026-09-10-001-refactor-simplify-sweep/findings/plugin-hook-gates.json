@@ -1,0 +1,282 @@
+{
+  "partition": "plugin-hook-gates",
+  "findings": [
+    {
+      "id": "plugin-hook-gates-F1",
+      "category": "duplication",
+      "title": "Six byte-equivalent copies of \"path relative to root, else the path as given\"",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:1065-1069",
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:543-554",
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:132-136",
+        "crates/ss-magic-plugin/src/hook/session_start.rs:495-499",
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:1374-1379",
+        "crates/ss-magic-plugin/src/scratchpad.rs:326-331"
+      ],
+      "evidence": "pre_tool_use.rs:1065  fn display_path(root: &Path, path: &Path) -> String {\n                      path.strip_prefix(root)\n                          .map(|p| p.to_string_lossy().into_owned())\n                          .unwrap_or_else(|_| path.to_string_lossy().into_owned())\nsubagent_stop.rs:551      path.strip_prefix(root)\n                          .map(|p| p.to_string_lossy().into_owned())",
+      "problem": "The same three-line reduction is written six times in the plugin crate under four names – `display_path` (pre_tool_use), `rel_to_state` (subagent_stop, after deriving the root from `report.state_root`'s grandparent), `rel_to_repo` (pre_compact), `display_rel` (session_start), `display_rel` (checklist/verbs) and `Ctx::rel_of` (scratchpad). The last two spell it `.unwrap_or(path).to_string_lossy().into_owned()`, which produces the identical string. Two of the copies feed a tracked-path refusal comparison, so a future change to how a path is rendered for git comparison has to be found in six places.",
+      "proposal": "Add one `pub(crate) fn display_rel(root: &Path, path: &Path) -> String` to `crates/ss-magic-plugin/src/pathnorm.rs` (the crate's existing home for path-shape reasoning) with the `strip_prefix / map / unwrap_or_else` body, and have all six sites call it. Each caller keeps its OWN root derivation – `subagent_stop::rel_to_state` keeps the state-root grandparent walk, `pre_compact` keeps `repo_root`, `scratchpad::Ctx::rel_of` keeps `&self.root` – only the shared tail moves.",
+      "behavior_preservation": "The moved body is character-for-character the existing one; `.map(..).unwrap_or_else(..)` and `.unwrap_or(path).to_string_lossy()` yield the same `String` for both the hit and the miss branch. No root derivation, no caller, and no output string changes.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-gates-F2",
+      "category": "copy-paste-variant",
+      "title": "The gate's worktree-root fallback is spelled twice, verbatim, in one file",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:768",
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:1458"
+      ],
+      "evidence": "768:   let root = worktree_root(ctx.cwd()).unwrap_or_else(|| ctx.config_root.clone());\n1458:  let root = worktree_root(ctx.cwd()).unwrap_or_else(|| ctx.config_root.clone());",
+      "problem": "`gate` (the Read branch) and `commit_nudge` (the Bash branch) each construct the gate's root with the identical expression, while a THIRD, deliberately different derivation (`actor_root`, :380-386, which canonicalizes the fallback) sits between them. A reader has to compare three expressions to see that two are the same and one is not, and a change to the fallback has to be made in both of the identical ones.",
+      "proposal": "Extract `fn gate_root(ctx: &HookContext<'_>) -> PathBuf { worktree_root(ctx.cwd()).unwrap_or_else(|| ctx.config_root.clone()) }` beside `actor_root` in `pre_tool_use.rs`, call it from both sites, and keep `actor_root` exactly as it is (its canonicalizing fallback is load-bearing for the R88 prefix comparison and is documented at :376-379).",
+      "behavior_preservation": "The extracted expression is identical to both call sites; `worktree_root` is already memoized per cwd, so the number of filesystem walks is unchanged. `actor_root` is untouched, so the checklist classification's basis does not move.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-gates-F3",
+      "category": "duplication",
+      "title": "The bypass paragraph is repeated verbatim in the two deny reasons",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:1121-1124",
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:1165-1168"
+      ],
+      "evidence": "1121:  To read the raw bytes in THIS window instead, run exactly:\\n\\\n1122:  \\n    ss-magic-plugin bypass {shown}\\n\\n\\\n1123:  and read the file again. That lets exactly the next Read of this file through, \\\n1124:  once; the one after it is gated again.\\n\n1165:  If you truly need the raw bytes in THIS window, run exactly:\\n\\\n1166:  \\n    ss-magic-plugin bypass {shown}\\n\\n\\ (… same two closing lines)",
+      "problem": "`hit_epilogue` and `miss_reason` differ only in the lead-in clause; everything from `run exactly:` onward – the invocation line, the wrapper spelling and the two-sentence explanation of the one-shot semantics – is duplicated character for character. A test (`every_deny_reason_names_the_bypass_invocation_verbatim`) already treats this as one rule, but the text has two sources.",
+      "proposal": "Add `fn bypass_paragraph(lead_in: &str, shown: &str) -> String` in `pre_tool_use.rs` that emits `\"{lead_in} run exactly:\\n\\n    ss-magic-plugin bypass {shown}\\n\\nand read the file again. That lets exactly the next Read of this file through, once; the one after it is gated again.\\n\"`, and call it with `\"To read the raw bytes in THIS window instead,\"` from `hit_epilogue` and `\"If you truly need the raw bytes in THIS window,\"` from `miss_reason`.",
+      "behavior_preservation": "Both denials are assembled from the same literal fragments in the same order, so the emitted `permissionDecisionReason` bytes are unchanged; the two lead-in clauses stay distinct at their call sites.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-gates-F4",
+      "category": "const-location",
+      "title": "`ROOT_MARKER` re-spells a path core already owns in two private constants",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:100",
+        "crates/ss-magic-core/src/superset_files.rs:26",
+        "crates/ss-magic-core/src/superset_files.rs:30",
+        "crates/ss-magic/src/main.rs:205"
+      ],
+      "evidence": "pre_tool_use.rs:100   const ROOT_MARKER: &str = \".superset/magic.json\";\nsuperset_files.rs:26  const SUPERSET_DIR: &str = \".superset\";\nsuperset_files.rs:30  const MAGIC_JSON: &str = \"magic.json\";\nss-magic/src/main.rs:205  let magic_json_path = root.join(\".superset/magic.json\");",
+      "problem": "The contract file's repo-relative path is a fresh literal in the plugin's hottest hook, while core owns its two halves privately and the CLI joins the same literal a third time. Core already has the precedent for the opposite arrangement: `state_tree.rs:35` exports `pub const STATE_REL: &str = \".superset/.magic\"` precisely as \"the ONE place its path is spelled\", with a test pinning it against `sync::EXCLUDED_TREES`. `magic.json` has no such single spelling, so the plugin's worktree walk and the CLI's probe can drift from `superset_files`'s own idea of where the file lives.",
+      "proposal": "Add `pub const MAGIC_JSON_REL: &str = \".superset/magic.json\";` to `crates/ss-magic-core/src/superset_files.rs` (next to `SUPERSET_DIR`/`MAGIC_JSON`, ideally built from them or pinned equal to them by a unit test, the way `state_tree`'s test pins `STATE_REL`). Replace `pre_tool_use.rs`'s `ROOT_MARKER` with a `use` of it (keeping the local doc comment that explains why the marker identifies a worktree), and use it at `ss-magic/src/main.rs:205`.",
+      "behavior_preservation": "The constant's value is the same string that is hardcoded today, so `walk_for_root`'s `current.join(ROOT_MARKER).is_file()` probes the same path and the CLI's probe is unchanged. Nothing but the spelling's owner moves.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-gates-F5",
+      "category": "const-location",
+      "title": "`DIR_MODE` / `FILE_MODE` are re-declared in ten modules of one crate",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:85-86",
+        "crates/ss-magic-plugin/src/hook/file_changed.rs:95",
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:67",
+        "crates/ss-magic-plugin/src/scratchpad.rs:119-122",
+        "crates/ss-magic-plugin/src/cache.rs:106-107",
+        "crates/ss-magic-plugin/src/bypass.rs:67-68",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:92-93",
+        "crates/ss-magic-plugin/src/heartbeat.rs:71-73",
+        "crates/ss-magic-plugin/src/ledger.rs:100-101",
+        "crates/ss-magic-plugin/src/tmproot.rs:101"
+      ],
+      "evidence": "subagent_stop.rs:82  /// Owner-only modes (R58), matching the rest of the state tree. Repeated here\nsubagent_stop.rs:83  /// rather than imported because this file is created independently of\nsubagent_stop.rs:84  /// `scratchpad::ensure`, which keeps its own copies private.\nsubagent_stop.rs:85  const DIR_MODE: u32 = 0o700;\nsubagent_stop.rs:86  const FILE_MODE: u32 = 0o600;",
+      "problem": "The crate's owner-only posture (R58) is a security-relevant value re-typed in ten modules – always `0o700` / `0o600`, always with its own rationale comment. The in-file justification at :82-84 argues only against importing `scratchpad`'s PRIVATE copy; it does not argue against there being one shared spelling. As it stands, a change of posture (or a single typo such as `0o700` where `0o600` was meant) has to be caught by review in ten places, and `setup_ci.rs:84`'s deliberately different `0o644` is indistinguishable from a copy that drifted.",
+      "proposal": "Declare the pair once in `crates/ss-magic-plugin/src/atomic.rs` – already the crate's shared write primitive and already taking `mode: Option<u32>` – as `pub(crate) const DIR_MODE: u32 = 0o700;` and `pub(crate) const FILE_MODE: u32 = 0o600;`, carrying the R58 rationale in one doc comment. Each of the ten modules replaces its own declaration with a `use crate::atomic::{DIR_MODE, FILE_MODE};`. `setup_ci.rs` keeps its local `0o644` with its own comment saying why committed content differs.",
+      "behavior_preservation": "Every replaced constant has the identical value today, so every `DirBuilder::mode` / `OpenOptions::mode` call receives the same bits. No gate, refusal or write ordering is touched; only where the number is written down changes.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-gates-F6",
+      "category": "hardcoded-value",
+      "title": "The salvage slug's length cap is a bare `40` among named bounds",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:520-522"
+      ],
+      "evidence": "520:      let slug: String = raw\n521:          .chars()\n522:          .take(40)",
+      "problem": "Every other bound in this module is a documented constant at the top of the file (`SALVAGE_BYTE_BUDGET`, `MAX_TRANSCRIPT_BYTES`, `MAX_NAME_ATTEMPTS`), but the filename-length cap – which is what keeps `write_salvage` from producing a name the filesystem rejects, per the doc at :509-511 – is an unnamed literal buried in an iterator chain, invisible to a grep for the module's limits.",
+      "proposal": "Add `const MAX_SLUG_CHARS: usize = 40;` beside `MAX_NAME_ATTEMPTS` (crates/ss-magic-plugin/src/hook/subagent_stop.rs:80) carrying the sentence already in `agent_slug`'s doc, and write `.take(MAX_SLUG_CHARS)`.",
+      "behavior_preservation": "Same numeric value in the same position of the same chain; the produced slug, and therefore every salvage file name, is unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-gates-F7",
+      "category": "copy-paste-variant",
+      "title": "Two handlers each hand-roll the scan over `Refusal::TrackedPaths`",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:559-568",
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:140-144"
+      ],
+      "evidence": "subagent_stop.rs:561  report.refusals.iter().any(|refusal| {\n                          matches!(refusal, Refusal::TrackedPaths { paths }\n                              if paths.iter().any(|p| p == rel || p.starts_with(&prefix)))\npre_compact.rs:141    report.refusals.iter().any(|refusal| {\n                          matches!(refusal, Refusal::TrackedPaths { paths } if paths.iter().any(|p| p == rel))",
+      "problem": "The R17 re-check that each handler must perform for its own file is written twice, and both copies reach into `Report`'s refusal list and pattern-match a variant that belongs to `scratchpad`. Only the matching RULE differs (exact vs exact-or-directory-prefix); the traversal of `refusals` and the knowledge of which variant carries paths is duplicated, so a new refusal shape or a rename of the variant has to be chased into both handlers.",
+      "proposal": "Add `pub(crate) fn tracked_paths(&self) -> impl Iterator<Item = &str>` to `Report` in `crates/ss-magic-plugin/src/scratchpad.rs`, yielding the strings of every `Refusal::TrackedPaths`. `pre_compact::is_tracked` becomes `report.tracked_paths().any(|p| p == rel)`; `subagent_stop::tracked_under` becomes `report.tracked_paths().any(|p| p == rel || p.starts_with(&prefix))`, keeping its own prefix rule and its doc explaining why a directory needs it.",
+      "behavior_preservation": "Each handler keeps its exact predicate, so the same rels refuse and the same rels pass; only the iteration over `refusals` and the variant match move behind `Report`, and the iterator visits the same elements in the same order.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-gates-F8",
+      "category": "efficiency",
+      "title": "Every Bash tool call copies the whole command string to strip heredocs that are almost never there",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:1241-1242",
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:1379-1381"
+      ],
+      "evidence": "1241:  fn shipping_action(command: &str) -> bool {\n1242:      shipping_action_words(&strip_heredocs(command))\n1379:  fn strip_heredocs(command: &str) -> String {\n1380:      let mut out = String::with_capacity(command.len());\n1381:      let mut lines = command.split('\\n').peekable();",
+      "problem": "`PreToolUse[Bash]` fires on the majority of tool calls in a session, and the module's own cost-discipline note (:1185-1196) makes the pre-filter's cheapness the point. Yet the very first thing the pre-filter does is allocate a `String` the size of the command and copy every line into it, in order to remove heredoc bodies – and the overwhelming majority of Bash commands contain no `<<` at all, so the copy is pure overhead on the hot path.",
+      "proposal": "Short-circuit in `shipping_action`: `if !command.contains(\"<<\") { return shipping_action_words(command); }` before falling through to `shipping_action_words(&strip_heredocs(command))`. One substring scan replaces one allocation plus a full copy for every non-heredoc command.",
+      "behavior_preservation": "With no `<<` on any line, `heredoc_delimiters` returns empty for every line, so `strip_heredocs` reproduces the input exactly plus one trailing `\\n`. `\\n` is not a word character (`is_word_char`, :1362), so it only ends the current word – and `shipping_action_words` already flushes the trailing word itself at :1317. The three-word window, and therefore the verdict, is identical. A `<<<` here-string still takes the existing path, unchanged.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-gates-F9",
+      "category": "quality",
+      "title": "`direnv_export` returns `Result<Option<Option<String>>>` where three named outcomes are meant",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/file_changed.rs:348-358",
+        "crates/ss-magic-plugin/src/hook/file_changed.rs:202-207"
+      ],
+      "evidence": "348:  fn direnv_export(program: &str, dir: &Path) -> Result<Option<Option<String>>> {\n347:  /// The outer `None` is direnv missing, the inner `None` is direnv failing.\n202:      let Some(script) = direnv_export(program, dir)? else {\n205:      let Some(script) = script else {",
+      "problem": "The nesting is stringly-typed-by-shape: which `None` means \"not installed\" and which means \"the run failed\" is carried only by a doc comment and by the ORDER of two `let … else` bindings that shadow the same name. A reader (or a later edit) that swaps the two arms produces a silently wrong refusal message on a path whose whole job is to refuse safely.",
+      "proposal": "Introduce a small enum in `file_changed.rs`: `enum Export { NotInstalled, Failed, Script(String) }`, returned as `Result<Export>` from `direnv_export`, and match it in `handle_with` with one arm per variant carrying today's three detail strings. `direnv_status` already returns a typed `Status` for the same reason, so this only brings the second helper up to the first's shape.",
+      "behavior_preservation": "The three branches, their order relative to the `script.trim().is_empty()` check, and the exact `with_detail` strings stay as they are; only the discriminant's spelling changes. `run_direnv`'s `Ok(None)`-for-NotFound contract is untouched.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-gates-F10",
+      "category": "quality",
+      "title": "`commit_nudge` builds its response inline instead of through the module's outcome helpers",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:1466-1470",
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:859-871"
+      ],
+      "evidence": "1466:  Outcome::new(Response::PreToolUse(PreToolUseResponse {\n1467:      additional_context: Some(nudge_text(&shown)),\n1468:      ..PreToolUseResponse::default()\n1469:  }))\n1470:  .with_detail(format!(\"nudge: checklist {shown} looks absent from this commit\"))",
+      "problem": "The file has a deliberate two-helper vocabulary for outcomes – `allow` (:859) and `deny` (:864) – and the section comment at :1180-1183 makes \"this branch never sets `decision`\" a load-bearing property. The one place that property is expressed is an inline struct literal, so the invariant is asserted in prose while the code that could break it (adding `decision:` to this literal) sits outside the helper pair that encodes it.",
+      "proposal": "Add `fn advise(context: impl Into<String>, detail: impl Into<String>) -> Outcome` beside `allow`/`deny`, building `PreToolUseResponse { additional_context: Some(context.into()), ..default() }` – structurally unable to set `decision`, the same way `deny` is the only place that can – and call it from `commit_nudge`.",
+      "behavior_preservation": "The helper constructs the identical `Response::PreToolUse` value with the same `additional_context` and the same detail string, so the emitted JSON and the heartbeat row are byte-identical.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-gates-F11",
+      "category": "duplication",
+      "title": "The case-folding comparison idiom is written twice in the checklist classifier",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:444-451",
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:576-581"
+      ],
+      "evidence": "445:      match (a.to_str(), b.to_str()) {\n446:          (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),\n449:          _ => a == b,\n576:      .all(|(a, b)| match (a.as_os_str().to_str(), b.as_os_str().to_str()) {\n577:          (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),\n580:          _ => a == b,",
+      "problem": "`paths_equal_ignoring_case` and the closure inside `ends_with_ignoring_case` implement the same rule – fold ASCII case when both sides are UTF-8, fall back to exact equality otherwise – with the same three-line shape and near-identical rationale comments. Both feed the R88 deny, where a miss means the deny does not fire, so the rule is one that must not drift between the two.",
+      "proposal": "Extract `fn os_str_equal_ignoring_case(a: &OsStr, b: &OsStr) -> bool` in `pre_tool_use.rs`, carrying the shared non-UTF-8 rationale once, and call it from the `ends_with_ignoring_case` closure (`os_str_equal_ignoring_case(a.as_os_str(), b.as_os_str())`). Leave `paths_equal_ignoring_case`'s own fallback as `a == b` on `&Path` – `Path`'s `PartialEq` compares COMPONENTS while `OsStr`'s compares bytes, so folding that site into the same helper would change the non-UTF-8 branch's answer for paths differing only in redundant separators. Keep them as caller and helper, not as one function.",
+      "behavior_preservation": "The `Component` sites compare `a == b`, which for `Component` is already `OsStr` equality, so routing them through the helper answers identically. The `Path` site is deliberately left alone, which is why the fix does not merge the two outright.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-gates-F12",
+      "category": "efficiency",
+      "title": "The checklist pointer is read from disk and parsed on every gated tool call, up to twice",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:159-166",
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:461-463",
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:150-153"
+      ],
+      "evidence": "pre_tool_use.rs:161  for root in classification_roots(ctx, &path) {\npre_tool_use.rs:162      if is_checklist_path(&root, &path) {\npre_tool_use.rs:461  let Some(target) = checklist::pointer_target(root) else {\nverbs.rs:151         let raw = fs::read_to_string(pointer_path(root)).ok()?;\nverbs.rs:152         let pointer: Pointer = serde_json::from_str(&raw).ok()?;",
+      "problem": "`classify_checklist` runs first on every `PreToolUse` carrying a target (Read, Edit, MultiEdit, Write, NotebookEdit). For the ordinary path, `matches_convention` is false, so `is_checklist_path` falls through to `checklist::pointer_target`, which does a fresh `read_to_string` plus a `serde_json` parse – once per candidate root, so up to twice per tool call, and again from `checklist_candidates` on a matching Bash command. `worktree_root` is memoized (:1023-1040) for exactly this reason (\"one hook invocation asks more than once … each answer is the same walk over the same unchanging directories\"), but the pointer read, which is strictly more expensive, is not.",
+      "proposal": "Wrap the call site in `pre_tool_use.rs` with a process-lifetime memo mirroring `worktree_root`: `fn pointer_for(root: &Path) -> Option<PathBuf>` holding a `static OnceLock<Mutex<HashMap<PathBuf, Option<PathBuf>>>>`, populated by `checklist::pointer_target`, used by `is_checklist_path`, `has_checklist_shape` and `checklist_candidates`. Memoize at this call site rather than inside `checklist::pointer_target` itself, because the checklist VERBS write the pointer within one process and must keep seeing their own write.",
+      "behavior_preservation": "A hook process handles one envelope and never writes the pointer, so within an invocation the file's content is already treated as fixed – the same assumption the `worktree_root` memo rests on. The memoized value is byte-identical to what a repeat read returns for every case except an external concurrent write mid-invocation, whose outcome is already unspecified (the two current reads could disagree with each other today).",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": true,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-gates-F13",
+      "category": "duplication",
+      "title": "A test fixture re-implements `testutil::write_file`",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/pre_tool_use/tests.rs:46-51",
+        "crates/ss-magic-core/src/testutil.rs:112-116"
+      ],
+      "evidence": "tests.rs:46   fn write(&self, rel: &str, body: &str) -> PathBuf {\ntests.rs:47       let path = self.root.join(rel);\ntests.rs:48       fs::create_dir_all(path.parent().unwrap()).unwrap();\ntests.rs:49       fs::write(&path, body).unwrap();\ntestutil.rs:113   let p = root.join(rel);\ntestutil.rs:114   fs::create_dir_all(p.parent().unwrap()).unwrap();",
+      "problem": "`Repo::write`'s body is `ss_magic_core::testutil::write_file` line for line, differing only in that it returns the path it wrote. The sibling `subagent_stop/tests.rs` already imports from `testutil` (`git_run`, `init_main_repo`), so the helper is in reach here; this copy is the kind the structure pins call out (\"a test helper re-implemented in a module's `tests.rs` when `testutil` already provides it IS a finding\").",
+      "proposal": "In `crates/ss-magic-plugin/src/hook/pre_tool_use/tests.rs`, make `Repo::write` delegate: `ss_magic_core::testutil::write_file(&self.root, rel, body); self.root.join(rel)`. Leave `scaffold_worktree` alone – it deliberately writes a `magic.json` carrying a `plugin` block and creates no git repository, which `testutil::write_magic`/`init_main_repo` do not do.",
+      "behavior_preservation": "Same parent creation, same `fs::write`, same panics on failure, same returned path; only the shared half of the body moves to the crate that already owns it. Tests are unaffected in what they assert.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 3 (platform/framework/downstream guarantees hand-maintained): nothing found – the hand-rolled pieces here (the shell word scanner, the heredoc stripper, the JSONL transcript scan) deliberately approximate behavior no runtime in this crate provides.",
+    "Rubric 2 item 1 (redundant state): nothing found – the `worktree_root` MEMO is a cache of a pure function with a documented rationale, and `Salvaged` carries no value derivable from elsewhere.",
+    "Rubric 2 item 2 (parameter sprawl): nothing found – `handle_with(ctx, program, raw_target)` and the injected `Classifier` are the pinned testability seams (structure-pins.md, 'Testability seams that inject the environment').",
+    "Rubric 2 item 4 (leaky abstractions): nothing found beyond F7, which is reported.",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable – no component-tree UI framework in this partition.",
+    "Rubric 2 item 7 (nested conditionals 3+ deep): nothing found – the deepest nesting is the two-level `Option<Option<…>>` unwrap reported as F9.",
+    "Rubric 2 item 8 (unnecessary comments): nothing found – every comment here states a rule, a measurement or an invariant; none narrates a change or restates the code.",
+    "Rubric 2 item 9 (dead code, unused imports, unused exports): nothing found – `file_changed.rs` is unwired but documented as deliberately pre-built (module doc :5-13, CLAUDE.md Architecture), and every private item in the three files has a caller.",
+    "Rubric 2 item 10 (context-dependent vocabulary): nothing found – terms track the codebase's own vocabulary (gate, deny, nudge, salvage, claim).",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): nothing found.",
+    "Rubric 3 item 2 (missed concurrency): nothing found – the two `direnv` runs are causally ordered (status must confirm trust before export).",
+    "Rubric 3 item 4 (recurring no-op updates): not applicable – no polling, event or reducer loop in this partition.",
+    "Rubric 3 item 5 (unnecessary existence checks / TOCTOU): nothing found – `gate`'s single `fs::metadata` is the documented one-stat budget, `staleness`'s `is_file()` gates a git call rather than an operation on the file, and the salvage/pre-compact writers already use `create_new` instead of pre-checking.",
+    "Rubric 3 item 6 (memory): nothing found – the transcript read is capped at `MAX_TRANSCRIPT_BYTES`, the salvage at `SALVAGE_BYTE_BUDGET`, and the `MEMO` map lives only for the one-envelope process."
+  ]
+}

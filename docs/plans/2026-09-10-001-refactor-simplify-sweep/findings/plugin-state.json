@@ -1,0 +1,412 @@
+{
+  "partition": "plugin-state",
+  "findings": [
+    {
+      "id": "plugin-state-F1",
+      "category": "duplication",
+      "title": "Six byte-equivalent \"path relative to root, else the path itself\" helpers under six different names",
+      "locations": [
+        "crates/ss-magic-plugin/src/scratchpad.rs:326-331",
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:132-136",
+        "crates/ss-magic-plugin/src/hook/session_start.rs:495-499",
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:1065-1069",
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:551-553",
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:1374-1379"
+      ],
+      "evidence": "scratchpad.rs:326  fn rel_of(&self, path: &Path) -> String {\n            path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy().into_owned()\npre_compact.rs:132  fn rel_to_repo(repo_root: &Path, path: &Path) -> String {\n            path.strip_prefix(repo_root).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string_lossy().into_owned())\nchecklist/verbs.rs:1374  fn display_rel(root: &Path, path: &Path) -> String {\n            path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()",
+      "problem": "The same three-line reduction is written six times in the plugin crate under five different names (`rel_of`, `rel_to_repo`, `rel_to_state`, `display_rel` twice, `display_path`). Two spellings of the body exist (`.map(..).unwrap_or_else(..)` and `.unwrap_or(path).to_string_lossy()`) that produce identical strings for identical inputs, so a reader has to prove they agree before trusting any of them, and a change to the fallback rule has to be made in six places. It is also a vocabulary inconsistency: the same concept is called `rel`, `display_rel` and `display_path`.",
+      "proposal": "Add one `pub(crate) fn rel_display(root: &Path, path: &Path) -> String` to `crates/ss-magic-plugin/src/pathnorm.rs` (already the crate's path module, already `pub(crate)`), with the `strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()` body. Replace all six bodies with a call: `Ctx::rel_of` becomes `pathnorm::rel_display(&self.root, path)`; `rel_to_state` keeps its state-root-to-worktree-root derivation and then calls it; the other four become one-line delegations (keep their local names so call sites and doc links are untouched, or drop the wrappers where the call site reads clearly).",
+      "behavior_preservation": "Both existing bodies return the stripped relative path when `strip_prefix` succeeds and the original path otherwise, and both go through `to_string_lossy().into_owned()`, so every returned string is byte-identical. No I/O, no error paths, no ordering involved.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F2",
+      "category": "reuse",
+      "title": "identity::slugify re-implements core's pub `reponame::sanitize_segment` loop (a third copy sits in checklist/render.rs)",
+      "locations": [
+        "crates/ss-magic-plugin/src/identity.rs:138-159",
+        "crates/ss-magic-core/src/reponame.rs:87-102",
+        "crates/ss-magic-plugin/src/checklist/render.rs:455-469"
+      ],
+      "evidence": "identity.rs:141  for ch in input.chars() {\n            if ('\\u{0300}'..='\\u{036F}').contains(&ch) { continue; }\n            let mapped = strip_diacritic(ch).unwrap_or(ch);\n            if mapped.is_ascii_alphanumeric() {\n                if pending_dash && !out.is_empty() { out.push('-'); }\n                pending_dash = false; out.push(mapped.to_ascii_lowercase());\n            } else { pending_dash = true; }",
+      "problem": "The dash-collapsing lowercase loop in `identity::slugify` is character-for-character the loop in `ss_magic_core::reponame::sanitize_segment`, which is `pub` and already imported by this very file (`use ss_magic_core::reponame;` at line 24, for `repo_name_stem`). `checklist/render.rs::slugify` is a third, exactly identical copy. The only thing genuinely local to `identity` is the pre-fold (combining marks skipped, `strip_diacritic` applied) and the 40-char bound.",
+      "proposal": "In `identity::slugify`, fold first and delegate the loop: `let folded: String = input.chars().filter(|c| !('\\u{0300}'..='\\u{036F}').contains(c)).map(|c| strip_diacritic(c).unwrap_or(c)).collect(); let mut result = reponame::sanitize_segment(&folded); result.truncate(SLUG_MAX_LEN);`. `checklist/render::slugify` can be replaced by a direct `reponame::sanitize_segment` call the same way (it has no pre-fold).",
+      "behavior_preservation": "`sanitize_segment` tests `is_ascii_alphanumeric` on the character it pushes and lowercases it, guards a leading dash with `pending_dash && !out.is_empty()`, and never emits a trailing dash - identical to the inlined loop. Folding into an intermediate `String` before the loop feeds the loop exactly the characters `strip_diacritic(ch).unwrap_or(ch)` produces today, in the same order.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F3",
+      "category": "dead-code",
+      "title": "identity::slugify's `trim_matches('-')` can never trim anything",
+      "locations": ["crates/ss-magic-plugin/src/identity.rs:156-158"],
+      "evidence": "    let mut result = out.trim_matches('-').to_string();\n    result.truncate(40);\n    result",
+      "problem": "`out` can never begin or end with `-`: a `-` is pushed only under `pending_dash && !out.is_empty()` and is immediately followed by an alphanumeric push, and every other push is an ASCII alphanumeric. So the trim is a guaranteed no-op that also costs an extra allocation. Worse, it reads as protection it does not give: it runs BEFORE `truncate(40)`, and truncation is the one operation here that CAN leave a trailing `-` (a 41-character slug cut mid-run), which this trim cannot see.",
+      "proposal": "Drop the trim: `let mut result = out; result.truncate(SLUG_MAX_LEN); result`. Do NOT move the trim after the truncation as part of this sweep - that would change output for names longer than 40 characters and is a behavior decision, not a simplification.",
+      "behavior_preservation": "Removing an operation that provably matches nothing on any reachable input returns the identical `String` for every input; only the intermediate allocation disappears.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F4",
+      "category": "const-location",
+      "title": "STATE_QUERY (\".superset/.magic/\") is declared twice while core's state_tree claims to be the one place the path is spelled",
+      "locations": [
+        "crates/ss-magic-plugin/src/scratchpad.rs:66",
+        "crates/ss-magic-plugin/src/hook/mod.rs:93",
+        "crates/ss-magic-core/src/state_tree.rs:34-35"
+      ],
+      "evidence": "scratchpad.rs:66  const STATE_QUERY: &str = \".superset/.magic/\";\nhook/mod.rs:93    const STATE_QUERY: &str = \".superset/.magic/\";\nstate_tree.rs:1   //! The plugin's per-worktree state tree, as the ONE place its path is spelled.\nstate_tree.rs:35  pub const STATE_REL: &str = \".superset/.magic\";",
+      "problem": "Core's `state_tree` module doc says it is \"the ONE place its path is spelled\" and owns `STATE_REL`, yet the trailing-slash variant that both fail-closed ignore gates actually pass to git is spelled independently in two plugin modules. The trailing slash is load-bearing (it forces git's directory-only match, per both consts' doc comments), so a change to that convention has to be made in two files with nothing enforcing agreement - and the module that promises to own the spelling would not be touched at all.",
+      "proposal": "Add `pub const STATE_QUERY: &str = \".superset/.magic/\";` to `crates/ss-magic-core/src/state_tree.rs` beside `STATE_REL`, with the existing doc text, plus a test in `state_tree/tests.rs` pinning `STATE_QUERY == format!(\"{STATE_REL}/\")` (the module already pins `STATE_REL` against `sync::EXCLUDED_TREES`). Replace both plugin consts with a re-export/import of it (`scratchpad.rs` already re-exports `STATE_REL` from the same module at line 60).",
+      "behavior_preservation": "The literal is identical in all three places; both call sites (`git::is_ignored_no_index_str` in scratchpad.rs:439 and hook/mod.rs:620) receive the same `&str`, and the refusal messages interpolate the same text.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F5",
+      "category": "const-location",
+      "title": "scratchpad::CLAIM_DIRS re-types the three directory names that cache/bypass/expect_artifact each own as pub DIR_NAME",
+      "locations": [
+        "crates/ss-magic-plugin/src/scratchpad.rs:113",
+        "crates/ss-magic-plugin/src/cache.rs:84",
+        "crates/ss-magic-plugin/src/bypass.rs:56",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:72"
+      ],
+      "evidence": "scratchpad.rs:113  const CLAIM_DIRS: [&str; 3] = [\"conclusions\", \"bypass\", \"expect-artifact\"];\ncache.rs:84        pub const DIR_NAME: &str = \"conclusions\";\nbypass.rs:56       pub const DIR_NAME: &str = \"bypass\";\nexpect_artifact.rs:72  pub const DIR_NAME: &str = \"expect-artifact\";",
+      "problem": "The three stores each own their directory name as a `pub` const and join it themselves (`cache.rs:204`, `bypass.rs:94`, `expect_artifact.rs:188`), but the module that CREATES those directories hardcodes its own copy of all three strings. Renaming any `DIR_NAME` compiles cleanly and silently stops the bootstrap from creating that store's directory - exactly the failure the comment above `CLAIM_DIRS` (\"so no hook verb ever has to bootstrap a directory of its own mid-flight\") exists to prevent.",
+      "proposal": "`const CLAIM_DIRS: [&str; 3] = [crate::cache::DIR_NAME, crate::bypass::DIR_NAME, crate::expect_artifact::DIR_NAME];` - all three are `pub` and const-evaluable, so nothing else changes. Keep the array order (it is the creation order recorded in `Report::created`).",
+      "behavior_preservation": "The three consts hold exactly the strings the array spells today, in the same positions, so the directories created (and the `created` entries pushed at scratchpad.rs:515) are unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F6",
+      "category": "const-location",
+      "title": "0o700 / 0o600 are re-declared as module-private DIR_MODE / FILE_MODE in eight modules each, plus two bare literals",
+      "locations": [
+        "crates/ss-magic-plugin/src/tmproot.rs:101",
+        "crates/ss-magic-plugin/src/scratchpad.rs:119-122",
+        "crates/ss-magic-plugin/src/heartbeat.rs:71-73",
+        "crates/ss-magic-plugin/src/cache.rs:106-107",
+        "crates/ss-magic-plugin/src/bypass.rs:67-68",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:92-93",
+        "crates/ss-magic-plugin/src/ledger.rs:100-101",
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:85-86",
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:67",
+        "crates/ss-magic-plugin/src/hook/file_changed.rs:95",
+        "crates/ss-magic-plugin/src/release_check.rs:114",
+        "crates/ss-magic-plugin/src/hook/session_start.rs:301"
+      ],
+      "evidence": "tmproot.rs:101    const DIR_MODE: u32 = 0o700;\nscratchpad.rs:119 const DIR_MODE: u32 = 0o700;\nheartbeat.rs:71   const DIR_MODE: u32 = 0o700;\nheartbeat.rs:73   const FILE_MODE: u32 = 0o600;\nrelease_check.rs:114        Some(0o600),\nhook/session_start.rs:301   .mode(0o600)",
+      "problem": "One rule - \"everything the plugin writes under a private root is owner-only\" - is spelled as eight independent `DIR_MODE = 0o700` consts, eight independent `FILE_MODE = 0o600` consts, and two bare `0o600` literals with no name at all. The same identifier means the same thing everywhere except `setup_ci.rs:84`, where `FILE_MODE` is `0o644` because that file is committed content, so a reader who has learned what `FILE_MODE` means in one module learns the wrong thing for another. `tmproot::validate_component` compares against its own copy, so the value it enforces and the value the writers set are only equal by convention.",
+      "proposal": "Declare the pair once in the plugin crate - `crates/ss-magic-plugin/src/atomic.rs` is the natural home (every writer already imports it), or a two-line `mode.rs`: `pub(crate) const OWNER_ONLY_DIR: u32 = 0o700;` and `pub(crate) const OWNER_ONLY_FILE: u32 = 0o600;`. Replace the sixteen consts and the two bare literals with imports of those. Leave `setup_ci.rs`'s `0o644` as its own named const (`COMMITTED_FILE_MODE`), since it deliberately is not the owner-only rule.",
+      "behavior_preservation": "Every replaced const holds the identical octal value; the chmod/mkdir calls receive the same `u32`. `setup_ci.rs` is deliberately untouched.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F7",
+      "category": "duplication",
+      "title": "heartbeat::now_secs_or re-implements core's release::now_secs (a third copy is in the CLI's reverse_sync)",
+      "locations": [
+        "crates/ss-magic-plugin/src/heartbeat.rs:286-291",
+        "crates/ss-magic-core/src/release.rs:198-204",
+        "crates/ss-magic/src/sync/reverse_sync.rs:695-700"
+      ],
+      "evidence": "heartbeat.rs:286  fn now_secs_or(fallback: u64) -> u64 {\n        std::time::SystemTime::now()\n            .duration_since(std::time::UNIX_EPOCH)\n            .map(|d| d.as_secs())\n            .unwrap_or(fallback)\n    }",
+      "problem": "`scratchpad.rs:640` already re-exports core's `now_secs` crate-wide precisely to end the copies of this body (its comment records collapsing six of them), yet `heartbeat` keeps a seventh whose only difference is the `unwrap_or` argument, and `reverse_sync::apply_timestamp` keeps an eighth that is byte-identical to core's (`unwrap_or(0)`).",
+      "proposal": "Add `pub fn now_secs_or(fallback: u64) -> u64` to `crates/ss-magic-core/src/release.rs` with this body and redefine `now_secs()` as `now_secs_or(0)`; import it in `heartbeat.rs` alongside the existing `scratchpad::now_secs` re-export path, and delete the local copy. `reverse_sync::apply_timestamp` becomes `format_timestamp(release::now_secs())`.",
+      "behavior_preservation": "`now_secs()` is defined as this exact expression with `unwrap_or(0)`, so `now_secs_or(0)` returns the same value; `heartbeat`'s call site (`now_secs_or(row.ts)` at line 262) keeps its fallback argument and therefore its behavior on a pre-epoch clock.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F8",
+      "category": "duplication",
+      "title": "The civil-from-days date arithmetic is hand-rolled twice, in two crates, with the same seven magic constants",
+      "locations": [
+        "crates/ss-magic-plugin/src/scratchpad.rs:655-672",
+        "crates/ss-magic/src/sync/reverse_sync.rs:707-724"
+      ],
+      "evidence": "scratchpad.rs:661  let z = days as i64 + 719_468;\n    let era = z.div_euclid(146_097);\n    let doe = z.rem_euclid(146_097);\n    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;\n    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);\n    let mp = (5 * doy + 2) / 153;",
+      "problem": "Two copies of Hinnant's algorithm, each with the same seven literals, differing only in integer types (`i64` vs a `u64` day-of-era cast) and in the final `format!`. The doc at scratchpad.rs:647-654 argues the two FORMATTERS should stay separate (different audiences, `YYYY-MM-DDTHH:MM:SSZ` vs `YYYYmmdd-HHMMSS`) - which is a good argument about the format string and not about the arithmetic underneath it, and the arithmetic is the part where a transcription slip would be silent.",
+      "proposal": "Put one `pub fn civil_from_days(days: u64) -> (i64, u64, u64)` and one `pub fn hms_from_secs(secs: u64) -> (u64, u64, u64)` in core (a small `timefmt.rs`, or beside `release::now_secs`). Keep BOTH formatters exactly where they are, each calling the two helpers and keeping its own `format!` - `scratchpad::format_rfc3339` stays `pub(crate)` for its fourteen in-crate callers, `reverse_sync::format_timestamp` stays private.",
+      "behavior_preservation": "The two implementations compute identical (y, m, d) and (h, m, s) for every non-negative `secs` (the plugin's `doe` is a non-negative `i64`, the CLI's the same value as `u64`); moving the shared expressions behind a function does not change any arithmetic, and each `format!` string is left untouched.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F9",
+      "category": "reuse",
+      "title": "write_pointer hand-rolls tmproot::open_lock_file's OpenOptions shape instead of calling it",
+      "locations": [
+        "crates/ss-magic-plugin/src/scratchpad.rs:594-606",
+        "crates/ss-magic-plugin/src/tmproot.rs:221-228"
+      ],
+      "evidence": "scratchpad.rs:595  let lock_file = fs::OpenOptions::new()\n        .read(true).write(true).create(true).truncate(false)\n        .mode(FILE_MODE)\n        .open(&lock_path)\ntmproot.rs:222     OpenOptions::new()\n        .read(true).write(true).create(true).truncate(false)\n        .open(path)",
+      "problem": "The four-flag lock-file open is written three times in the workspace (here, `tmproot::open_lock_file`, and `update/apply.rs:234`). Getting one flag wrong here - `truncate(true)` in particular - would silently empty a file under an advisory lock, so the shape is worth having exactly one copy of. The only real difference in this copy is the `.mode(FILE_MODE)` the state tree needs.",
+      "proposal": "Give `tmproot::open_lock_file` a `mode: Option<u32>` parameter (`pub(crate)` so `scratchpad` can call it): `if let Some(m) = mode { opts.mode(m); }`. `with_lock`/`try_with_lock` pass `None`; `write_pointer` calls `tmproot::open_lock_file(&lock_path, Some(FILE_MODE)).with_context(|| format!(\"opening {}\", lock_path.display()))?` and keeps its own `fd_lock::RwLock` + `.write()` context, so its error text is unchanged.",
+      "behavior_preservation": "The resulting `OpenOptions` are flag-for-flag identical, `.mode` is applied for the one caller that asks, and both `with_context` messages in `write_pointer` stay where they are - so both the created file's mode and every error string are unchanged. Do NOT swap `write_pointer` over to `tmproot::with_lock` itself: that returns `io::Result` and would drop the two anyhow contexts.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F10",
+      "category": "efficiency",
+      "title": "heartbeat::prune scans and filters the whole log twice",
+      "locations": ["crates/ss-magic-plugin/src/heartbeat.rs:323-335"],
+      "evidence": "    let total = text.lines().filter(|l| !l.trim().is_empty()).count();\n    let cutoff = now.saturating_sub(max_age);\n    let kept: Vec<&str> = text\n        .lines()\n        .filter(|line| !line.trim().is_empty())",
+      "problem": "The same `lines().filter(non-empty)` pass runs twice over a file that is at least `PRUNE_TRIGGER_BYTES` (256 KiB) by the time this is reached, once only to count. The trim on every line runs twice too.",
+      "proposal": "One pass: `let rows: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect(); let total = rows.len();` then filter `rows` by the timestamp predicate into `kept`.",
+      "behavior_preservation": "`total` is by definition the length of the non-empty line list, and the second filter already operates on exactly that list; the JSON-parse predicate, the `saturating_sub` cutoff, the `keep` tail slice and the early `Ok(0)` return are untouched.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F11",
+      "category": "efficiency",
+      "title": "Redundant existence pre-checks in front of already-idempotent directory creation",
+      "locations": [
+        "crates/ss-magic-plugin/src/heartbeat.rs:221-230",
+        "crates/ss-magic-plugin/src/scratchpad.rs:486-490"
+      ],
+      "evidence": "heartbeat.rs:221  fn ensure_store(dir: &Path) -> Result<()> {\n        if dir.is_dir() { return Ok(()); }\n        DirBuilder::new().recursive(true).mode(DIR_MODE).create(dir)\nscratchpad.rs:487  if !superset_dir.exists() {\n        fs::create_dir_all(&superset_dir)",
+      "problem": "`DirBuilder::recursive(true).create()` and `fs::create_dir_all` both return `Ok` when the directory already exists, so each pre-check is a `stat` that only re-answers the question the create is about to answer - the TOCTOU-shaped pattern rubric 3 calls out. `ensure_store` sits on the hook hot path: it is called on every `heartbeat::append` and again from `store_dir()`.",
+      "proposal": "Drop the pre-checks and call the creating function directly, keeping the existing `with_context`. Note one deliberate difference before applying the scratchpad half: if `.superset` exists as a regular FILE, today the check falls through and the failure surfaces later as \"creating <state_root>\", whereas `create_dir_all` would fail as \"creating <.superset>\" - if that message matters, guard with `if !superset_dir.is_dir()` instead of removing outright. `heartbeat::ensure_store` has no such difference (a non-directory there already fails the `create`).",
+      "behavior_preservation": "For every input except a path occupied by a non-directory, the create is a no-op returning `Ok` exactly as the pre-check's early return does; mode is applied only to components the builder actually creates, so an existing directory's permissions are untouched either way.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F12",
+      "category": "efficiency",
+      "title": "The state-root not-a-directory check stats the same path twice",
+      "locations": ["crates/ss-magic-plugin/src/scratchpad.rs:422-431"],
+      "evidence": "    if state_root.exists()\n        && !fs::metadata(&state_root)\n            .with_context(|| format!(\"reading {}\", state_root.display()))?\n            .is_dir()\n    {",
+      "problem": "`Path::exists()` is itself a `metadata` call that discards its result, so the state root is stat'ed twice on every `ensure` run - and `ensure` runs from seven call sites including three hook handlers.",
+      "proposal": "One `match fs::metadata(&state_root)`: `Ok(meta) if !meta.is_dir()` pushes the `NotADirectory` refusal and returns; `Ok(_)` falls through; `Err(e) if e.kind() == io::ErrorKind::NotFound` falls through; any other `Err(e)` returns `Err(e).with_context(|| format!(\"reading {}\", state_root.display()))`.",
+      "behavior_preservation": "Today: absent (or unstattable, since `exists()` reads an error as false) means fall through; present-and-not-a-dir means refuse; present-and-a-dir means fall through; a metadata error between the two calls propagates with the `reading …` context. The match reproduces each of those, with the same context string, and additionally propagates a non-NotFound error that `exists()` currently swallows - which is the fail-closed direction for a check that decides whether to write into the tree.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F13",
+      "category": "copy-paste-variant",
+      "title": "state_file_body re-spells the six file names STATE_FILES already owns, with an unreachable fallback arm holding the drift",
+      "locations": [
+        "crates/ss-magic-plugin/src/scratchpad.rs:80-87",
+        "crates/ss-magic-plugin/src/scratchpad.rs:697-739"
+      ],
+      "evidence": "scratchpad.rs:80   pub const STATE_FILES: [&str; 6] = [\"CONTEXT.md\", \"DECISIONS.md\", …];\nscratchpad.rs:698  match name {\n        \"CONTEXT.md\" => \"…\",\n        \"DECISIONS.md\" => \"…\",\nscratchpad.rs:735      // Unreachable for `STATE_FILES`; a future addition falls back to a\n        _ => \"\",",
+      "problem": "The six names are the array's data and the match's string keys, tied together by convention alone inside one module: a typo in a match arm compiles, and the `_ => \"\"` arm silently scaffolds an empty file instead of failing. (The third copy, `session_start::STATE_FILE_NOTES`, IS pinned by a test, so only this pair is unguarded.)",
+      "proposal": "Make one table the source: `const STATE_FILE_BODIES: [(&str, &str); 6] = [(\"CONTEXT.md\", \"…\"), …];`, derive `pub const STATE_FILES: [&str; 6] = [STATE_FILE_BODIES[0].0, …];` (const indexing is fine here, and the public type is unchanged for `scratchpad/tests.rs:124` and `session_start/tests.rs:475`), and turn `state_file_body` into a lookup over the table that keeps the `\"\"` fallback for an unknown name.",
+      "behavior_preservation": "Each name keeps the body it is paired with today, `STATE_FILES` keeps its type, order and contents, and an unknown name still yields `\"\"` - so `scaffold`'s writes are byte-identical.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F14",
+      "category": "dead-code",
+      "title": "tmproot::INSTALL_LOCK_NAME has no Rust caller and nothing checks it against the shell side it documents",
+      "locations": [
+        "crates/ss-magic-plugin/src/tmproot.rs:91-97",
+        "plugin/lib/tmproot.sh:42"
+      ],
+      "evidence": "tmproot.rs:96  #[allow(dead_code)]\n    pub const INSTALL_LOCK_NAME: &str = \"install.lock\";\ntmproot.sh:42  SS_MAGIC_INSTALL_LOCK_NAME=\"install.lock\"",
+      "problem": "Nothing in any crate reads this const (grep finds only the declaration and the `#[allow]`), and no check - not `scripts/build-plugin-zip.py --check`, not `scripts/test-bootstrap.sh` - compares it with the shell's `SS_MAGIC_INSTALL_LOCK_NAME`. As it stands it is documentation that carries none of the enforcement its own doc comment implies (\"a change here without a matching change there breaks that coordination\"), while an `#[allow(dead_code)]` suppresses the compiler's only signal about it.",
+      "proposal": "Two honest options; pick one rather than leaving it as is. (a) Delete the const and the `#[allow]`, moving the cross-language note into the `NAMESPACE_DIR` doc, since the shell owns that lock exclusively. (b) Keep it and make it load-bearing by asserting the pair in `scripts/test-bootstrap.sh` the way the `hooks spawn through the shim` invariant is asserted, then drop the `#[allow]` by referencing it from that test path.",
+      "behavior_preservation": "No code reads the const, so removing it cannot change any runtime path; option (b) adds only a test assertion.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F15",
+      "category": "quality",
+      "title": "Comments that narrate unit history, one of them now factually wrong",
+      "locations": [
+        "crates/ss-magic-plugin/src/tmproot.rs:84-88",
+        "crates/ss-magic-plugin/src/scratchpad.rs:199",
+        "crates/ss-magic-plugin/src/scratchpad.rs:277",
+        "crates/ss-magic-plugin/src/identity.rs:53-54"
+      ],
+      "evidence": "tmproot.rs:84  // Not yet referenced outside this module and its tests: U23's bootstrap.sh\n    // matches this contract in shell rather than calling into Rust.\n    …\n    // namespace name itself yet.\nscratchpad.rs:199  // Consumed by U11's heartbeat writer; asserted by the tests today.\nidentity.rs:53     // consumed by later units: the scratchpad bootstrap, the hook wrapper, and\n    // every human verb that reports or acts on a session directory.",
+      "problem": "These are task-history notes rather than invariants, and time has made them wrong: `status.rs:835` DOES use `tmproot::NAMESPACE_DIR` outside the module, so the claim that \"nothing outside this module needs the namespace name itself yet\" is false; `identity::resolve` has three production callers, so \"consumed by later units\" describes a plan, not the code. A reader auditing `NAMESPACE_DIR`'s blast radius is actively misled.",
+      "proposal": "Delete the three forward-looking notes (the surrounding doc comments already state the contract each const carries), and correct the tmproot one to name its real caller: \"`status` re-derives the root path from this const for its diagnostic; `bootstrap.sh` matches the same text in shell.\" Keep every comment that states a rule (the cross-language contract, the fail-closed reasoning).",
+      "behavior_preservation": "Comment-only change.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F16",
+      "category": "dead-code",
+      "title": "Refusal::code() is called only from tests, under a comment claiming the heartbeat writer consumes it",
+      "locations": [
+        "crates/ss-magic-plugin/src/scratchpad.rs:195-210",
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:106"
+      ],
+      "evidence": "scratchpad.rs:199  // Consumed by U11's heartbeat writer; asserted by the tests today.\n    #[allow(dead_code)]\n    pub fn code(&self) -> &'static str {",
+      "problem": "U11 shipped, and its heartbeat writer does not call this: the handlers put `report.heartbeat_note()` (which formats `Refusal`'s `Display`, not its code) into the row. The only callers are eight assertions in `scratchpad/tests.rs`. So the stable machine-readable vocabulary the method exists to protect is not actually in any row, and the `#[allow(dead_code)]` hides that.",
+      "proposal": "Decide and record it: either wire the codes into the row (out of scope for a simplify sweep - raise it instead), or drop `code()` together with its `#[allow]` and the eight test assertions, which currently only assert that a method nothing calls returns the strings it returns. At minimum, replace the comment with the truth (\"no production caller; the row carries `Display` text via `heartbeat_note`\") so the next reader does not assume the codes are in the log.",
+      "behavior_preservation": "No production code path calls `code()`, so removing it cannot change any output, row or exit code; the comment-only variant changes nothing at all.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F17",
+      "category": "quality",
+      "title": "write_atomically's seven positional parameters make every call site unreadable",
+      "locations": [
+        "crates/ss-magic-plugin/src/atomic.rs:51-59",
+        "crates/ss-magic-plugin/src/scratchpad.rs:620-628",
+        "crates/ss-magic-plugin/src/heartbeat.rs:352"
+      ],
+      "evidence": "scratchpad.rs:620  atomic::write_atomically(\n        path, &body, \".current-\", \"\",\n        Some(\"the session pointer\"), None, false,\n    )?;\nheartbeat.rs:352   atomic::write_atomically(path, &body, \".hooks-\", \".jsonl\", None, Some(FILE_MODE), false)?;",
+      "problem": "Two `Option`s, an empty string and a bare `bool` in positional tail position: at the call site nothing says that `\"\"` is a suffix, that `None` is the mode (heartbeat's `None` is the LABEL and scratchpad's is the MODE, in different positions), or what `false` turns off. Thirteen call sites across the crate read this way, and adding an eighth knob means touching all of them - the parameter-sprawl shape rubric 2 flags.",
+      "proposal": "Keep one function, give it an options struct with `Default`: `pub(crate) struct AtomicWrite<'a> { pub prefix: &'a str, pub suffix: &'a str, pub what: Option<&'a str>, pub mode: Option<u32>, pub sync: bool }` and `write_atomically(path, body, AtomicWrite { prefix: \".current-\", what: Some(\"the session pointer\"), ..Default::default() })`. Every field keeps its current meaning and its documentation moves onto the field.",
+      "behavior_preservation": "Pure call-shape refactor: each call site passes the same values for the same knobs, and the function body - temp file, write, flush, optional chmod, optional fsync, persist, and every `with_context` string - is unchanged.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F18",
+      "category": "duplication",
+      "title": "Two independent atomic-write implementations named write_atomically, one per crate",
+      "locations": [
+        "crates/ss-magic-plugin/src/atomic.rs:51-89",
+        "crates/ss-magic-core/src/superset_files.rs:180-212"
+      ],
+      "evidence": "atomic.rs:63       let mut tmp = tempfile::Builder::new().prefix(prefix).suffix(suffix).tempfile_in(dir)\nsuperset_files.rs:199  let staged = dir.join(format!(\".{name}.{}.{seq}.tmp\", std::process::id()));\n    let write = fs::write(&staged, body) … .and_then(|()| fs::rename(&staged, path)",
+      "problem": "Both crates hand-roll \"stage a sibling, then rename over the target\", with the same guarantee and different mechanics (tempfile crate vs a pid+counter name; anyhow contexts vs anyhow contexts with different wording; explicit cleanup vs `NamedTempFile`'s drop). The structure pins list this as legitimate to report: core cannot depend on the plugin, so the shared copy belongs in core.",
+      "proposal": "Move the plugin's generalized helper to core as `ss_magic_core::atomic::write_atomically` and re-export it from `crates/ss-magic-plugin/src/atomic.rs` so no plugin call site changes. Then make `superset_files::write_atomically` a thin wrapper that keeps its two distinctive behaviors - resolving the symlink first (`path.canonicalize().unwrap_or(path)`) and its own error wording - and delegates the staging/rename. Verify the concurrent-writer test in `superset_files/tests.rs` still passes: the pid+counter name exists so two threads of one process stage different files, which `tempfile` also guarantees.",
+      "behavior_preservation": "Not fully traced: the two differ in temp-file naming, in error message text, and in failure cleanup (explicit `remove_file` vs `NamedTempFile` drop). Preserved only if the wrapper keeps core's canonicalize step and its `writing …` / `moving … over …` contexts; the staged file's NAME is not observable to any caller or test that was checked.",
+      "confidence": 75,
+      "effort": "L",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F19",
+      "category": "hardcoded-value",
+      "title": "cache::MAX_AGE_SECS duplicates heartbeat::MAX_AGE_SECS by value, with a doc comment that says so",
+      "locations": [
+        "crates/ss-magic-plugin/src/heartbeat.rs:82-84",
+        "crates/ss-magic-plugin/src/cache.rs:95-99"
+      ],
+      "evidence": "heartbeat.rs:84  pub const MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;\ncache.rs:96      /// A month, matching the heartbeat log: past that the file it describes\ncache.rs:99      pub const MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;",
+      "problem": "The cache's own documentation states the value is chosen to match the heartbeat log's, and then re-spells the arithmetic. Changing the heartbeat retention would leave that sentence false with nothing failing. (The same identifier also exists at `bypass.rs:64` and `expect_artifact.rs:84` with different values, which is fine - those are unrelated claim TTLs - but it means the name alone cannot tell a reader which ones are meant to agree.)",
+      "proposal": "Have `cache.rs` name the coupling instead of restating it: `pub const MAX_AGE_SECS: u64 = crate::heartbeat::MAX_AGE_SECS;` (it is already `pub`), keeping the doc sentence. If the two should be independently tunable after all, say that in the doc and drop the \"matching the heartbeat log\" claim.",
+      "behavior_preservation": "Identical `u64` value, evaluated at compile time; both prune paths keep the same cutoff.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-state-F20",
+      "category": "hardcoded-value",
+      "title": "The 40-character slug bound is a bare literal in two modules that name every other bound",
+      "locations": [
+        "crates/ss-magic-plugin/src/identity.rs:157",
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:522"
+      ],
+      "evidence": "identity.rs:157            result.truncate(40);\nsubagent_stop.rs:522        .take(40)",
+      "problem": "Both are the same rule - bound a filesystem-name slug so an unexpectedly long ref or agent id cannot produce a name the filesystem rejects - and both are written as a bare `40` while their sibling bounds all have names (`IDENTIFIER_HEX_LEN`, `ROWS_KEPT`, `SALVAGE_BYTE_BUDGET`, `PRUNE_TRIGGER_BYTES`). In `identity.rs` the number also appears in prose in the doc comment, so the two can drift.",
+      "proposal": "Declare `const SLUG_MAX_LEN: usize = 40;` in `identity.rs` (with the existing rationale from the doc comment) and use it at the truncation; do the same for `subagent_stop.rs`'s `AGENT_SLUG_MAX_LEN`. Keep them as two consts unless the two bounds are deliberately the same rule - they are not shared today and this sweep should not couple them.",
+      "behavior_preservation": "Same value at the same call site; `truncate` and `take` receive the identical `usize`.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 3 (platform/framework guarantees hand-maintained): the hand-rolled pieces here exist for measured reasons the pins protect - SHA-256 must match the shell's `shasum -a 256`, `claim::take` is rename-based because `unlink` was measured non-exclusive, `pathnorm::normalize` is textual because `canonicalize` needs the file to exist. Nothing is re-implementing a guarantee the platform already provides.",
+    "Rubric 2 item 1 (redundant state): `Report`'s `created` / `refusals` / `wrote_state` are three different facts (what was written, why something was not, whether the tree is safe to write into) and the doc at scratchpad.rs:252-271 shows `wrote_state` is deliberately not derivable from the other two.",
+    "Rubric 2 item 4 (leaky abstractions): none found - `tmproot` exposes only `resolve_root`/`with_lock`/`try_with_lock`, `claim` exposes only `take`/`Claimed::text`, and `scratchpad`'s `Ctx` is private.",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable - no component-tree UI framework in this partition.",
+    "Rubric 2 item 7 (nested conditionals 3+ deep): deepest nesting in the partition is two levels (`slugify`'s loop, `prune`'s filters, `ensure`'s match arms).",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): none - nothing in these seven modules carries a superseded form kept for compatibility.",
+    "Rubric 3 item 2 (missed concurrency): the work here is a handful of stats and one small write per call; parallelizing any of it would add threads to a hook that must finish inside the harness timeout.",
+    "Rubric 3 item 3 (hot-path bloat): no new blocking work - `heartbeat::append` already gates its prune behind one `stat`, and `tmproot::with_lock` blocks only where R81 requires coordination.",
+    "Rubric 3 item 4 (recurring no-op updates): no polling, events or reducers in this partition.",
+    "Rubric 3 item 6 (memory): the one unbounded structure would be `hooks.jsonl`, and it is bounded twice over by `ROWS_KEPT` and `MAX_AGE_SECS`; `Claimed` unlinks on drop.",
+    "Rubric 3 item 7 (overly broad operations): `heartbeat::read`/`prune` read the whole log, but the log is size-bounded by the prune and every caller needs every row.",
+    "Test helpers duplicating core's `testutil`: none. `tmproot/tests.rs::mode_of`/`chmod`, `scratchpad/tests.rs::repo_with_gitignore` and `heartbeat/tests.rs::store` have no equivalent in `ss_magic_core::testutil`, and the tests that need `testutil` (identity, scratchpad) already import `git_run`/`init_main_repo`/`make_worktree`/`exit_code_to_u8` from it."
+  ]
+}

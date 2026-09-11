@@ -1,0 +1,396 @@
+{
+  "partition": "cli-sync",
+  "findings": [
+    {
+      "id": "cli-sync-F1",
+      "category": "duplication",
+      "title": "Hinnant civil-from-days arithmetic is byte-for-byte duplicated in the plugin crate; only the format! differs",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:707-723",
+        "crates/ss-magic-plugin/src/scratchpad.rs:655-671"
+      ],
+      "evidence": "reverse_sync.rs:713-716 —\n    let z = days as i64 + 719_468;\n    let era = z.div_euclid(146_097);\n    let doe = z.rem_euclid(146_097) as u64; // day-of-era [0, 146096]\n    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // year-of-era [0, 399]\nscratchpad.rs:661-664 — the same four lines (doe kept as i64).",
+      "problem": "Two crates carry an independent copy of the same date arithmetic (719_468 / 146_097 / 36_524 / 1_460 / 365 / 153 magic numbers, plus the 86_400 day split). scratchpad.rs's own doc comment names this file and argues against sharing — but the argument it makes is about the OUTPUT FORMAT (`YYYYmmdd-HHMMSS` directory name vs `YYYY-MM-DDTHH:MM:SSZ` instant), not about the arithmetic. The arithmetic, which is where a transcription error would hide, is what is duplicated. checklist/schema.rs:673-679 carries the inverse (`days_from_civil`) as a third instance of the same constant set.",
+      "proposal": "Add one pure primitive to core, e.g. `pub fn civil_from_days(days: i64) -> (i64, u32, u32)` and `pub fn hms_from_secs(secs: u64) -> (u64, u64, u64)` in a new `crates/ss-magic-core/src/civil.rs` (both binaries already depend on core). `reverse_sync::format_timestamp` becomes `let (h,mi,s) = hms_from_secs(secs % 86_400); let (y,m,d) = civil_from_days((secs / 86_400) as i64); format!(\"{y:04}{m:02}{d:02}-{h:02}{mi:02}{s:02}\")`; `scratchpad::format_rfc3339` keeps its own `format!`. Each caller keeps its format string, so scratchpad's stated reason for not sharing is not conceded.",
+      "behavior_preservation": "The two bodies compute identical values for every `secs >= 0` (the only inputs: `SystemTime::now()` since `UNIX_EPOCH`, with a fallback of 0). The only textual difference is `doe` being cast to u64 here vs left i64 there, which cannot change the result because `z.rem_euclid(146_097)` is non-negative by construction. Extracting the shared body and leaving both `format!` calls in place changes no output.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F2",
+      "category": "const-location",
+      "title": "BACKUPS_REL is a second, unpinned encoding of a path core already owns as EXCLUDED_TREES[0]",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:660-661",
+        "crates/ss-magic-core/src/sync/mod.rs:40-41",
+        "crates/ss-magic-core/src/state_tree.rs:34-35"
+      ],
+      "evidence": "reverse_sync.rs:660-661 —\n/// Repo-relative path of the tool's per-batch backups tree.\nconst BACKUPS_REL: &str = \".superset/backups\";\ncore/sync/mod.rs:40-41 —\npub const EXCLUDED_TREES: [&[&str]; 4] = [\n    &[\".superset\", \"backups\"],",
+      "problem": "One directory is spelled twice, in two crates, in two different representations (a slash string vs a component array), with nothing tying them together. The workspace already has the exact precedent for the sibling tree: core's `state_tree.rs` owns `STATE_REL = \".superset/.magic\"` as a `pub const`, its module doc says the same path also appears in `EXCLUDED_TREES`, and a core test pins the two spellings equal \"so they cannot drift apart\". The backups tree got neither the shared const nor the pin, even though it is the more dangerous of the two (it holds recovered secrets).",
+      "proposal": "Move the constant to core beside its sibling — either `pub const BACKUPS_REL: &str = \".superset/backups\";` in `crates/ss-magic-core/src/sync/mod.rs` (next to `EXCLUDED_TREES`), or a `backups_tree.rs` mirroring `state_tree.rs` that also hosts `ensure_backups_ignored`. Have `reverse_sync.rs` use the core const, and add the same equality test `state_tree/tests.rs` already has: assert `Path::new(BACKUPS_REL)` components equal `EXCLUDED_TREES[0]`.",
+      "behavior_preservation": "A const move plus a `use` changes no runtime value; the string literal is identical to the joined component array today, and the new test only asserts that, it does not change any code path. `ensure_backups_ignored` stays `pub(crate)` in the CLI crate if only the const moves.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F3",
+      "category": "hardcoded-value",
+      "title": "The cockpit help text re-spells both the backups path and the BACKUP_BATCHES_KEPT retention count as literals",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:1390-1393",
+        "crates/ss-magic/src/sync/reverse_sync.rs:726-730"
+      ],
+      "evidence": "cockpit.rs:1390-1393 —\n        Line::from(Span::styled(\n            \"  Backups first: .superset/backups/<timestamp>/ (10 newest kept)\",\n            Style::new().fg(Color::DarkGray),\n        )),\nreverse_sync.rs:730 — const BACKUP_BATCHES_KEPT: usize = 10;",
+      "problem": "The retention budget is owned by `BACKUP_BATCHES_KEPT` in reverse_sync.rs, where `finish_batch` already interpolates it into its own user-facing line (`\"…keeping the newest {BACKUP_BATCHES_KEPT}.\"`, line 423). The help overlay in another module hardcodes `10` and the `.superset/backups/` path in prose instead, so changing the constant silently makes the help screen lie — the same class of drift as F2, one module owning a value and another re-spelling it.",
+      "proposal": "Widen `BACKUP_BATCHES_KEPT` to `pub(crate)` (it already sits in the `pub(crate) mod reverse_sync`) and build the help line with `format!(\"  Backups first: {BACKUPS_REL}/<timestamp>/ ({} newest kept)\", reverse_sync::BACKUP_BATCHES_KEPT)`, taking `BACKUPS_REL` from wherever F2 lands it. Note the help overlay is sized to its content (`centered_rect_abs`, 22 lines) — the rendered string length is unchanged at the current value of 10, so no re-sizing is needed.",
+      "behavior_preservation": "With `BACKUP_BATCHES_KEPT == 10` and `BACKUPS_REL == \".superset/backups\"` the formatted string is byte-identical to today's literal, so the rendered help frame is unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F4",
+      "category": "duplication",
+      "title": "write_bytes is a third independent temp-file-then-rename atomic-write implementation",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:1075-1103",
+        "crates/ss-magic-plugin/src/atomic.rs:53-89",
+        "crates/ss-magic-core/src/superset_files.rs:180-215"
+      ],
+      "evidence": "reverse_sync.rs:1083-1101 —\n    let mut tmp = tempfile::NamedTempFile::new_in(parent)\n        .with_context(|| format!(\"creating temp file in {}\", parent.display()))?;\n    tmp.write_all(bytes)\n    …\n    tmp.as_file().sync_all().ok();\n    tmp.persist(target)",
+      "problem": "The workspace now has three hand-rolled copies of the same sequence (temp file in the target's own directory -> write -> permissions -> optional fsync -> `persist`/`rename`). The plugin's `atomic.rs` module doc explicitly exists because eight plugin modules had each hand-rolled it; this CLI copy and core's private `superset_files::write_atomically` were never folded in. structure-pins lists the core/plugin pair as knowingly-unresolved (not pinned), and this is a third instance of the same shape.",
+      "proposal": "Promote one generalized writer into core (core cannot depend on the plugin, so core is the only place all three can reach): `pub fn write_atomically(path: &Path, body: &[u8], opts: WriteOpts) -> Result<()>` in a new `crates/ss-magic-core/src/atomic.rs`, where `WriteOpts` carries the three real axes the existing callers differ on — `mode: Mode::{Leave, Set(u32), PreserveExisting}`, `sync: bool`, and `create_parents: bool` (plus core's symlink-resolving `canonicalize` step, which `superset_files` needs and the others must not get). Then `reverse_sync::write_bytes` becomes a one-line call with `Mode::PreserveExisting`, `sync: true`, `create_parents: true`, and the plugin's `atomic.rs` delegates.",
+      "behavior_preservation": "Only argued at the seam level: each caller keeps its own option set, so the byte sequence written, the error contexts and the fsync/chmod decisions stay as they are. Not fully traced through every plugin call site or through the error-message strings (`\"creating temp file in {}\"` vs `\"creating a temp file in {}\"` differ today), hence confidence 75 — the consolidation must keep each site's existing context strings or accept a message change.",
+      "confidence": 75,
+      "effort": "L",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F5",
+      "category": "copy-paste-variant",
+      "title": "apply_decision's Merge and Delete arms carry ~25 byte-identical lines of two-sided guard plus two-sided backup",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:1305-1329",
+        "crates/ss-magic/src/sync/reverse_sync.rs:1357-1387"
+      ],
+      "evidence": "Merge, 1305-1312 —\n            let wt_guard = check_target(&wt_target, baseline.wt.as_ref());\n            if matches!(wt_guard, Guard::Changed) {\n                return Ok(ApplyOutcome::Skipped(changed_reason()));\n            }\n            let main_guard = check_target(&main_target, baseline.main.as_ref());\nDelete, 1357-1361 — the same five lines verbatim; and the two `backups.extend(backup_if_unchanged(…Worktree…))` / `(…Main…)` blocks at 1316-1329 and 1374-1387 are likewise identical.",
+      "problem": "The most safety-critical code in the file — the TOCTOU guard order and the back-up-both-losing-sides rule — exists as two literal copies. A future correction to one arm (say, reversing which side is guarded first, or adding a third signal to the guard) silently applies to only one of the two destructive paths. This is exactly the drift shape structure-pins records for `execguard.sh`, resolved there by giving the rule one home.",
+      "proposal": "Extract two private helpers next to `backup_if_unchanged`: `fn guard_both_sides(ctx: &ApplyContext, rel: &Path, baseline: &Baseline) -> Option<(Guard, Guard)>` returning `None` when either side is `Guard::Changed` (caller maps `None` to `ApplyOutcome::Skipped(changed_reason())`), and `fn backup_both_sides(ctx: &ApplyContext, rel: &Path, wt_guard: Guard, main_guard: Guard) -> Result<Vec<PathBuf>>` performing the worktree-then-main `backup_if_unchanged` pair. Both Merge and Delete then call the pair; Push and Pull are deliberately NOT folded in (their source/target roles are swapped and only one side is backed up).",
+      "behavior_preservation": "The extracted bodies are the existing lines verbatim, in the same order: worktree guard evaluated before main guard (so a changed worktree side short-circuits before main is stat'ed, as today), and the worktree backup taken before the main backup (so `ApplyResult.backups` keeps its current order, which `apply_batch` prints and `finish_batch` echoes). No condition is weakened: `Guard::Changed` on either side still returns Skipped with nothing written.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": true,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F6",
+      "category": "copy-paste-variant",
+      "title": "backup_forward_targets re-implements finish_batch's print-backups-then-prune tail, including a verbatim warning string",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:640-656",
+        "crates/ss-magic/src/sync/reverse_sync.rs:402-433"
+      ],
+      "evidence": "backup_forward_targets:651-655 —\n    if let Err(err) = prune_old_backups(&backups_root, BACKUP_BATCHES_KEPT, Some(&ts)) {\n        println!(\n            \"{}\",\n            style::warn(format!(\"Backup pruning failed (backups left as-is): {err:#}\"))\n        );\nfinish_batch:428-431 — the identical `style::warn(format!(\"Backup pruning failed (backups left as-is): {err:#}\"))`.",
+      "problem": "Two of `finish_batch`'s three blocks (print the recorded backup paths under a header, then best-effort-prune with the same protected timestamp and the same warning text) are re-typed in `backup_forward_targets`. The pruning warning literal is identical; the header differs only in wording (\"Backups of overwritten files\" vs \"Backups of files about to be overwritten\"). `finish_batch` additionally reports a successful prune count while the forward pass silently swallows it — an inconsistency that is invisible precisely because the code is duplicated rather than shared.",
+      "proposal": "Extract `fn report_backups_and_prune(backups: &[PathBuf], header: &str, backups_root: &Path, ts: &str)` holding the two blocks (header + indented paths; then `prune_old_backups(root, BACKUP_BATCHES_KEPT, Some(ts))` with the existing three-way match). `finish_batch` calls it with \"Backups of overwritten files (recover a mistake here):\" and keeps its summary block; `backup_forward_targets` calls it with \"Backups of files about to be overwritten (recover a mistake here):\".",
+      "behavior_preservation": "Both blocks are already textually identical apart from the header, which becomes a parameter. Note one deliberate decision the fix must make explicit: today the forward pass prints nothing on a successful prune while `finish_batch` prints \"Pruned N old backup batch(es)…\". Sharing the helper as written above ADDS that line to the forward path, so to preserve output exactly the helper must take a `report_pruned: bool` (or the change must be accepted as intentional and noted).",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F7",
+      "category": "duplication",
+      "title": "The \"Nothing selected\" message and its early return appear twice, six lines apart, in run()",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:362-372"
+      ],
+      "evidence": "    let decisions = match cockpit::run_cockpit(worktree_root, main_root, &offered)? {\n        CockpitOutcome::Cancel => {\n            println!(\"{}\", style::info(\"Nothing selected — worktree and main untouched.\"));\n            return Ok(ExitCode::SUCCESS);\n        }\n        CockpitOutcome::Apply(d) => d,\n    };\n    if decisions.is_empty() {\n        println!(\"{}\", style::info(\"Nothing selected — worktree and main untouched.\"));",
+      "problem": "The same user-facing string and the same early return are written twice for the two ways the cockpit can produce no work. A wording change has to be made in both places, and a reader has to notice the strings are equal to see the two paths are the same outcome.",
+      "proposal": "Map `Cancel` to an empty decision vector and let the single `is_empty` check own the message and the return: `let decisions = match cockpit::run_cockpit(worktree_root, main_root, &offered)? { CockpitOutcome::Cancel => Vec::new(), CockpitOutcome::Apply(d) => d };` followed by the existing `if decisions.is_empty() { … }` block unchanged.",
+      "behavior_preservation": "Both arms currently print exactly the same line and return `ExitCode::SUCCESS` with nothing written; nothing between the two blocks has a side effect (the second block is the very next statement). The merged form prints the same line once and returns the same code on both paths.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F8",
+      "category": "hardcoded-value",
+      "title": "The legacy backup side-directory names \"local\" and \"main\" are spelled as bare literals in two places in prune_old_backups",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:795",
+        "crates/ss-magic/src/sync/reverse_sync.rs:830-838"
+      ],
+      "evidence": "795 —\n        } else if name == \"local\" || name == \"main\" {\n830-832 —\n    for side in [\"local\", \"main\"] {\n        let dir = backups_root.join(side);\n        let pruned_from_side = pruned.iter().any(|p| p.parent() == Some(dir.as_path()));",
+      "problem": "The set of legacy top-level side directories is defined twice inside one function — once as a two-branch string comparison that decides what to FOLD, once as an array literal that decides what to CLEAN UP. If the two ever disagree, a folded side dir is never emptied or an unfolded one is removed. It is also easy to misread against `merge::BackupSide::dir_name`, which returns \"worktree\"/\"main\" for the CURRENT layout — the same \"main\" string, a different \"local\"/\"worktree\" name — with nothing in the code marking which vocabulary is which.",
+      "proposal": "Add `/// Top-level side directories written by the legacy (pre-rename) merge backup layout; the current layout uses `merge::BackupSide::dir_name` (\"worktree\"/\"main\") under the timestamp dir instead.` `const LEGACY_SIDE_DIRS: [&str; 2] = [\"local\", \"main\"];` beside `is_backup_batch_name`, then use `LEGACY_SIDE_DIRS.contains(&name)` at 795 and `for side in LEGACY_SIDE_DIRS` at 830.",
+      "behavior_preservation": "`name == \"local\" || name == \"main\"` and `[\"local\", \"main\"].contains(&name)` are the same predicate over the same two values, and the iteration order of the array literal is unchanged, so the cleanup loop visits \"local\" before \"main\" exactly as now.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F9",
+      "category": "duplication",
+      "title": "reverse_sync/tests.rs re-implements four helpers that ss_magic_core::testutil already provides",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync/tests.rs:6-48",
+        "crates/ss-magic-core/src/testutil.rs:82-137",
+        "crates/ss-magic/src/tests/reverse_sync_flow.rs:8-10"
+      ],
+      "evidence": "tests.rs:40-48 —\nfn write_magic(root: &Path, patterns: &[&str]) {\n    fs::create_dir_all(root.join(\".superset\")).unwrap();\n    let files: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();\n    let cfg = superset_files::MagicConfig { files, ..Default::default() };\n    let body = format!(\"{}\\n\", serde_json::to_string_pretty(&cfg).unwrap());\n    fs::write(root.join(\".superset/magic.json\"), body).unwrap();\n(testutil.rs:100-110 is this function verbatim.)",
+      "problem": "Local `init_main_repo`, `make_worktree`, `write` and `write_magic` duplicate `testutil::init_main_repo`, `make_worktree`, `write_file` and `write_magic`. structure-pins names this exact case a finding. It has already cost something: testutil's `init_main_repo` sets `git config gc.auto 0` with a comment describing an intermittent `read_dir` race under parallel load, and the local copy — which drives the heaviest git-backed suite in the crate — does not have that fix. The crate's sibling files (`src/tests/sync.rs`, `src/tests/reverse_sync_flow.rs`, both `use ss_magic_core::testutil::{exit_code_to_u8, init_main_repo, make_worktree, write_file, write_magic}`) already do it the shared way, so this file is the outlier.",
+      "proposal": "Delete the four local helpers and `use ss_magic_core::testutil::{init_main_repo, make_worktree, write_file, write_magic};`, calling `init_main_repo(\"main\")` (the branch is a parameter there) and renaming the `write(...)` call sites to `write_file(...)`. Keep the file-local `rels` and `applied`/`meta` helpers, which testutil does not provide.",
+      "behavior_preservation": "`write_magic` and `write_file` are textually identical to testutil's. `make_worktree` differs only in the created branch name (\"feature/rs-test\" vs \"feature/sync-flow-test\"); testutil's doc states the branch name is arbitrary and no test in this file asserts on it (verified by grep for \"rs-test\"). `init_main_repo` differs by adding `git config gc.auto 0` — a strict addition that disables background repacking in the fixture and changes no assertion, and is the reason to switch rather than an obstacle.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F10",
+      "category": "quality",
+      "title": "merge.rs's module doc states behavior default_decision no longer has (\"only worktree-only files auto-push\")",
+      "locations": [
+        "crates/ss-magic/src/sync/merge.rs:8-10",
+        "crates/ss-magic/src/sync/merge.rs:61-70",
+        "crates/ss-magic/src/sync/merge.rs:48-49"
+      ],
+      "evidence": "Module doc, 8-10 —\n//! - [`default_decision`] picks a file's starting [`Decision`] from its\n//!   [`FileState`] — conservative: only worktree-only files auto-push,\n//!   everything that differs starts [`Decision::Undecided`].\nFunction, 68-70 —\npub fn default_decision(_state: FileState) -> Decision {\n    Decision::Undecided\n}",
+      "problem": "The module doc describes the superseded auto-push default; the function's own doc six lines below says the opposite (\"NOTHING is pre-selected (KD4) … This replaces the old worktree-only auto-push default\"). A reader landing on the module doc is told the tool will push worktree-only files on a bare keystroke — the precise behavior the KD4 change removed because the unified set now includes TRACKED worktree-only files. `FileState`'s own doc at 48-49 (\"Whether a candidate exists on both sides … or only in the worktree\") is stale in the same way: it predates the `MainOnly` variant declared immediately below it.",
+      "proposal": "Rewrite the module-doc bullet to match the function: \"[`default_decision`] is every file's starting [`Decision`] — always [`Decision::Undecided`]; nothing is pre-selected, so no file moves without an explicit key.\" Rewrite `FileState`'s summary to name all three variants (\"Which sides a candidate exists on: both, worktree-only, or main-only\").",
+      "behavior_preservation": "Doc-comment text only; no code, no output, no test assertion touches these strings.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F11",
+      "category": "dead-code",
+      "title": "default_decision ignores its only parameter, and cockpit::file_state exists solely to compute the value it discards",
+      "locations": [
+        "crates/ss-magic/src/sync/merge.rs:66-70",
+        "crates/ss-magic/src/tui/cockpit.rs:526",
+        "crates/ss-magic/src/tui/cockpit.rs:647-652"
+      ],
+      "evidence": "merge.rs:66-70 —\n/// bare keystroke. `FileState` is retained for the cockpit's exhaustive\n/// `file_state` mapping and future use.\npub fn default_decision(_state: FileState) -> Decision {\n    Decision::Undecided\n}\ncockpit.rs:526 —\n    let decision = default_decision(file_state(status));",
+      "problem": "The stated justification is circular: `FileState` is kept for the `file_state` mapping, and `file_state` (cockpit.rs:647-652) has exactly one caller — line 526 — whose only use of the result is to hand it to a function that discards it. So the mapping exists to feed the parameter and the parameter exists to justify the mapping. The signature also actively misleads: it invites a reader to believe a main-only file starts differently from a worktree-only one, which is the assumption the KD4 change deliberately eliminated.",
+      "proposal": "Change the signature to `pub fn default_decision() -> Decision`, update cockpit.rs:526 to `let decision = default_decision();`, and delete `cockpit::file_state` (its sole caller) together with `merge::FileState` and the `default_decision_is_conservative` test's `FileState` arguments — or, if the extensibility claim is judged real, keep `FileState` and say so honestly in the comment (\"no consumer today; kept so a per-state default can be reintroduced without touching the cockpit\") rather than pointing at a mapping that only exists for this call.",
+      "behavior_preservation": "`default_decision` returns `Decision::Undecided` for all three `FileState` values today (single-expression body), so dropping the argument cannot change the value assigned at cockpit.rs:526. `file_state` is pure and its result is used nowhere else (grep across the workspace finds only its definition and line 526). Confidence 75 rather than 100 because the doc comment asserts a future use, which is a judgment call the sweep owner should make, not a fact I can verify.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F12",
+      "category": "quality",
+      "title": "Plan-id-and-task-number-only comments and superseded \"picker\" vocabulary in the two modules' docs",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:105",
+        "crates/ss-magic/src/sync/reverse_sync.rs:62-63",
+        "crates/ss-magic/src/sync/reverse_sync.rs:72",
+        "crates/ss-magic/src/sync/merge.rs:57"
+      ],
+      "evidence": "reverse_sync.rs:105 —\n// consumed by U11 run(); wired into the menu by U10\nreverse_sync.rs:62-63 —\n/// Whether a candidate differs from main (and should be offered in the picker)\n/// or is identical (and is hidden — nothing to push). R24.\nreverse_sync.rs:72 and merge.rs:57 (verbatim in both) —\n    /// locally; a delete removes main's copy. NEW in the unified sync (Task 5).",
+      "problem": "structure-pins' review rules make a comment citing a plan id alone a finding. Line 105 is exactly that — it names U10 and U11 with no explanation, and what it says (who calls this) is already stated in the doc comment above it and is discoverable from the code. \"NEW in the unified sync (Task 5)\" is task-history narration, duplicated verbatim across two files, and will read as false the moment the unified sync stops being new. Separately, \"the picker\" at line 62 is superseded vocabulary: CLAUDE.md records that the reverse-sync picker was REPLACED by `tui/cockpit.rs`, and every other doc line in this file says \"cockpit\" (lines 229, 294, 315, 1161).",
+      "proposal": "Delete line 105 outright (the doc comment above already says what `compute_candidates` is for, and line 241's `// consumed by the unified cockpit run() and the direct reverse-sync run_bulk()` is the same kind of caller-restating comment, worth deleting with it). Drop \"NEW in the unified sync (Task 5)\" from both `DiffStatus::MainOnly` and `FileState::MainOnly`, keeping the behavioral half of each sentence. Change \"offered in the picker\" to \"offered in the cockpit\" at line 62. Leave the `(R23, KTD10)` / `(KD4, R13–R15)` tags alone — each of those is followed by a full prose explanation, which the rule allows.",
+      "behavior_preservation": "Comment text only.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F13",
+      "category": "reuse",
+      "title": "Eleven items are declared pub with no caller outside their own module, overstating the engine's integration surface",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:106",
+        "crates/ss-magic/src/sync/reverse_sync.rs:153",
+        "crates/ss-magic/src/sync/reverse_sync.rs:178",
+        "crates/ss-magic/src/sync/reverse_sync.rs:242",
+        "crates/ss-magic/src/sync/reverse_sync.rs:861",
+        "crates/ss-magic/src/sync/reverse_sync.rs:880",
+        "crates/ss-magic/src/sync/reverse_sync.rs:974",
+        "crates/ss-magic/src/sync/reverse_sync.rs:989",
+        "crates/ss-magic/src/sync/reverse_sync.rs:1002",
+        "crates/ss-magic/src/sync/merge.rs:251",
+        "crates/ss-magic/src/sync/merge.rs:272"
+      ],
+      "evidence": "reverse_sync.rs:106 — pub fn compute_candidates(worktree_root: &Path) -> Result<Vec<PathBuf>> {\nreverse_sync.rs:880 — pub fn meta_of(path: &Path) -> Result<Option<FileMeta>> {\nmerge.rs:272 — pub fn backup_rel_path(ts: &str, side: BackupSide, rel: &Path) -> PathBuf {",
+      "problem": "A workspace-wide grep for each of `compute_candidates`, `compute_reconcile_set`, `Candidate`, `FileMeta`, `meta_of`, `WriteDirection`, `ApplyResult`, `ApplyOutcome` (this crate's), `BackupSide` and `backup_rel_path`, excluding the two source files and their two `tests.rs` siblings, returns nothing. `classify` likewise has no caller outside this file. Meanwhile the genuinely reached-into items — `DiffStatus`, `ApplyContext`, `Baseline`, `apply_decision`, `run`, `run_bulk`, `backup_forward_targets`, `ensure_backups_ignored` — carry the same `pub`, so the marking no longer distinguishes the engine's four real integration points from its internals. Rust child `tests` modules see a parent's private items without any `pub`, so the test suite is not the reason.",
+      "proposal": "Narrow the eleven to the visibility they actually need: `classify`, `compute_candidates` and `compute_reconcile_set` to plain `fn` (private, still visible to `mod tests`); `Candidate`, `FileMeta`, `meta_of`, `WriteDirection`, `ApplyResult`, `ApplyOutcome` to private as well, except that `ApplyResult`/`ApplyOutcome`/`WriteDirection` appear in `apply_decision`'s (crate-public) signature and so must become `pub(crate)`, not private. In merge.rs, `BackupSide` and `backup_rel_path` become `pub(crate)` (used from `reverse_sync.rs`, never beyond).",
+      "behavior_preservation": "`ss-magic` is a binary crate: nothing outside it can name these items regardless of visibility, and both modules are already `pub(crate)` in `sync/mod.rs`. Narrowing a visibility marker generates no code and cannot change any output; the compiler proves the choice, so a too-narrow marker fails the build rather than changing behavior.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F14",
+      "category": "duplication",
+      "title": "is_safe_rel is a second spelling of the absolute/`..` rejection core says lives in ONE place",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:85-96",
+        "crates/ss-magic-core/src/git/mod.rs:251-262",
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:165-171"
+      ],
+      "evidence": "reverse_sync.rs:85-95 —\nfn is_safe_rel(rel: &Path) -> bool {\n    if rel.is_absolute() { return false; }\n    use std::path::Component;\n    rel.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir))\ncore/git/mod.rs:258 —\n        if p.is_absolute() || raw.split('/').any(|seg| seg == \"..\") {\ncore/git/mod.rs:249-250 (doc) — \"…so the filter lives in ONE place.\"",
+      "problem": "`parse_ls_files_z`'s doc asserts that the absolute-or-`..` filter lives in one place, and `is_safe_rel` is a second implementation of the same rule — applied, among other things, to the output of that very function (reverse_sync.rs:138 filters `git::untracked_files`, which already ran the core filter). A third, string-level variant sits in the plugin's `checklist::verbs`. Three spellings of one trust-boundary rule is the shape structure-pins records as a drift hazard, and the core doc's claim is currently untrue.",
+      "proposal": "Move the predicate to core as `pub fn is_safe_rel(rel: &Path) -> bool` beside `under_excluded_tree` in `crates/ss-magic-core/src/sync/mod.rs`, have `reverse_sync.rs` call it, and have `parse_ls_files_z` use it in place of its string test (`if !crate::sync::is_safe_rel(&p) { continue; }`). Do NOT remove reverse_sync.rs:138's filter — it is documented defense-in-depth on a secret-safety path and the point of this change is one definition, not fewer applications. Correct core's doc to say the filter is one PREDICATE applied at each boundary.",
+      "behavior_preservation": "Over the domain both see (git-emitted repo-relative paths on Unix) the two predicates agree: `p.is_absolute()` covers `Component::RootDir`/`Prefix`, and a `..` path segment parses to exactly `Component::ParentDir`, so `raw.split('/').any(|seg| seg == \"..\")` and `!matches!(c, Normal|CurDir)` reject the same strings; `./x` is accepted by both. Confidence 75 rather than 100: I verified the equivalence by reading both bodies, not by running the suites, and `parse_ls_files_z` sits on the secret-safety gate, so the swap needs its own test run before landing.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": true,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F15",
+      "category": "efficiency",
+      "title": "classify stats then fully reads both copies of every candidate, and the cockpit reads the same bytes again",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:245-258",
+        "crates/ss-magic/src/tui/cockpit.rs:500-524"
+      ],
+      "evidence": "reverse_sync.rs:245-257 —\n    match (wt_path.exists(), main_path.exists()) {\n…\n            match (fs::read(&wt_path), fs::read(&main_path)) {\n                (Ok(wt), Ok(mb)) if wt == mb => Ok(DiffStatus::Identical),\n                _ => Ok(DiffStatus::Differs),\n            }",
+      "problem": "Two inefficiencies on the same lines. (1) `exists()` is a pre-check before an operation that reports the same condition — the rubric's TOCTOU/pre-existence anti-pattern — and it costs two extra `stat`s per candidate on top of the reads. (2) Byte-equality is decided by reading both files whole, with no length short-circuit, for every configured file on every `run`/`run_bulk`; then, for every candidate the reconcile keeps, `cockpit::load_entry` -> `build_two_sided` reads both sides a second time. `compute_reconcile_set` additionally `is_dir`s both paths just before calling in (line 212), so a candidate costs 4 stats + 2 full reads before the cockpit even opens.",
+      "proposal": "Inside the `(true, true)` arm, take `fs::metadata` of both sides once and return `Ok(DiffStatus::Differs)` immediately when both stats succeed and the lengths differ; only then fall through to the existing `fs::read` pair. That alone removes the whole-file read for the common \"a line was added\" case. The deeper fix — threading the bytes `classify` already read into the cockpit's `FileDiff` so each side is read once per run — is a larger change to `compute_reconcile_set`'s return type and is noted rather than proposed here.",
+      "behavior_preservation": "The length short-circuit yields `Differs` exactly where the current code would: unequal lengths mean unequal bytes, so `wt == mb` is false and the `_` arm already returns `Differs`. Every other input (stat failure, equal lengths, read failure on either side, a directory on either side) still reaches the existing `fs::read` pair unchanged, so the read-error-means-Differs rule and the `(false,false)`/one-sided arms are untouched. Confidence 75: I verified the arm's logic but did not re-run the reverse_sync suite, and `classify`'s degradation behavior is asserted by several tests.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F16",
+      "category": "efficiency",
+      "title": "backup_if_exists pre-checks existence and then type, costing two stats where one metadata call decides both",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:592-606"
+      ],
+      "evidence": "fn backup_if_exists(root: &Path, target: &Path, dest: &Path) -> Result<Option<PathBuf>> {\n    if !target.exists() {\n        return Ok(None);\n    }\n    if target.is_dir() {",
+      "problem": "`exists()` and `is_dir()` are two independent `stat` calls answering one question, run for every pattern match on every forward `ss-magic sync` — the rubric's \"pre-checking existence before operating\" item, in the form where the follow-up call re-stats the same path.",
+      "proposal": "Replace the two calls with one `match fs::metadata(target) { Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None), Err(_) => return Ok(None), Ok(m) => m.is_dir() }` and branch on the boolean.",
+      "behavior_preservation": "Requires mapping ALL metadata errors to `Ok(None)`, not just `NotFound`: `Path::exists()` is defined as `metadata().is_ok()`, so today a permission-denied or I/O error on the parent already returns `Ok(None)` here, and an error-propagating rewrite would change a silent skip into a failed forward sync. Written as above the outcome is identical for every case (absent, unreadable, file, directory), including a broken symlink, since `exists()` and `metadata()` both follow links. Confidence 75: the equivalence rests on `exists()`'s documented definition, which I read but did not exercise against a permission-denied fixture.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F17",
+      "category": "copy-paste-variant",
+      "title": "The review-baseline capture loop is written twice, in run and run_bulk",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:347-358",
+        "crates/ss-magic/src/sync/reverse_sync.rs:568-581"
+      ],
+      "evidence": "run:347-357 —\n    let mut baseline: HashMap<PathBuf, Baseline> = HashMap::new();\n    for c in &reconcile {\n        let (wt, main) = review_baseline(worktree_root, main_root, &c.rel, c.status);\n        baseline.insert(c.rel.clone(), Baseline { wt, main, source_untracked: c.wt_untracked });\nrun_bulk:570-579 — the same four statements with `*status` and `source_untracked: true`.",
+      "problem": "Both entry points build the `HashMap<PathBuf, Baseline>` that feeds the TOCTOU guard with the same four statements, differing only in where `source_untracked` comes from. The fail-closed default that `apply_batch` applies on a lookup miss (line 484) is the guard against a bookkeeping gap here, so keeping the construction in one place is worth more than the four saved lines.",
+      "proposal": "Add `fn capture_baselines<'a>(worktree_root: &Path, main_root: &Path, items: impl IntoIterator<Item = (&'a Path, DiffStatus, bool)>) -> HashMap<PathBuf, Baseline>` next to `review_baseline`, and call it from both sites — `run` passing `c.wt_untracked`, `run_bulk` passing `true` (keeping its separate `decisions.push((rel.clone(), Decision::Push))` loop, or folding that in as a second return value).",
+      "behavior_preservation": "`review_baseline` is called with the same four arguments per entry and in the same iteration order in both sites, and the map is keyed by the same `rel.clone()`; `HashMap` insertion order is not observable (`apply_batch` iterates `decisions`, not the map). `run`'s capture must stay BEFORE `cockpit::run_cockpit` — that ordering is the point of the review-time baseline — so the helper is called at each site's existing position.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F18",
+      "category": "naming",
+      "title": "ApplyOutcome names two unrelated types in the same crate",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:1002-1007",
+        "crates/ss-magic/src/update/apply.rs:302-310"
+      ],
+      "evidence": "reverse_sync.rs:1002-1006 —\npub enum ApplyOutcome {\n    /// The decision was applied; carries the write details.\n    Applied(ApplyResult),\n    /// Nothing was written; the string is a human-readable reason.\n    Skipped(String),\nupdate/apply.rs:302-305 —\npub enum ApplyOutcome {\n    /// Another updater held the lock; we skipped (AE2). Caller runs current.\n    Skipped,",
+      "problem": "One name, two meanings, in one crate — the sweep's \"same name for two different values\" case. Both even carry a `Skipped` variant with different semantics (a per-file TOCTOU skip vs a whole-update lock contention). A grep for `ApplyOutcome` across the crate returns mostly updater hits, which is what made the reverse-sync type's true call graph hard to establish while checking F13.",
+      "proposal": "Rename the sync-engine type to `DecisionOutcome` (it is the outcome of applying one `Decision`), matching the vocabulary already used by `apply_decision`, `Decision` and `merge::Decision`. Touches `reverse_sync.rs` (definition, `apply_decision`'s return type, `apply_batch`'s match) and `sync/reverse_sync/tests.rs`. Leave `update::apply::ApplyOutcome` alone — it is the older name and its module is literally `apply`.",
+      "behavior_preservation": "A type rename inside a binary crate; no serialization, no output string, and no trait impl depends on the identifier. The compiler proves completeness.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-sync-F19",
+      "category": "dead-code",
+      "title": "Lead (unverified): the legacy 0.4.0 backup-layout fold may be scaffolding for a layout that was never released",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync.rs:795-810",
+        "crates/ss-magic/src/sync/reverse_sync.rs:736-742",
+        "crates/ss-magic/src/sync/reverse_sync.rs:827-838"
+      ],
+      "evidence": "795-797 —\n        } else if name == \"local\" || name == \"main\" {\n            // Legacy merge layout: fold `<side>/<epoch>/` into its batch.\n            for child in fs::read_dir(entry.path())\n736-741 — `is_backup_batch_name` additionally accepts the \"legacy all-digits epoch shape\".",
+      "problem": "CLAUDE.md describes this branch as folding \"the unreleased-0.4.0 merge layout's top-level `local/<epoch>`+`main/<epoch>` dirs\". If that layout was genuinely never released, no user's disk can hold such directories, and roughly 25 lines here (the fold branch, the all-digits arm of `is_backup_batch_name`, and the side-dir cleanup loop) plus their tests exist for an input that cannot occur — the rubric's pre-release compatibility scaffolding item.",
+      "proposal": "Do not act on this without evidence. The check is `git log --oneline --all -- crates/ss-magic/src/sync/reverse_sync.rs` around the 0.4.0 window plus `git tag --list 'v0.4.*'` against the published releases: if a `v0.4.0` release exists that wrote `local/<epoch>`, the code stays as-is and this finding is closed; if no such release was ever published, the fold branch, the all-digits arm and the cleanup loop can be deleted together with `LEGACY_SIDE_DIRS` (F8) and the legacy-layout tests.",
+      "behavior_preservation": "NOT preserved if acted on blindly, which is why this is filed at confidence 50 as a lead. On a machine that does hold such directories, removing the fold means those batches stop counting against the keep budget and survive forever — the exact outcome the branch was written to prevent. The removal is only behavior-neutral if the layout was never on any user's disk, which I could not verify from the source alone.",
+      "confidence": 50,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 3 (platform, framework, or downstream guarantees hand-maintained): nothing found — the hand-rolled pieces here (civil-from-days, FNV/SHA hashing reached via core, the rename-based atomic write) are duplications of in-workspace code, covered by F1/F4, not re-implementations of a guarantee a platform provides.",
+    "Rubric 2 item 1 (redundant state / derivable caches): nothing found — `Baseline` and `ApplyContext` are the pinned testability seams (structure-pins), `BatchSummary` accumulates rather than caches, and `FileMeta.content_hash` is populated only when mtime is absent, which is a real fallback signal rather than a duplicate of one.",
+    "Rubric 2 item 2 (parameter sprawl): nothing found — `ApplyContext`/`Baseline` are named in structure-pins as deliberate injection seams; `finish_batch`'s five parameters are all consumed and distinct.",
+    "Rubric 2 item 4 (leaky abstractions): nothing found beyond the visibility overreach already filed as F13; `merge.rs` correctly exposes no TUI or filesystem detail and `apply_decision` keeps the gitignore boundary internal.",
+    "Rubric 2 item 5 (stringly-typed code where an enum exists): nothing found — the side-directory names go through `merge::BackupSide::dir_name`, and the only bare side strings are the legacy names filed as F8, which deliberately do not belong to that enum.",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable — no component-tree UI framework in this partition.",
+    "Rubric 2 item 7 (nested conditionals 3+ deep): nothing found — the deepest nesting is two levels (`merge_segments`' `match change.tag()` over `match pending.take()` inside a loop, and `apply_decision`'s match arms with single-level `matches!` guards).",
+    "Rubric 2 item 9 (unused imports / unused exports): no unused imports; the over-broad `pub` markers are filed as F13 rather than as unused exports, since every one of them is used inside its own module.",
+    "Rubric 3 item 2 (missed concurrency): nothing worth flagging — the only independent pair is the two `apply::match_paths` calls in `compute_reconcile_set`, and parallelizing two glob walks would add a thread pool to a path that must stay deterministic in ordering.",
+    "Rubric 3 item 3 (hot-path bloat): nothing found — nothing in this partition runs per-request or at startup; the heaviest path (`compute_reconcile_set`) is user-initiated and its cost is filed under F15.",
+    "Rubric 3 item 4 (recurring no-op updates): not applicable — no polling, event or reducer loop in this partition.",
+    "Rubric 3 item 6 (memory / unbounded growth / leaks): nothing found — `prune_old_backups` bounds the backups tree at `BACKUP_BATCHES_KEPT`, the batch vectors are bounded by the configured pattern set, and there are no listeners or long-lived handles."
+  ]
+}

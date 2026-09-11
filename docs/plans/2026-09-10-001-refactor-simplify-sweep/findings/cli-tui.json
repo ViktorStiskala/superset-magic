@@ -1,0 +1,389 @@
+{
+  "partition": "cli-tui",
+  "findings": [
+    {
+      "id": "cli-tui-F1",
+      "category": "duplication",
+      "title": "The three sync-direction labels are hand-typed in two match statements over two enums",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:479-493",
+        "crates/ss-magic/src/sync/reverse_sync.rs:492-497"
+      ],
+      "evidence": "cockpit.rs:481-490\n                Decision::Push if f.status == DiffStatus::Differs => {\n                    Some((f.rel.clone(), \"worktree → main\"))\n                Decision::Pull if f.status != DiffStatus::MainOnly => {\n                    Some((f.rel.clone(), \"main → worktree\"))\n                Decision::Merge(_) => Some((f.rel.clone(), \"merged → both\")),\nreverse_sync.rs:493-495\n                    WriteDirection::PushToMain => \"worktree → main\",\n                    WriteDirection::PullFromMain => \"main → worktree\",\n                    WriteDirection::MergeBoth => \"merged → both\",",
+      "problem": "The batched-confirm list in the cockpit and the per-file 'Applied … [dir]' line printed by `apply_batch` describe the SAME three directions with byte-identical strings, but each match statement owns its own copy (cockpit matches `Decision`, reverse_sync matches `WriteDirection`). The confirm is the user's only pre-apply review of what will be destroyed and the applied line is the after-the-fact record; a reworded direction in one place silently desyncs the pair. `literals.md` lines 127/129/133 confirm each string occurs exactly twice, once per file.",
+      "proposal": "Give `WriteDirection` (already `pub` in `crates/ss-magic/src/sync/reverse_sync.rs:974`) an inherent `pub fn label(self) -> &'static str` holding the four literals, and have `apply_batch` call `result.direction.label()`. In `cockpit.rs::App::destructive_overwrites`, replace the three literals with `WriteDirection::PushToMain.label()` / `PullFromMain.label()` / `MergeBoth.label()` (cockpit already imports from `crate::sync::reverse_sync`). The Delete arm stays on `delete_target(f.status)` — the cockpit deliberately names the sides a delete removes, which `WriteDirection::DeleteBoth`'s 'deleted from both sides' does not.",
+      "behavior_preservation": "`label()` returns the same `&'static str` values the two matches return today, so every rendered string, its `&'static str` type, and the arm ordering are unchanged; no arm is added or removed and the Delete path is untouched.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F2",
+      "category": "duplication",
+      "title": "menu.rs re-spells the two root-resolution error messages that main.rs::resolve_sync_roots already owns",
+      "locations": [
+        "crates/ss-magic/src/tui/menu.rs:116-144",
+        "crates/ss-magic/src/main.rs:293-317"
+      ],
+      "evidence": "menu.rs:120-127 / 138-142\n                style::err(format!(\n                    \"error: cannot resolve git repo root from {}: {err:#}\",\n                    cwd.display()\n            return Ok(ExitCode::from(1));\n                    style::err(format!(\"error: cannot resolve main checkout root: {err:#}\"))\nmain.rs:299-313 (resolve_sync_roots)\n                tui::style::err(format!(\n                    \"error: cannot resolve git repo root from {}: {err:#}\",\n                    cwd.display()\n                tui::style::err(format!(\"error: cannot resolve main checkout root: {err:#}\"))",
+      "problem": "`main.rs::resolve_sync_roots` exists precisely to hold this pair ('printing the same styled error and returning the exit code on failure. Shared by `sync_core` … and `run_reverse_sync_flow`'), but `menu.rs::run` hand-copies both messages and both exit codes rather than reusing it. Two copies of a user-facing error string with no compile-time link.",
+      "proposal": "Split `resolve_sync_roots` into the two halves it already is: `fn resolve_cwd_root(cwd: &Path) -> Result<PathBuf, ExitCode>` and `fn resolve_main_root(cwd_root: &Path) -> Result<PathBuf, ExitCode>` in `main.rs` (both `pub(crate)`), with `resolve_sync_roots` composed of the two. `menu.rs::run` then calls `crate::resolve_cwd_root(cwd)` at line 117 and `crate::resolve_main_root(&cwd_root)` at line 135, mapping `Err(code) => return Ok(code)`. Do NOT call `resolve_sync_roots` wholesale from the menu: it resolves BOTH roots, and the menu's main-checkout branch must never probe the main-checkout root.",
+      "behavior_preservation": "Each helper keeps the exact `format!` string, the `style::err` wrapping, the `eprintln!` target and `ExitCode::from(1)`. The menu still runs `cwd_repo_root` first, then `is_worktree`, then `main_checkout_root` only on the worktree branch — same probes, same order, same number of subprocesses. Only the `Err` carrier changes (`Result<_, ExitCode>` unwrapped at the menu's call site into its existing `Ok(ExitCode::from(1))` return).",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F3",
+      "category": "duplication",
+      "title": "The usize-count-to-u16-scroll-bound expression is written out three times",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:233-239",
+        "crates/ss-magic/src/tui/cockpit.rs:353-360",
+        "crates/ss-magic/src/tui/cockpit.rs:364-371"
+      ],
+      "evidence": "233-239 (MergeOverlay::max_preview_scroll)\n        self.preview().lines().count().saturating_sub(1).min(u16::MAX as usize) as u16\n353-360 (App::max_hscroll)\n            .map(|f| max_content_width(&f.diff)).unwrap_or(0)\n            .saturating_sub(1).min(u16::MAX as usize) as u16\n364-371 (App::max_scroll)\n        lines.saturating_sub(1).min(u16::MAX as usize) as u16",
+      "problem": "`count.saturating_sub(1).min(u16::MAX as usize) as u16` — the 'a line/column count becomes a scroll upper bound' conversion, including the saturating cast that keeps a huge file from wrapping — appears character-for-character three times across two types. A change to the clamp (e.g. reserving a viewport height) has to be found in three places.",
+      "proposal": "Add one private helper beside the other pure helpers in `cockpit.rs`: `/// The scroll upper bound for a `count`-line/column body … fn scroll_bound(count: usize) -> u16 { count.saturating_sub(1).min(u16::MAX as usize) as u16 }`, and call it from all three. The same file also repeats `x.saturating_add(step).min(bound)` in `scroll_down` (333), `scroll_right` (341-344) and `scroll_preview_down` (242-245); a companion `fn advance_scroll(cur: u16, step: u16, bound: u16) -> u16` removes those three too.",
+      "behavior_preservation": "Pure integer expression moved verbatim into a function; identical inputs give identical `u16` outputs, and no call site's argument evaluation order changes (each caller still computes its own count before calling).",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F4",
+      "category": "efficiency",
+      "title": "The focused file's widest line and its diff row count are recomputed on every frame / keypress",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:730-743",
+        "crates/ss-magic/src/tui/cockpit.rs:1019-1028",
+        "crates/ss-magic/src/tui/cockpit.rs:964-965",
+        "crates/ss-magic/src/tui/cockpit.rs:353-371"
+      ],
+      "evidence": "730-735 (diff_line_count, reached from App::max_scroll on every PgUp/PgDn)\n        FileDiff::Text { local, main } => diffmodel::unified(local, main, CONTEXT).len() + 1,\n1019-1022 (max_content_width, reached from render_diff on every draw)\n    let longest = |text: &str| text.lines().map(|l| l.chars().count()).max().unwrap_or(0);\n        FileDiff::Text { local, main } => longest(local).max(longest(main)),\n964-965 (render_diff)\n    let clipped = scrollable\n        && max_content_width(&f.diff) > visible as usize + app.diff_hscroll as usize;",
+      "problem": "Both values are pure functions of `FileEntry::diff`, which is built once in `load_entry` and never mutated afterwards (only `decision` changes). Yet `max_content_width` rescans every char of both sides on every redraw (the loop draws after each key event), and `diff_line_count` runs a FULL `diffmodel::unified` — `TextDiff::from_lines`, `grouped_ops`, `iter_inline_changes`, allocating every row — on every PgUp/PgDn just to take `.len()`. On a file near the 2 MiB `MAX_DIFF_BYTES` cap that is megabytes of scanning, and a whole discarded diff, per keystroke.",
+      "proposal": "Precompute both in `load_entry` and store them on `FileEntry`: `content_width: usize` (from `max_content_width(&diff)`) and `scroll_lines: usize` (from `diff_line_count`). `App::max_hscroll`/`max_scroll` and `render_diff` then read the stored fields. Keep the two functions as the pure constructors called once from `load_entry` (they are unit-tested by name in `cockpit/tests.rs`). Out of scope here: `render_split`/`render_unified` also rebuild the whole `similar` diff per frame — caching those is layout-dependent (split vs unified) and needs its own design.",
+      "behavior_preservation": "`FileDiff` is immutable after `App::new` (no code path mutates `FileEntry::diff`), so the cached values equal what the functions return at any later call; the same numbers reach the same comparisons, and rendering output is byte-identical.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F5",
+      "category": "efficiency",
+      "title": "render_confirm clones every decision (including whole assembled merge texts) just to count them",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:1424",
+        "crates/ss-magic/src/tui/cockpit.rs:466-472"
+      ],
+      "evidence": "1424\n    let decided = app.decisions().len();\n466-472 (App::decisions)\n            .filter(|f| !matches!(f.decision, Decision::Undecided))\n            .map(|f| (f.rel.clone(), f.decision.clone()))\n            .collect()",
+      "problem": "`render_confirm` runs on every frame while the confirm overlay is open. `decisions()` allocates a `Vec`, clones a `PathBuf` per decided file and clones each `Decision` — and `Decision::Merge(String)` carries the ENTIRE assembled merge text, so a confirm over a few merged files copies the whole merged contents on each redraw, only for `.len()`.",
+      "proposal": "Replace line 1424 with a count that allocates nothing: `let decided = app.files.iter().filter(|f| !matches!(f.decision, Decision::Undecided)).count();`. Better, add `fn decided_count(&self) -> usize` next to `App::decisions` so the filter predicate has one owner and `decisions()` can be defined in terms of the same predicate. Leave `decisions()` itself alone — `handle_key`'s `CockpitOutcome::Apply(app.decisions())` genuinely needs the owned clones.",
+      "behavior_preservation": "`.filter(pred).map(clone).collect().len()` and `.filter(pred).count()` yield the same number for the same predicate; nothing else reads the intermediate vector, and the rendered line `\"{decided} file(s) will be written.\"` is unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F6",
+      "category": "efficiency",
+      "title": "The merge overlay assembles its whole preview twice per frame and again per scroll key",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:233-246",
+        "crates/ss-magic/src/tui/cockpit.rs:275-277",
+        "crates/ss-magic/src/tui/cockpit.rs:1599"
+      ],
+      "evidence": "233-239 (max_preview_scroll)\n        self.preview()\n            .lines()\n            .count()\n275-277 (preview)\n    fn preview(&self) -> String {\n        merge_preview(&self.segments, &self.choices)\n1599 (render_merge_preview)\n    let preview = m.preview();",
+      "problem": "`preview()` calls `assemble(segments, choices)`, building the entire merged file as a fresh `String`. It runs once per frame in `render_merge_preview`, and again inside `max_preview_scroll` on every `cycle_choice` (line 228) and every `scroll_preview_down` (line 245) — so a PgDn in merge mode assembles the file twice before the frame that assembles it a third time.",
+      "proposal": "Cache the assembled text on the overlay: add `preview: String` to `MergeOverlay`, fill it in `build` (after `choices` is initialized) and refresh it at the end of `cycle_choice` — the only place `choices` is mutated (`segments` is never mutated). `preview()` becomes `&self.preview` (a `&str` getter); `max_preview_scroll` and `render_merge_preview` read it. `App::accept_merge` (line 457) can keep calling `merge_preview(&overlay.segments, &overlay.choices)` or take the cached string.",
+      "behavior_preservation": "`assemble` is pure over `(segments, choices)`; refreshing the cache at the single mutation point makes the stored string equal to what a fresh call would return at every observation point, so the rendered preview, the scroll clamp and the accepted `Decision::Merge` payload are byte-identical.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F7",
+      "category": "hardcoded-value",
+      "title": "The 'Local file' / 'Main branch' side labels are hand-typed twice in cockpit.rs",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:1191-1203",
+        "crates/ss-magic/src/tui/cockpit.rs:1511-1524"
+      ],
+      "evidence": "1192-1200 (render_split titles)\n            \"Local file\".bold().underlined().fg(Color::Cyan),\n            \"Main branch\".bold().underlined().fg(Color::Cyan),\n1514-1521 (render_merge side titles)\n        \"Local file (keep-local)\",\n        \"Main branch (keep-main)\",",
+      "problem": "The split diff view and the merge overlay name the same two sides, once bare and once with a parenthetical. Because the merge strings are longer literals, the literal index does not even see them as a repeat (`literals.md` lines 224-225 list only `cockpit.rs:1193`/`1200`), so a rename in one view would pass every existing check while the two views disagree about what 'local' and 'main' are called.",
+      "proposal": "Add two module consts beside the other label consts: `const LOCAL_SIDE_LABEL: &str = \"Local file\";` and `const MAIN_SIDE_LABEL: &str = \"Main branch\";`. `render_split` uses them directly; `render_merge` passes `&format!(\"{LOCAL_SIDE_LABEL} (keep-local)\")` and `&format!(\"{MAIN_SIDE_LABEL} (keep-main)\")` (`render_merge_side` already takes `label: &str`).",
+      "behavior_preservation": "The composed strings are character-identical to today's literals, and `render_split` keeps its `Stylize` chain on the same text, so both panes render exactly as before.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F8",
+      "category": "const-location",
+      "title": "HIGHLIGHT_SYMBOL_WIDTH is a separate literal that must equal HIGHLIGHT_SYMBOL's column count, with nothing enforcing it",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:747-768"
+      ],
+      "evidence": "749-758\nconst HIGHLIGHT_SYMBOL: &str = \"› \";\n/// Columns `List` reserves as a left prefix on EVERY row once the list has a\n/// selection. [`render_file_list`] always selects a row, so this budget is\n/// always in effect (the symbol is `\"› \"` — two columns).\nconst HIGHLIGHT_SYMBOL_WIDTH: u16 = 2;",
+      "problem": "Two facts five lines apart that must agree, linked only by a doc comment. `file_list_content_width` subtracts the width to decide where `wrap_hard` breaks a path; widening the symbol without editing the width would wrap paths one column too wide and clip them again — the exact defect the wrapping was added to fix — with no test failing.",
+      "proposal": "Pin the agreement with an assertion instead of a comment. `str::chars` is not const, so a `const` derivation is not available; add a unit test to `cockpit/tests.rs` beside `file_list_content_width_subtracts_border_and_highlight_symbol` (line 1060): `assert_eq!(HIGHLIGHT_SYMBOL.chars().count(), HIGHLIGHT_SYMBOL_WIDTH as usize, \"the reserved width must match the symbol\");`. Keep both consts where they are.",
+      "behavior_preservation": "Adds a test only; no production code changes, so every rendered column is unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F9",
+      "category": "hardcoded-value",
+      "title": "The 4-column line-number field is spelled once in num() and again inside three gutter-width constants",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:1328-1334",
+        "crates/ss-magic/src/tui/cockpit.rs:59-69",
+        "crates/ss-magic/src/tui/diffmodel.rs:176-179"
+      ],
+      "evidence": "cockpit.rs:1329-1333 (num)\n        Some(n) => format!(\"{n:>4}\"),\n        None => \"    \".to_string(),\ncockpit.rs:62 / 69\nconst UNIFIED_GUTTER: u16 = 12;\nconst NEW_GUTTER: u16 = 7;\ndiffmodel.rs:179\npub const SPLIT_GUTTER: u16 = 5;",
+      "problem": "One fact — a line number renders right-aligned in 4 columns — is spelled four ways: the `{n:>4}` format, the 4-space `None` arm, and three gutter widths whose doc comments spell out the derivation (`\"%4d \"` → 5, `\"%4d %4d \" + \"± \"` → 12, `\"%4d \" + \"+ \"` → 7) while the code carries bare literals. `diffmodel.rs:190` derives `SPLIT_MIN_PANE_WIDTH` as an expression two lines away, so the bare-literal style is inconsistent even inside this partition. Widening the number field silently desyncs the fixed gutters from the content they are supposed to hold.",
+      "proposal": "In `diffmodel.rs`, add `pub const LINE_NO_WIDTH: usize = 4;` beside `SPLIT_GUTTER` and set `pub const SPLIT_GUTTER: u16 = LINE_NO_WIDTH as u16 + 1;` (number + one separator space). In `cockpit.rs`, add `const SIGN_WIDTH: u16 = 2;` (the `\"± \"` / `\"+ \"` column) and define `const UNIFIED_GUTTER: u16 = 2 * diffmodel::SPLIT_GUTTER + SIGN_WIDTH;` and `const NEW_GUTTER: u16 = diffmodel::SPLIT_GUTTER + SIGN_WIDTH;`. Make `num` read `format!(\"{n:>LINE_NO_WIDTH$}\")` and `\" \".repeat(LINE_NO_WIDTH)`.",
+      "behavior_preservation": "Every constant keeps its current value (5, 12, 7) and `num` produces the same 4-wide strings, so all layout math and rendered output are identical; only the spelling becomes derived. The doc comments move from asserting the derivation to explaining the parts.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F10",
+      "category": "const-location",
+      "title": "The merge overlay's key legend is an inline literal while the normal-view legend is a named const",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:1336-1337",
+        "crates/ss-magic/src/tui/cockpit.rs:1527-1533"
+      ],
+      "evidence": "1336-1337\n/// The persistent key legend (R5).\nconst FOOTER_LEGEND: &str = \"↑↓/jk move · PgUp/PgDn/Space/b scroll · p push …\";\n1528-1530 (render_merge)\n        Paragraph::new(Line::from(\n            \"↑↓/jk hunk · ←→/hl choice · PgUp/PgDn/Space/b scroll preview · Enter accept · Esc cancel\",\n        ))",
+      "problem": "The cockpit has two footer legends. One is a documented module const the tests can name; its twin is buried inline in a `Paragraph::new` inside `render_merge`, so the two live in different places and only one is discoverable when the key bindings change. `handle_key`'s Merge arm and the help overlay (1381-1385) restate the same bindings a third and fourth time.",
+      "proposal": "Add `/// The merge overlay's key legend — the Merge-mode twin of [`FOOTER_LEGEND`]. const MERGE_FOOTER_LEGEND: &str = …;` directly beneath `FOOTER_LEGEND` and have `render_merge` render `Line::from(MERGE_FOOTER_LEGEND)`. Leave the help overlay's prose alone — it is a different, wider description, and folding it into the legends would change what is rendered.",
+      "behavior_preservation": "A literal moved into a const of the same type and rendered by the same widget with the same style; the drawn footer is byte-identical.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F11",
+      "category": "hardcoded-value",
+      "title": "format_mtime's minute/hour/day boundaries are bare literals",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:712-726"
+      ],
+      "evidence": "714-723\n            let secs = d.as_secs();\n            if secs < 60 {\n            } else if secs < 3600 {\n                format!(\"{}m ago\", secs / 60)\n            } else if secs < 86_400 {\n                format!(\"{}h ago\", secs / 3600)",
+      "problem": "Each boundary is spelled twice (once as the comparison, once as the divisor) with no name, so six magic numbers encode three units. The workspace names this kind of value everywhere else it appears — `bypass::MAX_AGE_SECS = 24 * 60 * 60`, `heartbeat::MAX_AGE_SECS = 30 * 24 * 60 * 60`, `release::FRESH_FOR = Duration::from_secs(24 * 60 * 60)` — so the bare form here is the outlier. (There is no existing shared `SECS_PER_DAY` to reuse: I grepped every crate.)",
+      "proposal": "Add three private consts above `format_mtime`: `const SECS_PER_MINUTE: u64 = 60; const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE; const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;` and use them in both the comparison and the divisor of each arm. Keep them local to `cockpit.rs` — the only other coarse-duration formatter, `ss-magic-plugin/src/release_check.rs:562` (`format_age`), lives in the other binary and produces a different format (`3h 2m`), so hoisting a shared unit constant into core would serve nothing today.",
+      "behavior_preservation": "The consts evaluate to 60, 3600 and 86400, the same values in the same comparisons and divisions; every produced string is unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F12",
+      "category": "quality",
+      "title": "ui.rs and menu.rs carry doc comments describing a second picker and two flows that were removed",
+      "locations": [
+        "crates/ss-magic/src/tui/ui.rs:43-46",
+        "crates/ss-magic/src/tui/ui.rs:82-83",
+        "crates/ss-magic/src/tui/ui.rs:94-102",
+        "crates/ss-magic/src/tui/ui.rs:210-213",
+        "crates/ss-magic/src/tui/menu.rs:3"
+      ],
+      "evidence": "ui.rs:44-46\n/// set. Pickers use this to flag rows that didn't trip their detection\n/// signal (`(no matches)` for the patterns picker, `(not detected)` for\n/// the setup-commands picker).\nui.rs:82-83\n/// Static text for one action-loop picker. Both in-tree pickers\n/// construct one of these as a const.\nui.rs:212\n/// [`super::superset_files::existing_unknown_entries`] to compute the",
+      "problem": "There is exactly ONE in-tree picker left: `pick_patterns` is the only caller of `PickerStrings`/`pick_with_actions` (grepped: no other construction site in any crate), and `pick_final_action` uses a plain `Select`. The setup-commands picker was removed in U13, so `(not detected)`, 'Both in-tree pickers', 'the bootstrap pickers' (94-95) and 'what both in-tree call sites use' (101-102) all describe code that no longer exists — a reader looking for the second picker will not find it. `ui.rs:212`'s intra-doc link is also broken: `super` from `tui::ui` is `tui`, which has no `superset_files` (it lives at `crate::workspace::superset_files`). `menu.rs:3` still points at `bootstrap_flow`/`apply_flow`, neither of which exists anywhere in the crate.",
+      "proposal": "Reword to the single surviving caller: drop the `(not detected)` clause at ui.rs:45-46; make ui.rs:82-83 read 'Static text for an action-loop picker; `pick_patterns` constructs one as a const'; make 94-95 'Action-loop driver for the pattern picker' and 101-102 'which is what the call site uses'. Fix the link at ui.rs:212 to `[`crate::workspace::superset_files::existing_unknown_entries`]`. Replace menu.rs:3 with a sentence naming what bare invocation does today rather than what it replaced. Do NOT remove `pick_with_actions`'s `V`/`D` generics on the strength of the single caller — nothing verifies that seam is obsolete.",
+      "behavior_preservation": "Comments only; no executable line changes.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F13",
+      "category": "reuse",
+      "title": "cockpit::is_interactive restates the both-ends-are-a-tty rule that main::menu_blocked_reason owns",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:87-93",
+        "crates/ss-magic/src/main.rs:127-141"
+      ],
+      "evidence": "cockpit.rs:90-93\npub fn is_interactive() -> bool {\n    use std::io::IsTerminal;\n    io::stdin().is_terminal() && io::stdout().is_terminal()\nmain.rs:135-137 (menu_blocked_reason)\n    match (stdin_tty, stdout_tty) {\n        (true, true) => None,",
+      "problem": "Two independent expressions of the same interactivity rule live in one crate. `menu_blocked_reason` was deliberately 'split from the `IsTerminal` probe so the decision is unit-testable without allocating a pty'; `is_interactive` re-derives the same conjunction inline and therefore gets none of that testability, even though it guards the same class of refusal (R16, exit 2).",
+      "proposal": "Define `is_interactive` in terms of the existing decision: `pub fn is_interactive() -> bool { use std::io::IsTerminal; crate::menu_blocked_reason(io::stdin().is_terminal(), io::stdout().is_terminal()).is_none() }` (`menu_blocked_reason` is already `pub` in `main.rs`). The probes stay in the cockpit, only the rule moves to its owner.",
+      "behavior_preservation": "`menu_blocked_reason` returns `None` exactly for `(true, true)`, so `.is_none()` is the same boolean as `stdin && stdout`; the same two `is_terminal()` calls are made in the same order and nothing is printed.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F14",
+      "category": "hardcoded-value",
+      "title": "The cursor glyph is a named const in one cockpit site and an inline literal in the other",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:747-749",
+        "crates/ss-magic/src/tui/cockpit.rs:1578-1580"
+      ],
+      "evidence": "747-749\n/// The literal handed to [`List::highlight_symbol`] in [`render_file_list`] —\n/// named so its column count is documented in one place.\nconst HIGHLIGHT_SYMBOL: &str = \"› \";\n1579-1580 (render_merge_hunk_list)\n            let focused = i == m.hunk;\n            let marker = if focused { \"› \" } else { \"  \" };",
+      "problem": "The file-list selection marker is a named const documented as the one place its column count lives, while the merge hunk list's focus marker — the same two-column `\"› \"` glyph, the same 'this row is focused' meaning — is an inline literal. The const's stated purpose (one place for the glyph and its width) is already only half true.",
+      "proposal": "Have `render_merge_hunk_list` use the existing const: `let marker = if focused { HIGHLIGHT_SYMBOL } else { \"  \" };`, and widen the const's doc to say it is the cockpit's focus marker, used by `List::highlight_symbol` and by the hunk list. Leave `theme.rs:38`'s bare `Styled::new(\"›\")` alone: that is `inquire`'s prompt prefix, a different (non-cockpit) surface, and the glyph there has no trailing space.",
+      "behavior_preservation": "Same two-character string in the same `if` arm; the unfocused `\"  \"` arm and the styling are untouched, so the hunk list renders identically.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F15",
+      "category": "copy-paste-variant",
+      "title": "handle_key's Merge arm repeats `if let Some(m) = app.merge.as_mut()` six times",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:1710-1753"
+      ],
+      "evidence": "1717-1726\n                KeyCode::Up | KeyCode::Char('k') => {\n                    if let Some(m) = app.merge.as_mut() {\n                        m.prev_hunk();\n                    }\n                }\n                KeyCode::Down | KeyCode::Char('j') => {\n                    if let Some(m) = app.merge.as_mut() {",
+      "problem": "Six arms differ only in the single method called on the overlay; each re-wraps the identical `Option` guard, so the whole navigation table is four lines per binding instead of one and a new binding is a five-line copy-paste.",
+      "proposal": "Keep `Esc` and `Enter` (which need `app` itself) as their own arms, then take the overlay once for the rest: `code => { if let Some(m) = app.merge.as_mut() { match code { KeyCode::Up | KeyCode::Char('k') => m.prev_hunk(), KeyCode::Down | KeyCode::Char('j') => m.next_hunk(), KeyCode::Right | KeyCode::Char('l') => m.cycle_choice(true), KeyCode::Left | KeyCode::Char('h') => m.cycle_choice(false), KeyCode::PageDown | KeyCode::Char(' ') => m.scroll_preview_down(page), KeyCode::PageUp | KeyCode::Char('b') => m.scroll_preview_up(page), _ => {} } } }`. Keep the comment above the PageDown pair.",
+      "behavior_preservation": "Same guard, same methods, same arguments; the arms stay mutually exclusive on the same `KeyCode` patterns and `None` still means 'do nothing', so `handle_key` returns `None` on every one of these keys exactly as now. The Merge-mode key tests (cockpit/tests.rs:758-855) drive all six.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F16",
+      "category": "quality",
+      "title": "render_created carries eight parameters and an allow(too_many_arguments)",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:1056-1066",
+        "crates/ss-magic/src/tui/cockpit.rs:977-997"
+      ],
+      "evidence": "1056-1065\n#[allow(clippy::too_many_arguments)]\nfn render_created(\n    frame: &mut Frame,\n    area: Rect,\n    content: Option<&str>,\n    scroll: u16,\n    hscroll: u16,\n    header: &str,",
+      "problem": "Three of the eight parameters (`header`, `header_color`, `absent_note`) are one bundle: the per-side presentation text, always passed together as a matched triple from the two call sites in `render_diff`. Passing them loose is what pushed the function past the lint and forced a blanket `allow` onto a function whose OTHER parameters are also worth counting.",
+      "proposal": "Introduce `struct CreatedView { header: &'static str, header_color: Color, absent_note: &'static str }` beside the other pure helpers, with two constructors or two consts (`NEW_FILE_VIEW`, `MAIN_ONLY_VIEW`) holding today's literals. `render_created(frame, area, content, scroll, hscroll, view: &CreatedView)` then takes six parameters and the `allow` comes off; the two `render_diff` arms pass the matching const.",
+      "behavior_preservation": "The same three values reach the same `format!`/`Span::styled` sites in the same order; the layout, colors and text are unchanged.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F17",
+      "category": "quality",
+      "title": "Seg is reached by full path inside cockpit.rs although diffmodel is already imported",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:1284-1289",
+        "crates/ss-magic/src/tui/cockpit.rs:1300-1304",
+        "crates/ss-magic/src/tui/cockpit.rs:51"
+      ],
+      "evidence": "51\nuse crate::tui::diffmodel::{self, ContentKind, DiffRow, RowTag, UnifiedTag};\n1287\n    segs: &[crate::tui::diffmodel::Seg],\n1302\n    segs: &[crate::tui::diffmodel::Seg],",
+      "problem": "One module is spelled two ways in one file: every other diffmodel item comes through the `use` at line 51 (as `diffmodel::…` or the imported name), while `Seg` is written out as `crate::tui::diffmodel::Seg` in the two helper signatures. The long form reads as if it named something outside the partition.",
+      "proposal": "Write `segs: &[diffmodel::Seg]` in both signatures (the `self` import at line 51 already binds `diffmodel`), or add `Seg` to the braced import list and write `&[Seg]` like `DiffRow`.",
+      "behavior_preservation": "Both spellings resolve to the same type; a path rewrite has no runtime effect.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F18",
+      "category": "copy-paste-variant",
+      "title": "Two rect-centering helpers coexist, one percentage-based and one absolute",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:1413-1420",
+        "crates/ss-magic/src/tui/cockpit.rs:1612-1626"
+      ],
+      "evidence": "1414-1419 (centered_rect_abs)\n    let w = width.min(area.width);\n    let h = height.min(area.height);\n    let x = area.x + (area.width - w) / 2;\n1613-1617 (centered_rect)\n    let vertical = Layout::vertical([\n        Constraint::Percentage((100 - percent_y) / 2),",
+      "problem": "Two 'center a popup in `area`' primitives sit 200 lines apart with one call site each: `centered_rect_abs` for the help and confirm overlays, `centered_rect(88, 90, area)` for the merge overlay. The absolute one was added because a fixed percentage clipped the confirm list; the percentage one survived for the merge overlay only, so the file now documents two answers to the same question.",
+      "proposal": "Either give the merge overlay a content-derived absolute size and delete `centered_rect` (the direction the help/confirm overlays already went), or implement `centered_rect` in terms of `centered_rect_abs` with `width = area.width * percent_x / 100`. I could NOT verify either is behavior-preserving: ratatui's constraint solver distributes the three `Percentage` chunks with its own rounding, which does not have to equal integer `area.width * 88 / 100`, so a swap can shift the popup by a column on some sizes. Treat this as a lead — measure the two against a `TestBackend` at several widths before choosing.",
+      "behavior_preservation": "NOT established: the solver's rounding and the integer-division centering can disagree by a cell. Any consolidation needs a `TestBackend` comparison across widths first; that is why this is filed at 50.",
+      "confidence": 50,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-tui-F19",
+      "category": "duplication",
+      "title": "Three renderers each inline their own gutter-line builder around num()",
+      "locations": [
+        "crates/ss-magic/src/tui/cockpit.rs:1079-1091",
+        "crates/ss-magic/src/tui/cockpit.rs:1141-1147",
+        "crates/ss-magic/src/tui/cockpit.rs:1284-1297"
+      ],
+      "evidence": "1080-1086 (render_created)\n                nums.push(Line::from(vec![\n                    Span::styled(format!(\"{} \", num(Some(i + 1))), Style::new().fg(Color::DarkGray)),\n                    Span::styled(\"+ \", Style::new().fg(Color::Green)),\n1141-1147 (render_unified)\n        nums.push(Line::from(vec![\n            Span::styled(format!(\"{} {} \", num(local_no), num(main_no)), Style::new().fg(Color::DarkGray)),\n            Span::styled(format!(\"{sign} \"), style_of(color, false)),",
+      "problem": "`render_created`, `render_unified` and `push_side_cell` each build the same shape by hand — a DarkGray `num(...)`-formatted number span, optionally followed by a colored sign span, pushed into a `nums` vector that is then handed to `render_gutter_and_content`. The `Style::new().fg(Color::DarkGray)` for the number is repeated three times, so a change to the gutter's dimming has three edit sites.",
+      "proposal": "Add `fn gutter_line(numbers: String, sign: Option<Span<'static>>) -> Line<'static>` beside `num`, building `Line::from` with the DarkGray number span plus the optional sign span; the three sites pass `format!(\"{} \", num(..))` / `format!(\"{} {} \", ..)` and their sign span (or `None` for the split columns). I have verified the three shapes are identical modulo the number text and the presence of a sign, but have NOT traced whether the resulting signature reads better than the current explicit form — the split column's `Line::from(Span::styled(..))` single-span case would gain a `None` argument. Filed as a lead; skip if the reviewer judges it a readability loss.",
+      "behavior_preservation": "The proposed helper emits the same span sequence with the same styles for each caller, so the rendered gutter is byte-identical — but this is argued from the shapes, not from a compiled comparison.",
+      "confidence": 50,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "rubric 1 item 2 (standard-library or runtime primitives): no hand-rolled logic in this partition has a behavior-equivalent std/ratatui/inquire built-in — wrap_hard is char-boundary hard wrap that Paragraph's word Wrap does not reproduce, and normalize_eol has no std equivalent (grepped: it is the only EOL normalizer in the workspace).",
+    "rubric 1 item 3 (platform, framework, or downstream guarantees): nothing here hand-maintains a guarantee ratatui/crossterm already provides; the TerminalGuard + panic hook pair is the guarantee, not a duplicate of one.",
+    "rubric 2 item 1 (redundant state): App::merge being Some iff mode == Mode::Merge is documented as deliberate (Mode stays Copy so the segment/choice buffers can be owned), and no other cockpit field duplicates or caches derivable state.",
+    "rubric 2 item 4 (leaky abstractions): diffmodel exposes only row models and has no ratatui dependency; the cockpit is its sole consumer. No boundary is crossed the wrong way.",
+    "rubric 2 item 6 (unnecessary wrapper elements): not applicable — ratatui is an immediate-mode renderer, not a component-tree UI framework.",
+    "rubric 2 item 7 (nested conditionals 3+ deep): the deepest nesting is two levels (handle_key's match-on-mode containing a match-on-code; format_mtime's match containing an if/else chain).",
+    "rubric 2 item 9 (dead code, unused imports, unused exports): cargo check -p ss-magic is warning-clean, and every pub item in diffmodel/menu/theme/ui has a verified caller (diffmodel's are all consumed by cockpit.rs; MenuOp/Location/operations_for by menu.rs and its tests; render_config by install).",
+    "rubric 2 item 11 (pre-release compatibility scaffolding): none found — no superseded-within-branch forms in this partition.",
+    "rubric 3 item 2 (missed concurrency): App::new's per-file reads are sequential, but parallelizing needs a new dependency and would reorder the first-error report; not a behavior-preserving change.",
+    "rubric 3 item 4 (recurring no-op updates): the event loop redraws once per event by design, including resizes; there is no polling or reducer to guard.",
+    "rubric 3 item 5 (unnecessary existence checks): the fs::metadata calls before fs::read in read_created_content and build_two_sided are size gates (R8: never pay for a full read of an oversized file), not pre-existence checks; both handle the read error afterwards anyway.",
+    "rubric 3 item 6 (memory): no unbounded structure — per-side content is capped by diffmodel::MAX_DIFF_BYTES and the file set is the reconcile set; no listeners or handles are retained.",
+    "rubric 3 item 7 (overly broad operations): reads are already size-gated by metadata before any full read.",
+    "test helpers duplicating core's testutil: none — the five tests.rs files in this partition use no tempdirs, git, or environment fixtures at all (cockpit/tests.rs's helpers are TestBackend buffer assertions, which testutil does not provide)."
+  ]
+}
