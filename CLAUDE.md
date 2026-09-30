@@ -25,9 +25,9 @@ tune it per crate) and `[profile.dist]` inheriting it. Members live under
 - `crates/ss-magic-core` – the shared library. `publish = false` plus
   `[package.metadata.dist] dist = false`, version `0.1.0`, never a release
   surface and never tagged.
-- `crates/ss-magic` – binary `ss-magic`, the sync CLI. Currently `0.11.1`.
+- `crates/ss-magic` – binary `ss-magic`, the sync CLI. Currently `0.11.2`.
 - `crates/ss-magic-plugin` – binary `ss-magic-plugin`, the plugin's hook runtime
-  and verb tree. Currently `1.0.0`.
+  and verb tree. Currently `1.0.1`.
 
 Every `cargo` command is run from the root with `--workspace`; `cargo install
 --path` needs a `[package]`, so it names `crates/ss-magic`. `make install`
@@ -1508,8 +1508,9 @@ binary is the sole file-copy implementation.)
   `ENV_LOCK` remains acceptable only for a variable no concurrent test's child
   could misread (`HOME` in the checklist-deny tests). CI
   (`.github/workflows/ci.yml`) runs `cargo test --workspace --locked` on every
-  PR commit and gates cargo-dist releases via `plan-jobs` (see
-  dist-workspace.toml); its plan phase also refuses a release tag matching
+  PR commit and gates cargo-dist releases as the `custom-ci` job registered
+  under `local-artifacts-jobs` (see dist-workspace.toml and the release-gate
+  rule below). As part of that gate it also refuses a release tag matching
   neither `^v[0-9]+\.[0-9]+\.[0-9]+$` nor
   `^ss-magic-plugin-v[0-9]+\.[0-9]+\.[0-9]+$`, since a prefixed CLI tag such as
   `ss-magic-v0.11.1` would publish a release the updater's anchored filter and
@@ -1518,12 +1519,14 @@ binary is the sole file-copy implementation.)
   ground `cargo test` cannot reach, and CI runs all five:
   `python3 scripts/build-plugin-zip.py --selftest` (the builder's own
   reproducibility and refusal tests); `python3 scripts/build-plugin-zip.py
-  --check`, which now prints SEVEN assertion lines – `R101 marketplace sha256
+  --check`, which now prints EIGHT assertion lines – `R101 marketplace sha256
   key`, `R95 version surfaces (ss-magic)`, `R95 version surfaces
   (ss-magic-plugin)`, `distinct release lines`, `hooks spawn through the shim`,
-  `workspace shape` and `R96 committed digest pin` (the last three are new: the
-  hooks-shim manifest guard, the "no `self_update`/`inquire`/`ratatui` in the
-  plugin or core manifest plus `publish = false` on core" guard, and the digest);
+  `workspace shape`, `release gate blocks publishing` and `R96 committed digest
+  pin` (the hooks-shim manifest guard; the "no `self_update`/`inquire`/`ratatui`
+  in the plugin or core manifest plus `publish = false` on core" guard; the
+  generated `release.yml`'s host job waiting for and checking the test gate, see
+  the release-gate rule below; and the digest);
   `cargo tree --locked -p ss-magic-plugin -i <crate>` for each of `self_update`,
   `inquire` and `ratatui`, which must report no match – a build proves a
   dependency PRESENT and can never prove one ABSENT, so this is the only evidence
@@ -1586,6 +1589,36 @@ binary is the sole file-copy implementation.)
   bootstrap suite); `dist generate
   --check` must stay green after any `dist-workspace.toml` change, and the
   `release.yml` is REGENERATED, never hand-edited.
+- **The release test gate must block the PUBLISH, not only the builds.**
+  cargo-dist's `host` job (the one that runs `gh release create`) publishes
+  when `plan` succeeded and each build job succeeded OR WAS SKIPPED. A job
+  upstream of the builds whose result `host` never checks can therefore fail,
+  skip every build, and still let `host` publish a release with no assets. That
+  is exactly what a `plan-jobs` entry is: upstream of `build-local-artifacts`,
+  absent from `host`'s `needs` and `if`. On 2026-09-30 the gate (then
+  `plan-jobs = ["./ci"]`) failed on a date-dependent test, and `host` published
+  `v0.11.1` and `ss-magic-plugin-v1.0.0` holding only `dist-manifest.json`.
+  Release immutability forbids adding assets, and GitHub never lets a deleted
+  immutable release's tag be reused. The tag ruleset forbids moving or deleting
+  the tags. So both versions were lost for good, and the fix shipped as 0.11.2
+  and 1.0.1. The two empty releases remain, marked as pre-releases (so neither
+  updater selects them) and titled "broken – no assets, do not use". The gate is now
+  `local-artifacts-jobs = ["./ci"]`: cargo-dist adds such a job to `host`'s
+  `needs` AND checks its result in `host`'s `if`, so a red or cancelled suite
+  skips `host`, `announce` and `custom-mark-latest`. The builds run alongside the
+  tests, so a red gate still spends build minutes and leaves attested archives in
+  Actions storage, but uploads nothing. `ci.yml` declares the optional `plan`
+  input cargo-dist passes to such a job (GitHub rejects an undeclared one).
+  cargo-dist 0.33 keeps the same `host` condition, so an upgrade is no
+  substitute. `--check`'s `release gate blocks publishing` asserts the shape on
+  the GENERATED `release.yml`. `custom-ci` must call `ci.yml`, and `host` must
+  need it and check its result. Every job `build-local-artifacts` waits on must
+  appear as `needs.<job>.result` in `host`'s `if`, so any future `plan-jobs`
+  entry fails there rather than in a release. Independently of the gate, push a
+  release tag only after CI on `main` is green for that exact commit. A red
+  release still burns its version number: nothing is published, but the tag is
+  protected and cannot move. See
+  [docs/solutions/logic-errors/cargo-dist-plan-job-failure-publishes-empty-release.md](./docs/solutions/logic-errors/cargo-dist-plan-job-failure-publishes-empty-release.md).
 - Version bumps follow the GROUP, never the repository. Bump
   `crates/ss-magic/Cargo.toml` and the matching `ss-magic` entry in `Cargo.lock`
   on any change that alters CLI behavior – a fix, a new/changed command or flag,
@@ -1596,8 +1629,10 @@ binary is the sole file-copy implementation.)
   at all. The two groups' versions must never be EQUAL – `--check`'s `distinct
   release lines` assertion refuses that, because a bare `vX.Y.Z` tag would then
   announce both packages. Bug fixes bump patch; new/changed user-visible
-  behavior bumps minor (pre-1.0 on the CLI line; the plugin line starts at
-  `1.0.0` and follows ordinary semver).
+  behavior bumps minor (pre-1.0 on the CLI line; the plugin line follows
+  ordinary semver from 1.0 – its first release with assets is `1.0.1`, since
+  `ss-magic-plugin-v1.0.0` was published empty, see the release-gate rule
+  above).
 - After every implementation change, update `CLAUDE.md` and `README.md`
   to match the current state before the change is considered done. A
   new/changed command, flag, module, or behavior must be reflected in the

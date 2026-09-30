@@ -727,6 +727,134 @@ def check_workspace_shape(root: Path) -> list[str]:
     return problems
 
 
+RELEASE_WORKFLOW = Path(".github") / "workflows" / "release.yml"
+# The release workflow's test-suite job, and the reusable workflow it must call.
+GATE_JOB = "custom-ci"
+GATE_WORKFLOW = "./.github/workflows/ci.yml"
+
+
+def _workflow_jobs(text: str) -> dict[str, list[str]]:
+    """Split a GitHub workflow's `jobs:` map into {job id: its body lines}.
+
+    Line-oriented, like the manifest reading above: there is no YAML parser in
+    the standard library. It relies on the layout `dist generate` emits, with
+    `jobs:` at column 0, each job id indented two spaces and its keys four.
+    Comment lines are dropped, so a comment inside a `needs:` list cannot end
+    it early.
+    """
+    jobs: dict[str, list[str]] = {}
+    in_jobs = False
+    current: str | None = None
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        if not raw.startswith(" "):
+            in_jobs = raw.rstrip() == "jobs:"
+            current = None
+            continue
+        if not in_jobs:
+            continue
+        header = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", raw)
+        if header:
+            current = header.group(1)
+            jobs[current] = []
+        elif current is not None:
+            jobs[current].append(raw)
+    return jobs
+
+
+def _job_key(body: list[str], key: str) -> str | None:
+    """The single-line value of a job's top-level `key`, or None if absent."""
+    for line in body:
+        m = re.match(rf"^    {re.escape(key)}:\s*(.*)$", line)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _job_needs(body: list[str]) -> list[str]:
+    """The job ids a job's `needs:` names, in block-list or inline form."""
+    for i, line in enumerate(body):
+        m = re.match(r"^    needs:\s*(.*)$", line)
+        if not m:
+            continue
+        inline = m.group(1).strip()
+        if inline:
+            return [s.strip().strip("\"'") for s in inline.strip("[]").split(",") if s.strip()]
+        needs = []
+        for item in body[i + 1 :]:
+            entry = re.match(r"^      - ([A-Za-z0-9_-]+)\s*$", item)
+            if not entry:
+                break
+            needs.append(entry.group(1))
+        return needs
+    return []
+
+
+def check_release_gate(root: Path) -> list[str]:
+    """A failed test suite must stop a release from being PUBLISHED, not only built.
+
+    cargo-dist's host job (the one that runs `gh release create`) publishes when
+    `plan` succeeded and each build job either succeeded OR WAS SKIPPED. "Skipped
+    is fine" exists so a release with nothing to build can still publish. The
+    consequence: a job that sits upstream of the builds and that host never
+    checks can fail, skip every build, and still let host publish a release with
+    no assets.
+
+    That happened on 2026-09-30. The test suite ran as a `plan-jobs` entry
+    (upstream of build-local-artifacts, absent from host's `needs` and `if`). It
+    failed, and host published v0.11.1 and ss-magic-plugin-v1.0.0 carrying only
+    `dist-manifest.json`. Release immutability and the tag ruleset then made
+    both versions unrecoverable.
+
+    The suite now runs as a `local-artifacts-jobs` entry, which cargo-dist adds
+    to host's `needs` and whose result it checks in host's `if`. This asserts
+    that shape on the GENERATED workflow, because the property belongs to
+    release.yml, whichever dist-workspace.toml key produced it:
+
+    - `custom-ci` calls ci.yml, and host both waits for it and checks its result.
+    - Every job build-local-artifacts waits for is one host checks by result.
+      That is the general form of the rule the plan-jobs shape broke, so any
+      future `plan-jobs` entry fails here rather than in a release.
+    """
+    problems: list[str] = []
+    jobs = _workflow_jobs(_read_text(root, RELEASE_WORKFLOW, "the cargo-dist release workflow"))
+    for job in ("host", "build-local-artifacts", GATE_JOB):
+        if job not in jobs:
+            problems.append(
+                f"{RELEASE_WORKFLOW} has no `{job}` job, so the release gate cannot be "
+                f"verified. Regenerate it with `dist generate`."
+            )
+    if problems:
+        return problems
+
+    uses = _job_key(jobs[GATE_JOB], "uses")
+    if uses != GATE_WORKFLOW:
+        problems.append(
+            f"`{GATE_JOB}` calls {uses!r}, not {GATE_WORKFLOW!r}; the test suite is not "
+            f"what gates the release."
+        )
+
+    host_if = _job_key(jobs["host"], "if") or ""
+    if GATE_JOB not in _job_needs(jobs["host"]) or f"needs.{GATE_JOB}.result" not in host_if:
+        problems.append(
+            f"the host job does not wait for `{GATE_JOB}` and check its result, so a failed "
+            f"test suite does not stop the release from being published. Register ci.yml "
+            f"under `local-artifacts-jobs` in dist-workspace.toml (never `plan-jobs`) and "
+            f"re-run `dist generate`."
+        )
+
+    for job in _job_needs(jobs["build-local-artifacts"]):
+        if f"needs.{job}.result" not in host_if:
+            problems.append(
+                f"build-local-artifacts waits for `{job}`, whose result the host job never "
+                f"checks. If `{job}` fails, every build is skipped, host reads 'skipped' as "
+                f"fine, and it publishes a release with no assets, as v0.11.1 and "
+                f"ss-magic-plugin-v1.0.0 were. Move `{job}` out of `plan-jobs`."
+            )
+    return problems
+
+
 def check_pin(root: Path, plugin_dir: Path) -> list[str]:
     """R96/AE82: the committed pin must equal the digest of the tree as it stands."""
     computed = digest_of(build_zip_bytes(plugin_dir))
@@ -1233,6 +1361,57 @@ def selftest() -> int:
         assert any("publish = false" in p for p in found), found
         checks.append("workspace shape rejects self_update/inquire/ratatui and a publishable core")
 
+    # -- A failed test gate must block the publish, not only the builds. The
+    #    fixtures reproduce the two shapes `dist generate` emitted: the gate as a
+    #    local-artifacts job (host waits for it), and as a plan job (the shape
+    #    that published v0.11.1 and ss-magic-plugin-v1.0.0 with no assets).
+    def release_yml(*, gate_is_plan_job: bool, gate_uses: str = GATE_WORKFLOW) -> str:
+        gate = f"  custom-ci:\n    needs:\n      - plan\n    uses: {gate_uses}\n    secrets: inherit\n"
+        build_needs = "      - plan\n" + ("      - custom-ci\n" if gate_is_plan_job else "")
+        host_needs = "      - plan\n      - build-local-artifacts\n" + (
+            "" if gate_is_plan_job else "      - custom-ci\n"
+        )
+        host_if = (
+            "always() && needs.plan.result == 'success' && "
+            "(needs.build-local-artifacts.result == 'skipped' || "
+            "needs.build-local-artifacts.result == 'success')"
+        ) + (
+            ""
+            if gate_is_plan_job
+            else " && (needs.custom-ci.result == 'skipped' || needs.custom-ci.result == 'success')"
+        )
+        return (
+            "name: Release\non:\n  push:\njobs:\n"
+            "  plan:\n    runs-on: ubuntu-22.04\n"
+            + (gate if gate_is_plan_job else "")
+            + f"  build-local-artifacts:\n    needs:\n{build_needs}    runs-on: x\n"
+            + ("" if gate_is_plan_job else gate)
+            + f"  host:\n    needs:\n{host_needs}"
+            + "    # Only run if we're \"publishing\" (skipped is fine)\n"
+            + f"    if: ${{{{ {host_if} }}}}\n    runs-on: x\n"
+        )
+
+    with tempfile.TemporaryDirectory() as f:
+        def gate_problems(name: str, text: str) -> list[str]:
+            repo = Path(f) / name
+            (repo / RELEASE_WORKFLOW).parent.mkdir(parents=True)
+            (repo / RELEASE_WORKFLOW).write_text(text, encoding="utf-8")
+            return check_release_gate(repo)
+
+        found = gate_problems("local", release_yml(gate_is_plan_job=False))
+        assert not found, found
+        found = gate_problems("plan", release_yml(gate_is_plan_job=True))
+        assert len(found) == 2, found  # host ignores the gate AND the builds wait on it
+        assert any("does not stop the release" in p for p in found), found
+        assert any("no assets" in p for p in found), found
+        found = gate_problems(
+            "elsewhere", release_yml(gate_is_plan_job=False, gate_uses="./.github/workflows/x.yml")
+        )
+        assert len(found) == 1 and "not what gates" in found[0], found
+        found = gate_problems("nohost", "jobs:\n  plan:\n    runs-on: x\n")
+        assert found and all("cannot be verified" in p for p in found), found
+        checks.append("the release gate rejects a test job the host job does not check")
+
     # -- The extra-artifact surface falls back to dist-workspace.toml.
     with tempfile.TemporaryDirectory() as f:
         fallback = _version_repo(Path(f) / "fallback", artifact_in_dist=True)
@@ -1286,8 +1465,9 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "assert the sha256 key (R101), both release lines' version surfaces and the "
             "README installer pin (R95), that the two lines' versions differ, that every "
-            "hook spawns the shim, the workspace's forbidden-dependency shape (R2), and "
-            "the committed digest pin (R96)"
+            "hook spawns the shim, the workspace's forbidden-dependency shape (R2), that "
+            "a failed test gate blocks the release workflow's publish, and the committed "
+            "digest pin (R96)"
         ),
     )
     parser.add_argument(
@@ -1322,6 +1502,7 @@ def main(argv: list[str] | None = None) -> int:
                     record(name, found)
                 record("hooks spawn through the shim", check_hooks_shim(root))
                 record("workspace shape", check_workspace_shape(root))
+                record("release gate blocks publishing", check_release_gate(root))
                 record("R96 committed digest pin", check_pin(root, plugin_dir))
             if args.check_bump:
                 found = check_bump(root, args.check_bump)

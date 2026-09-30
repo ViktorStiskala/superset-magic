@@ -1361,11 +1361,11 @@ out of step or a stale digest, or a bump applied to the wrong group's surfaces.
   it cannot reach, and CI runs all of them:
   `python3 scripts/build-plugin-zip.py --selftest` (the zip builder's
   reproducibility guarantees and its refusals);
-  `python3 scripts/build-plugin-zip.py --check`, whose seven assertion lines are
+  `python3 scripts/build-plugin-zip.py --check`, whose eight assertion lines are
   `R101 marketplace sha256 key`, `R95 version surfaces (ss-magic)`,
   `R95 version surfaces (ss-magic-plugin)`, `distinct release lines`,
-  `hooks spawn through the shim`, `workspace shape` and
-  `R96 committed digest pin`;
+  `hooks spawn through the shim`, `workspace shape`,
+  `release gate blocks publishing` and `R96 committed digest pin`;
   `/bin/bash scripts/test-bootstrap.sh` (the bootstrap's failure paths –
   offline, corrupted download, hostile pin, unwritable data dir, unsupported
   platform, concurrent sessions – each asserting exit 0, empty stdout, and an
@@ -1443,12 +1443,25 @@ out of step or a stale digest, or a bump applied to the wrong group's surfaces.
   `README.md`, `CONTRIBUTING.md`, `CONCEPTS.md`, `CLAUDE.md`, this file) spells
   the retired `ss-magic` + `plugin` subcommand form – `docs/plans/` is
   deliberately out of scope, a plan being a historical record; and `README.md`
-  names no `releases/latest/download/` URL. The plan phase additionally refuses a release tag matching neither
+  names no `releases/latest/download/` URL. On a release, the same job also refuses a tag matching neither
   `^v[0-9]+\.[0-9]+\.[0-9]+$` nor `^ss-magic-plugin-v[0-9]+\.[0-9]+\.[0-9]+$` – a
   prefixed CLI tag such as `ss-magic-v0.11.1` would publish a release the
   updater's anchored filter and every installed binary ignore, stranding the line
-  silently. It gates cargo-dist releases via `plan-jobs` in
-  `dist-workspace.toml`. Flag hand edits to the generated
+  silently. It gates cargo-dist releases as the `custom-ci` job, registered via
+  `local-artifacts-jobs = ["./ci"]` in `dist-workspace.toml`, and it declares
+  the optional `plan` input cargo-dist passes to such a job. Flag any move of it
+  (or of any other job) to `plan-jobs`. cargo-dist's `host` job runs
+  `gh release create` whenever `plan` succeeded and each build job succeeded OR
+  WAS SKIPPED. A plan job sits upstream of the builds and appears in neither
+  `host`'s `needs` nor its `if`, so a failing plan job skips the builds and
+  `host` publishes a release with no assets. That happened on 2026-09-30 to
+  `v0.11.1` and `ss-magic-plugin-v1.0.0`. Release immutability and the tag
+  ruleset then made both versions unrecoverable. A local-artifacts job is in
+  `host`'s `needs` and checked in its `if`. `--check`'s
+  `release gate blocks publishing` asserts that on the generated `release.yml`,
+  and every job `build-local-artifacts` waits on must appear as
+  `needs.<job>.result` in `host`'s `if`. Flag a change that weakens that
+  assertion or its selftest. Flag hand edits to the generated
   `.github/workflows/release.yml` (regenerate with the pinned `dist` version
   instead), flag `allow-dirty = ["ci"]` additions, and flag a workspace-level
   `extra-artifacts` entry for the plugin zip (it belongs on the plugin crate,

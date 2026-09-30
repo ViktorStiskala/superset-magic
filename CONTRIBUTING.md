@@ -309,13 +309,16 @@ latest-mark selection suite, a
 build of the exact asset cargo-dist will publish, and three document greps: no
 skill body may name `CLAUDE_PLUGIN_DATA`, no document may spell the retired
 `ss-magic` `plugin` subcommand form, and `README.md` may name no
-`releases/latest/download/` URL. The plan phase additionally refuses a release
+`releases/latest/download/` URL. On a release, the same job also refuses a
 tag matching neither `^v[0-9]+\.[0-9]+\.[0-9]+$` nor
 `^ss-magic-plugin-v[0-9]+\.[0-9]+\.[0-9]+$` – a prefixed CLI tag such as
 `ss-magic-v0.11.1` would publish a release the updater's anchored filter and
 every installed binary ignore, stranding the line silently. The same workflow
-gates releases: the cargo-dist release pipeline invokes it as a plan job, so a
-release cannot ship with a red suite.
+gates releases. The cargo-dist release pipeline invokes it as the `custom-ci`
+job, registered under `local-artifacts-jobs` (never `plan-jobs`). The job that
+publishes the GitHub Release waits for it and checks its result, so a red or
+cancelled suite publishes nothing. See "A red release gate" below for why the
+shape matters.
 
 ## Pull requests
 
@@ -355,8 +358,9 @@ release cannot ship with a red suite.
   digest, is what tells the Claude Code client to update, so changing the zip
   and its `sha256` without bumping the version leaves every installed user
   silently on the cached copy. Pre-1.0 rules for the CLI: bug fixes bump patch;
-  new or changed user-visible behavior bumps minor. The plugin line starts at
-  `1.0.0` and follows ordinary semver.
+  new or changed user-visible behavior bumps minor. The plugin line follows
+  ordinary semver from 1.0. Its first release with assets is `1.0.1`, because
+  `ss-magic-plugin-v1.0.0` was published empty (see "A red release gate").
 - **A change under `plugin/` also re-pins the digest.** Run `python3
   scripts/build-plugin-zip.py --update-manifest`, then `--check`.
 - Update the docs in the same PR: `README.md` must describe the tool as it is
@@ -380,8 +384,9 @@ release cannot ship with a red suite.
 Releases are built and published to GitHub Releases by
 [cargo-dist](https://opensource.axo.dev/cargo-dist/) (configured in
 `dist-workspace.toml`), which also generates the one-line installer script and
-per-archive checksums. The pipeline runs the locked test suite before building
-macOS (arm64/x86-64) and Linux (arm64/x86-64) archives, and attests the
+per-archive checksums. The pipeline runs the locked test suite alongside the
+macOS (arm64/x86-64) and Linux (arm64/x86-64) archive builds, publishes only if
+the suite passed, and attests the
 per-target `.tar.gz` archives with signed build provenance (Sigstore/Rekor);
 users can verify them with `gh attestation verify` as described in the README.
 The self-updater itself trusts the TLS-authenticated download plus cargo-dist
@@ -449,8 +454,8 @@ a requirement. The second rule is why a mis-cut release is fixed by a new patch
 release, never by moving the tag.
 
 **CLI (`ss-magic`).** Bump `crates/ss-magic/Cargo.toml`, run `cargo build` so
-`Cargo.lock` follows, run `--check`, merge. Then `git tag v<X.Y.Z>` on `main`
-and push the tag. Finally, advance `README.md`'s pinned installer tag to
+`Cargo.lock` follows, run `--check`, merge. Wait for CI on `main` to finish
+green for the merge commit, then `git tag v<X.Y.Z>` on it and push the tag. Finally, advance `README.md`'s pinned installer tag to
 `v<X.Y.Z>` in a follow-up commit – the pin is only ever moved **after** the
 release it names exists.
 
@@ -463,8 +468,9 @@ an older release that still works, which is harmless.
 **Plugin (`ss-magic-plugin`).** Bump `crates/ss-magic-plugin/Cargo.toml`,
 `plugin/.claude-plugin/plugin.json`, `plugin/ss-magic-plugin.version`, the
 marketplace URL (tag and asset), and the extra-artifact filename. Run `cargo
-build`, then `--update-manifest`, then `--check`. Merge. Then `git tag
-ss-magic-plugin-v<X.Y.Z>` on `main` and push the tag. Afterwards, confirm the
+build`, then `--update-manifest`, then `--check`. Merge. Wait for CI on `main`
+to finish green for the merge commit, then `git tag ss-magic-plugin-v<X.Y.Z>`
+on it and push the tag. Afterwards, confirm the
 newest `v*` release is still marked latest:
 
 ```sh
@@ -500,8 +506,48 @@ published – so a tag cut from an unmerged commit produces a suggestion pointin
 at an update the user cannot yet obtain.
 
 **Never tag a commit where the two crates share a version string.** `--check`
-refuses it, and CI's plan phase runs `--check`, so such a tag fails before any
-artifact is built.
+refuses it, and the release gate runs `--check`, so such a tag publishes
+nothing. Its version is still burned, though, as the next section explains.
+
+### A red release gate
+
+**Push a release tag only after CI on `main` has finished green for that exact
+commit.** A merge starts CI on `main`, and a tag pushed a minute later runs the
+same suite again inside the release workflow. If that suite is red, the release
+fails. Even with the gate working as intended, the version number is burned:
+the tag ruleset refuses to move or delete a pushed tag. If a release was
+published at all, release immutability forbids adding assets to it, and GitHub
+never lets a deleted immutable release's tag be reused. Recovery is always the
+next patch version, never a re-tag.
+
+The gate itself must block the **publish**, not only the builds. cargo-dist's
+`host` job runs `gh release create` whenever `plan` succeeded and each build
+job succeeded *or was skipped*. A job upstream of the builds whose result
+`host` never checks can therefore fail, skip every build, and let `host`
+publish an empty release. A `plan-jobs` entry is exactly that. On 2026-09-30
+the gate was `plan-jobs = ["./ci"]`, a date-dependent test failed, and
+`v0.11.1` and `ss-magic-plugin-v1.0.0` were published holding only
+`dist-manifest.json`. Both versions are unrecoverable, and the fix shipped as
+`v0.11.2` and `ss-magic-plugin-v1.0.1`. The two empty releases remain, marked
+as pre-releases (which both updaters skip) and titled "broken – no assets, do
+not use".
+
+The gate is now `local-artifacts-jobs = ["./ci"]`, which cargo-dist adds to
+`host`'s `needs` and whose result it checks in `host`'s `if`.
+`scripts/build-plugin-zip.py --check` asserts that shape on the generated
+`release.yml` (`release gate blocks publishing`). Every job
+`build-local-artifacts` waits on must be one `host` checks by result, so
+adding anything to `plan-jobs` fails `--check`. If a release is ever published
+empty anyway:
+
+```sh
+gh release edit <newest good bare v tag> --latest
+gh release edit <empty tag> --prerelease --title "<empty tag> (broken – no assets, do not use)"
+```
+
+Then fix forward with the next patch version on the affected line. The full
+account is in
+[docs/solutions/logic-errors/cargo-dist-plan-job-failure-publishes-empty-release.md](./docs/solutions/logic-errors/cargo-dist-plan-job-failure-publishes-empty-release.md).
 
 ## License
 

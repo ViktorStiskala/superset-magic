@@ -732,7 +732,16 @@ fn the_handler_withholds_the_notice_under_quiet_mode() {
 
 // ── The plugin release suggestion (R29–R31, AE10–AE12) ────────────────────────
 
-const NEWER: &str = "ss-magic-plugin-v1.1.0";
+/// The version the plugin roots below pin: the running binary's own, so
+/// `version_drift_notice` stays silent and every `systemMessage` assertion
+/// sees the release suggestion alone. It used to be the literal `"1.0.0"`,
+/// which quietly assumed the crate would stay at that version; the first bump
+/// (to 1.0.1) turned on the drift notice and failed six tests here.
+const PIN: &str = env!("CARGO_PKG_VERSION");
+
+/// A plugin release newer than any version this crate will carry, so the
+/// suggestion fires whatever `PIN` is.
+const NEWER: &str = "ss-magic-plugin-v999.0.0";
 
 /// A plugin root pinning `pin`.
 fn plugin_root_pinning(pin: &str) -> TempDir {
@@ -767,7 +776,7 @@ fn read_release_cache(cache: &TempDir) -> Cache {
 }
 
 /// Surroundings for a watched terminal session on an installed plugin
-/// pinning 1.0.0, with the given cache directory and a recording spawner.
+/// pinning `PIN`, with the given cache directory and a recording spawner.
 fn watched(
     plugin: &TempDir,
     cache: &TempDir,
@@ -795,14 +804,14 @@ fn run_startup(root: &Path, surroundings: &Surroundings, session: &str) -> Outco
     handle_with(&ctx, surroundings).unwrap()
 }
 
-/// AE10: pin 1.0.0, cache newest 1.1.0, nothing suggested yet, `startup`,
+/// AE10: pin `PIN`, cache newest `NEWER`, nothing suggested yet, `startup`,
 /// `permission_mode` default. The first run announces on `systemMessage`
 /// with the `/plugin` flow; the second is silent because `suggested` now
 /// equals that tag; `additionalContext` never mentions it.
 #[test]
 fn ae10_plugin_update_is_suggested_once() {
     let (_dir, root) = ignored_repo();
-    let plugin = plugin_root_pinning("1.0.0");
+    let plugin = plugin_root_pinning(PIN);
     let cache = cache_dir_with(NEWER, 60);
     let lock = tempfile::tempdir().unwrap();
     let (surroundings, _spawns) = watched(&plugin, &cache, &lock);
@@ -811,7 +820,7 @@ fn ae10_plugin_update_is_suggested_once() {
     let (additional_context, system_message) = session_start_response(&first);
     let message = system_message.as_deref().expect("the first startup announces");
     assert!(message.contains(NEWER), "{message}");
-    assert!(message.contains("pins 1.0.0"), "{message}");
+    assert!(message.contains(&format!("pins {PIN}")), "{message}");
     assert!(message.contains("/plugin"), "{message}");
     assert!(message.contains("new session"), "{message}");
     assert!(
@@ -838,7 +847,7 @@ fn ae10_plugin_update_is_suggested_once() {
 #[test]
 fn ae11_a_headless_session_stays_silent_and_spawns_nothing() {
     let (_dir, root) = ignored_repo();
-    let plugin = plugin_root_pinning("1.0.0");
+    let plugin = plugin_root_pinning(PIN);
     // Stale, so a watched session WOULD spawn a refresh here.
     let cache = cache_dir_with(NEWER, 2 * 24 * 60 * 60);
     let lock = tempfile::tempdir().unwrap();
@@ -884,7 +893,7 @@ fn ae11_a_headless_session_stays_silent_and_spawns_nothing() {
 #[test]
 fn ae12_session_start_spawns_a_detached_refresh_and_does_not_wait() {
     let (_dir, root) = ignored_repo();
-    let plugin = plugin_root_pinning("1.0.0");
+    let plugin = plugin_root_pinning(PIN);
     let cache = tempfile::tempdir().unwrap();
     let lock = tempfile::tempdir().unwrap();
     let (surroundings, spawns) = watched(&plugin, &cache, &lock);
@@ -922,17 +931,17 @@ fn ae12_session_start_spawns_a_detached_refresh_and_does_not_wait() {
 #[test]
 fn the_refresh_is_spawned_only_when_stale_on_startup_with_a_pin() {
     let (_dir, root) = ignored_repo();
-    let plugin = plugin_root_pinning("1.0.0");
+    let plugin = plugin_root_pinning(PIN);
     let lock = tempfile::tempdir().unwrap();
 
     // Fresh cache: no spawn.
-    let fresh = cache_dir_with("ss-magic-plugin-v1.0.0", 60);
+    let fresh = cache_dir_with(&format!("ss-magic-plugin-v{PIN}"), 60);
     let (surroundings, spawns) = watched(&plugin, &fresh, &lock);
     run_startup(&root, &surroundings, "sess-1");
     assert_eq!(spawns.get(), 0, "fresh cache");
 
     // Stale cache: spawn.
-    let stale = cache_dir_with("ss-magic-plugin-v1.0.0", 25 * 60 * 60);
+    let stale = cache_dir_with(&format!("ss-magic-plugin-v{PIN}"), 25 * 60 * 60);
     let (surroundings, spawns) = watched(&plugin, &stale, &lock);
     run_startup(&root, &surroundings, "sess-2");
     assert_eq!(spawns.get(), 1, "stale cache");
@@ -966,7 +975,7 @@ fn the_refresh_is_spawned_only_when_stale_on_startup_with_a_pin() {
 #[test]
 fn a_failed_spawn_is_recorded_not_raised() {
     let (_dir, root) = ignored_repo();
-    let plugin = plugin_root_pinning("1.0.0");
+    let plugin = plugin_root_pinning(PIN);
     let cache = tempfile::tempdir().unwrap();
     let lock = tempfile::tempdir().unwrap();
     let (mut surroundings, _) = watched(&plugin, &cache, &lock);
@@ -1017,7 +1026,7 @@ fn the_suggestion_rides_system_message_and_leaves_additional_context_unchanged()
 #[test]
 fn the_suggestion_is_withheld_while_the_release_cache_is_locked() {
     let (_dir, root) = ignored_repo();
-    let plugin = plugin_root_pinning("1.0.0");
+    let plugin = plugin_root_pinning(PIN);
     let cache = cache_dir_with(NEWER, 60);
     let lock = tempfile::tempdir().unwrap();
     let (surroundings, _) = watched(&plugin, &cache, &lock);
@@ -1046,7 +1055,7 @@ fn the_suggestion_is_withheld_while_the_release_cache_is_locked() {
 #[test]
 fn the_suggestion_is_withheld_without_a_lock_root() {
     let (_dir, root) = ignored_repo();
-    let plugin = plugin_root_pinning("1.0.0");
+    let plugin = plugin_root_pinning(PIN);
     let cache = cache_dir_with(NEWER, 60);
     let lock = tempfile::tempdir().unwrap();
     let (mut surroundings, _) = watched(&plugin, &cache, &lock);
