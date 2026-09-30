@@ -2472,7 +2472,7 @@ dependencies = [
 
 [[package]]
 name = "ss-magic"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "anyhow",
  "bzip2",
@@ -2508,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "ss-magic-plugin"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "directories",

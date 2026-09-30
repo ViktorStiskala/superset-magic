@@ -25,9 +25,9 @@ tune it per crate) and `[profile.dist]` inheriting it. Members live under
 - `crates/ss-magic-core` – the shared library. `publish = false` plus
   `[package.metadata.dist] dist = false`, version `0.1.0`, never a release
   surface and never tagged.
-- `crates/ss-magic` – binary `ss-magic`, the sync CLI. Currently `0.11.1`.
+- `crates/ss-magic` – binary `ss-magic`, the sync CLI. Currently `0.11.2`.
 - `crates/ss-magic-plugin` – binary `ss-magic-plugin`, the plugin's hook runtime
-  and verb tree. Currently `1.0.0`.
+  and verb tree. Currently `1.0.1`.
 
 Every `cargo` command is run from the root with `--workspace`; `cargo install
 --path` needs a `[package]`, so it names `crates/ss-magic`. `make install`
