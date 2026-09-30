@@ -248,6 +248,17 @@ pub fn log_path(store: &Path) -> PathBuf {
 /// also failed; a successful append followed by a failed prune returns `Ok`,
 /// because the row — the thing that matters — is on disk.
 pub fn append(store: &Path, row: &Row) -> Result<()> {
+    append_at(store, row, now_secs_or(row.ts))
+}
+
+/// [`append`] with the clock injected: `now` is the instant a prune ages rows
+/// against. Split out so a test can pin it. A test that stamps its fixture rows
+/// with a fixed instant and then lets the prune read the real clock passes only
+/// until that instant is `MAX_AGE_SECS` old; after that every fixture row is
+/// "expired" and gets dropped. That happened once: CI went red on 2026-09-29,
+/// a month after the fixture date, with no code change, and a release tagged
+/// that day published without assets.
+fn append_at(store: &Path, row: &Row, now: u64) -> Result<()> {
     ensure_store(store)?;
     let path = log_path(store);
 
@@ -259,7 +270,7 @@ pub fn append(store: &Path, row: &Row) -> Result<()> {
         // Best-effort by construction (KTD14's posture): the prune's own
         // failure is swallowed here so it can never turn a successful append
         // into a reported failure.
-        let _ = maybe_prune(&path, now_secs_or(row.ts));
+        let _ = maybe_prune(&path, now);
         Ok::<(), anyhow::Error>(())
     })
     .with_context(|| format!("locking the heartbeat log in {}", store.display()))?;

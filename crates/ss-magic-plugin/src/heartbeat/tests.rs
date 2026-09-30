@@ -15,6 +15,11 @@ use super::*;
 
 /// A fixed instant, so timestamps in assertions are stable: 2026-08-30
 /// 12:00:00 UTC.
+///
+/// Rows stamped with it must never reach a prune that reads the real clock.
+/// That prune ages them against today, and a month after this date they all
+/// count as expired. Pass it as the clock instead (`prune(.., NOW)`,
+/// `append_at(.., NOW)`).
 const NOW: u64 = 1_788_091_200;
 
 fn store() -> (TempDir, PathBuf) {
@@ -299,7 +304,11 @@ fn the_log_is_trimmed_to_its_bound_once_it_passes_the_trigger() {
     fs::write(&path, body).unwrap();
     assert!(fs::metadata(&path).unwrap().len() > PRUNE_TRIGGER_BYTES);
 
-    append(&store, &row("session-end", Outcome::Ok)).unwrap();
+    // The prune's clock is pinned to the fixture's `NOW`. Calling `append` here
+    // would age these rows against the real clock, and from 2026-09-29 (`NOW`
+    // plus the 30-day `MAX_AGE_SECS`) every row would be dropped as expired,
+    // leaving 0 instead of `ROWS_KEPT`.
+    append_at(&store, &row("session-end", Outcome::Ok), NOW).unwrap();
 
     // The newly appended row survives — it is the newest — and the file is
     // back at the bound.
