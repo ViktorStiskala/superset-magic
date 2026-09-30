@@ -1,16 +1,23 @@
 # Test suite CI, plus the plugin packaging assertions.
 #
 # Runs on every PR commit and on pushes to main. Also callable as a reusable
-# workflow: dist-workspace.toml registers it via `plan-jobs = ["./ci"]`, so the
-# cargo-dist release workflow (release.yml) invokes it as a `custom-ci` job and
-# artifact builds are gated on the suite passing (see docs/plans/
-# 2026-07-14-001-feat-ci-and-src-restructure-plan.md, KTD1).
+# workflow: dist-workspace.toml registers it via `local-artifacts-jobs =
+# ["./ci"]`, so the cargo-dist release workflow (release.yml) invokes it as a
+# `custom-ci` job, alongside the artifact builds, and the host job (the one that
+# creates the GitHub Release) publishes only if this workflow succeeded.
+#
+# It used to be a plan job (`plan-jobs`), which gated the BUILDS but not the
+# publish. A failure there skipped the builds, host read "skipped" as fine, and
+# on 2026-09-30 it published v0.11.1 and ss-magic-plugin-v1.0.0 with no assets.
+# Both releases are immutable and their tags protected, so both versions were
+# lost. `scripts/build-plugin-zip.py --check` now asserts the gate's shape in
+# release.yml.
 #
 # The `plugin` job guards the marketplace delivery path: the plugin zip's SHA-256
 # is committed into .claude-plugin/marketplace.json before the tag exists, and a
 # pin that does not match the tree it names installs nothing (or, worse, installs
-# unpinned). Because this workflow is a plan-phase job, those assertions run
-# before any release asset is built or published.
+# unpinned). When this workflow runs as the release gate, a failed assertion
+# means nothing is published, although the builds may already have run.
 #
 # The GITHUB_TOKEN stays read-only even when called from release.yml (which
 # grants contents: write): cargo test executes third-party build scripts, so
@@ -24,9 +31,15 @@ on:
   pull_request:
   push:
     branches: [main]
-  # cargo-dist invokes plan-jobs workflows with no inputs; do not declare
-  # a required `plan` input here.
+  # cargo-dist passes local-artifacts jobs the plan manifest as `plan`. The
+  # input must be declared (GitHub rejects an undeclared one: "Invalid input,
+  # plan is not defined in the referenced workflow"), but nothing here reads it,
+  # and it stays optional so the workflow can still be called without it.
   workflow_call:
+    inputs:
+      plan:
+        type: string
+        required: false
 
 # Cancel superseded runs on the same PR. Guarded so tag-triggered release
 # invocations (unique refs) never cancel each other. Workflow-level
@@ -101,9 +114,11 @@ jobs:
       # release. A prefixed CLI tag like `ss-magic-v0.11.1` builds and publishes
       # perfectly well, but the updater's anchored filter only recognises bare
       # `vX.Y.Z`, so every already-installed binary ignores that release forever
-      # -- the line is stranded with no error anywhere. This is a plan-phase job,
-      # so failing here stops the release before any artifact is built.
-      - name: Release tag shape (plan phase)
+      # -- the line is stranded with no error anywhere. On a release this job is
+      # part of the gate the host job waits for, so failing here stops the
+      # release from being published (the builds run alongside it, but nothing
+      # they produce is uploaded).
+      - name: Release tag shape
         run: |
           set -euo pipefail
           if [ "${GITHUB_REF_TYPE:-}" != "tag" ]; then

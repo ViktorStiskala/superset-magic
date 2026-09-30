@@ -18,10 +18,22 @@ installers = ["shell"]
 unix-archive = ".tar.gz"
 # We own the self-update path (self_update crate); do not install cargo-dist's axoupdater.
 install-updater = false
-# Gate releases on the test suite: run .github/workflows/ci.yml as a custom
-# plan-phase job. build-local-artifacts depends on it, so red tests mean no
-# artifacts are ever built (and hence nothing can be published).
-plan-jobs = ["./ci"]
+# Gate releases on the test suite: run .github/workflows/ci.yml as the
+# `custom-ci` job, alongside the artifact builds. This must be a
+# LOCAL-ARTIFACTS job, never a plan job. cargo-dist puts a local-artifacts job
+# in the host job's `needs` AND checks its result in host's `if`, so red tests
+# mean host is skipped and nothing is published.
+#
+# A plan job sits upstream of build-local-artifacts and appears in neither of
+# host's lists. When it fails, the builds are SKIPPED, and host's `if` reads
+# "skipped" as fine ("skipped is fine" in the cargo-dist 0.32/0.33 template).
+# So host publishes a release with no assets. That is exactly what happened to
+# v0.11.1 and ss-magic-plugin-v1.0.0 (2026-09-30): the test gate failed, both
+# releases went out holding only dist-manifest.json, and release immutability
+# plus the tag ruleset made both versions unrecoverable.
+# `scripts/build-plugin-zip.py --check` ("release gate blocks publishing")
+# asserts the generated release.yml keeps this shape.
+local-artifacts-jobs = ["./ci"]
 # After a release is announced, give the repository-wide "latest" mark back to
 # the newest CLI release if a plugin release just took it (R12). `gh release
 # create` marks whatever it published as latest, and every `ss-magic` binary
