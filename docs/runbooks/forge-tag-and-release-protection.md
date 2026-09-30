@@ -51,8 +51,8 @@ flowchart TD
   subgraph tagging["Pushing the tag"]
     C --> D["Push ss-magic-plugin-vX.Y.Z (plugin) or vX.Y.Z (CLI)"]
     D --> S["Tag ruleset checks the tagged COMMIT carries a verified signature; unsigned is refused before anything runs (R99)"]
-    S --> E["CI plan phase re-derives the digest, runs --check, and fails on a mismatch"]
-    E --> F["cargo-dist publishes that line's assets in one gh release create"]
+    S --> E["Release gate (custom-ci, a local-artifacts job the host job waits for) re-derives the digest, runs --check, and fails on a mismatch"]
+    E --> F["cargo-dist publishes that line's assets in one gh release create, only if the gate passed"]
   end
   subgraph after["After the assets exist"]
     F --> G["Release immutability freezes the assets (R100)"]
@@ -63,9 +63,10 @@ flowchart TD
 
 The marketplace digest is committed **before** the tag, because the builder can produce it from the
 working tree – and `plugin/ss-magic-plugin.version` moves with it, never after it. The pin is one of
-the files under `plugin/` the digest is computed over, and `--check` (which the CI plan phase runs)
-requires it to EQUAL the plugin crate's version, so a tag pushed from a tree whose pin still lags is
-refused before any asset is built; advancing it after the release would move the digest instead and
+the files under `plugin/` the digest is computed over, and `--check` (which the release gate runs)
+requires it to EQUAL the plugin crate's version, so a tag pushed from a tree whose pin still lags
+publishes nothing – though its version number is burned all the same (see the 2026-09-30 incident
+below); advancing it after the release would move the digest instead and
 leave the frozen zip pinning the previous binary forever. Between the bump commit and the release
 publishing, the marketplace entry's `url` names an asset that does not exist yet and the pin names a
 release that does not exist yet; both are expected and self-correcting, because an installed bootstrap
@@ -78,6 +79,24 @@ one pin that moves in a follow-up commit.
 The obvious workaround for a mis-cut release – tag, rebuild, commit the new digest, move the tag – is
 exactly what the ruleset forbids. GitHub's own documentation is blunt about it: *"Git tags cannot be
 moved."* Cut a new patch release instead.
+
+### Incident: two versions published empty (2026-09-30)
+
+These two controls did what they were built to do, and that is exactly what made the incident
+permanent. PR #7 was merged, and `v0.11.1` and `ss-magic-plugin-v1.0.0` were pushed a minute later,
+before CI on `main` had finished. The release workflow's test gate then ran as a cargo-dist
+**plan job**. It failed on a date-dependent test: fixture rows stamped 2026-08-30 were pruned
+against the real clock once they were 30 days old. The builds were skipped, and cargo-dist's `host`
+job treats a skipped build as fine. So it published both releases holding only `dist-manifest.json`.
+
+| | state after the incident |
+|---|---|
+| `v0.11.1`, `ss-magic-plugin-v1.0.0` | immutable, no assets, tags locked by the ruleset. GitHub: *"If you delete the immutable release, you can delete the tag, but you cannot reuse the same tag name."* Both version numbers are gone for good. |
+| what was done | `gh release edit v0.11.0 --latest` (the plugin release had taken the mark, and `custom-mark-latest` was skipped along with everything else after the failed gate); both empty releases marked `--prerelease` (so neither updater selects them) and retitled "(broken – no assets, do not use)", with a warning prepended to their notes. Immutability still allows editing title, notes, the pre-release flag and the latest mark. |
+| fix forward | the test was fixed, the gate became `local-artifacts-jobs = ["./ci"]` (cargo-dist puts that job in `host`'s `needs` and checks its result in `host`'s `if`), `--check` gained `release gate blocks publishing`, and the lines moved to `v0.11.2` and `ss-magic-plugin-v1.0.1`. |
+
+Two rules came out of it, both in `CONTRIBUTING.md`. Push a release tag only after CI on `main` is
+green for that exact commit. And the release gate must block the publish, not only the builds.
 
 ## R99 – the tag ruleset
 
@@ -139,9 +158,9 @@ created `2026-08-31T12:52:13+02:00`.
 Then prove it against a real tag, as the repository owner – the point of the check is that the owner
 is not exempt. Run steps 1 and 2 against **both** shapes, since a ruleset scoped to one of them would
 pass a check that only ever exercises that one – but only ever against a tag that has actually been
-published on that line. At the time of writing every published tag is on the CLI line (the newest is
-`v0.11.0`) and no plugin release has been cut at all, so the `ss-magic-plugin-v*` half of steps 1 and
-2 waits for the first plugin release: run the `v*` half now and come back for the other. Do not fill
+published on that line. When this was first written every published tag was on the CLI line, so the
+`ss-magic-plugin-v*` half of steps 1 and 2 had to wait. Since 2026-09-30 `ss-magic-plugin-v1.0.0`
+exists on origin (published empty, see the incident above), so both halves can be run. Do not fill
 in the crate's version and run it anyway. Deleting a tag that origin does not have fails with `remote ref
 does not exist`, which says nothing about the ruleset; and force-pushing one is a *creation*, which
 the ruleset deliberately permits, which the release workflow picks up as a real plugin release cut
@@ -185,7 +204,9 @@ Two disposable tags therefore exist permanently on the remote, both pointing at 
 annotated tag) and `test-unsigned-probe` (a lightweight tag that landed because the signature rule
 checks the commit, not the tag – its own delete attempt was then refused with `Cannot delete this
 tag`, which is one more confirmation). Neither is version-shaped, so neither triggered the release
-workflow. The `ss-magic-plugin-v*` half of steps 1 and 2 still waits for the first plugin release.
+workflow. The `ss-magic-plugin-v*` half of steps 1 and 2 has not been run. A plugin-line tag now
+exists (`ss-magic-plugin-v1.0.0`, published empty – see the incident above), so it can be run against
+that tag; the refusal leaves nothing changed.
 
 ## R100 – release immutability
 
@@ -247,8 +268,10 @@ gh release upload v0.11.0 ae84-junk-asset.txt
 # HTTP 422: Cannot upload assets to an immutable release.
 ```
 
-The release's 14 assets were unchanged afterwards. The plugin-line command waits for the first plugin
-release.
+The release's 14 assets were unchanged afterwards. The plugin-line upload probe has not been run. On
+2026-09-30, `gh api repos/ViktorStiskala/superset-magic/releases` reported `immutable: true` on
+`ss-magic-plugin-v1.0.0` and `v0.11.1`, the first releases cut on each line after the 2026-09-08
+check, so the setting covers the plugin line too.
 
 ## Restoring these settings
 
