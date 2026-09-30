@@ -2472,7 +2472,7 @@ dependencies = [
 
 [[package]]
 name = "ss-magic"
-version = "0.10.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "bzip2",
@@ -2485,10 +2485,40 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
- "supports-color",
+ "ss-magic-core",
  "tar",
  "tempfile",
+ "walkdir",
+]
+
+[[package]]
+name = "ss-magic-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "globset",
+ "serde",
+ "serde_json",
+ "supports-color",
+ "tempfile",
  "ureq",
+ "walkdir",
+]
+
+[[package]]
+name = "ss-magic-plugin"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "fd-lock",
+ "globset",
+ "serde",
+ "serde_json",
+ "similar",
+ "ss-magic-core",
+ "tempfile",
  "walkdir",
 ]
 

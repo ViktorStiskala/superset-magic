@@ -76,12 +76,13 @@ not on the flat match list. Replace the blind `append_dir_all` with a guarded
 entry's repo-relative path:
 
 ```rust
-fn append_dir_excluding_backups<W: Write>(
+fn append_dir_excluding_trees<W: Write>(
     builder: &mut tar::Builder<W>, root: &Path, rel: &Path, abs: &Path,
+    added: &mut HashSet<PathBuf>,
 ) -> Result<()> {
     let walker = WalkDir::new(abs).follow_links(false).into_iter()
         .filter_entry(|e| match e.path().strip_prefix(root) {
-            Ok(r) => !crate::sync::reverse_sync::under_backups_dir(r), // prunes the subtree
+            Ok(r) => !crate::sync::under_excluded_tree(r), // prunes the subtree
             Err(_) => true,
         });
     for entry in walker {
@@ -89,7 +90,10 @@ fn append_dir_excluding_backups<W: Write>(
         let name = entry.path().strip_prefix(root).unwrap_or(rel);
         let ft = entry.file_type();
         if ft.is_dir() { builder.append_dir(name, entry.path())?; }
-        else if ft.is_symlink() || ft.is_file() { builder.append_path_with_name(entry.path(), name)?; }
+        else if ft.is_symlink() || ft.is_file() {
+            builder.append_path_with_name(entry.path(), name)?;
+            added.insert(name.to_path_buf()); // feeds the unique-path count
+        }
     }
     Ok(())
 }
@@ -97,7 +101,7 @@ fn append_dir_excluding_backups<W: Write>(
 
 `filter_entry` returning `false` for a directory PRUNES it from the walk, so
 `.superset/backups/` is never descended, no matter how the ancestor match entered
-`rels`. The flat `under_backups_dir` retain is kept too (it cheaply drops leaf
+`rels`. The flat `under_excluded_tree` retain is kept too (it cheaply drops leaf
 matches before the walk), but it is no longer the only line of defense.
 
 ## Why This Works
@@ -138,4 +142,10 @@ fn excludes_backups_subtree_from_ancestor_directory_match() {
 ## Related Issues
 
 - The complementary secret gate learned the same run: [secret-gate-positive-tracked-determination-fail-closed.md](./secret-gate-positive-tracked-determination-fail-closed.md)
-- `sync/reverse_sync.rs::under_backups_dir` is the shared predicate; `pack.rs::write_archive` is the enumeration site that must honor it.
+- `sync/mod.rs::under_excluded_tree` (over the `EXCLUDED_TREES` constant) is the
+  shared predicate; `pack.rs::append_dir_excluding_trees`, called from
+  `write_archive`, is the enumeration site that must honor it. The predicate was
+  generalized after this incident: it now covers `.superset/.magic` (the plugin's
+  machine-local state), `.scratchpad` and `.git` as well as `.superset/backups`,
+  so one ancestor match such as a bare `.superset` pattern can sit above several
+  excluded trees at once.

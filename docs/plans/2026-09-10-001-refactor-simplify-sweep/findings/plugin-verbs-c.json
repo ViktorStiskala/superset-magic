@@ -1,0 +1,338 @@
+{
+  "partition": "plugin-verbs-c",
+  "findings": [
+    {
+      "id": "plugin-verbs-c-F1",
+      "category": "duplication",
+      "title": "`plural` is defined twice byte-for-byte and inlined three more times",
+      "locations": [
+        "crates/ss-magic-plugin/src/ledger.rs:1525-1531",
+        "crates/ss-magic-plugin/src/spill_index.rs:459-465",
+        "crates/ss-magic-plugin/src/compact_window.rs:513",
+        "crates/ss-magic-plugin/src/hook/session_end.rs:97",
+        "crates/ss-magic-plugin/src/status.rs:2298"
+      ],
+      "evidence": "ledger.rs:1525  fn plural(n: usize) -> &'static str {\nledger.rs:1526      if n == 1 {\nledger.rs:1527          \"\"\nledger.rs:1528      } else {\nledger.rs:1529          \"s\"\nspill_index.rs:459  fn plural(n: usize) -> &'static str {   // identical body",
+      "problem": "The English-plural suffix rule exists five times in one crate: two byte-identical private `fn plural(n: usize) -> &'static str` definitions (`ledger.rs`, `spill_index.rs`) and three inline `if x == 1 { \"\" } else { \"s\" }` expressions (`compact_window::recommend`'s basis sentence, `hook::session_end`'s heartbeat detail, `status`'s hook-row line).",
+      "proposal": "Add `crates/ss-magic-plugin/src/text.rs` with `pub(crate) fn plural(n: usize) -> &'static str` (the existing body verbatim), declare `mod text;` in `main.rs`, delete both private copies, and replace the three inline expressions with `text::plural(n)`. Every site is in the plugin crate, so the helper does not belong in `ss-magic-core` (no CLI caller exists — grepped).",
+      "behavior_preservation": "The moved body is unchanged and every call site passes the same `usize` it already tests against 1, so each produces the same `\"\"`/`\"s\"` and the same rendered line. The inline sites take `usize` fields (`sessions`, `row.files`, `status.hooks.rows`), matching the signature exactly.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F2",
+      "category": "duplication",
+      "title": "`ledger::ensure_store` is a byte-identical copy of `heartbeat::ensure_store`, for the same directory",
+      "locations": [
+        "crates/ss-magic-plugin/src/ledger.rs:1080-1089",
+        "crates/ss-magic-plugin/src/heartbeat.rs:221-230"
+      ],
+      "evidence": "ledger.rs:1080  fn ensure_store(dir: &Path) -> Result<()> {\nledger.rs:1081      if dir.is_dir() { return Ok(()); }\nledger.rs:1084      DirBuilder::new().recursive(true).mode(DIR_MODE).create(dir)\nledger.rs:1088          .with_context(|| format!(\"creating the plugin store at {}\", dir.display()))\nheartbeat.rs:221  fn ensure_store(dir: &Path) -> Result<()> {   // identical, same context string",
+      "problem": "Both functions create the SAME machine-level store directory (`ledger::record` is always handed `heartbeat::store_dir()` / `heartbeat::existing_store_dir()`), at the same mode, with the same `anyhow` context text. `ledger.rs` already imports `crate::heartbeat` (line 74), so the copy buys nothing; if the store's mode or its error wording ever changes, one of the two will be missed.",
+      "proposal": "Make `heartbeat::ensure_store` `pub(crate)` and delete `ledger::ensure_store`, calling `heartbeat::ensure_store(store)?` from `ledger::record` (ledger.rs:852). `ledger::DIR_MODE` then loses its only use in the module and can go (see F14).",
+      "behavior_preservation": "The two bodies are textually identical including the `is_dir()` short-circuit, the `recursive(true).mode(DIR_MODE)` builder and the context message; `DIR_MODE` is `0o700` in both modules. Same success value, same error type and text, same side effect.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F3",
+      "category": "duplication",
+      "title": "`ledger::transcript_root` re-implements `spill_index::projects_root`, which is public and documents the shared intent",
+      "locations": [
+        "crates/ss-magic-plugin/src/ledger.rs:1162-1170",
+        "crates/ss-magic-plugin/src/spill_index.rs:109-123"
+      ],
+      "evidence": "ledger.rs:1163      if let Ok(dir) = std::env::var(\"CLAUDE_CONFIG_DIR\") {\nledger.rs:1164          if !dir.is_empty() { return Some(PathBuf::from(dir).join(\"projects\")); }\nledger.rs:1168      let home = std::env::var(\"HOME\").ok().filter(|h| !h.is_empty())?;\nledger.rs:1169      Some(PathBuf::from(home).join(\".claude\").join(\"projects\"))\nspill_index.rs:113  /// Deliberately the same resolution `plugin::ledger` uses for transcripts —\nspill_index.rs:116  pub fn projects_root() -> Option<PathBuf> {   // identical body",
+      "problem": "`spill_index::projects_root` is `pub`, has the identical body, and its own doc comment says it is \"[d]eliberately the same resolution `plugin::ledger` uses for transcripts ... two different answers to 'where does the harness keep this' would be a bug waiting to happen\". The intent is stated but never actually shared, so the two can still drift.",
+      "proposal": "Delete `ledger::transcript_root` and call `crate::spill_index::projects_root()` at its one use site (`run_backfill`, ledger.rs:1268), keeping the `Only needed by the backfill path` note as a comment there. (If the dependency direction reads badly, hoist the body per F4 instead and have both modules call the hoisted helper.)",
+      "behavior_preservation": "The bodies are token-for-token the same — same variable names, same empty-string filtering, same `.join(\"projects\")` — so the returned `Option<PathBuf>` is identical for every environment. Neither reads anything else.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F4",
+      "category": "duplication",
+      "title": "The `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` resolution is hand-written in four modules, two of which already share `non_empty_env`",
+      "locations": [
+        "crates/ss-magic-plugin/src/compact_window.rs:363-366",
+        "crates/ss-magic-plugin/src/ledger.rs:1163-1169",
+        "crates/ss-magic-plugin/src/spill_index.rs:117-123",
+        "crates/ss-magic-plugin/src/status.rs:805-807"
+      ],
+      "evidence": "compact_window.rs:364  let config_dir = non_empty(\"CLAUDE_CONFIG_DIR\").map(PathBuf::from)\ncompact_window.rs:366      .or_else(|| non_empty(\"HOME\").map(|home| PathBuf::from(home).join(\".claude\")));\nstatus.rs:805  let config = non_empty_env(\"CLAUDE_CONFIG_DIR\").map(PathBuf::from)\nstatus.rs:807      .or_else(|| non_empty_env(\"HOME\").map(|h| PathBuf::from(h).join(\".claude\")));\nledger.rs:1163  if let Ok(dir) = std::env::var(\"CLAUDE_CONFIG_DIR\") { if !dir.is_empty() { ... } }",
+      "problem": "Four sites answer \"where is the harness's config directory\" independently. Two are the same expression written twice (`compact_window`, `status`); two more (`ledger`, `spill_index`) re-implement the same rule inline instead of using `status::non_empty_env`, which `compact_window` already reuses for exactly this idiom. The rule is one harness fact and has four owners.",
+      "proposal": "Add `pub(crate) fn harness_config_dir() -> Option<PathBuf>` beside `status::non_empty_env` (status.rs:878) with the `compact_window`/`status` expression as its body. `compact_window::Sources::from_process` uses `harness_config_dir()?.join(\"settings.json\")`; `status::locate_data_root` uses it directly; `spill_index::projects_root` becomes `Some(harness_config_dir()?.join(\"projects\"))`; `ledger::transcript_root` goes away per F3.",
+      "behavior_preservation": "`non_empty_env(name)` is `std::env::var(name).ok().filter(|v| !v.is_empty())` — exactly what the two inline copies spell out with `if let Ok(dir) ... if !dir.is_empty()` plus `.ok().filter(...)`, and the fallback joins `.claude` in both spellings. `None` is returned in the same three cases (no `CLAUDE_CONFIG_DIR` and no `HOME`, or both empty).",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F5",
+      "category": "copy-paste-variant",
+      "title": "Six `usage_error`/`fail` helpers with four different signatures, two of them argument-swapped",
+      "locations": [
+        "crates/ss-magic-plugin/src/ledger.rs:1250-1254",
+        "crates/ss-magic-plugin/src/compact_window.rs:837-849",
+        "crates/ss-magic-plugin/src/cache.rs:1006-1010",
+        "crates/ss-magic-plugin/src/config.rs:938-942",
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:1438-1459"
+      ],
+      "evidence": "ledger.rs:1250     fn usage_error(message: &str) -> Result<ExitCode> {\ncompact_window.rs:837  fn usage_error(message: &str) -> ExitCode {\ncompact_window.rs:846  fn fail(message: String) -> ExitCode {\ncache.rs:1006      fn usage_error(message: &str, usage: &str) -> Result<ExitCode> {\nconfig.rs:938      fn usage_error(usage: &str, message: &str) -> ExitCode {\nchecklist/verbs.rs:1438 fn usage_error(message: &str) -> ExitCode { ... refused() }",
+      "problem": "Every body is the same three statements — `eprintln!(style::err(\"error: {message}\"))`, `eprintln!(usage)`, exit 2 — but the crate carries four incompatible signatures for it, including `cache::usage_error(message, usage)` and `config::usage_error(usage, message)`, which take the SAME two `&str` in opposite order. A reader (or a future edit) moving between verbs has to re-derive the argument order and the return type each time, and swapping them silently prints the usage banner as the error line.",
+      "proposal": "Put `pub(crate) fn usage_error(message: &str, usage: &str) -> ExitCode` and `pub(crate) fn fail(message: &str) -> ExitCode` in the new `text.rs` from F1 (or beside `atomic`), each with the existing body and `ExitCode::from(2)`. Every verb passes its own `USAGE`/`COST_USAGE` const; the two `Result<ExitCode>` call sites become `return Ok(usage_error(msg, COST_USAGE))`; `checklist::refused()` stays as the local name for the code but the printing helpers go.",
+      "behavior_preservation": "All six write the same two lines to stderr in the same order through `style::err` and return exit code 2 (`checklist::refused()` is `ExitCode::from(2)`); only the wrapper `Ok(...)` moves from the callee to the caller, which is not observable. `compact_window::fail` takes `String` and `checklist::fail` takes `String`; both call sites already build the string with `format!`, so `&str` at the boundary prints identically.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F6",
+      "category": "hardcoded-value",
+      "title": "Two operator messages re-spell `WINDOW_KEY` and `SETTINGS_LOCAL_REL` as literals in the file that owns them",
+      "locations": [
+        "crates/ss-magic-plugin/src/compact_window.rs:658-662",
+        "crates/ss-magic-plugin/src/compact_window.rs:828-832"
+      ],
+      "evidence": "compact_window.rs:659      \"Tip: no autoCompactWindow is configured for this repository. \\\ncompact_window.rs:660       `ss-magic-plugin compact-window --recommend` sizes one from its recorded \\\ncompact_window.rs:829          \"Nothing was written. `--set` is the only write this verb makes, and only to \\\ncompact_window.rs:830           .claude/settings.local.json.\"",
+      "problem": "`WINDOW_KEY` (line 118) and `SETTINGS_LOCAL_REL` (line 89) are defined in this same file and interpolated everywhere else that names them (`run_core` at 250/264/266, `render_text`'s section header at 783), but these two messages hand-type the values. `enable_tip` additionally wraps a placeholder-free string in `format!`, which is what hides that it could have interpolated.",
+      "proposal": "In `enable_tip`, change the literal to `format!(\"Tip: no {WINDOW_KEY} is configured for this repository. ...\")`. In `render_text`, wrap the closing line in `format!` so it ends `... and only to {SETTINGS_LOCAL_REL}.\"`. Consider making `WINDOW_KEY` `pub(crate)` so `status.rs:1051` and `hook/session_start.rs:219`, which also hand-type `autoCompactWindow`, can stop doing so (separate partitions).",
+      "behavior_preservation": "`WINDOW_KEY` is exactly `\"autoCompactWindow\"` and `SETTINGS_LOCAL_REL` exactly `\".claude/settings.local.json\"`, so both interpolations render byte-identical strings; `style::info` receives the same text. `format!` versus a `&'static str` is invisible to `style::info`, which takes `impl Display`/`AsRef<str>` at both existing call sites.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F7",
+      "category": "hardcoded-value",
+      "title": "The `USAGE` banner hand-types the window bounds and both settings paths that are consts three lines above it",
+      "locations": [
+        "crates/ss-magic-plugin/src/compact_window.rs:134-152",
+        "crates/ss-magic-plugin/src/compact_window.rs:123-125"
+      ],
+      "evidence": "compact_window.rs:143  --set writes an absolute auto-compact window (100000-1000000 tokens) into\ncompact_window.rs:144  this repository's local, gitignored settings file (.claude/settings.local.json),\ncompact_window.rs:123  const WINDOW_MIN: u64 = 100_000;\ncompact_window.rs:125  const WINDOW_MAX: u64 = 1_000_000;\ncompact_window.rs:199  \"`{window}` is outside the allowed range {WINDOW_MIN}-{WINDOW_MAX} tokens\"",
+      "problem": "The runtime error `parse_args` produces interpolates `{WINDOW_MIN}-{WINDOW_MAX}`, but the usage banner a person actually reads next to it hand-types `100000-1000000` (and `.claude/settings.local.json`, `.claude/settings.json`, `autoCompactWindow`). A `const &str` cannot interpolate, so changing a bound would leave the banner contradicting the refusal it is printed beside.",
+      "proposal": "Replace the const with `fn usage() -> String` containing the same text as a `format!` with `{WINDOW_MIN}`, `{WINDOW_MAX}`, `{SETTINGS_LOCAL_REL}`, `{SETTINGS_PROJECT_REL}` and `{WINDOW_KEY}` placeholders, and update its two call sites (`run`'s Help arm at line 168 and `usage_error` at line 839) to `println!(\"{}\", usage())` / `eprintln!(\"{}\", usage())`. No test references `USAGE` (grepped), so nothing else moves.",
+      "behavior_preservation": "The interpolated values are exactly the literals in the banner today (`100_000` prints as `100000`, `1_000_000` as `1000000`, and the two path consts and the key const are the same strings), so both call sites emit byte-identical output on the same stream.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F8",
+      "category": "hardcoded-value",
+      "title": "A bare `64 * 1024` line buffer sits beside the named `READ_BUF_BYTES` in the same scan pipeline",
+      "locations": [
+        "crates/ss-magic-plugin/src/ledger.rs:683",
+        "crates/ss-magic-plugin/src/ledger.rs:551-555"
+      ],
+      "evidence": "ledger.rs:683      let mut buf = Vec::with_capacity(64 * 1024);\nledger.rs:551  const HEAD_SCAN_BYTES: usize = 256;\nledger.rs:554  /// Read buffer per transcript file. Large enough that a 400 MB tree ...\nledger.rs:555  const READ_BUF_BYTES: usize = 256 * 1024;",
+      "problem": "The module names every other tuning number (`HEAD_SCAN_BYTES`, `READ_BUF_BYTES`, `PRUNE_TRIGGER_BYTES`'s peers in `heartbeat`), but the per-line `Vec` capacity — the second-largest allocation in the hot scan — is an unexplained literal four times smaller than the reader capacity two functions above it.",
+      "proposal": "Add `const LINE_BUF_BYTES: usize = 64 * 1024;` immediately after `READ_BUF_BYTES` with a one-line doc saying it is the starting capacity for one transcript line (it grows for a larger one), and use it at line 683.",
+      "behavior_preservation": "A named const with the same value produces the same `Vec::with_capacity` argument; capacity is not observable in output and the vector still grows on demand for longer lines.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F9",
+      "category": "efficiency",
+      "title": "`rows_for_repository` resolves every root in the whole ledger before truncating to 20 rows",
+      "locations": [
+        "crates/ss-magic-plugin/src/ledger.rs:421-429"
+      ],
+      "evidence": "ledger.rs:421      let mut rows: Vec<Row> = read(store)?\nledger.rs:423          .filter(|row| row.peak_context_tokens.is_some())\nledger.rs:424          .filter(|row| row.root.iter().chain(row.also_roots.iter()).any(&mut belongs))\nledger.rs:427      rows.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.session_id.cmp(&b.session_id)));\nledger.rs:428      rows.truncate(limit);",
+      "problem": "`belongs` runs `root_belongs_to` — an `is_dir()` plus `git::discover::roots`, a filesystem walk that falls back to two `git` subprocesses when the walk declines — once per DISTINCT root in the entire ledger, including every root belonging to other repositories and every ancient row that the `truncate(limit)` (20, from `compact_window::RECOMMEND_ROWS`) throws away. On a machine with a long history across many repositories that is a walk (or a `git` spawn) per foreign worktree on every `--recommend` and every `status`.",
+      "proposal": "Reorder to cheap-filter, sort, then resolve lazily: collect the `peak_context_tokens.is_some()` rows, `sort_by` the same comparator, then `into_iter().filter(|row| row.root.iter().chain(row.also_roots.iter()).any(&mut belongs)).take(limit).collect()`. The memoizing `resolved` map stays as is.",
+      "behavior_preservation": "The comparator is a total order over the rows (ts, then session id, which is the ledger's unique key), so filtering a sorted sequence and taking the first `limit` yields the same rows in the same order as sorting a filtered sequence and truncating. Only the number of `git::discover::roots` calls drops; the returned `Vec<Row>` is identical, and no other side effect exists (discovery is read-only).",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F10",
+      "category": "efficiency",
+      "title": "`--recommend` reads and parses each project settings file twice per run",
+      "locations": [
+        "crates/ss-magic-plugin/src/compact_window.rs:566-582",
+        "crates/ss-magic-plugin/src/compact_window.rs:676-679"
+      ],
+      "evidence": "compact_window.rs:570      .chain([root.join(SETTINGS_PROJECT_REL), root.join(SETTINGS_LOCAL_REL)])\ncompact_window.rs:576      if let Some(value) = env_value_in(&file) {\ncompact_window.rs:676  let override_ = detect_override(root, sources);\ncompact_window.rs:677  let local = read_window(root, SETTINGS_LOCAL_REL);\ncompact_window.rs:678  let project = read_window(root, SETTINGS_PROJECT_REL);",
+      "problem": "`detect_override` reads and JSON-parses `.claude/settings.json` and `.claude/settings.local.json` through `env_value_in` -> `read_settings_object`, and `recommend_report` then reads and parses the same two files again through `read_window`. Four reads where two would do, and the two halves of the report can disagree if the file changes between them.",
+      "proposal": "Inside `recommend_report`, parse each of the two project files once (a small `HashMap<PathBuf, ExistingSettings>` or two locals) and pass the parsed `ExistingSettings` to both consumers: split `read_window` into the current path-taking wrapper plus `window_from(rel, &ExistingSettings) -> WindowSetting`, and give `detect_override` an equivalent `env_value_from(&ExistingSettings)`. `window_configured`, `enable_tip` and `status` keep the path-taking wrappers unchanged.",
+      "behavior_preservation": "`read_settings_object` is pure with respect to the file's bytes, so one read feeding both consumers yields the same `WindowSetting` and the same `OverrideLocation` list, including the note text for a malformed or non-object file. Impact is modest (a human verb over two small files); the consistency gain is the real point.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F11",
+      "category": "efficiency",
+      "title": "`read_settings_object` pre-checks existence instead of handling `NotFound`, unlike `ledger::read` next door",
+      "locations": [
+        "crates/ss-magic-plugin/src/compact_window.rs:296-300",
+        "crates/ss-magic-plugin/src/ledger.rs:378-382"
+      ],
+      "evidence": "compact_window.rs:297      if !path.exists() {\ncompact_window.rs:298          return Ok(ExistingSettings::Absent);\ncompact_window.rs:300      let raw = fs::read_to_string(path).with_context(|| format!(\"reading {}\", path.display()))?;\nledger.rs:380      Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),\nledger.rs:381      Err(e) => return Err(e).with_context(|| format!(\"reading {}\", path.display())),",
+      "problem": "Check-then-act: an extra `stat` per call (four per `--recommend`, see F10) and the classic TOCTOU shape — a file removed between `exists()` and the read surfaces as a hard `Err` rather than `Absent`. `ledger::read`, in this same partition, already does it the other way and is the pattern to copy.",
+      "proposal": "Drop the `exists()` branch and match on the read: `match fs::read_to_string(path) { Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ExistingSettings::Absent), Err(e) => return Err(e).with_context(...), Ok(raw) => raw }`, then parse as today.",
+      "behavior_preservation": "For every non-racing input the answer is unchanged: an absent file yields `Absent` either way, and a present file takes the same read-and-parse path with the same context message (a directory or a permission error still reports `reading <path>`). The only difference is the racing removal, which becomes `Absent` instead of an I/O error — the same answer the pre-check would have given a moment earlier.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F12",
+      "category": "duplication",
+      "title": "The same `BTreeSet<String>` to comma-list chain is written twice in `report`, cloning every element",
+      "locations": [
+        "crates/ss-magic-plugin/src/ledger.rs:1462-1467",
+        "crates/ss-magic-plugin/src/ledger.rs:1494-1499"
+      ],
+      "evidence": "ledger.rs:1462          group.branches\nledger.rs:1464              .iter()\nledger.rs:1465              .cloned()\nledger.rs:1466              .collect::<Vec<_>>()\nledger.rs:1467              .join(\", \")\nledger.rs:1494          group.unpriced.iter().cloned().collect::<Vec<_>>().join(\", \")",
+      "problem": "Two identical five-link chains thirty lines apart render a `BTreeSet<String>` as a comma-separated list, each allocating a clone of every string only to drop it after the join.",
+      "proposal": "Add `fn comma_list(items: &BTreeSet<String>) -> String { items.iter().map(String::as_str).collect::<Vec<_>>().join(\", \") }` beside `plural`/`compact` at the end of `ledger.rs`, and call it from both sites (the `branches` site keeps its `if group.branches.is_empty() { \"-\" }` arm).",
+      "behavior_preservation": "`BTreeSet` iteration order is unchanged, so the joined string is byte-identical; `join` over `Vec<&str>` produces the same bytes as over `Vec<String>`, and the clones were never observed.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F13",
+      "category": "copy-paste-variant",
+      "title": "Two `.json` writers pass a `.jsonl` temp suffix copied from the ledger writer",
+      "locations": [
+        "crates/ss-magic-plugin/src/ledger.rs:354-362",
+        "crates/ss-magic-plugin/src/ledger.rs:1154"
+      ],
+      "evidence": "ledger.rs:355      &store.join(OFFSETS_FILE_NAME),          // \"transcript-offsets.json\"\nledger.rs:357      \".offsets-\",\nledger.rs:358      \".jsonl\",\nledger.rs:1146     let path = dir.join(format!(\"{PRICE_TABLE_VERSION}.json\"));\nledger.rs:1154     atomic::write_atomically(&path, &body, \".prices-\", \".jsonl\", None, Some(FILE_MODE), false)",
+      "problem": "`write_offsets` writes `transcript-offsets.json` and `snapshot_prices` writes `prices/<version>.json`, but both stage through a temp file suffixed `.jsonl` — the suffix `replace_row` correctly uses for `cost.jsonl`, copied to two files that are plain JSON. Anyone debugging a leftover temp file (or writing a cleanup glob) is told the wrong format.",
+      "proposal": "Pass `\".json\"` as the suffix at ledger.rs:358 and ledger.rs:1154; leave `replace_row`'s `\".jsonl\"` (ledger.rs:1127) alone.",
+      "behavior_preservation": "The suffix only names the `tempfile::Builder` staging file, which is renamed onto the target before the call returns; the final path, bytes and mode are unchanged, and no test asserts on a temp name (grepped for `.offsets-` / `.prices-`).",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F14",
+      "category": "const-location",
+      "title": "`DIR_MODE`/`FILE_MODE` are redeclared in ten modules, and `FILE_MODE` names two different values",
+      "locations": [
+        "crates/ss-magic-plugin/src/ledger.rs:98-101",
+        "crates/ss-magic-plugin/src/compact_window.rs:127-132",
+        "crates/ss-magic-plugin/src/setup_ci.rs:84",
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:105-111"
+      ],
+      "evidence": "ledger.rs:100  const DIR_MODE: u32 = 0o700;\nledger.rs:101  const FILE_MODE: u32 = 0o600;\nsetup_ci.rs:84  const FILE_MODE: u32 = 0o644;\ncompact_window.rs:132  const NEW_FILE_MODE: u32 = 0o644;\nchecklist/verbs.rs:111  const NEW_FILE_MODE: u32 = 0o644;",
+      "problem": "`DIR_MODE = 0o700` appears in 8 modules and `FILE_MODE = 0o600` in 8 (bypass, cache, expect_artifact, heartbeat, ledger, scratchpad, tmproot, hook/{file_changed,pre_compact,subagent_stop}) — every copy expressing the one \"machine-local state is owner-only\" rule. Worse, `setup_ci::FILE_MODE` is `0o644`, so the SAME name means two different modes depending on the file you are reading, while the same 0o644 is called `NEW_FILE_MODE` in `compact_window` and `checklist::verbs`.",
+      "proposal": "Declare the three modes once beside the shared writer they are all passed to — `atomic.rs` — as `pub(crate) const OWNER_DIR_MODE: u32 = 0o700; pub(crate) const OWNER_FILE_MODE: u32 = 0o600; pub(crate) const COMMITTED_FILE_MODE: u32 = 0o644;`, and have every module import them instead of redeclaring. `setup_ci`'s `FILE_MODE` becomes `COMMITTED_FILE_MODE`, removing the name collision.",
+      "behavior_preservation": "Every replacement is the same octal value the module already used, passed to the same `DirBuilder::mode` / `atomic::write_atomically` argument, so every created file and directory keeps its current permissions. This is a rename, not a change of policy — the owner-only modes stay owner-only.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F15",
+      "category": "dead-code",
+      "title": "Nine `pub` items in these two verbs have no consumer outside their own module",
+      "locations": [
+        "crates/ss-magic-plugin/src/ledger.rs:82-90",
+        "crates/ss-magic-plugin/src/ledger.rs:109",
+        "crates/ss-magic-plugin/src/ledger.rs:368",
+        "crates/ss-magic-plugin/src/ledger.rs:454",
+        "crates/ss-magic-plugin/src/compact_window.rs:105-115"
+      ],
+      "evidence": "ledger.rs:86   pub const OFFSETS_FILE_NAME: &str = \"transcript-offsets.json\";\nledger.rs:90   pub const PRICES_DIR_NAME: &str = \"prices\";\nledger.rs:109  pub const PRICE_TABLE_VERSION: &str = \"2026-06-24\";\nledger.rs:368  pub fn ledger_path(store: &Path) -> PathBuf {\nledger.rs:454  pub fn transcript_tree(transcript: &Path) -> Vec<PathBuf> {\ncompact_window.rs:105  pub const RECOMMEND_ROWS: usize = 20;",
+      "problem": "A grep for each symbol outside its own file finds nothing in production code: `OFFSETS_FILE_NAME`, `PRICES_DIR_NAME`, `PRICE_TABLE_VERSION`, `ledger_path`, `transcript_tree`, `RECOMMEND_ROWS` and `RECOMMEND_SCHEMA_VERSION` are used only inside their module (and the sibling `tests.rs`, which reaches private items anyway). `LEDGER_FILE_NAME` and `read` have exactly one outside consumer each, and both are test modules (`compact_window/tests.rs`, `hook/session_end/tests.rs`), so `pub(crate)` is the widest they need. The `pub` surface reads as a promise of an external contract this binary crate cannot have.",
+      "proposal": "Make `OFFSETS_FILE_NAME`, `PRICES_DIR_NAME`, `PRICE_TABLE_VERSION`, `ledger_path`, `transcript_tree`, `RECOMMEND_ROWS` and `RECOMMEND_SCHEMA_VERSION` private (`const`/`fn` with no visibility modifier), and narrow `LEDGER_FILE_NAME` and `read` to `pub(crate)`. Leave `record`, `rows_for_repository`, `Ingest`, `Recorded`, `Row`, `Tokens`, `Basis`, `run`, `recommend_report`, `Sources` and `OVERRIDE_ENV` as they are — those have real cross-module callers.",
+      "behavior_preservation": "This is a binary crate with no downstream consumers, so no item is reachable from outside; a sibling `tests.rs` sees its parent module's private items regardless. Nothing about the compiled behavior changes — `cargo build --workspace` and `cargo test --workspace` are the check.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-c-F16",
+      "category": "const-location",
+      "title": "The crate's timestamp helpers live in `scratchpad` and are imported by a dozen unrelated modules",
+      "locations": [
+        "crates/ss-magic-plugin/src/ledger.rs:75",
+        "crates/ss-magic-plugin/src/heartbeat.rs:51",
+        "crates/ss-magic-plugin/src/release_check.rs:44",
+        "crates/ss-magic-plugin/src/spill_index.rs:43",
+        "crates/ss-magic-plugin/src/checklist/schema.rs:76"
+      ],
+      "evidence": "ledger.rs:75   use crate::scratchpad::{format_rfc3339, now_secs};\nheartbeat.rs:51  use crate::scratchpad::format_rfc3339;\nrelease_check.rs:44  use crate::scratchpad::format_rfc3339;\nspill_index.rs:43  use crate::scratchpad::format_rfc3339;\nchecklist/schema.rs:76  use crate::scratchpad::format_rfc3339;",
+      "problem": "`format_rfc3339` and `now_secs` are general clock helpers, but they are owned by `scratchpad`, whose subject is the `.superset/.magic/` state tree. Twelve modules — the ledger, the heartbeat, the release check, the spill index, the checklist, four hook handlers, status, cache, bypass, expect_artifact — reach into that module for a time format they have nothing else to do with, which makes `scratchpad` look like a dependency of half the crate.",
+      "proposal": "Move `format_rfc3339` and `now_secs` verbatim into the `text.rs` proposed in F1 (or a dedicated `clock.rs`), re-export them from `scratchpad` for one change if a big-bang import rewrite is unwanted, and update the `use` lines. No body changes.",
+      "behavior_preservation": "A pure move of two functions with no state; every caller gets the same formatting and the same `SystemTime`-derived seconds. The risk is purely mechanical (import churn), which the compiler catches.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 2 (standard-library or runtime primitives): the candidates here are not behavior-equivalent. `ledger::contains` (ledger.rs:807) has no stable std byte-slice substring search, and it deliberately runs on the raw 256-byte head BEFORE the UTF-8 check, so `str::contains` cannot replace it. `group_rows`'s `partial_cmp(...).unwrap_or(Equal)` (ledger.rs:1393-1395) is NOT `f64::total_cmp` — they order NaN differently. `hashing`'s hand-rolled SHA-256 and FNV-1a are pinned by structure-pins.",
+    "Rubric 1 item 3 (platform / framework / downstream guarantees): nothing in these two verbs hand-maintains a guarantee the platform already owns. The atomic-write, fd-lock and gitignore guarantees are already delegated to `atomic::write_atomically`, `tmproot::with_lock` and `gitignore::ensure_path_ignored`.",
+    "Rubric 2 item 2 (parameter sprawl): `compact_window::Sources` and the `recommend_report(root, main_root, store, sources)` seam are pinned testability seams; `ledger::Ingest` is the same shape. Nothing else grew a parameter.",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable — no component-tree UI framework in this crate (the plugin links neither `ratatui` nor `inquire`).",
+    "Rubric 2 item 7 (nested conditionals 3+ deep): the deepest nesting in either file is two levels (`plan_starts`'s match inside a match, `read_usage`'s `if let` chain), each with a documented reason.",
+    "Rubric 2 item 8 (unnecessary comments): every comment in both files states a rule, a measurement or an invariant (why the head is scanned before the JSON parse, why cost-state is a floor, why an explicit null is not a value). None restates the code or narrates a change, and the plan ids that do appear (R25, R26, AE31, AE33, KTD11) are each followed by the explanation the convention asks for.",
+    "Rubric 2 item 10 (context-dependent vocabulary): the vocabulary is consistent with CONCEPTS.md and CLAUDE.md — store, ledger, row, worktree root, main checkout, peak context, window.",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): the two backward-compatible readers here are deliberate and still needed — `read_usage`'s flat `cache_creation_input_tokens` fallback for older transcripts, and `Row::peak_context_tokens` being `Option` for rows written before the field existed. Both are consumed by shipped data on disk, not superseded within this branch.",
+    "Rubric 3 item 2 (missed concurrency): the scans are already sequential by design (the expensive scan runs outside the lock, the commit inside it), and parallelising a directory walk over a session's transcripts would change ordering and the hook's process footprint.",
+    "Rubric 3 item 4 (recurring no-op updates): no polling, event or reducer loop in either module.",
+    "Rubric 3 item 6 (memory): both stores are bounded — the ledger holds one row per session id (`replace_row` keeps it that way) and the scan reads line by line into a reused buffer rather than slurping a transcript.",
+    "Test helpers duplicating core's `testutil`: none. `compact_window/tests.rs` already uses `testutil::{exit_code_to_u8, init_main_repo}`; its remaining helpers (`fixture`, `read_local_settings`, `gitignore_contents`, `ledger_row`, `store_with`, `sources_with_home`, `snapshot`) build shapes `testutil` does not provide."
+  ]
+}

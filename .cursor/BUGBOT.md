@@ -13,60 +13,140 @@ conventions change.
 
 ## Tech Stack
 
-Standalone interactive Rust CLI (binary: `ss-magic`; repo:
-`ViktorStiskala/superset-magic`). Edition 2021. Key dependencies: `anyhow`
-(errors), `inquire` (interactive prompts), `ratatui` + `crossterm` (the
-full-screen bidirectional sync merge cockpit; `crossterm` also backs `inquire`),
-`similar` (line/word diffing for the diff model and merge assembly),
-`globset` + `walkdir` (pattern
-matching), `serde`/`serde_json` (config I/O), `tempfile` (atomic staging),
-`tar` + `bzip2` (pack archives), `self_update` + `ureq` + `fd-lock`
-(self-update and the plugin's advisory locks), `directories` (the plugin's
-machine-level data dir), `supports-color` (palette). No `clap` (the arg parser is
-hand-rolled) and no `git2` (all git/gh is shelled out). Hashing is in-crate
-(`src/hashing.rs`: FNV-1a plus a hand-rolled SHA-256) – flag the addition of a
-hashing crate for these uses. Release binaries are
-built by cargo-dist (`dist-workspace.toml`) and self-update from GitHub
-Releases. Tests use `tempfile` + shell-invoked `git init` / `git worktree add`.
+Rust, edition 2021, repo `ViktorStiskala/superset-magic`. The repository is a
+Cargo **workspace with three members**: the root `Cargo.toml` is a virtual
+manifest (no `[package]`) that owns `[workspace.package]` and both build
+profiles (`[profile.release]` with `opt-level = "z"` – a measured size/speed
+decision that applies to every member, flag a per-crate override – and
+`[profile.dist]` inheriting it), and the crates live under `crates/`:
 
-The binary also carries a **Claude Code plugin** (`src/plugin/`, exposed as
-`ss-magic plugin <VERB>`), shipped as a packaged tree under `plugin/` and pinned
-by SHA-256 in `.claude-plugin/marketplace.json`. Two non-Rust pieces are part of
-the product, not tooling: `scripts/build-plugin-zip.py` (python3; the
-reproducible zip builder and the release assertions) and
-`plugin/hooks/bootstrap.sh` + `scripts/test-bootstrap.sh` (bash 3.2 – macOS's
-version, so no associative arrays, no `mapfile`, no `${var^^}`).
+- `crates/ss-magic-core` – library `ss-magic-core`, crate name
+  `ss_magic_core`, `publish = false` plus `[package.metadata.dist] dist =
+  false`, version `0.1.0`, never a release surface and never tagged.
+- `crates/ss-magic` – binary `ss-magic`, the interactive sync CLI. Releases on
+  bare `vX.Y.Z` tags.
+- `crates/ss-magic-plugin` – binary `ss-magic-plugin`, the Claude Code plugin's
+  hook runtime and verb tree. Releases on `ss-magic-plugin-vX.Y.Z` tags.
+
+**The plugin's inability to self-update or open a TUI is STRUCTURAL.** Neither
+`crates/ss-magic-plugin/Cargo.toml` nor `crates/ss-magic-core/Cargo.toml` may
+declare `self_update`, `inquire` or `ratatui`, in any dependency table, under
+any rename – core counts because the plugin links it, so a dependency added
+there reaches the plugin transitively and the guarantee is gone without the
+plugin's own manifest changing a line. Flag any of the three appearing in
+either manifest. A `cargo build` proves a dependency is PRESENT and can say
+nothing about one being ABSENT, so the absence is asserted mechanically by
+`python3 scripts/build-plugin-zip.py --check` and by
+`cargo tree --locked -p ss-magic-plugin -i <crate>` in CI – flag a change that
+drops either assertion.
+
+**`ss-magic` has NO `plugin` subcommand.** The token was deleted outright when
+the plugin became its own binary: no alias, no redirect, no deprecation shim.
+`ss-magic plugin` now takes the ordinary unknown-subcommand path. Flag any
+reintroduction of the token in `cli.rs`, and flag any prose or model-facing
+string spelling a plugin verb as a subcommand of `ss-magic`.
+
+Module paths below are written relative to a crate's `src/`. Core owns `git/`,
+`hashing.rs`, `style.rs` (palette and color decision only), the pure half of
+`sync/` (`mod.rs`, `pattern.rs`, `repo_scan.rs`, `apply.rs`),
+`superset_files.rs`, `reponame.rs`, `state_tree.rs`, `release.rs` and
+`testutil.rs`. The CLI re-exports core's modules under the names it used before
+the split (`crate::git`, `crate::hashing`, `crate::tui::style`,
+`crate::sync::apply`, `crate::workspace::superset_files`); the plugin crate
+does the same for `crate::git` and `crate::hashing` only, and reaches the rest
+by their real paths – `ss_magic_core::style` (never `crate::tui::style`, which
+does not exist there) and `ss_magic_core::reponame::repo_name_stem` (never
+`crate::pack`). Flag a plugin-crate path that reaches into the CLI's module
+names; the two binaries share core, not each other.
+
+Key dependencies: `anyhow` (errors), `inquire` (interactive prompts, CLI only),
+`ratatui` + `crossterm` (the full-screen bidirectional sync merge cockpit, CLI
+only; `crossterm` also backs `inquire`), `similar` (line/word diffing for the
+diff model and merge assembly), `globset` + `walkdir` (pattern matching),
+`serde`/`serde_json` (config I/O), `tempfile` (atomic staging), `tar` + `bzip2`
+(pack archives), `self_update` (CLI only) + `ureq` + `fd-lock` (self-update and
+the plugin's advisory locks), `directories` (the plugin's machine-level data
+dir), `supports-color` (palette). No `clap` (the arg parsers are hand-rolled)
+and no `git2` (every git/gh COMMAND is shelled out; the one filesystem-only
+exception is core's `git/discover.rs`, below). Hashing is in-crate (core's
+`hashing.rs`: FNV-1a plus a hand-rolled SHA-256) – flag the addition of a
+hashing crate for these uses. Release binaries are built by cargo-dist
+(`dist-workspace.toml` plus per-package `[package.metadata.dist]` tables); only
+`ss-magic` self-updates from GitHub Releases. Tests use `tempfile` +
+shell-invoked `git init` / `git worktree add`.
+
+The plugin also ships as a packaged tree under `plugin/`, pinned by SHA-256 in
+`.claude-plugin/marketplace.json`. Two non-Rust pieces are part of the product,
+not tooling: `scripts/build-plugin-zip.py` (python3; the reproducible zip
+builder and the release assertions) and `plugin/hooks/bootstrap.sh` +
+`plugin/hooks/run-hook.sh` + `plugin/bin/ss-magic-plugin` +
+`plugin/lib/*.sh` + `scripts/test-bootstrap.sh` (bash 3.2 – macOS's version, so
+no associative arrays, no `mapfile`, no `${var^^}`).
 
 ## No External Process Libraries
 
-- **All `git` and `gh` interaction shells out via `std::process::Command`** —
+- **All `git` and `gh` COMMANDS shell out via `std::process::Command`** –
   there is NO `git2`/`libgit2`. Flag any addition of `git2`, `gix`, or another
   git-binding crate to `Cargo.toml`. The shared entry point is the `git_raw`
-  helper in `src/git/mod.rs` (surfaces stderr verbatim); `git` and `git_optional`
+  helper in core's `git/mod.rs` (surfaces stderr verbatim); `git` and `git_optional`
   are thin one-liners on top. Flag new git/gh calls that spawn `Command`
   directly instead of routing through these helpers.
-- **The CLI arg parser is hand-rolled in `src/cli.rs`** — there is NO `clap`.
-  `parse(&[String]) -> Parsed` selects the command from the first non-flag
-  token; `Command` is `{ Bare, Sync { no_backup }, ReverseSync { no_backup },
-  Pack, Update }`, and `Parsed` additionally carries `Init(Vec<String>)`,
-  `Plugin(Vec<String>)`, `Version`, `Help` and `Error(token)`.
-  `sync`/`reverse-sync` read the `-n`/`--no-backup` flag via a
-  full-argv scan (`has_no_backup`, position-independent – before OR after the
-  subcommand), an intentional asymmetry with `-h`/`--help` (a terminal
+- **Core's `git/discover.rs` is the ONE filesystem-only reduction of git
+  behavior, and it is bounded.** It answers exactly two read-only probes –
+  `git rev-parse --show-toplevel` and `--git-common-dir` – by walking the
+  filesystem, for the plugin crate only: the hook pipeline (where spawning
+  nothing is the point), plus the two read-only verbs that attribute ledger
+  rows to a repository – `compact-window --recommend` and the `cost` ledger's
+  `rows_for_repository`. The CLI's own commands keep the subprocess probes.
+  Flag: (1) any caller in the `ss-magic` CLI crate or in core itself;
+  (2) anything in `discover.rs` that reads refs, the index, or writes –
+  resolving `HEAD` to a branch, reading `packed-refs`, parsing more of the
+  config than the format check (`core.bare`, `core.worktree`,
+  `repositoryformatversion`, `[extensions]`) – that belongs in a subprocess;
+  (3) any change that turns an `Undecided` into a `Found`, or alters what a
+  `Found` returns, without a matching real-git scenario added to the
+  equivalence matrix in core's `git/discover/tests.rs`. The invariant is that a
+  fast answer is byte-equal to git's or there is none: widening the
+  `Undecided` set is always safe, narrowing it never is without measurement.
+- **A test that changes the process environment must not use `set_var` for a
+  variable a concurrent test's `git` child could inherit** (`PATH`, `GIT_*`).
+  The suite runs multithreaded and a lock around the setter does not stop
+  other threads' children from inheriting the value. Flag such tests unless
+  they run the assertion in a child process via
+  `ss_magic_core::testutil::run_ignored_test_in_child`. `HOME` under `ENV_LOCK`
+  in the checklist-deny tests is the tolerated exception (no concurrent child
+  misreads it).
+- **Both arg parsers are hand-rolled** – there is NO `clap` in either binary.
+  The CLI's is `cli.rs`: `parse(&[String]) -> Parsed` selects the command from
+  the first non-flag token; `Command` is `{ Bare, Sync { no_backup },
+  ReverseSync { no_backup }, Pack, Update }`, and `Parsed` additionally carries
+  `Init(Vec<String>)`, `Version`, `Help` and `Error(token)` – there is no
+  `Plugin` variant any more. `sync`/`reverse-sync` read the `-n`/`--no-backup`
+  flag via a full-argv scan (`has_no_backup`, position-independent – before OR
+  after the subcommand), an intentional asymmetry with `-h`/`--help` (a terminal
   short-circuit recognized only BEFORE the subcommand). Flag any addition of
   `clap`/`structopt`/`argh`, command dispatch logic added outside `cli.rs`, or a
   "fix" that makes `has_no_backup` and the `--help` scan match each other.
-- **Three deliberate parse asymmetries protect the plugin, and must not be
-  "harmonised".** (1) `Parsed::Plugin` carries the remaining argv VERBATIM,
-  flags included – unlike `Init`, which filters them – because the plugin verbs
-  take their own `--json`/`--local`/`--set`. (2) `version_requested` scans PAST a
-  subcommand token, so `ss-magic sync --version` prints the version; without
-  that, an unrecognized `--version` is skipped as an unknown flag and falls
-  through to `Command::Bare`, which IS update-gated and opens the interactive
-  menu – exactly wrong when a hook shells out to identify the binary. (3) That
-  same scan STOPS at the `plugin` token, because a `-V` after it may be a verb's
-  own flag. Flag a change that filters `Parsed::Plugin`'s argv, that stops the
-  `--version` scan at the subcommand, or that lets it run past `plugin`.
+- **The CLI's `--version` scan runs PAST a subcommand token, and must keep
+  doing so.** `ss-magic sync --version` prints the version; without that, an
+  unrecognized `--version` is skipped as an unknown flag and falls through to
+  `Command::Bare`, which IS update-gated and opens the interactive menu –
+  exactly wrong when a script shells out to identify the binary. The scan used
+  to STOP at a `plugin` token so a `-V` belonging to a plugin verb was not
+  swallowed; that token no longer exists, and re-adding either the token or the
+  stop is a regression. Flag a change that stops the `--version` scan at the
+  subcommand, or that reintroduces `plugin` handling in `cli.rs`.
+- **The plugin binary's own parse is separate and deliberately stricter.**
+  `crates/ss-magic-plugin/src/main.rs::parse` recognizes `-V`/`--version` and
+  `-h`/`--help` only as the FIRST token, because every verb parses its own
+  arguments and a whole-argv scan would swallow one of them. `-V`/`--version`
+  must print `ss-magic-plugin <version>` on ONE line and exit 0, ahead of verb
+  parsing: `hooks/bootstrap.sh` gates every install on
+  `"$staged_bin" --version | head -1 | awk '{print $NF}'` equalling the pin, and
+  `status` probes the same shape for drift. A flag that answered with usage text
+  or a non-zero exit would make the bootstrap discard every download it made.
+  Flag a change to that line's shape, to the version's position on it, or to the
+  first-token-only rule.
 
 ## Architecture: Layering (pure logic vs interactive layer)
 
@@ -79,22 +159,32 @@ isolation from the interactive TUI. Preserve this boundary.
   scan), `git/gitignore.rs` (`.gitignore` helpers), `sync/merge.rs` (the
   push/pull/merge decision model and per-hunk merge assembly), `tui/diffmodel.rs`
   (the diff-to-rows model powering the cockpit's diff pane), `hashing.rs`
-  (FNV-1a + SHA-256), and effectively all of `src/plugin/` – the plugin's parse
-  (`plugin/mod.rs`), its state modules, its hook handlers, and the whole
-  `plugin/checklist/` family (schema, canonical ordering, validator, renderer,
+  (FNV-1a + SHA-256), `reponame.rs` (the repo-name stem), `state_tree.rs`
+  (the `.superset/.magic` constant and its gitignore rule; a core test pins the
+  constant equal to the `sync::EXCLUDED_TREES` entry – flag a change to one
+  side without the other), and effectively all of the plugin crate – its parse
+  (the crate root `main.rs`), its state modules, its hook handlers, and the whole
+  `checklist/` family (schema, canonical ordering, validator, renderer,
   verbs) are unit-tested with no terminal and no harness involved.
 - Interactive/side-effecting: `tui/menu.rs`, `tui/ui.rs` (`inquire` wrappers),
-  `tui/style.rs` (palette), the finishing-action prompts in `workspace/migrate.rs` /
+  `tui/theme.rs` (installs the `inquire` render config from core's `style`
+  color decision; `render_config(false)` must stay `RenderConfig::empty()`),
+  the finishing-action prompts in `workspace/migrate.rs` /
   `sync/reverse_sync.rs`, `tui/cockpit.rs` (the full-screen reverse-sync merge
   cockpit — its event loop and terminal lifecycle are manual-smoke like the
   rest of this list, but its render path (`draw`) and key dispatch
   (`handle_key`) are unit-tested via `ratatui::backend::TestBackend`, so a
   regression there IS expected to be caught by `cargo test`).
-- `main.rs` composes: `cli::parse` → `tui::style::init` (SKIPPED for
-  `Parsed::Plugin`, which makes the color decision itself so a hook can force
-  color off) → [auto-update gate for `Bare`/`Sync`/`ReverseSync`/`Pack`] →
-  `dispatch`. `Parsed::Version` answers before any dispatch; `Parsed::Plugin`
-  is handled in a SIBLING arm of the update gate, never inside it.
+- The CLI's `main.rs` composes: `cli::parse` → `tui::style::init` +
+  `tui::theme::install` → [auto-update gate for
+  `Bare`/`Sync`/`ReverseSync`/`Pack`] → `dispatch`. `Parsed::Version` answers
+  before any dispatch. The plugin no longer appears here at all – it is a
+  different binary, which is a stronger separation than the sibling-arm
+  arrangement it replaced.
+- The plugin's `main.rs` composes: `parse` → `style::init_no_color()` for a
+  `hook` invocation or `style::init()` otherwise → dispatch to a hook handler or
+  a human verb. It installs no `inquire` theme and constructs no menu, and
+  cannot: the crate links neither library.
 
 Flag business/pure logic (glob expansion, config merge, path resolution) added
 directly into `tui/menu.rs`/`tui/ui.rs`/`main.rs` instead of a testable module, and
@@ -128,7 +218,7 @@ structurally valid". The engine's rules:
 - `globset`'s `*` crosses path separators (unlike POSIX shell glob) — do not
   introduce code that assumes `*` matches a single path component.
 - **`EXCLUDED_TREES` is enforced at every point of FINAL enumeration, never on
-  the match list alone.** `src/sync/mod.rs` owns the ONE rule: `EXCLUDED_TREES`
+  the match list alone.** Core's `sync/mod.rs` owns the ONE rule: `EXCLUDED_TREES`
   = `.superset/backups` (pre-write backups, i.e. recovered secrets),
   `.superset/.magic` (the plugin's machine-local state), `.scratchpad`, `.git`;
   `under_excluded_tree(rel)` answers "is this rel one of them, or inside one".
@@ -464,29 +554,36 @@ committable and must never leak.
   skips the gitignore-safety step for an untracked source, or one that appends a
   rule for a tracked source.
 
-## The Claude Code Plugin (`src/plugin/`, `plugin/`, `scripts/`)
+## The Claude Code Plugin (`crates/ss-magic-plugin/`, `plugin/`, `scripts/`)
 
-`ss-magic plugin <VERB>` is a second program inside the same binary. It runs
-inside a developer's Claude Code session, writes into a state tree beside the
-secrets the rest of the tool moves, and is reached by an automated caller that
-cannot see its errors – so review it with the same suspicion as the sync engine.
+`ss-magic-plugin <VERB>` is a second binary beside the sync CLI. It runs inside
+a developer's Claude Code session, writes into a state tree beside the secrets
+the rest of the tool moves, and is reached by an automated caller that cannot
+see its errors – so review it with the same suspicion as the sync engine.
 
 ### Two callers, two opposite postures
 
-- **`plugin hook <event>` serves the harness.** The envelope arrives on stdin
-  and the ONLY thing allowed on stdout is the JSON response, so a stray
-  `println!`, a progress line, or an ANSI escape corrupts it. `plugin::run`
-  calls `style::init_no_color()` for a hook invocation precisely for this – flag
-  a change that initializes color unconditionally, or that prints to stdout from
-  a handler instead of returning a `Response`. Handler diagnostics go to stderr
-  through `HookContext::diagnostic`, flushed after dispatch.
-- **A named verb (`status`, `checklist`, …) serves a person or a skill**, and
-  reports on stderr with a non-zero exit like any CLI.
-- **Only human verbs may write configuration.** `enable`, `disable` and `config
-  set` are the write path, and nothing reachable from a hook may call one –
-  otherwise a repository could arrange its own enablement by getting a hook to
-  fire. `HumanVerb::writes_config` marks them. Flag any hook handler that
-  reaches a config write, or a new config-writing path added to `hook/`.
+- **`ss-magic-plugin hook <event>` serves the harness.** The envelope arrives on
+  stdin and the ONLY thing allowed on stdout is the JSON response, so a stray
+  `println!`, a progress line, or an ANSI escape corrupts it. The crate root's
+  `run` calls `style::init_no_color()` for a hook invocation precisely for this –
+  flag a change that initializes color unconditionally, or that prints to stdout
+  from a handler instead of returning a `Response`. Handler diagnostics go to
+  stderr through `HookContext::diagnostic`, flushed after dispatch.
+- **A named verb (`status`, `checklist`, …) serves a skill or the person's own
+  request**, and reports on stderr with a non-zero exit like any CLI. Nobody
+  types one at a shell prompt: the binary is installed under
+  `${CLAUDE_PLUGIN_DATA}` and deliberately kept off the user's `PATH`.
+- **No hook may reach anything that can set `plugin.enabled`.** That, not "no
+  hook writes configuration", is the property. `enable`, `disable` and `config
+  set` are the three verbs that can reach the key, and `HumanVerb::can_set_enabled`
+  is the predicate that marks them; no hook invokes any of them. `HumanVerb::
+  writes_config` is BROADER and no longer implies hook-unreachability, because
+  `seed-config` writes configuration AND is invoked by the `SessionStart`
+  bootstrap – see the seed's bounds below. Flag a hook handler that reaches a
+  verb marked `can_set_enabled`, a new `enabled`-writing path added under
+  `hook/`, or a review comment that re-derives "hook-reachable" from
+  `writes_config`.
 - **There is no `install` verb**, and `ss-magic sync` runs no plugin step: the
   marketplace is the only delivery path. Flag any code that writes a plugin tree
   onto the machine.
@@ -521,9 +618,11 @@ either toward the other.
 ### State: where it goes, and what guards it
 
 - **`.superset/.magic/` is written only after git confirms it is ignored.**
-  `scratchpad::ensure_state_ignored` is the ONE place that gitignore rule is
-  written, called eagerly from init/migrate and lazily from `plugin
-  enable`/`config set plugin.enabled true`, NEVER from a hook. The check uses
+  Core's `state_tree::ensure_state_ignored` is the ONE place that gitignore rule
+  is written – the CLI's init/migrate calls it eagerly, the plugin's `enable` /
+  `config set plugin.enabled true` call it lazily through the plugin's
+  `scratchpad` re-export, and NO hook calls it, the `seed-config` bootstrap
+  write included. The check uses
   `git::is_ignored_no_index_str` (rules-only, index-ignoring) so a tracked file
   inside the tree does not read as "the tree is unignored". Flag a write into
   the state tree that skips the gate, a hand-rolled gitignore append for it, or
@@ -546,6 +645,100 @@ either toward the other.
   only for content that is committed (the generated CI workflow). Flag a
   world-readable state file or a 0600 committed artifact.
 
+### Compaction guidance is advice only; `--set` is the single write
+
+Four surfaces talk about the auto-compact window – `compact-window
+--recommend`, `status`'s `Compaction` section and its `problems` line,
+`enable`'s tip line, and the `SessionStart` operator notice – and every one of
+them is read-only. The ONLY thing in the crate that writes a settings file is
+`compact_window::run_core`, reached from an explicit `compact-window --set
+<TOKENS>`, and it writes ONLY the gitignored `.claude/settings.local.json`,
+never over a value already there. Nothing may edit the user's
+`~/.claude/settings.json` (or `${CLAUDE_CONFIG_DIR}/settings.json`), the
+git-tracked `.claude/settings.json`, or a platform managed-settings file, and
+nothing may remove `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` from anywhere – the report
+names the file and tells the person to delete the key by hand. Flag any new
+write to a settings file outside `run_core`, any write reachable from
+`--recommend` / `status` / `enable` / a hook, an "auto-apply the
+recommendation" path, or a removal of the override; also flag a test for the
+report that does not snapshot the tree before and after.
+
+Two smaller rules ride along. The recommendation arithmetic is INTEGER
+(`(max_peak * 5).div_ceil(4)`, then `div_ceil(10_000) * 10_000`, then a clamp
+to 100000-1000000): `1.25 x 80000` must stay exactly 100,000, and a float
+rewrite would round it to 110,000 – flag one. And the once-per-machine
+`SessionStart` notice writes its `compact-advice-shown` marker only when the
+notice actually went out (a silent path – wrong source, quiet mode, a window
+already configured – must not spend the budget) and is withheld outright when
+no cache directory can be resolved, because "once" is the promise; flag a
+marker written on a silent path or a notice emitted with nowhere to record it.
+The marker is CLAIMED with `create_new`, not checked with `exists()` and then
+written: two sessions starting at the same moment must produce one notice, and
+`AlreadyExists` is the "already shown" answer. Flag an `exists()`-then-write
+sequence on any once-only marker. `compact-window --set` treats an explicit
+`"autoCompactWindow": null` as unset, the same reading `read_window` and
+`window_configured` use, so the verb that `--recommend` points a `null`-window
+user at actually writes; flag a guard that matches `Value::Null` as configured.
+
+`hook::quiet_mode(envelope, entrypoint)` is the one "is anybody watching"
+verdict: quiet on `permission_mode` `bypassPermissions` or `dontAsk`, or on a
+`CLAUDE_CODE_ENTRYPOINT` other than `cli`; ABSENT signals are NOT quiet, on
+purpose (the notices are one operator line each and bounded, so a wrong
+"quiet" hides them from every harness that omits a field). Flag an inverted
+default, a new headless heuristic added on suspicion, or an operator notice
+placed on `additionalContext` instead of `systemMessage`.
+
+### The plugin release suggestion reads a file, records before it announces, and never fetches from a hook
+
+`SessionStart` tells the operator, once per release, that a newer
+`ss-magic-plugin-vX.Y.Z` release exists – and nothing more. Four rules, each a
+test in `release_check/tests.rs` or `hook/session_start/tests.rs`:
+
+- **No HTTP client on the hook path.** The hook reads the plugin release
+  cache (`plugin-release-check.json` in the `ss-magic` cache dir) through
+  core's `release::read_cache` and, when the cache is missing or older than
+  24 h, spawns `release-check --refresh --quiet` DETACHED (own process group,
+  every stream on `/dev/null`, child dropped) and returns without waiting.
+  The only client construction in the crate is `release_check::run_refresh`,
+  reached from an explicit `--refresh`. A source-scan test asserts no `hook/`
+  module names `UreqReleaseClient`, `ureq`, `fetch_releases`, `refresh_cache`,
+  `refresh_with`, `for_product` or `resolve_newest_uncached`. Flag a fetch,
+  a client, or a blocking wait on the child anywhere under `hook/`.
+- **Record, then announce – under the shared non-blocking lock.** The
+  once-per-tag promise lives in the cache record's `suggested` field. The
+  hook writes it through `release_check::record_suggested` (a
+  `tmproot::try_with_lock` on `release-check.lock`, re-reading the cache
+  inside the lock) and announces ONLY when that write returned `Written`.
+  Contention (`Busy`), a tag the cache no longer names (`Superseded`), no
+  lock root, or a write error each WITHHOLD the notice for that session; the
+  next startup decides again. Flag a notice emitted before or without the
+  record, a blocking `with_lock` here or in the refresh (a hook must not
+  wait on a 5 s fetch), or a write to the cache outside
+  `release_check::write_cache` (the atomic 0600 writer – the file has two
+  writers and a lock-free reader).
+- **Quiet mode is decided BEFORE the write, and gates the spawn too.** A
+  headless session (`hook::quiet_mode`) neither announces nor spends the
+  once-per-tag budget nor forks a refresh on the operator's behalf. In the
+  pure decision `release_check::suggestion` quiet is tested LAST, so a
+  headless session with something to say records `release suggestion
+  suppressed (quiet mode: …)` while one with nothing to say records "not
+  newer". Flag a `suggested` write on a quiet path, a spawn on a quiet path,
+  a spawn on any source but `startup`, or a spawn when no pin exists.
+- **The refresh derivation is core's, and it carries the marker.** Both the
+  verb's refresh and the CLI's `run_check` go through
+  `release::refresh_cache`, which keeps the prior tag on `NotModified` /
+  `Failed`, bumps `checked_at` on every outcome, and carries `suggested`
+  forward when the re-selected tag equals the prior tag, clearing it only
+  for a DIFFERENT tag. Flag a second derivation, a refresh that rebuilds the
+  record wholesale (it would re-arm the notice every 24 h), or a verb
+  freshness short-circuit (`--refresh` means fetch).
+
+The notice's remedy ends in "start a new session": `/reload-plugins` alone
+re-registers the plugin but keeps the old binary until a fresh session's
+bootstrap swaps it. Flag a remedy that names the reload as sufficient, and
+flag any path from `release-check` to a download or an install – it reports,
+and `/plugin` updates.
+
 ### Exactly-once claims must not be built on `unlink`
 
 **Never treat a successful delete as having won a claim.** Measured on this
@@ -555,7 +748,7 @@ expect, which is what makes it dangerous – the one-shot bypass token ("exactly
 the next gated Read") was built on it and would have admitted every concurrent
 read that raced it.
 
-`plugin/claim.rs::take` is the single correct primitive: create a private
+The plugin crate's `claim.rs::take` is the single correct primitive: create a private
 landing file in the SAME directory (so the rename never crosses a filesystem)
 and `fs::rename` the claim onto it. `rename` requires its source to exist, so
 exactly one caller wins. Flag any new one-shot/exactly-once store built on
@@ -565,7 +758,7 @@ correct test must race N threads and assert exactly one winner.
 
 ### Parse-sensitive git output must bypass the trimming helper
 
-`git()` and `git_optional()` in `src/git/mod.rs` `.trim()` the whole output.
+`git()` and `git_optional()` in core's `git/mod.rs` `.trim()` the whole output.
 That is right for a single value and **destructive** for a fixed-column format:
 `git status --porcelain`'s index column is a literal SPACE when a file is
 modified in the worktree only, so trimming eats the leading space of the FIRST
@@ -593,11 +786,101 @@ through `git`/`git_optional`, a per-line `.trim()` applied to such output, or a
   survives. `config set` is scoped to keys rooted at `"plugin"`. Flag a write
   that rebuilds the file from known fields only, that touches both layers, or
   that reaches outside the `plugin` key.
+- **Every writer takes the one `magic-json.lock` under the per-machine temp
+  root, and the files are replaced by rename.** `seed-config` runs unattended
+  from every session start, so a seed that loaded `magic.json` an instant
+  before `enable` wrote `plugin.enabled` would otherwise write its loaded copy
+  back without the key. The human verbs (`enable`, `disable`, `config set`)
+  BLOCK on the lock; `seed-config` uses the non-blocking variant and defers to
+  the next session on contention, because a hook must never wait. Both
+  `write_magic_json` and `write_magic_local_json` stage a sibling file and
+  `rename` it over the target (through a symlink, onto its resolved target), so
+  a write that dies half-way leaves the previous tracked file, never a prefix.
+  Flag a config write that bypasses the lock, a seed that waits on it, or a
+  return to a truncating `fs::write` on either file.
+- **Every writer refuses a target that resolves outside the repository, and
+  the check lives in the one writer.** `write_plugin_key` – the load-modify-write
+  behind `enable`, `disable`, `config set` AND the seed – decides `landing()`
+  before it reads: canonicalize the repository root and the deepest EXISTING
+  component of `.superset/<file>` (the file, else the `.superset` directory,
+  else nothing, since a fresh create under the root cannot be redirected) and
+  require the second inside the first. `Outside` is a hard error for the human
+  verbs and the `OutsideRepository` outcome for the seed; a link that stays
+  inside the repository is written through onto its target, and a repository
+  that itself sits behind a link (macOS's `/tmp`) still passes. The hazard is a
+  repository committing `.superset/magic.json`, or `.superset` itself, as a
+  link to a JSON file the person owns: a verb run in that checkout would load
+  that file, fold a `plugin` key in and write it back through the link. Flag a
+  new writer that reaches `write_magic_json`/`write_magic_local_json` without
+  going through `write_plugin_key`, a check that canonicalizes only the leaf
+  (it misses a linked `.superset` with no file behind it yet, where the write
+  would CREATE the file outside), only the root, or compares un-canonicalized
+  paths, and a version that refuses every symlink (it would break in-repo
+  links, which are tested to work).
+
+### The `seed-config` bootstrap write has SIX bounds, each a test
+
+`seed-config` exists because there is no terminal path to the configuration at
+all: the CLI dropped its `plugin` subcommand, and the plugin's binary lives under
+`${CLAUDE_PLUGIN_DATA}`, off the user's `PATH`. Rather than document a command
+nobody can type, `hooks/bootstrap.sh` invokes the verb on every session that
+reaches a usable pinned binary, so the gate's knobs are visible in a file the
+repository already tracks. Note the frequency: the binary is installed once per
+MACHINE but the block is seeded once per REPOSITORY, so a call sited only after
+a fresh install seeds the first repository and silently skips every later one.
+Flag a change that moves the call behind the already-installed fast path.
+It is the one config write a hook can reach, so its bounds are the whole safety
+argument. Each is asserted by a test, not left to convention:
+
+1. **It never writes `enabled`.** `config::seed_block` is built field by field
+   from `GateConfig::default()` as a literal map with three named inserts, so
+   there is no code path to that key at all – a stronger guarantee than being
+   kept away from it by convention. Writing `false` would buy nothing (an absent
+   key already reads as off) and would make the seed look like a decision about
+   enablement, which it must not be. Flag a rewrite that serializes a config
+   struct instead (the guarantee would then follow whatever fields the struct
+   grows next), and flag any `enabled` insertion here.
+2. **It never stages.** No `git add` here or downstream: the block appears in
+   `git status` as an ordinary edit, because it is being SURFACED, not slipped
+   in. Flag a staging call anywhere on this path.
+3. **It writes only when there is no `plugin` key at all.** Any existing block –
+   seeded earlier, hand-edited, or committed by a teammate – means "already
+   present" and no write, so the seed cannot repeat on later sessions or fight a
+   deliberate edit. Flag a merge/deep-merge that touches an existing block.
+4. **It never creates the file.** An absent `.superset/`, an absent
+   `magic.json`, or one that does not parse all mean "not a workspace" and no
+   write. Installing a plugin must not introduce a tracked file into a checkout
+   that is not an ss-magic workspace, and an unparseable file is far more likely
+   a merge conflict than an invitation to rebuild it. Flag a create-if-missing
+   or a rebuild-from-defaults path.
+5. **It never writes through a symlink that leaves the repository.**
+   `seed_config_at` asks the shared `landing()` decision (see the config write
+   path above) before it reads, and maps `Outside` to
+   `SeedOutcome::OutsideRepository` – a link on the file OR on the `.superset`
+   directory. `write_plugin_key` would refuse the same target on its own; the
+   seed decides a step earlier only so the answer is an OUTCOME rather than a
+   failed write, because it runs unattended. This is the bound the split
+   created: the same write used to need a person to type a config verb, and now
+   fires unattended from a `SessionStart` hook against a path the repository
+   controls – `serde_json` reads through a symlink and the rename-based writer
+   lands on the link's resolved target, so without the check any JSON object
+   file the user can write is in range. Flag a seed that skips `landing()`, or
+   one that turns `Outside` into an error.
+6. **It preserves every other key.** The write goes through the same typed
+   load-modify-write as the rest (`MagicConfig`'s flattened `extras`), never a
+   hand-rolled JSON splice. Flag a text-level edit of `magic.json`. Note it
+   re-serializes rather than patching, so unknown keys come back alphabetized;
+   values are what survive, not byte order.
+
+Every outcome is a normal result, never an error: the verb runs unattended from a
+`SessionStart` hook in whatever repository the session happens to be in, and most
+of those are not ss-magic workspaces at all. Flag a `?`/`bail!` that can turn one
+of the four outcomes into a failed session start.
 
 ### The operator checklist is CLI-write-only
 
 The `PreToolUse` handler denies a direct `Read`/`Edit`/`Write`/`NotebookEdit` of
-a checklist file, so `plugin/checklist/verbs.rs` is the ONLY write path – that
+a checklist file, so the plugin crate's `checklist/verbs.rs` is the ONLY write path – that
 is what keeps every stored document canonically ordered and valid.
 
 - Every mutating verb is read-modify-write over the WHOLE document (read →
@@ -711,12 +994,117 @@ blocked. Flag a nudge that sets a decision, that widens the `gh pr` match beyond
   as `-text` so checkout-time line-ending conversion cannot move the digest.
   Flag a builder change that reads a clock or an mtime, that deflates, that
   drops a refusal, or a removal of the `plugin/**` `-text` rule.
-- **Any change under `plugin/` must re-pin AND bump the version.** Run `python3
-  scripts/build-plugin-zip.py --update-manifest` then `--check`. The resolved
-  VERSION, not the digest, is the client's update signal – changing the zip and
-  its `sha256` without a version bump leaves every installed user silently on
-  the cached copy. Flag a `plugin/` change with a stale digest or an unbumped
-  version.
+- **Any change under `plugin/` must re-pin AND bump the whole
+  `ss-magic-plugin` version group** (see Version Bump Discipline below for the
+  surfaces). Run `python3 scripts/build-plugin-zip.py --update-manifest` then
+  `--check`. The resolved VERSION, not the digest, is the client's update
+  signal – changing the zip and its `sha256` without a version bump leaves every
+  installed user silently on the cached copy. Flag a `plugin/` change with a
+  stale digest, an unbumped version, or a bump that touched the CLI's surfaces
+  instead.
+- **The pin file is `plugin/ss-magic-plugin.version`**, and the installed binary
+  is `${CLAUDE_PLUGIN_DATA}/bin/ss-magic-plugin`. Both were renamed when the
+  plugin became its own binary; the marketplace plugin NAME and every marker
+  file stayed `ss-magic`, deliberately, so per-machine state stays where it is.
+  There is deliberately NO cleanup of a stale pre-split `bin/ss-magic` – nothing
+  spawns it once the manifest and the wrapper both name the new one, so it is
+  inert. Flag migration code added to remove it: a bootstrap that deletes files
+  is a new failure mode on a path that must never fail a session.
+
+### No hook command may name an artifact created at runtime
+
+Every entry in `plugin/hooks/hooks.json` must spawn something that exists the
+moment the plugin is installed: `"command": "bash"` with `args[0]` a path under
+`${CLAUDE_PLUGIN_ROOT}`. **A command naming `${CLAUDE_PLUGIN_DATA}` – or any other
+path the bootstrap creates at runtime – is a bug**, and it shipped once.
+
+`${CLAUDE_PLUGIN_DATA}/bin/ss-magic-plugin` does not exist until the
+`SessionStart` bootstrap fetches it, and hooks on one event fire CONCURRENTLY, so
+the bootstrap cannot be relied on to finish first. A manifest naming the binary
+directly makes the harness `posix_spawn` a path that is not there, and the user's
+first session dies with `ENOENT (posix_spawn)`. The specified behaviour is the
+opposite: with no binary present every hook is INERT and the session behaves
+normally. **The binary having its own name now changes nothing here** – it is
+still fetched at runtime, so naming `ss-magic-plugin` in `hooks.json` reproduces
+exactly the failure the shim exists to prevent.
+
+The reason this is a manifest rule and not a code rule: the binary implements
+fail-open itself – its hook entry point has no non-zero exit path and catches
+handler panics – but **that code is unreachable when the binary is the missing
+thing.** Fail-open has to live in a shim that always exists
+(`plugin/hooks/run-hook.sh`), not inside the artifact that may be absent. Flag any
+`command` that is not `bash`, any `args[0]` outside `${CLAUDE_PLUGIN_ROOT}`, and
+any reasoning that treats "the binary handles it" as covering the case where the
+binary is gone.
+
+That shim is silent on BOTH stdout and stderr, unlike `bin/ss-magic-plugin`, which
+prints one explanatory stderr line. The difference is the consumer: the wrapper
+serves a person running a skill, while the shim runs on `PreToolUse`, which fires
+on nearly every tool call. Flag a diagnostic added to the shim.
+
+**Assert this over every entry, never just the one you are touching.** The
+manifest check originally covered the bootstrap group alone, which is exactly how
+the other five entries drifted into naming the binary. Assert the event token as
+well as the script path: a manifest naming the right script with the wrong token
+in `args[1]` routes the event to the wrong handler, and a check that reads only
+`args[0]` passes it.
+
+The invariant is asserted TWICE on purpose: `scripts/test-bootstrap.sh` walks
+every `hooks.json` entry, and `python3 scripts/build-plugin-zip.py --check`
+repeats it as its `hooks spawn through the shim` line so the one-command release
+gate covers it without running the bash suite. **The two must be changed
+together** – weakening one and leaving the other is how a manifest regression
+reaches a release through whichever gate a given run happens to skip. Flag a
+change to one without the other.
+
+Note the one entry that must NOT go through the shim: the `SessionStart`
+bootstrap. The shim does nothing when the binary is absent, and the bootstrap is
+what installs it, so routing the bootstrap through the shim would leave the
+plugin inert forever rather than for one session. Flag any change that does this,
+and flag any prose claiming *every* hook is spawned through the shim.
+
+### Deciding a file is runnable needs more than `[ -x ]`, and needs one definition
+
+Before any script `exec`s the pinned binary it must go through
+`ss_magic_is_loadable_executable` in `plugin/lib/execguard.sh`. **A bare
+`[ -x "$bin" ]` is a bug**, and it shipped in two different scripts.
+
+Two failures hide behind that test:
+
+- `-x` is TRUE for a **directory** carrying the search bit. `exec` on a directory
+  does not fail quietly – bash prints its own diagnostic and exits 126.
+- `-f` and `-x` both ask about the FILE. Neither can see `execve` failing on the
+  way into it, and **ENOEXEC is the dangerous one**: when the file is readable but
+  not a loadable executable – a truncated download, a foreign architecture, disk
+  corruption – bash does not report a failure at all. It falls back to POSIX
+  behaviour and REINTERPRETS the bytes as a shell script, so `shopt -s execfail`
+  never fires and the process exits with whatever those bytes parse to. Measured
+  over 30 corrupted binaries on bash 3.2: exit 2 roughly half the time. **Exit 2
+  from a `PreToolUse` hook means BLOCK the tool call**, so a binary damaged after
+  install would silently block nearly every tool call in the session.
+
+The guard is ONE shared file on purpose. The check was added to
+`hooks/run-hook.sh` first while `bin/ss-magic-plugin` kept the weaker `[ -x ]`
+for a whole release – the sibling drift a shared definition prevents. **Flag any
+new inline copy of this check, and flag a fix applied to one of the two scripts
+without the other.**
+
+Its two failure directions are deliberately opposite, so do not "simplify" either
+into the other: an unrecognised magic number fails CLOSED (refuse to exec), while
+a missing `od` or `tr` fails OPEN (proceed), because refusing there would silently
+disable the whole plugin on a machine merely lacking a utility. Callers still set
+`shopt -s execfail` afterwards, for the exec failures no file test can see.
+
+`hooks/bootstrap.sh` is exempt and should stay exempt: at install time it runs the
+staged binary and refuses the install unless it reports the pinned version, which
+is strictly stronger than a magic-number test.
+
+Keep `exec` in both callers. It makes the harness's child pid BE the binary, so a
+hook timeout kills the binary instead of killing the shell and orphaning it –
+which matters most on `SessionEnd`, the hook the CLI blocks on while a session
+exits. Flag a change that drops `exec` for a plain call. Equally, flag
+`exec ... 2>/dev/null`: it applies to the SUCCESS path too and would swallow the
+binary's own diagnostics.
 
 ### The bootstrap must never fail a session
 
@@ -743,42 +1131,64 @@ blocked. Flag a nudge that sets a decision, that widens the `gh pr` match beyond
 - It is written for **bash 3.2** (macOS's version): no associative arrays, no
   `mapfile`, no `${var^^}`. Flag bash 4+ syntax here or in
   `scripts/test-bootstrap.sh`.
-- `plugin/bin/ss-magic-plugin` is the wrapper skills invoke. It must keep
-  injecting the `plugin` verb (so a skill can never reach bare `ss-magic`, its
-  update gate, or its TUI) and must keep its distinct name (a wrapper called
-  `ss-magic` would resolve non-deterministically against a user's own install).
-  A missing binary is a normal state – it exits 0 with one stderr line. No skill
-  body may name `${CLAUDE_PLUGIN_DATA}` or a bare `ss-magic`; CI asserts this.
-- **The wrapper spelling is required in ALL model-facing text, not just skill
-  bodies.** Any command a hook response tells the model to run – every deny
-  reason, nudge, and `additionalContext` – is executed through the Bash tool,
-  where `${CLAUDE_PLUGIN_DATA}` is NOT exported, so only `ss-magic-plugin`
-  resolves. A bare `ss-magic` there reaches nothing on a marketplace-only
-  install (the only delivery path), so a conclusion can never be recorded and a
-  bypass never consumed – the same oversized Read stays a miss forever. This
-  already bit once: the checklist deny carried the wrapper from the start while
-  the size-gate deny quietly did not. Flag a bare `ss-magic` in any string that
-  reaches the model. **The human verbs' own `Usage:` strings are the deliberate
-  exception** – a person runs those in a terminal, where the bare name is
-  correct – so check where the string is printed, not just its text.
+- `plugin/bin/ss-magic-plugin` is the wrapper skills invoke. It `exec`s the
+  installed binary with argv passed through VERBATIM – there is no `plugin` verb
+  to inject any more, because the binary's own argv starts at the verb
+  (`ss-magic-plugin checklist list` is exactly what the binary sees). It must
+  keep its distinct name: a wrapper called `ss-magic` would resolve
+  non-deterministically against a user's own install, and would hand a skill the
+  sync CLI's update gate and TUI. A missing binary is a normal state – it exits 0
+  with one stderr line. No skill body may name `${CLAUDE_PLUGIN_DATA}` or a bare
+  `ss-magic`; CI asserts both, plus that no document spells the retired
+  `ss-magic` + `plugin` subcommand form.
+- **`ss-magic-plugin` is required in ALL model-facing text, and there is no
+  longer any exception.** Any command a hook response tells the model to run –
+  every deny reason, nudge, and `additionalContext` – is executed through the
+  Bash tool, where `${CLAUDE_PLUGIN_DATA}` is NOT exported, so only the wrapper
+  resolves. A bare `ss-magic` there reaches nothing on a marketplace-only install
+  (the only delivery path), so a conclusion can never be recorded and a bypass
+  never consumed – the same oversized Read stays a miss forever. This already bit
+  once: the checklist deny carried the wrapper from the start while the size-gate
+  deny quietly did not. The human verbs' `Usage:` strings USED to be a deliberate
+  exception, on the reasoning that a person runs those in a terminal; they no
+  longer are, and every one of them now spells `ss-magic-plugin`, because nobody
+  runs a verb in a terminal at all. Flag a bare `ss-magic` in any string this
+  crate prints or returns.
 
-### `ss-magic plugin` never self-updates and never opens the TUI
+### `status --json` versions its shape
 
-`main.rs` handles `Parsed::Plugin` in a sibling arm of the auto-update gate, and
-`should_run_update_gate` is an INCLUSION list over `Command` – `plugin` is not a
-`Command` at all. The binary is pinned alongside the skills, hooks and Markdown
+`status.rs` carries `SCHEMA_VERSION`, emitted as the top-level `schema` key of
+`--json`, and it is bumped whenever a key changes meaning or goes away – `2`
+since the workspace split, where `versions.cli` became `versions.running` and
+`versions` gained `newest_release` / `update_available` beside the new
+`compaction` section. Flag a renamed or removed key that leaves the number
+alone, and flag `update_available` answering `false` for a pin that is not a
+plain `MAJOR.MINOR.PATCH` (the answer is unknown, `null`, exactly as
+`release-check` reports it). `status` resolves the release cache through the
+NON-creating `existing_cache_file`; flag a diagnostic path that creates the
+cache directory it reports on.
+
+### The plugin never self-updates and never opens a TUI, by construction
+
+This used to be maintained by keeping the plugin out of the CLI's update gate.
+It is now structural: `ss-magic-plugin` is its own binary linking neither
+`self_update` nor `inquire`/`ratatui`, so there is no gate to stay out of and no
+menu to construct. The binary is pinned alongside the skills, hooks and Markdown
 the marketplace ships with it, so a silent mid-session swap would leave the two
-describing different behavior. Flag a `plugin` arm added to
-`should_run_update_gate`, an inversion of it to an exclusion list, or any
-interactive-menu construction reachable from a plugin verb.
+describing different behavior; updating the plugin through the marketplace is
+what replaces the binary. The plugin does CHECK – `release-check` and the
+`SessionStart` suggestion, see the section above – but a check writes one cache
+file and prints one line. Flag any dependency or code path that would restore
+either capability, any path from the check to a download, and a "convenience"
+re-export that lets plugin code call into the CLI crate.
 
 ### The shipped manifest declares FIVE hook events
 
 `plugin/hooks/hooks.json` registers `SessionStart`, `PreToolUse`, `PreCompact`,
 `SubagentStop`, and `SessionEnd` – and no `FileChanged` entry. `HookEvent`
 parses a `file-changed` token and `hook/mod.rs::route()` still has an arm for it,
-so `src/plugin/hook/file_changed.rs` is reachable by argv and stays covered by
-tests, but **nothing in a real session invokes it**. Do not describe it as a
+so the plugin crate's `hook/file_changed.rs` is reachable by argv and stays
+covered by tests, but **nothing in a real session invokes it**. Do not describe it as a
 shipped hook, and do not "fix" the manifest by adding a `FileChanged` entry
 shaped like the others: that matcher is a watch-path list, not a name filter, so
 an entry without one registers zero watch paths and can never fire. Flag
@@ -823,13 +1233,53 @@ change to the `.superset/magic.sh` body made anywhere OTHER than
 `assets/magic.sh` (a hard-coded wrapper string elsewhere would drift from the
 embedded source of truth).
 
-## Self-Update Safety (`update/`)
+## Self-Update Safety (core's `release.rs`, the CLI's `update/`)
 
-- The daily-cached "latest release" check (`update/check.rs`) uses `ureq` with
-  an ETag and a short timeout, and must fall through SILENTLY on any offline /
-  non-200 / timeout result — a failed update check must never block or slow a
-  normal invocation. Flag an update-check change that surfaces a hard error or
-  removes the timeout.
+Only `ss-magic` self-updates. The per-line release CHECK lives in core
+(`release.rs`); the apply path lives in the CLI crate (`update/`), and nothing in
+the plugin crate reaches the latter. The plugin crate reaches the check for its
+own line only (`PLUGIN_LINE`), through `release_check.rs`.
+
+- The daily-cached release check (core's `release.rs`) lists `/releases` (first
+  page) and filters PER RELEASE LINE with an anchored, exact tag filter
+  (`parse_line_tag`: `CLI_LINE` accepts only `v` + `MAJOR.MINOR.PATCH`,
+  `PLUGIN_LINE` only `ss-magic-plugin-v` + `MAJOR.MINOR.PATCH` – nothing
+  before, nothing after, case-sensitive, ASCII digits only), drops drafts and
+  prereleases, and selects the GREATEST triple rather than the first entry.
+  Both filters are load-bearing now that both tag shapes really exist in the
+  repository: an unanchored `v` match would let `ss-magic-plugin-v1.0.0` read as
+  a CLI release. Flag any change that reads `releases/latest`, matches a tag by
+  substring or an unanchored regex, takes the first match, or lets a tag of the
+  other line through. The mark itself is kept on the CLI line by the release
+  workflow's post-announce job (`dist-workspace.toml` `post-announce-jobs =
+  ["./mark-latest"]` → `.github/workflows/mark-latest.yml` →
+  `scripts/mark-latest.sh`, which re-marks the numerically greatest published
+  bare `v*` release after a plugin tag and reads the mark back, failing loudly
+  if it did not take); pre-0.11.0 binaries depend on it. `release.yml` is
+  generated by `dist generate` – flag a hand edit to it, a `dist-workspace.toml`
+  change without a regenerated `release.yml` (`dist generate --check` must
+  pass), a selection that could pick a plugin tag, a draft or a prerelease, or
+  a job that swallows an edit failure. It uses `ureq` with an ETag and a short timeout, and must
+  fall through SILENTLY on any offline / non-200 / timeout / non-JSON-array
+  result – a failed update check must never block or slow a normal invocation.
+  Flag an update-check change that surfaces a hard error or removes the timeout.
+  `refresh_cache(prior, client, line, now)` is the ONE derivation of the next
+  cache record (used by `run_check` once the cache is stale and by the plugin's
+  `release-check --refresh` on every call); `Cache.suggested` is the plugin
+  line's once-per-release marker, skipped from the JSON when `None` so the
+  CLI's `version-check.json` keeps its old shape. Flag a second derivation, a
+  `Cache` rebuilt wholesale on refresh (it drops the marker), or a `suggested`
+  written by the CLI.
+- Every `self_update` call is pinned: `apply_update`, `apply_update_unlocked`
+  and `run_self_update` (`update/apply.rs`) take a mandatory `&str` tag and
+  always set `target_version_tag`. Flag a signature that regrows
+  `Option<&str>` or any path that lets the backend choose "latest" itself –
+  with two release lines in one repository it WOULD install a plugin release
+  over the CLI, and the two are no longer even the same program.
+  `ss-magic update` resolves the tag first
+  (`release::resolve_newest_uncached`, no cache) and maps a failed resolution to
+  `UpdateReport::Unavailable` ("could not check"), never to `AlreadyLatest`;
+  flag a change that conflates the two.
 - The apply path (`update/apply.rs`) takes an advisory `fd-lock`
   (skip-on-contention), downloads over TLS, atomically swaps the binary, then
   re-execs and blocks on the child. The re-exec loop guard (`SS_MAGIC_UPDATED`
@@ -842,59 +1292,104 @@ embedded source of truth).
 
 ## Style / Output
 
-- All colored output goes through `tui/style.rs` (gray info, bold green ok, bold
-  orange warn, bold red err, bold cyan header). The color decision (NO_COLOR +
-  supports-color) is captured once in a `OnceLock<bool>`. Flag raw ANSI escape
-  codes emitted outside `tui/style.rs`, or output that ignores the NO_COLOR
-  decision.
+- All colored output goes through core's `style.rs` (gray info, bold green ok,
+  bold orange warn, bold red err, bold cyan header) – reached as
+  `crate::tui::style` from the CLI and as `ss_magic_core::style` from the plugin.
+  The color decision (NO_COLOR + supports-color) is captured once in a
+  `OnceLock<bool>`. The `inquire` half lives separately in the CLI's
+  `tui/theme.rs`, which is what lets the palette sit in a crate that links no
+  prompt library. Flag raw ANSI escape codes emitted outside core's `style.rs`,
+  output that ignores the NO_COLOR decision, or an `inquire` type reintroduced
+  into core.
 - Interactive prompts must be inert on Esc / Ctrl-C (leave the tree untouched
   and exit success) — `tui/menu.rs` and the pickers follow this. Flag an
   interactive path where cancellation mutates the filesystem.
-- A `plugin hook` invocation owns stdout for its JSON envelope: color is forced
-  off there and nothing but the envelope may be printed. Flag a `println!` added
-  to a hook handler, or a style init that ignores the hook case.
+- A `ss-magic-plugin hook` invocation owns stdout for its JSON envelope: color is
+  forced off there and nothing but the envelope may be printed. Flag a `println!`
+  added to a hook handler, or a style init that ignores the hook case.
 
 ## Version Bump Discipline (REQUIRED)
 
-The binary self-updates from GitHub Releases keyed on the crate version, so a
-stale version means users never receive the change. **Any change that alters
-CLI behavior — a fix, a new/changed command or flag, or different output —
-MUST bump `version` in `Cargo.toml` AND the matching `ss-magic` entry in
-`Cargo.lock`.** Bug fixes bump patch; new/changed user-visible behavior bumps
-minor (pre-1.0). Flag a behavior-changing PR that does not bump both
-`Cargo.toml` and `Cargo.lock`, or that bumps only one of the two.
+**There are TWO release lines, with TWO version groups that never mix.** The
+surfaces belong to exactly one group each:
 
-**A change under `plugin/` bumps FOUR version surfaces, not one**, and re-pins
-the digest: `Cargo.toml`, `plugin/.claude-plugin/plugin.json`,
-`plugin/ss-magic.version`, and the release-asset URL in
-`.claude-plugin/marketplace.json` must all agree, and the `sha256` there must
-match the rebuilt zip. `python3 scripts/build-plugin-zip.py --check` asserts all
-of it; `--update-manifest` re-pins. The resolved VERSION, not the digest, is the
-client's update signal, so a content change without a version bump leaves every
-installed user silently on the cached copy. Flag a `plugin/` change with any
-surface out of step, or with a stale digest.
+| Group | Tag shape | Surfaces that must all agree |
+|---|---|---|
+| `ss-magic` | `vX.Y.Z` | `crates/ss-magic/Cargo.toml` `[package] version`; the `name = "ss-magic"` entry in `Cargo.lock`; `README.md`'s pinned installer tag – compared `<=`, never `==` |
+| `ss-magic-plugin` | `ss-magic-plugin-vX.Y.Z` | `crates/ss-magic-plugin/Cargo.toml` `[package] version`; the `name = "ss-magic-plugin"` entry in `Cargo.lock`; `plugin/.claude-plugin/plugin.json`; `plugin/ss-magic-plugin.version`; both the tag AND the asset name in `.claude-plugin/marketplace.json`'s release URL; the literal zip filename in the plugin crate's `[[package.metadata.dist.extra-artifacts]]` (cargo-dist does not template it) |
+
+`crates/ss-magic-core/Cargo.toml` is NOT a surface (`0.1.0`, `publish = false`,
+`dist = false`). The root `Cargo.toml` is virtual and carries no version.
+`Cargo.lock` holds one `[[package]]` per crate, so a bump must match on the
+`name = "…"` line, never on a bare version string – and the lock is regenerated
+by `cargo build`, never by a blind replace.
+
+**The two groups' versions must NEVER be equal.** cargo-dist parses a release tag
+as `[PACKAGE_NAME-]VERSION`, so a bare `vX.Y.Z` tag announces EVERY dist-able
+package sitting at that version – pushing the CLI's tag at equal versions would
+publish a `ss-magic-plugin` release nobody asked for, under a tag shape the
+plugin line never uses. There is no way to say "this tag means the CLI only";
+keeping the numbers apart IS the mechanism. `python3
+scripts/build-plugin-zip.py --check` refuses a tree where they match (its
+`distinct release lines` line). Flag a PR that lands equal versions, and flag a
+change that weakens or removes that guard.
+
+**The README installer pin is compared `<=`, not `==`, on purpose.** It names the
+last PUBLISHED CLI release, and the procedure is bump → merge → tag, so an
+equality rule would make `main`'s README name an unreleased tag – and 404 the
+documented install command – for the whole window between a merged bump and a
+published release. A lagging pin names an older release that still works. Flag a
+"fix" that tightens this to equality, a pin that EXCEEDS the crate version, or
+any `releases/latest/download/` URL in `README.md` (the mark is repository-wide
+and can resolve to a plugin release, which publishes no installer script).
+
+**When to bump.** For `ss-magic`: any change that alters CLI behavior – a fix, a
+new/changed command or flag, or different output – because the installed binary
+self-updates keyed on that version and a stale version means users never receive
+the change. Bug fixes bump patch; new/changed user-visible behavior bumps minor
+(pre-1.0). For `ss-magic-plugin`: any change under `plugin/` or in the plugin
+crate, and the change must ALSO re-pin the digest (`--update-manifest`, then
+`--check`). The resolved VERSION, not the digest, is the client's update signal,
+so a content change without a version bump leaves every installed user silently
+on the cached copy. Flag a behavior-changing PR that bumps neither group, one
+that bumps a manifest without `Cargo.lock`, a `plugin/` change with any surface
+out of step or a stale digest, or a bump applied to the wrong group's surfaces.
 
 ## Test Requirements
 
-- **`cargo test` is not the whole suite.** Three non-Rust suites cover code it
-  cannot reach, and CI runs all of them:
+- **`cargo test --workspace` is not the whole suite.** Five checks cover ground
+  it cannot reach, and CI runs all of them:
   `python3 scripts/build-plugin-zip.py --selftest` (the zip builder's
-  reproducibility guarantees and its refusals),
-  `python3 scripts/build-plugin-zip.py --check` (the release assertions: the
-  marketplace `sha256` key exists, the four version surfaces agree, the
-  committed digest matches the tree), and
+  reproducibility guarantees and its refusals);
+  `python3 scripts/build-plugin-zip.py --check`, whose seven assertion lines are
+  `R101 marketplace sha256 key`, `R95 version surfaces (ss-magic)`,
+  `R95 version surfaces (ss-magic-plugin)`, `distinct release lines`,
+  `hooks spawn through the shim`, `workspace shape` and
+  `R96 committed digest pin`;
   `/bin/bash scripts/test-bootstrap.sh` (the bootstrap's failure paths –
   offline, corrupted download, hostile pin, unwritable data dir, unsupported
   platform, concurrent sessions – each asserting exit 0, empty stdout, and an
-  untouched pre-existing binary). Flag a change to `plugin/`, `scripts/`, or the
-  release assertions that leaves these unrun or unmentioned.
+  untouched pre-existing binary, PLUS the shim's inertness contract, the
+  wrapper's, and the `hooks.json` manifest invariant over every entry); and
+  `cargo tree --locked -p ss-magic-plugin -i <crate>` for each of `self_update`,
+  `inquire` and `ratatui`, which must report no match – a build can only show a
+  dependency is present, so this is the only evidence of absence; and
+  `/bin/bash scripts/test-mark-latest.sh` (the post-announce latest-mark
+  selection against a fake `gh`: drafts and prereleases dropped, anchored `v` +
+  triple, numeric order, the plugin tag never chosen, a `v*` tag a no-op, a
+  mark that did not take exit 1). Both shell suites also run on the macOS leg
+  of the `test` job under `/bin/bash` 3.2, the only proof that they hold on
+  the older shell they are written for. Flag a change
+  to `plugin/`, `scripts/`, either binary's manifest, or the release assertions
+  that leaves any of these unrun or unmentioned, and flag a `--check` assertion
+  quietly dropped from the list.
 - Tests use `tempfile` for scratch trees and shell-invoked `git init` /
   `git worktree add` for git fixtures. Pure modules (`cli.rs`, `sync/pattern.rs`,
   `sync/apply.rs`, `sync/mod.rs`, `pack.rs`, `hashing.rs`,
   `workspace/superset_files.rs`, `git/mod.rs` probes, `tui/menu.rs`
   routing via `operations_for`, `sync/merge.rs`, `tui/diffmodel.rs`,
   `sync/reverse_sync.rs`'s `apply_decision`/backup/TOCTOU seam, and every module
-  under `src/plugin/` – its parse, state modules, hook handlers and the whole
+  in the plugin crate – its parse, state modules, hook handlers and the whole
   `checklist/` family) have unit
   tests; the interactive
   menu/pickers and final-action git ops are validated by manual smoke, not
@@ -921,21 +1416,43 @@ surface out of step, or with a stale digest.
   fixture. For `git status --porcelain` specifically, also cover the
   worktree-only-modified case (` M`, leading space), not just `M ` and `??`.
 - Test layout: every module declares `#[cfg(test)] mod tests;` with the body
-  in a dedicated child file (`<module>/tests.rs`) – including every module under
-  `src/plugin/`; crate-root tests and shared
-  helpers live in `src/tests/` (`sync.rs`, `reverse_sync_flow.rs`,
-  `update_gate.rs`, `support.rs`).
+  in a dedicated child file (`<module>/tests.rs`) – in all three crates,
+  the plugin crate included; the CLI's crate-root tests live in `crates/ss-magic/src/tests/`
+  (`sync.rs`, `reverse_sync_flow.rs`, `update_gate.rs`), and the shared
+  helpers are `ss_magic_core::testutil` (`crates/ss-magic-core/src/testutil.rs`:
+  `git_run`, `init_main_repo`, `make_worktree`, `write_magic`, `write_file`,
+  `exit_code_to_u8`, `neutralize_global_excludes`, `run_ignored_test_in_child`,
+  `run_ignored_test_in_child_from`, `test_path_in_binary`), compiled under
+  `cfg(test)` or core's `testutil` feature, which a binary enables from its
+  `[dev-dependencies]` ONLY – flag `features = ["testutil"]` on a normal
+  `[dependencies]` entry, since that would compile test helpers into a release
+  binary. A test whose subject is the process environment (`PATH`, a `GIT_*`
+  variable, or the process's own working directory – `cargo test` starts a
+  binary in `crates/<name>`, not the repository root) runs its assertion in a
+  child process through those two helpers, never through `set_var` /
+  `set_current_dir` in a parallel suite.
   Flag a PR that adds an inline `mod tests { ... }` block to a source file
   instead of a sibling test file.
-- CI (`.github/workflows/ci.yml`) runs `cargo test --locked` on Ubuntu and
-  macOS for every PR commit, plus a `plugin package` job carrying the builder
-  selftest, the release assertions, a check that a content change under
-  `plugin/` came with a version bump, a check that no skill body names
-  `CLAUDE_PLUGIN_DATA`, and the bootstrap failure-path suite; it gates
-  cargo-dist releases via `plan-jobs` in
+- CI (`.github/workflows/ci.yml`) runs `cargo test --workspace --locked` on Ubuntu and
+  macOS for every PR commit, plus a `plugin` job carrying the builder
+  selftest, the release assertions, the `cargo tree` absence proof, a check that
+  a content change under `plugin/` came with a version bump (its baseline
+  considers BOTH tag shapes), the bootstrap failure-path suite, a build of the
+  exact asset cargo-dist will publish, and three document greps: no skill body
+  names `CLAUDE_PLUGIN_DATA`; no document (`plugin/skills/`, `docs/solutions/`,
+  `README.md`, `CONTRIBUTING.md`, `CONCEPTS.md`, `CLAUDE.md`, this file) spells
+  the retired `ss-magic` + `plugin` subcommand form – `docs/plans/` is
+  deliberately out of scope, a plan being a historical record; and `README.md`
+  names no `releases/latest/download/` URL. The plan phase additionally refuses a release tag matching neither
+  `^v[0-9]+\.[0-9]+\.[0-9]+$` nor `^ss-magic-plugin-v[0-9]+\.[0-9]+\.[0-9]+$` – a
+  prefixed CLI tag such as `ss-magic-v0.11.1` would publish a release the
+  updater's anchored filter and every installed binary ignore, stranding the line
+  silently. It gates cargo-dist releases via `plan-jobs` in
   `dist-workspace.toml`. Flag hand edits to the generated
   `.github/workflows/release.yml` (regenerate with the pinned `dist` version
-  instead) and flag `allow-dirty = ["ci"]` additions.
+  instead), flag `allow-dirty = ["ci"]` additions, and flag a workspace-level
+  `extra-artifacts` entry for the plugin zip (it belongs on the plugin crate,
+  with `working-dir = "../.."`, or it rides every release including the CLI's).
 - Release archives are attested (`github-attestations = true` in
   `dist-workspace.toml` → `actions/attest` in the release workflow's
   build-local-artifacts job, signing same-job build output before it
@@ -959,9 +1476,18 @@ inventory or the
 `main.rs`/`cli.rs` descriptions, a changed build/test/release workflow not
 reflected in `CONTRIBUTING.md`, or a new module absent from that
 contributor-instructions file's per-module Architecture section). The README's
-command inventory must match `cli.rs`'s `parse`
-and `plugin/mod.rs`'s `HumanVerb`/`HookEvent`, and the documented hook events
-must match what `plugin/hooks/hooks.json` actually registers – flag a doc that
-claims an event the manifest does not declare.
+command inventory must match `cli.rs`'s `parse` and the plugin crate's
+`HumanVerb`/`HookEvent`, and the documented hook events must match what
+`plugin/hooks/hooks.json` actually registers – flag a doc that claims an event
+the manifest does not declare. README must also stay explicit that no plugin
+verb is typed in a terminal: every one is `ss-magic-plugin <verb>`, reached
+through Claude Code, and turning the plugin on for a repository is documented as
+editing `"enabled": true` into the seeded `plugin` block, not as a command.
+`docs/runbooks/forge-tag-and-release-protection.md` must cover both tag shapes
+and keep recording the settings as they are on the forge (its ruleset JSON is
+the restore recipe, so a rule added or removed there must be mirrored) – flag a
+release-procedure change that assumes a tag can be moved or deleted, or a tag
+on an unsigned commit, since the live ruleset refuses all three.
 This `.cursor/BUGBOT.md` must likewise be re-synchronised whenever the
-conventions above change.
+conventions above change, and must stay self-contained – restate a convention
+inline rather than pointing at another document.

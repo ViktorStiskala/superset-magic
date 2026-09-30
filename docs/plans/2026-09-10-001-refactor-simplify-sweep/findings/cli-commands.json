@@ -1,0 +1,276 @@
+{
+  "partition": "cli-commands",
+  "findings": [
+    {
+      "id": "cli-commands-F1",
+      "category": "duplication",
+      "title": "pack_core re-implements resolve_sync_roots' repo-root resolution, including the byte-identical error line",
+      "locations": [
+        "crates/ss-magic/src/main.rs:294-307",
+        "crates/ss-magic/src/pack.rs:120-132"
+      ],
+      "evidence": "main.rs:295-303  let cwd_root = match git::cwd_repo_root(cwd) { Ok(r) => r, Err(err) => { eprintln!(\"{}\", tui::style::err(format!(\"error: cannot resolve git repo root from {}: {err:#}\", cwd.display()))); return Err(ExitCode::from(1)); } };\npack.rs:120-131  let root = match git::cwd_repo_root(cwd) { Ok(r) => r, Err(err) => { eprintln!(\"{}\", style::err(format!(\"error: cannot resolve git repo root from {}: {err:#}\", cwd.display()))); return Ok(ExitCode::from(1)); } };",
+      "problem": "The `git::cwd_repo_root` failure branch — the same probe, the same styled stderr line with the same format string, and the same exit code 1 — is written twice. `resolve_sync_roots` (main.rs) resolves cwd-root AND main-root as a pair, so pack cannot call it whole; instead pack copied the cwd-root half. A future change to the message or the exit code has to be made in two places and the CI suite would not catch a miss (each has its own test).",
+      "proposal": "Split the first half of `resolve_sync_roots` into `fn resolve_cwd_repo_root(cwd: &Path) -> std::result::Result<PathBuf, ExitCode>` in `crates/ss-magic/src/main.rs` (right beside `load_magic_or_exit`, which `pack.rs` already reaches as `crate::load_magic_or_exit`). `resolve_sync_roots` becomes `let cwd_root = resolve_cwd_repo_root(cwd)?;` followed by its existing main-root arm; `pack_core` becomes `let root = match crate::resolve_cwd_repo_root(cwd) { Ok(r) => r, Err(code) => return Ok(code) };`.",
+      "behavior_preservation": "The extracted body is the moved text verbatim: same probe function, same `tui::style::err` (pack's `style` is `use crate::tui::style`, the identical module), same format string and arguments, same `ExitCode::from(1)`. Only the carrier changes (`Err(code)` instead of an early `Ok(code)`), and pack already performs exactly that `Err(code) => return Ok(code)` mapping for `load_magic_or_exit` two statements later, so stdout/stderr bytes and the process exit code are unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-commands-F2",
+      "category": "copy-paste-variant",
+      "title": "The `files` is empty guard is duplicated between sync_core and pack_core with only the verb differing",
+      "locations": [
+        "crates/ss-magic/src/main.rs:339-346",
+        "crates/ss-magic/src/pack.rs:141-148"
+      ],
+      "evidence": "main.rs:340-345  if cfg.files.is_empty() { println!(\"{}\", tui::style::info(\"magic.json `files` is empty — nothing to sync.\")); return Ok(ExitCode::SUCCESS); }\npack.rs:142-147  if cfg.files.is_empty() { println!(\"{}\", style::info(\"magic.json `files` is empty — nothing to pack.\")); return Ok(ExitCode::SUCCESS); }",
+      "problem": "Both guards sit immediately after the shared `load_magic_or_exit` call, read the same field of the same type, print the same sentence through the same style helper, and return the same exit code. The only difference is the trailing verb. The pairing with `load_magic_or_exit` is already documented as \"one place\" for the absent/malformed path; this adjacent step escaped that consolidation.",
+      "proposal": "Add `pub fn empty_files_notice(cfg: &workspace::superset_files::MagicConfig, verb: &str) -> bool` next to `load_magic_or_exit` in `crates/ss-magic/src/main.rs`: it returns `false` when `cfg.files` is non-empty, and otherwise prints `tui::style::info(format!(\"magic.json `files` is empty — nothing to {verb}.\"))` and returns `true`. Call sites become `if empty_files_notice(&cfg, \"sync\") { return Ok(ExitCode::SUCCESS); }` and `if crate::empty_files_notice(&cfg, \"pack\") { return Ok(ExitCode::SUCCESS); }`.",
+      "behavior_preservation": "`format!(\"…nothing to {verb}.\")` with verb `\"sync\"`/`\"pack\"` produces the two current strings byte for byte; the same `style::info` wrapper and the same `println!` are used, and the `return Ok(ExitCode::SUCCESS)` stays at the original call site so control flow and exit code are unchanged. Lower value than F1 because the shared body is six lines — take it only if the reviewer wants the guard to live beside the loader it pairs with.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-commands-F3",
+      "category": "hardcoded-value",
+      "title": "migrate.rs declares MAGIC_LOCAL_REL, then re-spells the same path literal at three of its four uses",
+      "locations": [
+        "crates/ss-magic/src/workspace/migrate.rs:65",
+        "crates/ss-magic/src/workspace/migrate.rs:298",
+        "crates/ss-magic/src/workspace/migrate.rs:520",
+        "crates/ss-magic/src/workspace/migrate.rs:570"
+      ],
+      "evidence": "migrate.rs:65   const MAGIC_LOCAL_REL: &str = \".superset/magic.local.json\";\nmigrate.rs:298  if !repo_root.join(\".superset/magic.local.json\").exists() {\nmigrate.rs:520  let had_local = repo_root.join(\".superset/magic.local.json\").exists();\nmigrate.rs:570  let had_local = repo_root.join(\".superset/magic.local.json\").exists();",
+      "problem": "The constant exists in this very file and is referenced exactly once (line 93, the gitignore rule). The three \"does the repo already have a local overlay?\" probes — the guards that decide whether `bootstrap_magic_local_json` would clobber a gitignored, unrecoverable file — each re-type the literal instead. Same value, four spellings, and the three that matter most for data loss are the ones not tied to the constant.",
+      "proposal": "Replace each of the three `repo_root.join(\".superset/magic.local.json\")` with `repo_root.join(MAGIC_LOCAL_REL)` in `crates/ss-magic/src/workspace/migrate.rs`. (Wider option, cross-crate: core already owns this exact string privately as `superset_files::MAGIC_LOCAL_PATTERN` at `crates/ss-magic-core/src/superset_files.rs:35`; making that `pub` and dropping `MAGIC_LOCAL_REL` would give the workspace one owner for the fragment. The in-file fix above is the minimal, zero-risk half.)",
+      "behavior_preservation": "`MAGIC_LOCAL_REL` is the identical string literal, so `Path::join` produces the identical `PathBuf` and `.exists()` the identical bool at all three sites. Purely a substitution of a named constant for its own value; no control flow, output, or ordering changes.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-commands-F4",
+      "category": "reuse",
+      "title": "rename_setup_config re-implements copy_into_repo's delete-set, which run_migrate already invokes on the previous line",
+      "locations": [
+        "crates/ss-magic/src/workspace/migrate.rs:359-360",
+        "crates/ss-magic/src/workspace/migrate.rs:380-387",
+        "crates/ss-magic-core/src/superset_files.rs:477-484"
+      ],
+      "evidence": "migrate.rs:359-360  superset_files::copy_into_repo(staging.path(), repo_root, &[SETUP_SH_REL])?;\n                    rename_setup_config(repo_root)?;\nmigrate.rs:381-385  let old = repo_root.join(\".superset/setup_config.json\"); if old.exists() { std::fs::remove_file(&old).with_context(|| format!(\"deleting {}\", old.display()))?; }\nsuperset_files.rs:478-483  for rel in delete { let target = repo_root.join(rel); if target.exists() { fs::remove_file(&target).with_context(|| format!(\"deleting {}\", target.display()))?; } }",
+      "problem": "`copy_into_repo`'s `delete: &[&str]` parameter exists precisely to remove retired repo-relative paths after the staged tree is materialized, and `run_migrate` already passes `.superset/setup.sh` through it. The retirement of `.superset/setup_config.json` instead gets a private function that repeats the same three steps — join, existence check, `remove_file` with the same `\"deleting {}\"` context string — one line later. The path literal is also re-spelled here even though core owns it as `SETUP_CONFIG_JSON` (`superset_files.rs:29`).",
+      "proposal": "Add `const SETUP_CONFIG_REL: &str = \".superset/setup_config.json\";` beside `SETUP_SH_REL` in `crates/ss-magic/src/workspace/migrate.rs`, change the call at line 359 to `superset_files::copy_into_repo(staging.path(), repo_root, &[SETUP_SH_REL, SETUP_CONFIG_REL])?;`, and delete `rename_setup_config` (lines 376-387) plus its call at line 360. The migrate/tests.rs case `rename_setup_config_noop_when_absent` becomes a `copy_into_repo`-level assertion (core already covers the absent-path arm, so it can simply be dropped or restated against the new call).",
+      "behavior_preservation": "The `delete` loop performs exactly the operations `rename_setup_config` performs — `repo_root.join(rel)`, `target.exists()`, `fs::remove_file` with the same `\"deleting {}\"` anyhow context — and both deletions already run after all staged copies, in slice order, so putting `SETUP_SH_REL` first keeps the current setup.sh-then-setup_config.json order. On success nothing is printed by either path; on failure the error text is character-identical. The only change is that the error would surface from inside `copy_into_repo`'s `?` rather than the next line's, which is the same `Result` propagated out of `run_migrate`.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-commands-F5",
+      "category": "duplication",
+      "title": "run_init and run_init_noninteractive duplicate the whole stage-and-materialize sequence, tempdir prefix and status lines included",
+      "locations": [
+        "crates/ss-magic/src/workspace/migrate.rs:505-540",
+        "crates/ss-magic/src/workspace/migrate.rs:554-586"
+      ],
+      "evidence": "migrate.rs:506-509  let staging = tempfile::Builder::new().prefix(\"ss-magic-init-\").tempdir().context(\"creating init staging tempdir\")?;\nmigrate.rs:555-558  let staging = tempfile::Builder::new().prefix(\"ss-magic-init-\").tempdir().context(\"creating init staging tempdir\")?;\nmigrate.rs:520-523 / 570-573  let had_local = repo_root.join(\".superset/magic.local.json\").exists(); if !had_local { superset_files::bootstrap_magic_local_json(stage_root)?; }\nmigrate.rs:526-528 / 575-577  superset_files::copy_into_repo(stage_root, repo_root, &[])?; ensure_bootstrap_gitignores(repo_root)?; clear_legacy_skills_install();",
+      "problem": "Roughly eighteen consecutive statements are the same in both functions: identical tempdir prefix AND identical `.context(\"creating init staging tempdir\")` string, `merge_files_into_magic_config` → `write_magic_json` → `write_magic_sh` → `merge_setup_into_config` → `write_config_json`, the `had_local` guard that protects an existing gitignored overlay, then `copy_into_repo` → `ensure_bootstrap_gitignores` → `clear_legacy_skills_install`, and finally the same `Wrote .superset/magic.json` / `Wrote .superset/magic.sh` / `Wrote .superset/config.json` / `Gitignored …` status lines. The two differ only in where `existing` (the `Config`) comes from and in whether the `Kept existing …` line is printed. A change to the staged layout has to be made twice, and the identical tempdir prefix also means a leftover staging dir cannot be attributed to either caller.",
+      "proposal": "Extract `fn stage_and_materialize_init(repo_root: &Path, files: Vec<String>, existing_magic: Option<&superset_files::MagicConfig>, existing_config: Option<&Config>) -> Result<bool>` in `crates/ss-magic/src/workspace/migrate.rs`, holding lines 506-528 verbatim and returning `had_local`. `run_init` calls it with the `existing_magic` it already loaded at line 476 and the `existing` parameter; `run_init_noninteractive` loads `superset_files::load_magic_json(repo_root)?` and `superset_files::load_config(repo_root)?` first and passes both. Each caller keeps its own `println!` block so the differing `Kept existing …` line and the leading blank line stay explicit at the call site. While there, give the two staging dirs distinguishable prefixes only if the reviewer wants them (that IS an observable change to temp file names, so it is optional and separate).",
+      "behavior_preservation": "Every statement moves unchanged and in the same order, so the same files are written into the same staged tree and materialized by the same `copy_into_repo` call with the same empty delete set. The one ordering shift is in `run_init_noninteractive`: `load_magic_json` / `load_config` would run BEFORE the tempdir is created instead of after. That is observable only if tempdir creation AND a config read both fail in the same run, in which case the reported error changes which of the two it names; if the reviewer wants byte-exact error ordering there, pass the two loads as closures instead. Status printing stays at the call sites, so stdout is unchanged.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-commands-F6",
+      "category": "hardcoded-value",
+      "title": "The pack archive's name prefix and suffix are spelled once in archive_file_name and again in is_pack_archive_rel",
+      "locations": [
+        "crates/ss-magic/src/pack.rs:42-45",
+        "crates/ss-magic/src/pack.rs:221-230"
+      ],
+      "evidence": "pack.rs:43-44  let stem = repo_name_stem(root).unwrap_or_else(|| \"files\".to_string());\n               format!(\"ss-magic-{stem}.tar.bz2\")\npack.rs:226-229  && rel.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(\"ss-magic-\") && n.ends_with(\".tar.bz2\"))",
+      "problem": "`is_pack_archive_rel` is the self-exclusion guard that keeps a pack archive (current name, legacy name, or one left under a previous origin's name) out of the next archive — a secret-nesting guard. It recognizes the archive by a prefix and a suffix that the producer, `archive_file_name`, writes as an inline format string. Nothing ties the two spellings together, so renaming the output would silently stop the guard from matching newly written archives.",
+      "proposal": "Declare `const ARCHIVE_PREFIX: &str = \"ss-magic-\";` and `const ARCHIVE_SUFFIX: &str = \".tar.bz2\";` at the top of `crates/ss-magic/src/pack.rs`; make `archive_file_name` return `format!(\"{ARCHIVE_PREFIX}{stem}{ARCHIVE_SUFFIX}\")` and `is_pack_archive_rel` test `n.starts_with(ARCHIVE_PREFIX) && n.ends_with(ARCHIVE_SUFFIX)`. `pack/tests.rs:12`'s `LEGACY_PACK_FILE_NAME` (\"ss-magic-files.tar.bz2\") can stay a literal — it is deliberately a frozen historical name.",
+      "behavior_preservation": "Both constants hold the exact substrings the current code contains, so the formatted name and the two boolean tests evaluate identically for every input. No control flow, ordering, or output change; the guard's decision set is unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-commands-F7",
+      "category": "copy-paste-variant",
+      "title": "apply_update and apply_update_unlocked repeat the same run_self_update outcome mapping",
+      "locations": [
+        "crates/ss-magic/src/update/apply.rs:358-363",
+        "crates/ss-magic/src/update/apply.rs:373-379"
+      ],
+      "evidence": "apply.rs:359-363  match run_self_update(target_tag) { Ok(Some(version)) => ApplyOutcome::Updated { version }, Ok(None) => ApplyOutcome::NoUpdate, Err(_) => ApplyOutcome::NoUpdate, }\napply.rs:374-378  match run_self_update(target_tag) { Ok(Some(version)) => ApplyOutcome::Updated { version }, Ok(None) => ApplyOutcome::NoUpdate, Err(_) => ApplyOutcome::NoUpdate, }",
+      "problem": "The two entry points differ only in whether the lock is held; the swap itself and its three-arm mapping to `ApplyOutcome` are byte-identical fifteen lines apart. Anything added to the mapping (say, distinguishing a network error from a failed swap) would have to be added twice, and the unlocked fallback is the arm least likely to be exercised.",
+      "proposal": "Add `fn swap_outcome(target_tag: &str) -> ApplyOutcome` in `crates/ss-magic/src/update/apply.rs` holding that match verbatim. `apply_update`'s tail becomes `swap_outcome(target_tag)` (keeping the existing comment about `_guard` dropping after it) and `apply_update_unlocked`'s whole body becomes `swap_outcome(target_tag)`.",
+      "behavior_preservation": "The extracted function is the moved expression: `run_self_update` is still called exactly once per entry point, at the same point in the control flow, and returns the same `ApplyOutcome`. In `apply_update` the call still happens inside the scope that owns `_guard`, so the advisory lock is still held for the swap and released at the same place.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-commands-F8",
+      "category": "duplication",
+      "title": "apply_update inlines the stale-check/open/RwLock prelude that try_lock_state_at already owns, and the tested function is not the production one",
+      "locations": [
+        "crates/ss-magic/src/update/apply.rs:270-278",
+        "crates/ss-magic/src/update/apply.rs:335-339"
+      ],
+      "evidence": "apply.rs:271-278  let stale = lock_is_stale(lock_path, ttl, now); let Ok(file) = open_lock_file(lock_path) else { return LockState::Contended; }; let mut lock = fd_lock::RwLock::new(file);\napply.rs:335-339  let stale = lock_is_stale(lock_path, STALE_TTL, SystemTime::now()); let Ok(file) = open_lock_file(lock_path) else { return ApplyOutcome::Skipped; }; let mut lock = fd_lock::RwLock::new(file);",
+      "problem": "`try_lock_state_at` / `try_lock_state` / `LockState` all carry `#[allow(dead_code)] // used in tests`: nothing in production calls them, and `apply_update` — the shipped path — re-does their opening three statements inline. The AE2 contention test therefore pins a parallel implementation rather than the code that actually runs, and the two have already drifted (`try_lock_state_at` calls `touch` after a first-try acquisition; `apply_update` does not). A future edit to one is not caught by the other's test.",
+      "proposal": "Extract the shared prelude as `fn stale_and_open(lock_path: &Path, ttl: Duration, now: SystemTime) -> Result<(bool, fd_lock::RwLock<File>), ()>` in `crates/ss-magic/src/update/apply.rs`, returning `Err(())` when `open_lock_file` fails. `try_lock_state_at` maps `Err(())` to `LockState::Contended`, `apply_update` maps it to `ApplyOutcome::Skipped`, and each keeps its own post-acquisition policy (touch-on-acquire vs. hold-the-guard) unchanged. Separately, note in `apply_update`'s doc comment that the touch-on-acquire difference is deliberate, or make the two agree — that part is a behavior decision, not a simplification, and is out of scope here.",
+      "behavior_preservation": "The three extracted statements are pure setup with no side effect beyond `open_lock_file`'s create-if-absent, which both callers already perform in the same order with the same arguments; `lock_is_stale` is a read-only stat. Each caller keeps its own error mapping and its own `try_write` sequence afterwards, so the acquisition semantics, the mtime touching, and both return types are untouched.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-commands-F9",
+      "category": "duplication",
+      "title": "open_lock_file exists twice in the workspace, once per binary crate, with the plugin copy documented as a mirror",
+      "locations": [
+        "crates/ss-magic/src/update/apply.rs:234-244",
+        "crates/ss-magic-plugin/src/tmproot.rs:218-229"
+      ],
+      "evidence": "apply.rs:238-243  OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)\ntmproot.rs:220-221 (doc)  /// Open (creating if absent) the lock file at `path` for `fd_lock`. Mirrors\n                          /// `update/apply.rs::open_lock_file`; the file's contents are never read\ntmproot.rs:226-231  OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)",
+      "problem": "Both binaries need the same `fd_lock` file-opening primitive and each has its own private copy; the plugin's doc comment names the CLI's copy as the thing it mirrors, which is exactly the drift shape `plugin/lib/execguard.sh` was created to fix on the shell side. The structure pins say a helper shared by both binaries belongs in core, and both crates already depend on `ss-magic-core`.",
+      "proposal": "Move the five-call `OpenOptions` chain into `ss-magic-core` — a `pub fn open_lock_file(path: &Path) -> io::Result<File>` in a small `crates/ss-magic-core/src/lockfile.rs` (or beside the existing `hashing`/`state_tree` leaf modules). `tmproot::open_lock_file` becomes a re-export or a direct call. `update/apply.rs::open_lock_file` keeps its extra `create_dir_all(parent)` line and then delegates: `if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); } ss_magic_core::lockfile::open_lock_file(path)`.",
+      "behavior_preservation": "The moved chain is character-identical in both copies, so the resulting `File` and every error case are the same. The CLI's parent-directory creation stays where it is and still runs before the open, so its behavior on a missing cache dir is unchanged; the plugin's copy never had that step and does not gain it.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-commands-F10",
+      "category": "duplication",
+      "title": "pack/tests.rs re-implements write_magic, write_file and the repo fixture that core's testutil already exports",
+      "locations": [
+        "crates/ss-magic/src/pack/tests.rs:14-47",
+        "crates/ss-magic-core/src/testutil.rs:73-115"
+      ],
+      "evidence": "pack/tests.rs:30-38  fn write_magic(root: &Path, patterns: &[&str]) { fs::create_dir_all(root.join(\".superset\")).unwrap(); … fs::write(root.join(\".superset/magic.json\"), body).unwrap(); }\npack/tests.rs:41-45  fn write_file(root: &Path, rel: &str, body: &str) { let p = root.join(rel); fs::create_dir_all(p.parent().unwrap()).unwrap(); fs::write(p, body).unwrap(); }\ntestutil.rs:100-115  pub fn write_magic(root: &Path, patterns: &[&str]) { … }   pub fn write_file(root: &Path, rel: &str, body: &str) { … }",
+      "problem": "`write_magic` and `write_file` are line-for-line the same as `ss_magic_core::testutil`'s (the `MagicConfig` they build is the same type — the CLI re-exports core's `superset_files`), and the file already imports `git_run` and `neutralize_global_excludes` from testutil, so the dependency is present. `init_repo` (lines 20-27) is `init_main_repo(\"main\")` minus one line, and `exit_ok` (lines 14-16) is `exit_code_to_u8(code) == 0`. The structure pins name a testutil-provided helper re-implemented in a module's `tests.rs` as a finding.",
+      "proposal": "In `crates/ss-magic/src/pack/tests.rs`, delete the local `write_magic` and `write_file` and extend the existing import to `use ss_magic_core::testutil::{git_run, write_file, write_magic};` (call sites are unchanged — same names, same signatures). Replace `init_repo()` with `ss_magic_core::testutil::init_main_repo(\"main\")` and delete the local fixture. `exit_ok` can stay as a one-line readability wrapper, or become `assert_eq!(exit_code_to_u8(code), 0)` at its call sites — that is a style call, not a correctness one.",
+      "behavior_preservation": "The two writer helpers are byte-equivalent, so every fixture tree the tests build is identical. `init_main_repo` differs from `init_repo` by one added `git config gc.auto 0` in the fixture repo, which suppresses a background `gc --auto` repack during parallel runs; it changes no assertion input and is the reason testutil's version exists. No production code is touched.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-commands-F11",
+      "category": "efficiency",
+      "title": "load_magic_or_exit stats magic.json before load_overlaid stats it again, for an answer load_overlaid already gives",
+      "locations": [
+        "crates/ss-magic/src/main.rs:205-223",
+        "crates/ss-magic-core/src/superset_files.rs:92-101"
+      ],
+      "evidence": "main.rs:218-223  if !magic_json_path.is_file() { return Err(absent()); }\n                 match workspace::superset_files::load_overlaid(root) { Ok(Some(cfg)) => Ok(cfg), Ok(None) => Err(absent()), …\nsuperset_files.rs:96-101  let base: MagicConfig = match read_json::<MagicConfig>(&base_path)…? { None => return Ok(None), Some(cfg) => cfg, };",
+      "problem": "The pre-check duplicates work `load_overlaid` already does: `read_json` returns `Ok(None)` for an absent base and the caller already maps that to the identical `absent()` error, so the extra `is_file()` is a second stat of the same path whose only unique contribution is deciding an error message in one pathological case. This is the pre-check-then-operate shape the efficiency rubric names.",
+      "proposal": "In `crates/ss-magic/src/main.rs`, drop lines 218-220 and let the existing `Ok(None) => Err(absent())` arm carry the absent case. Keep the `magic_json_path` binding — line 212 still uses it for the `expected {}` half of the message.",
+      "behavior_preservation": "For an absent file the outcome is character-identical (`Ok(None)` → the same `absent()` closure → the same stderr line and `ExitCode::from(1)`). For a readable file, unreadable file, or malformed JSON nothing changes. ONE divergence: if `.superset/magic.json` exists as a directory or other non-regular file, core's `read_json` bails with \"`…` exists but is not a regular file\" (still exit 1) instead of today's \"no `.superset/magic.json` in …\". If the reviewer requires byte-exact stderr in that case, keep the check — otherwise the core message is the more accurate of the two.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-commands-F12",
+      "category": "const-location",
+      "title": "The `.superset/magic.json` path is owned privately by core and re-spelled as a literal in both binaries",
+      "locations": [
+        "crates/ss-magic/src/main.rs:205",
+        "crates/ss-magic-core/src/superset_files.rs:26-30",
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:100"
+      ],
+      "evidence": "main.rs:205  let magic_json_path = root.join(\".superset/magic.json\");\nsuperset_files.rs:26-30  const SUPERSET_DIR: &str = \".superset\";  const MAGIC_JSON: &str = \"magic.json\";\npre_tool_use.rs:100  const ROOT_MARKER: &str = \".superset/magic.json\";",
+      "problem": "Core builds every one of its own `.superset/magic.json` paths from `superset_dir(root).join(MAGIC_JSON)`, but both constants are private, so the CLI's probe and the plugin's repo-root marker each hardcode the joined literal. Three spellings of the file that defines a workspace, with the owner unable to be reused.",
+      "proposal": "Export a path accessor from `crates/ss-magic-core/src/superset_files.rs` — `pub fn magic_json_path(root: &Path) -> PathBuf { superset_dir(root).join(MAGIC_JSON) }` (the private `superset_dir` and `MAGIC_JSON` already exist at lines 270 and 30). `main.rs:205` becomes `let magic_json_path = workspace::superset_files::magic_json_path(root);`. The plugin's `ROOT_MARKER` is a relative marker rather than an absolute path, so it can stay a constant, or core can additionally expose the relative `pub const MAGIC_JSON_REL: &str = \".superset/magic.json\";` for it — decide that with the plugin partition.",
+      "behavior_preservation": "`superset_dir(root).join(MAGIC_JSON)` yields the same `PathBuf` as `root.join(\".superset/magic.json\")` for every root (`Path::join` of \".superset\" then \"magic.json\" is the same as joining the two-component relative path), so the `is_file()` probe and the `expected {}` message text are unchanged. Adding a `pub fn` to core changes nothing for existing callers.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "cli-commands-F13",
+      "category": "hardcoded-value",
+      "title": "The lock tests re-type STALE_TTL's 60 seconds instead of naming the constant (lead, weakly held)",
+      "locations": [
+        "crates/ss-magic/src/update/apply/tests.rs:133",
+        "crates/ss-magic/src/update/apply/tests.rs:148",
+        "crates/ss-magic/src/update/apply.rs:93"
+      ],
+      "evidence": "apply.rs:93  const STALE_TTL: Duration = Duration::from_secs(60);\ntests.rs:133  let state = try_lock_state_at(&lock_path, Duration::from_secs(60), SystemTime::now());\ntests.rs:148  let state = try_lock_state_at(&lock_path, Duration::from_secs(60), SystemTime::now());",
+      "problem": "Both tests spell the production TTL's value rather than referencing `STALE_TTL`, which is in scope through `use super::*`. If the constant is retuned, the tests keep asserting against the old number and stay green.",
+      "proposal": "Pass `STALE_TTL` at both call sites in `crates/ss-magic/src/update/apply/tests.rs`.",
+      "behavior_preservation": "`STALE_TTL` IS `Duration::from_secs(60)`, so both assertions evaluate identically today. Counter-argument, and why this is only a lead: `try_lock_state_at`'s injectable `ttl` exists precisely so the test can choose a TTL independent of production — line 133's case (mtime forced to the unix epoch) is stale under any TTL, and line 148's only needs a TTL longer than the test's own runtime. A reviewer may reasonably decide the decoupling is the point and leave both literals alone.",
+      "confidence": 50,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 2 (standard-library or runtime primitives): no hand-rolled logic in this partition has a behavior-equivalent std replacement — `cli::parse` is a deliberate no-clap parser, `pack`'s tar/bzip2 loop and `update/apply`'s self_update wiring are already thin over their crates.",
+    "Rubric 1 item 3 (platform/framework/downstream guarantees): nothing here hand-maintains a guarantee its provider already gives; the self_update KTD5 gaps are documented as NOT exposed by the crate, not as re-implementations.",
+    "Rubric 2 item 1 (redundant state): no cached value that could be derived and no observer/effect indirection — the event closures in `sync_core`/`pack_core` are the tested rendering seam.",
+    "Rubric 2 item 2 (parameter sprawl): `execute_final_action`'s `commit_message`/`branch_prefix` and `pack_core`/`sync_core`'s `on_event` are the documented testability seams the structure pins protect.",
+    "Rubric 2 item 4 (leaky abstractions): none — `pack.rs` reaches `crate::load_magic_or_exit` and `crate::sync::under_excluded_tree` through the intended crate-root seams.",
+    "Rubric 2 item 5 (stringly-typed code): `Command`/`Parsed`/`Branch`/`FinalAction`/`ApplyOutcome`/`UpdateReport` are already enums; no raw string stands in for one.",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable — no component-tree UI framework in this partition.",
+    "Rubric 2 item 7 (nested conditionals 3+ deep): deepest nesting is two levels (`execute_final_action`'s match arms, `print_event`'s if/else chain).",
+    "Rubric 2 item 8 (unnecessary comments): the comments here state rules and measured decisions (the update-gate truth table, the KTD5 conformance notes, the pack self-exclusion rationale); none merely restates code or narrates a change.",
+    "Rubric 2 item 9 (dead code / unused imports): the only production-dead items are `LockState`/`try_lock_state`/`try_lock_state_at`, reported under F8 rather than as removals — they are reachable from tests and deleting them would drop the contention coverage.",
+    "Rubric 2 item 10 (context-dependent vocabulary): naming follows the CONCEPTS.md vocabulary (main checkout, worktree, forward/reverse sync, candidate); the cross-crate name echoes recon flagged (`run`, `usage`, `parse`, `version_line`, `UpdateReport`) are separate crates with unrelated signatures, not drift.",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): the legacy surfaces here (`setup_config.json` reader, `LEGACY_SKILLS_REL` cleanup, the legacy `ss-magic-files.tar.bz2` exclusion) all serve already-deployed installs and must stay.",
+    "Rubric 3 item 2 (missed concurrency): every flow is a single-shot CLI command; parallelizing the pattern walk or the archive write would change output ordering.",
+    "Rubric 3 item 3 (hot-path bloat): the auto-update gate is already cache-gated and `should_run_update_gate` short-circuits on the guard env before any I/O.",
+    "Rubric 3 item 4 (recurring no-op updates): no polling, event, or reducer loop in this partition.",
+    "Rubric 3 item 6 (memory): the only growing structures are `write_archive`'s `added` set and `match_paths`' result, both bounded by the configured pattern matches.",
+    "Rubric 3 item 7 (overly broad operations): reads are whole small JSON config files, which is what parsing them requires; the pack walk is already pruned at the enumeration layer."
+  ]
+}

@@ -1,0 +1,324 @@
+{
+  "partition": "plugin-hook-core",
+  "findings": [
+    {
+      "id": "plugin-hook-core-F1",
+      "category": "duplication",
+      "title": "The strip_prefix-plus-lossy \"path relative to root\" idiom is written four times in the plugin crate",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/session_start.rs:495-499",
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:132-136",
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:551-553",
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:1374-1379"
+      ],
+      "evidence": "session_start.rs:495  fn display_rel(root: &Path, path: &Path) -> String {\n                       path.strip_prefix(root)\n                           .map(|p| p.to_string_lossy().into_owned())\n                           .unwrap_or_else(|_| path.to_string_lossy().into_owned())\npre_compact.rs:132   fn rel_to_repo(repo_root: &Path, path: &Path) -> String {   // same three lines\nverbs.rs:1374        fn display_rel(root: &Path, path: &Path) -> String { path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned() }",
+      "problem": "Four copies of one three-line reduction, under three different names (`display_rel`, `rel_to_repo`, and inlined at the tail of `rel_to_state`). Two of them share a name across modules while one of the same-named pair is spelled with `.unwrap_or(path)` instead of `.unwrap_or_else(|_| …)`; a reader grepping `display_rel` finds two definitions and cannot tell whether they agree.",
+      "proposal": "Add one `pub(crate) fn display_rel(root: &Path, path: &Path) -> String` to the plugin crate's existing path-helper module `crates/ss-magic-plugin/src/pathnorm.rs` (it already owns the crate's lexical path helpers and is imported by the gate modules). Have `hook/session_start.rs`, `hook/pre_compact.rs` (renaming `rel_to_repo` away entirely) and `checklist/verbs.rs` call it, and have `hook/subagent_stop.rs::rel_to_state` keep its state-root derivation but end in `pathnorm::display_rel(root, path)`.",
+      "behavior_preservation": "All four bodies compute the same string: `strip_prefix` returns `Ok(rel)` or `Err(StripPrefixError)`, and the checklist variant's `.unwrap_or(path)` yields the same `path` the other variant's `.unwrap_or_else(|_| …)` falls back to; `to_string_lossy().into_owned()` is then applied to the identical `Path` in every case. No caller inspects the error, so the outputs, the absence of I/O and the call ordering are unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F2",
+      "category": "const-location",
+      "title": "STATE_QUERY is defined twice as the same hardcoded literal while a third site derives it from core's STATE_REL",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/mod.rs:93",
+        "crates/ss-magic-plugin/src/scratchpad.rs:66",
+        "crates/ss-magic-plugin/src/status.rs:1270"
+      ],
+      "evidence": "hook/mod.rs:93       const STATE_QUERY: &str = \".superset/.magic/\";\nscratchpad.rs:66     const STATE_QUERY: &str = \".superset/.magic/\";\nstatus.rs:1270       let query = format!(\"{}/\", scratchpad::STATE_REL);",
+      "problem": "The one path core owns (`ss_magic_core::state_tree::STATE_REL`, re-exported as `scratchpad::STATE_REL`) is re-spelled as a slash-suffixed literal in two private consts with the same name and near-identical doc comments, while `status.rs` derives the very same value from `STATE_REL`. Three spellings of one query string, two of which are independent literals that a change to `STATE_REL` would silently leave behind.",
+      "proposal": "Keep exactly one definition: make `crates/ss-magic-plugin/src/scratchpad.rs:66`'s const `pub(crate) const STATE_QUERY: &str = \".superset/.magic/\";` (it already re-exports `STATE_REL` and owns the state tree), delete `hook/mod.rs:93` and import `crate::scratchpad::STATE_QUERY` there, and replace `status.rs:1270`'s `format!` with the same const.",
+      "behavior_preservation": "All three sites currently evaluate to the byte-identical string `\".superset/.magic/\"` (`STATE_REL` is `.superset/.magic`, so the `format!` appends the same slash), and each is passed to `git::is_ignored_no_index_str` or interpolated into a message. Substituting one const for three equal values changes no argument, message or ordering; `status.rs` loses one heap allocation per call and nothing else.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F3",
+      "category": "duplication",
+      "title": "The ignored-state-tree probe and its two refusal sentences are written twice, word for word apart from one suffix",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/mod.rs:619-631",
+        "crates/ss-magic-plugin/src/scratchpad.rs:438-455"
+      ],
+      "evidence": "hook/mod.rs:620   match git::is_ignored_no_index_str(root, STATE_QUERY) {\n                    Ok(false) => Some(format!(\"git does not ignore {STATE_QUERY} — no covering rule in any .gitignore; \\\n                       run `ss-magic-plugin enable` (or `ss-magic init`) to add it. No state was written.\")),\nscratchpad.rs:439 match git::is_ignored_no_index_str(&root, STATE_QUERY) {\n                    Ok(false) => … detail: format!(\"git does not ignore {STATE_QUERY} — no covering rule in any .gitignore; \\\n                       run `ss-magic-plugin enable` (or `ss-magic init`) to add it\"),",
+      "problem": "Two modules independently spell the same fail-closed probe and the same two sentences; `hook/mod.rs`'s versions differ only by a trailing `. No state was written.` on each. A wording fix in one leaves the other stale, and the heartbeat row and the guidance block would then disagree about the same refusal.",
+      "proposal": "Add `pub(crate) fn ignore_refusal(root: &Path) -> Option<String>` to `crates/ss-magic-plugin/src/scratchpad.rs`, holding the probe and the two base sentences exactly as `scratchpad` spells them today (no trailing suffix). `scratchpad::ensure` uses its result as `Refusal::NotIgnored { detail }`; `hook/mod.rs::state_tree_refusal` becomes `scratchpad::ignore_refusal(root).map(|base| format!(\"{base}. No state was written.\"))`. Both call sites keep their own probe call, so neither gate is thinned or skipped.",
+      "behavior_preservation": "The suffixed strings reproduce today's `hook/mod.rs` text exactly (`\"… to add it\"` + `\". No state was written.\"` = `\"… to add it. No state was written.\"`; `\"… is ignored: {e}\"` + `\". No state was written.\"` = today's error sentence), and the `Ok(true) => None` / fail-closed `Err` mapping is unchanged. Each caller still performs its own `git::is_ignored_no_index_str` call at the same point in its flow, so the number and ordering of subprocesses is untouched.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F4",
+      "category": "efficiency",
+      "title": "Every state-writing hook runs the same `git check-ignore --no-index` probe twice per invocation",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/mod.rs:525-529",
+        "crates/ss-magic-plugin/src/hook/session_start.rs:171",
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:98",
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:113"
+      ],
+      "evidence": "hook/mod.rs:525   if route.writes_state {\n                      if let Some(detail) = state_tree_refusal(&config_root) {\nsession_start.rs:171  let report = scratchpad::ensure(ctx.cwd())?;   // scratchpad.rs:439 probes the same query again",
+      "problem": "The pipeline gate asks git whether `.superset/.magic/` is ignored, and the handler it then dispatches to immediately calls `scratchpad::ensure`, whose first act is the identical `git::is_ignored_no_index_str(root, STATE_QUERY)` probe. That is two `git` process spawns per `SessionStart`, `PreCompact` and `SubagentStop` invocation for one question already answered — on `SessionEnd`'s budget-sensitive sibling events, and on a path the module doc describes as the cost every invocation pays.",
+      "proposal": "Carry the verdict rather than dropping it: have `hook/mod.rs::gate_and_dispatch` record the `Ok(true)` it already obtained on `HookContext` (a new `state_tree_ignored: bool` field beside `main_root`), and add `pub(crate) fn ensure_verified(cwd: &Path) -> Result<Report>` to `crates/ss-magic-plugin/src/scratchpad.rs` that skips only the ignore probe and is callable only with that flag set; the three hook handlers call it, and the public `ensure` — used by `status`, the verbs and every non-hook caller — keeps probing exactly as now.",
+      "behavior_preservation": "The skipped probe is the same call against the same root, made microseconds earlier in the same process, and it is only skipped when it returned `Ok(true)` (the gate returns before dispatch on `Ok(false)` and on `Err`). The `Report` a handler receives is otherwise built identically, so refusals, guidance text and heartbeat details are unchanged. Marked as touching a safety check because it moves a fail-closed probe's result across a call boundary; if the reviewer judges the flag too easy to mis-set later, the finding should be dropped rather than weakened.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": true,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F5",
+      "category": "efficiency",
+      "title": "SessionStart reads the plugin pin file twice, from two notices that document themselves as reading one pin",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/session_start.rs:331",
+        "crates/ss-magic-plugin/src/hook/session_start.rs:394",
+        "crates/ss-magic-plugin/src/hook/session_start.rs:349-353"
+      ],
+      "evidence": "session_start.rs:331   let pinned = read_pin(plugin_root)?;            // version_drift_notice\nsession_start.rs:394   let pinned = read_pin(surroundings.plugin_root.as_deref());   // release_suggestion\nsession_start.rs:347   /// … Shared by\nsession_start.rs:348   /// the version-drift notice and the release suggestion so the two can never\nsession_start.rs:349   /// read a different pin.",
+      "problem": "`read_pin` is a file read (`status::read_pin_file`), and both notices call it on every `startup`. The doc comment claims the two \"can never read a different pin\", but they read the file twice and could in principle disagree; the sharing is only of the function, not of the value.",
+      "proposal": "In `handle_with`, read it once — `let pinned = read_pin(surroundings.plugin_root.as_deref());` — and pass `pinned.as_deref()` into `version_drift_notice` and `release_suggestion`, changing both signatures to take the already-read pin instead of a `plugin_root`.",
+      "behavior_preservation": "`version_drift_notice` already reads the pin unconditionally on every source, so hoisting the read never adds one: a non-`startup` session still performs exactly one read (release_suggestion returns at its `source != \"startup\"` check before reaching the pin today, and would simply be handed a value it ignores), and a `startup` goes from two reads to one. The value is identical in both because the file is not written between the two calls, and the notices' texts and ordering are unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F6",
+      "category": "efficiency",
+      "title": "The cache-directory closure is invoked twice per SessionStart, and each call runs create_dir_all",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/session_start.rs:265",
+        "crates/ss-magic-plugin/src/hook/session_start.rs:395",
+        "crates/ss-magic-core/src/release.rs:471-475"
+      ],
+      "evidence": "session_start.rs:265   let Some(dir) = marker_dir() else {\nsession_start.rs:395   let Some(dir) = (surroundings.cache_dir)() else {\nrelease.rs:471         pub fn cache_dir() -> Option<PathBuf> { let dir = cache_dir_path()?; let _ = std::fs::create_dir_all(&dir); Some(dir) }",
+      "problem": "On a `startup` where the compaction advice reaches its marker step, `compaction_advice` and `release_suggestion` each invoke the injected `cache_dir` closure, and the production closure is `release::cache_dir`, which resolves `ProjectDirs` and calls `create_dir_all` every time. The second resolution and mkdir are pure repeat work on the session-start path.",
+      "proposal": "Memoize inside `handle_with` without losing the laziness the `Surroundings` doc requires: build a local `let cached = std::cell::OnceCell::new();` and a closure `|| cached.get_or_init(|| (surroundings.cache_dir)()).clone()`, and pass that closure to both `compaction_advice` and `release_suggestion` in place of the raw one.",
+      "behavior_preservation": "The closure is still called only when a branch actually needs the directory, so a plain `resume` — or a startup without the override — still never touches the cache directory, which is the property the doc pins. When it is needed, `release::cache_dir` is idempotent (`create_dir_all` on an existing directory is `Ok`), so one call returns the same `Option<PathBuf>` the second call would have; every marker path, cache path and heartbeat detail is unchanged.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F7",
+      "category": "copy-paste-variant",
+      "title": "pre_compact computes the same `trigger_display` fallback twice in one file",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:82-86",
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:189-193"
+      ],
+      "evidence": "pre_compact.rs:82    let trigger_display = if trigger.is_empty() { \"(unset)\" } else { trigger };\npre_compact.rs:189   let trigger_display = if trigger.is_empty() { \"(unset)\" } else { trigger };",
+      "problem": "`handle` renders the trigger for the heartbeat detail and `append_note` renders it again for the file body, from the same input, with the same literal `\"(unset)\"` spelled twice. The two are required to agree (the row and the note describe one event) but nothing makes them.",
+      "proposal": "Add one private `fn trigger_display(trigger: &str) -> &str { if trigger.is_empty() { \"(unset)\" } else { trigger } }` to `crates/ss-magic-plugin/src/hook/pre_compact.rs` and call it from both sites, so the `\"(unset)\"` literal exists once.",
+      "behavior_preservation": "Both call sites are already the identical expression over the identical `trigger` value (`append_note` receives the same `&str` `handle` matched out of the payload), so extracting it yields byte-identical output in the heartbeat detail and in the note's `## <ts> — trigger: …` line.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F8",
+      "category": "duplication",
+      "title": "Three handlers repeat the same repo_root guard and the same hard-coded detail sentence",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/session_start.rs:167-169",
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:94-96",
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:109-111"
+      ],
+      "evidence": "session_start.rs:168   return Ok(Outcome::silent().with_detail(\"not inside a git repository; nothing to do\"));\npre_compact.rs:95      return Ok(Outcome::silent().with_detail(\"not inside a git repository; nothing to do\"));\nsubagent_stop.rs:110   return Ok(Outcome::silent().with_detail(\"not inside a git repository; nothing to do\"));",
+      "problem": "The same heartbeat sentence is a bare string literal in three handlers, each preceded by a four-line comment restating the same `HookContext::repo_root` contract. The heartbeat vocabulary is otherwise centralised as named `REASON_*` consts in `hook/mod.rs`; this one class of note is stringly-typed and triplicated instead.",
+      "proposal": "Add `pub(crate) const NO_REPOSITORY_DETAIL: &str = \"not inside a git repository; nothing to do\";` next to the `REASON_*` block in `crates/ss-magic-plugin/src/hook/mod.rs` and use it at all three sites (keeping each handler's own `let Some(repo_root) = … else` / `if ctx.repo_root.is_none()` shape, which differs because two of them need the bound root).",
+      "behavior_preservation": "Only a literal is replaced by a const holding that literal; the guards, their position in each handler and every emitted `Outcome` stay identical.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F9",
+      "category": "duplication",
+      "title": "`pre_compact::is_tracked` is a narrower copy of `subagent_stop::tracked_under`, and collides by name with `scratchpad::is_tracked`",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:140-144",
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:559-568",
+        "crates/ss-magic-plugin/src/scratchpad.rs:363"
+      ],
+      "evidence": "pre_compact.rs:141   report.refusals.iter().any(|refusal| {\n                         matches!(refusal, Refusal::TrackedPaths { paths } if paths.iter().any(|p| p == rel))\nsubagent_stop.rs:560 let prefix = format!(\"{rel}/\");\nsubagent_stop.rs:561 report.refusals.iter().any(|refusal| { matches!(refusal, Refusal::TrackedPaths { paths }\n                         if paths.iter().any(|p| p == rel || p.starts_with(&prefix))) })\nscratchpad.rs:363    fn is_tracked(&self, path: &Path) -> bool   // unrelated: queries the live tracked set",
+      "problem": "Two hook handlers each carry their own scan of `Report::refusals` for a tracked path, differing only by the `rel/` prefix branch, and the narrower one is named `is_tracked` — the same name `scratchpad` uses for an unrelated question (\"does git report this tracked\", against a live `HashSet`). A reader grepping the name gets two different answers, and a fix to the refusal scan has two homes.",
+      "proposal": "Move `tracked_under(report: &Report, rel: &str) -> bool` up to `crates/ss-magic-plugin/src/hook/mod.rs` as `pub(super) fn tracked_under`, and have both `hook/pre_compact.rs` and `hook/subagent_stop.rs` call it — deleting `pre_compact::is_tracked` and with it the name clash.",
+      "behavior_preservation": "For the file path `pre_compact` passes (`<session dir>/PRE-COMPACT.md`), `tracked_under`'s extra `p.starts_with(\"<rel>/\")` arm can only match if git tracks a path *inside* something named `PRE-COMPACT.md`, i.e. if that name is a directory — in which case today's code proceeds to open it and fails with an I/O error, while the shared helper refuses quietly. Every other input is answered identically. The divergence is only in that impossible-in-practice case and moves the handler further toward its own fail-closed posture, so confidence is 75 rather than 100.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F10",
+      "category": "const-location",
+      "title": "The owner-only file mode is nine private FILE_MODE consts, one inline literal in this partition, and one same-named const holding a different value",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/pre_compact.rs:64-67",
+        "crates/ss-magic-plugin/src/hook/session_start.rs:298-302",
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:86",
+        "crates/ss-magic-plugin/src/setup_ci.rs:84"
+      ],
+      "evidence": "pre_compact.rs:64    /// Owner-only file mode (R58) … Repeated here rather than imported …\npre_compact.rs:67    const FILE_MODE: u32 = 0o600;\nsession_start.rs:301         .mode(0o600)\nsetup_ci.rs:84       const FILE_MODE: u32 = 0o644;",
+      "problem": "`const FILE_MODE: u32 = 0o600` exists nine times in the plugin crate (`bypass`, `cache`, `expect_artifact`, `heartbeat`, `ledger`, `scratchpad`, `hook/file_changed`, `hook/subagent_stop`, `hook/pre_compact`), `setup_ci.rs` binds the SAME name to `0o644`, and this partition also writes the mode as a bare `0o600` literal in `session_start::claim_marker` — so the crate has three spellings of one policy and one name that means two different things.",
+      "proposal": "Declare `pub(crate) const OWNER_ONLY_MODE: u32 = 0o600;` once (beside `write_atomically` in `crates/ss-magic-plugin/src/atomic.rs`, which already takes a mode parameter and is the crate's shared write primitive), have the nine 0o600 sites and `session_start.rs:301`'s inline literal use it, and rename `setup_ci.rs`'s const to `COMMITTED_FILE_MODE` so no two values share a name.",
+      "behavior_preservation": "Every replaced site passes the same `u32` to the same `OpenOptionsExt::mode` / `set_permissions` call, so the on-disk modes are unchanged; the `setup_ci` rename touches a private const with a single reader. `pre_compact.rs`'s doc comment defending the local copy is superseded by the shared const and should be rewritten rather than deleted.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F11",
+      "category": "const-location",
+      "title": "The `unroutable-event` heartbeat class has two independent owners",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/mod.rs:102-103",
+        "crates/ss-magic-plugin/src/hook/event.rs:257-263"
+      ],
+      "evidence": "hook/mod.rs:103   const REASON_UNROUTABLE: &str = \"unroutable-event\";\nevent.rs:258      match self {\nevent.rs:262          Self::Unroutable(_) => \"unroutable-event\",",
+      "problem": "One string names one condition, but it is spelled independently in a bare const in `hook/mod.rs` (used by the pre-decode screen) and in `DecodeError::class`'s match arm (used when the same condition is reached through `decode`). `class()` is documented as \"a stable, machine-readable class … so changing the human text below never breaks anything reading the log\" — yet the log's other producer of that class is not tied to it.",
+      "proposal": "Own it once in `crates/ss-magic-plugin/src/hook/event.rs`: `pub(crate) const CLASS_UNROUTABLE: &str = \"unroutable-event\";`, returned by `DecodeError::class`'s `Unroutable` arm, and referenced from `hook/mod.rs` in place of `REASON_UNROUTABLE` (or as its initializer, keeping the local name).",
+      "behavior_preservation": "The emitted class string is the same literal on both paths, so every heartbeat row, `status` count and grep over the log is byte-identical.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F12",
+      "category": "duplication",
+      "title": "STATE_FILE_NOTES retypes the six state-file names that scratchpad::STATE_FILES already owns",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/session_start.rs:66-90",
+        "crates/ss-magic-plugin/src/scratchpad.rs:80-87",
+        "crates/ss-magic-plugin/src/hook/session_start/tests.rs:473"
+      ],
+      "evidence": "session_start.rs:66  /// `(file name, one-line description)`, in the exact order and spelling of\nsession_start.rs:67  /// [`scratchpad::STATE_FILES`]. … a name here that U8 does not actually create\nsession_start.rs:68  const STATE_FILE_NOTES: [(&str, &str); 6] = [ (\"CONTEXT.md\", …), (\"DECISIONS.md\", …), …\nscratchpad.rs:80     pub const STATE_FILES: [&str; 6] = [ \"CONTEXT.md\", \"DECISIONS.md\", … ];",
+      "problem": "The six names are typed a second time purely so a description can sit beside each, and the const's own doc comment says a name that diverges would be \"guidance worse than none\". The divergence is currently caught only at test time (`state_file_notes_match_what_u8_actually_scaffolds`), i.e. by a test that exists to police a duplication rather than a behavior.",
+      "proposal": "Replace the pair array with `const STATE_FILE_DESCRIPTIONS: [&str; scratchpad::STATE_FILES.len()]` holding only the six descriptions in the same order, and render with `for (name, desc) in scratchpad::STATE_FILES.iter().zip(STATE_FILE_DESCRIPTIONS)` at `session_start.rs:549`. The array-length expression makes a future seventh state file a compile error instead of a test failure.",
+      "behavior_preservation": "The names and their order are byte-identical between the two arrays today (verified item by item), so the rendered `{name:<22}{desc}` lines — and therefore the whole `additionalContext` body — are unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F13",
+      "category": "hardcoded-value",
+      "title": "The harness's 10,000-character additionalContext cliff is spelled as a bare number in four comments and one test assertion",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/event.rs:357",
+        "crates/ss-magic-plugin/src/hook/event.rs:397",
+        "crates/ss-magic-plugin/src/hook/session_start.rs:464",
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:1554",
+        "crates/ss-magic-plugin/src/hook/session_start/tests.rs:261"
+      ],
+      "evidence": "event.rs:357          /// cliffs at 10,000 characters and is replaced by a persisted-output preview\nevent.rs:397          /// model at all. Budget `additional_context` under 10,000 characters or\nsession_start.rs:464  /// this one line past R19's 10,000-character budget on every session start,\npre_tool_use.rs:1554  /// 10,000-character cliff (`hook/event.rs`), so unlike the Read gate's cached\ntests.rs:261          text.len() < 10_000,",
+      "problem": "One measured harness limit is restated as a literal in four doc comments across three modules and asserted as a bare `10_000` in a test, while a differently-purposed `GATE_INLINE_BYTE_BUDGET_DEFAULT: u32 = 10_000` lives in `config.rs` for the Read gate's inline budget. Nothing ties the four sites together, and the coincidence of the two numbers invites a reader to assume one governs the other.",
+      "proposal": "Declare the limit once where the wire format is owned — `pub(crate) const ADDITIONAL_CONTEXT_CLIFF_CHARS: usize = 10_000;` in `crates/ss-magic-plugin/src/hook/event.rs`, documented as the measured harness cliff — reference it by name from the three other doc comments, and use it in `session_start/tests.rs:261`'s assertion in place of the literal.",
+      "behavior_preservation": "Nothing but a test literal is replaced by a const of the same value; the four comment sites are prose. `config.rs`'s `GATE_INLINE_BYTE_BUDGET_DEFAULT` is deliberately left alone — it is a configurable, clamped default for a different channel and must not be aliased to this const.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F14",
+      "category": "quality",
+      "title": "Four comments in hook/mod.rs still describe a pre-U12 state in which the handlers had not landed",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/mod.rs:182-183",
+        "crates/ss-magic-plugin/src/hook/mod.rs:229-230",
+        "crates/ss-magic-plugin/src/hook/mod.rs:238-239",
+        "crates/ss-magic-plugin/src/hook/mod.rs:265-266"
+      ],
+      "evidence": "mod.rs:182  // The pipeline builds every field; the readers are the per-event handlers of\nmod.rs:183  // U12 onward, so until those land the compiler sees write-only fields.\nmod.rs:229  // Read by the per-event handlers of U12 onward; the tests here already\nmod.rs:238  // First production caller arrives with the per-event handlers; exercised by\nmod.rs:265  // Used by the per-event handlers as they land; the stubs below return\nmod.rs:266  // `silent`.",
+      "problem": "All six handlers have landed, `HookContext::cwd` is read by three of them, `Outcome::new` is constructed by `session_start`, and there are no stubs left in this module — so these four comments narrate task history that no longer describes the code. Two of them also mis-state the present: `cwd()` is not waiting for a reader, and `Outcome::new`'s \"the stubs below\" has no referent.",
+      "proposal": "Delete the four narration comments. Where they carry a live fact, restate it as one: on `HookContext::event` and `main_root` keep the existing doc comment's reason for the `#[allow(dead_code)]` (the field records which root the gate read `enabled` from) and drop the U12 sentence; on `diagnostic`, replace the note with \"no handler writes a diagnostic today; the channel exists so one can, without touching stderr itself\".",
+      "behavior_preservation": "Comment-only edits; no expression, attribute or signature changes.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-hook-core-F15",
+      "category": "quality",
+      "title": "`base` names two different row builders in one function, and a third identical closure is redeclared in the next",
+      "locations": [
+        "crates/ss-magic-plugin/src/hook/mod.rs:423",
+        "crates/ss-magic-plugin/src/hook/mod.rs:458",
+        "crates/ss-magic-plugin/src/hook/mod.rs:504"
+      ],
+      "evidence": "mod.rs:423  let base = || Row::new(event.as_str(), now, RowOutcome::NoOp);\nmod.rs:458  let base = || base_row(event, &envelope.common.cwd, now);\nmod.rs:504  let base = || base_row(event, &envelope.common.cwd, now);",
+      "problem": "Inside `pipeline`, `base()` means \"a row with no cwd\" above line 458 and \"a row carrying the envelope's cwd\" below it — a shadow that changes what the same call produces halfway down the function, in code whose whole subject is what a heartbeat row records. `gate_and_dispatch` then re-declares the identical second closure a third time.",
+      "proposal": "Rename the first closure to `bare_row` (its two callers are the unroutable branch at 430 and the `NoInput` branch at 445, both of which deliberately have no decoded cwd), and pass the second closure's row builder down rather than redeclaring it: give `gate_and_dispatch` the already-built `base` closure as a parameter, or drop both closures and call `base_row(event, &envelope.common.cwd, now)` directly at each of its use sites.",
+      "behavior_preservation": "Renaming a local closure and either reusing or inlining an identical one changes no constructed `Row`: `base_row` is a pure function of `(event, cwd, now)`, all three of which are fixed for the invocation.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 2 (standard-library or runtime primitives): no hand-rolled loop in this partition has a behavior-equivalent std replacement; `join_system_messages`, `panic_message` and `from_raw` are each already the thinnest form of what they do.",
+    "Rubric 1 item 3 (platform/framework guarantees): nothing here hand-maintains a guarantee serde, the harness or the kernel already provides; the `create_new` exclusivity in `pre_compact::append_note` and `session_start::claim_marker` is the correct use of the kernel's guarantee, not a re-implementation.",
+    "Rubric 2 item 1 (redundant state): no cached value in this partition duplicates derivable state beyond the repeated reads already reported as F5/F6.",
+    "Rubric 2 item 2 (parameter sprawl): `Surroundings`, `HookIo` and the injected `route`/`now` are documented testability seams (structure-pins: \"Testability seams that inject the environment … are not parameter sprawl\").",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable — no component-tree UI framework here.",
+    "Rubric 2 item 7 (nested conditionals): nothing in this partition nests three or more levels; the deepest is the two-level match in `release_suggestion`.",
+    "Rubric 2 item 9 (dead code): `HookContext::event`, `HookContext::main_root` and `HookContext::diagnostic` are unread in production but each carries a documented reason and an `#[allow(dead_code)]`; only their stale narration is reported (F14), not their removal.",
+    "Rubric 2 item 10 (context-dependent vocabulary): the R-numbers and U-numbers in doc comments are the repository's own established vocabulary and are paired with prose explanations, per the repo's comment convention.",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): `hook/file_changed.rs`'s routing is deliberately kept exercised though the manifest declares no such event (CLAUDE.md); `FileChanged::file_paths` tolerates a spelling the harness never sends, also deliberate.",
+    "Rubric 3 item 2 (missed concurrency): the pipeline's git probe, config resolution and handler dispatch are ordered dependencies; the one detachable piece (the release refresh) is already spawned detached.",
+    "Rubric 3 item 4 (recurring no-op updates): no polling or reducer surface in this partition.",
+    "Rubric 3 item 6 (memory): every buffer here is bounded — stdin is one envelope, diagnostics are handler-produced lines, and the heartbeat's own pruning lives outside this partition.",
+    "Rubric 3 item 7 (overly broad operations): the only whole-file reads are the pin file and the release cache, both small and both already single-purpose.",
+    "Test helpers: `ignored_repo()` is byte-identical in `hook/session_start/tests.rs:28`, `hook/pre_compact/tests.rs:28` and `hook/subagent_stop/tests.rs:32`, but `ss_magic_core::testutil` provides no equivalent (only `init_main_repo`), so per the brief's rule this is not reported as a finding."
+  ]
+}

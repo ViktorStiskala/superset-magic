@@ -1,0 +1,285 @@
+{
+  "partition": "shell",
+  "findings": [
+    {
+      "id": "shell-F1",
+      "category": "duplication",
+      "title": "Every give_up message in bootstrap.sh hand-repeats the same \"; installed nothing.\" suffix (16 sites)",
+      "locations": [
+        "plugin/hooks/bootstrap.sh:69-73",
+        "plugin/hooks/bootstrap.sh:157-157",
+        "plugin/hooks/bootstrap.sh:419-421",
+        "plugin/hooks/bootstrap.sh:461-468"
+      ],
+      "evidence": "give_up() {\n    [ -n \"$state_file\" ] && rm -f \"$state_file\" 2>/dev/null\n    printf 'ss-magic: %s\\n' \"$1\" >&2\n    exit 0\n}\n...\n    give_up \"could not download $archive_url; installed nothing.\"",
+      "problem": "All sixteen `give_up \"...\"` call sites (157, 168, 171, 173, 371, 406, 419, 421, 426, 430, 432, 437, 445, 454, 461, 468 – verified by grep, no exceptions) end with the identical literal `; installed nothing.`. The invariant \"a failure of this script never installs anything\" is restated sixteen times by hand instead of being owned by the one function that owns the failure exit; a seventeenth call site added without the suffix would silently break the wording contract, and nothing checks it.",
+      "proposal": "Move the suffix into `give_up` itself: `printf 'ss-magic: %s; installed nothing.\\n' \"$1\" >&2`, and drop `; installed nothing.` from all sixteen argument strings (e.g. line 419 becomes `give_up \"could not download $archive_url\"`). No new file, no new helper – the constant moves into the single function that already owns the one failure exit in the file.",
+      "behavior_preservation": "Pure string concatenation at a different place: the bytes printed on stderr are identical for every one of the sixteen paths, and the marker removal plus `exit 0` are untouched. scripts/test-bootstrap.sh asserts on these lines with substring greps (`assert_contains`), which see the same bytes.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F2",
+      "category": "copy-paste-variant",
+      "title": "The pin-shape rejection message is written out three times across two case statements",
+      "locations": ["plugin/hooks/bootstrap.sh:166-174"],
+      "evidence": "case \"$pin\" in\n    *[!0-9.]*|.*|*.|*..*)\n        give_up \"version pin is not a MAJOR.MINOR.PATCH literal; installed nothing.\" ;;\nesac\ncase \"$pin\" in\n    *.*.*.*) give_up \"version pin is not a MAJOR.MINOR.PATCH literal; installed nothing.\" ;;",
+      "problem": "One rule (\"the pin is exactly MAJOR.MINOR.PATCH\") is spread over two case statements with three copies of the same failure message; lines 171 and 173 differ only in which glob reached them. Reading the rule requires reading three arms and noticing the messages are the same. This is the supply-chain validation gate, so its shape should read as a single predicate.",
+      "proposal": "Extract the two passes into one predicate beside the other helpers, and call `give_up` once:\n\n```\npin_is_triple() {  # exactly MAJOR.MINOR.PATCH; two passes because globs cannot count\n    case \"$1\" in *[!0-9.]*|.*|*.|*..*) return 1 ;; esac\n    case \"$1\" in *.*.*.*) return 1 ;; *.*.*) return 0 ;; *) return 1 ;; esac\n}\npin_is_triple \"$pin\" || give_up \"version pin is not a MAJOR.MINOR.PATCH literal\"\n```\n\n(the message loses its suffix only if shell-F1 is applied; otherwise keep it verbatim). The two-pass comment at 160-165 moves onto the predicate unchanged.",
+      "behavior_preservation": "The glob arms and their order are copied verbatim, so the accept/reject set is identical for every input; the only difference is that the single surviving `give_up` call is made by the caller rather than inside a case arm, and it prints the same bytes and exits 0 the same way. The gate is not thinned – no input that was rejected becomes accepted.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F3",
+      "category": "duplication",
+      "title": "The `--version | head -1 | awk '{print $NF}'` probe is spelled twice in bootstrap.sh",
+      "locations": [
+        "plugin/hooks/bootstrap.sh:186-189",
+        "plugin/hooks/bootstrap.sh:452-452"
+      ],
+      "evidence": "installed_version() {\n    [ -x \"$bin_path\" ] || return 1\n    \"$bin_path\" --version 2>/dev/null | head -1 | awk '{print $NF}'\n}\n...\nstaged_version=$(\"$staged_bin\" --version 2>/dev/null | head -1 | awk '{print $NF}')",
+      "problem": "The version-probe pipeline – which CLAUDE.md documents as a contract (\"the version must stay LAST on line one\") shared with `status.rs`'s drift probe – is written twice, once for the installed binary and once for the staged one. A change to the contract (say, tolerating a trailing `\\r`) has to be made in two places, and the second is easy to miss because it is buried inline in the install path.",
+      "proposal": "Add one helper taking the path and keep `installed_version` as the guarded wrapper:\n\n```\nversion_of() {  # $1 binary path; last field of line 1 of `--version`\n    \"$1\" --version 2>/dev/null | head -1 | awk '{print $NF}'\n}\ninstalled_version() {\n    [ -x \"$bin_path\" ] || return 1\n    version_of \"$bin_path\"\n}\n```\n\nand line 452 becomes `staged_version=$(version_of \"$staged_bin\")`.",
+      "behavior_preservation": "Same command, same redirections, same pipeline, same command substitution; only the path is now an argument. `installed_version` keeps its `[ -x ]` guard and its return-1 path, and the staged probe keeps assigning the empty string when the binary cannot run (which line 453 still turns into a `give_up`).",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F4",
+      "category": "duplication",
+      "title": "bootstrap.sh's `digest_of` re-implements the shasum/sha256sum detection chain that the tmproot.sh it already sources provides",
+      "locations": [
+        "plugin/hooks/bootstrap.sh:390-398",
+        "plugin/lib/tmproot.sh:54-62"
+      ],
+      "evidence": "digest_of() {\n    if command -v shasum >/dev/null 2>&1; then\n        shasum -a 256 \"$1\" 2>/dev/null | cut -d' ' -f1\n    elif command -v sha256sum >/dev/null 2>&1; then\n        sha256sum \"$1\" 2>/dev/null | cut -d' ' -f1",
+      "problem": "`ss_magic_sha256_hex` (tmproot.sh:54) is the same tool-detection chain reading stdin, and bootstrap.sh already sources that file at line 115. Two copies of \"which SHA-256 tool does this machine have\" exist in the packaged tree, and a third and fourth exist in the test suite (see shell-F13). The copies can drift on the very question – digest tooling – that the cross-language identifier contract depends on.",
+      "proposal": "Make `digest_of` delegate rather than re-branch, keeping its own fallback because bootstrap.sh sources `lib/tmproot.sh` TOLERANTLY (115-117, `[ -r ]` plus `|| true`) and must still verify a download on a machine where the source failed:\n\n```\ndigest_of() {\n    command -v ss_magic_sha256_hex >/dev/null 2>&1 || return 1\n    ss_magic_sha256_hex <\"$1\" 2>/dev/null\n}\n```\n\n`digest_of` returning non-zero already has a defined meaning at line 429 (`give_up \"no SHA-256 tool available to verify ...\"`), so an unsourced lib lands on the existing refuse-the-install path rather than on a new one. If that trade (a missing lib now refuses the install instead of falling back to a local shasum) is judged too strict, leave this finding unapplied – the duplication is small and the refusal direction is the safe one either way.",
+      "behavior_preservation": "`shasum -a 256 FILE | cut -d' ' -f1` and `shasum -a 256 <FILE | cut -d' ' -f1` print the same 64 hex characters (only the filename column differs, and it is cut away); the same holds for sha256sum. The changed case is only \"tmproot.sh was unreadable\": today that falls back to a local shasum, afterwards it takes the already-existing `give_up` path, which installs nothing – a refusal, never a weaker verification.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F5",
+      "category": "duplication",
+      "title": "The R80 handoff read (resolve root, read data-root, require non-empty) is duplicated between run-hook.sh and bin/ss-magic-plugin",
+      "locations": [
+        "plugin/hooks/run-hook.sh:66-77",
+        "plugin/bin/ss-magic-plugin:77-86"
+      ],
+      "evidence": "run-hook.sh:\n    root=$(ss_magic_resolve_root) || give_up\n    handoff=\"$root/$SS_MAGIC_DATA_ROOT_FILE\"\n    [ -r \"$handoff\" ] || give_up\n    { IFS= read -r data <\"$handoff\"; } 2>/dev/null\n    [ -n \"${data:-}\" ] || give_up",
+      "problem": "Both scripts perform the identical four steps against the identical constant, differing only in the message each failure produces (silent `give_up` in the shim, an `explain` line in the wrapper). tmproot.sh already exists precisely so \"the writer and the reader cannot drift apart\" about where the handoff lives, but only the ROOT derivation is shared – the READ of the handoff is copied. The braced-read TOCTOU comment is likewise duplicated (run-hook.sh:69-75, ss-magic-plugin:83-84).",
+      "proposal": "Add the read to `plugin/lib/tmproot.sh` beside `ss_magic_resolve_root`, keeping the two distinct failure kinds as distinct exit statuses so each caller can keep its own wording:\n\n```\n# Print the data root the bootstrap published, or return 1 (no usable R80 root)\n# or 2 (root exists but holds no readable, non-empty handoff).\nss_magic_read_data_root() {\n    local root handoff line\n    root=$(ss_magic_resolve_root) || return 1\n    handoff=\"$root/$SS_MAGIC_DATA_ROOT_FILE\"\n    { IFS= read -r line <\"$handoff\"; } 2>/dev/null\n    [ -n \"${line:-}\" ] || return 2\n    printf %s \"$line\"\n}\n```\n\nrun-hook.sh then reads `data=$(ss_magic_read_data_root) || give_up`; the wrapper branches on `$?` being 1 or 2 to pick its two existing messages. The braced-read comment moves to the helper, once.",
+      "behavior_preservation": "Same order of operations, same constant, same braced redirection (so the shell's own \"cannot open\" diagnostic stays suppressed), same \"empty line means not installed\" rule. The two wrapper messages are preserved by the 1/2 split; the shim discards the status exactly as it does today. Command substitution strips no trailing newline that `read -r` would have kept, because `read -r` already dropped it.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F6",
+      "category": "efficiency",
+      "title": "`[ -r \"$handoff\" ]` is a TOCTOU pre-check whose failure path is already covered by the braced read that follows",
+      "locations": [
+        "plugin/hooks/run-hook.sh:68-77",
+        "plugin/bin/ss-magic-plugin:80-86"
+      ],
+      "evidence": "ss-magic-plugin:\n    [ -r \"$handoff\" ] ||\n        explain \"the pinned binary has not been installed yet; start a new session to install it.\"\n    { IFS= read -r data <\"$handoff\"; } 2>/dev/null\n    [ -n \"${data:-}\" ] ||\n        explain \"the pinned binary has not been installed yet; start a new session to install it.\"",
+      "problem": "The pre-check and the post-check produce the SAME message in the wrapper (verbatim identical strings at 81 and 86) and the same silent `give_up` in the shim, and the braced read already handles an unopenable file with its stderr suppressed – which is exactly what the comment above it says. So the `test -r` stat is a pure pre-check of an operation that is about to be attempted anyway (rubric 3, item 5), and it is on the PreToolUse path in run-hook.sh, which fires on essentially every tool call.",
+      "proposal": "Delete the `[ -r \"$handoff\" ] || …` line in both files and let the existing `{ IFS= read -r data <\"$handoff\"; } 2>/dev/null` plus `[ -n \"${data:-}\" ]` decide. Keep the comment explaining why the braces are required, and extend it with one clause: \"and why no `-r` pre-check is needed – an unopenable handoff leaves `data` empty, which the next line already refuses on.\" If shell-F5 is applied first, this change lands once, inside `ss_magic_read_data_root`.",
+      "behavior_preservation": "`data` is provably empty on entry (the enclosing branch is `[ -z \"$data\" ]`), so a failed redirect leaves it empty and the existing non-empty check takes the same branch with the same message and the same exit status. A file that is readable but empty, or unreadable, or absent, all already converge on that second check today. Only one `stat(2)` disappears.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F7",
+      "category": "copy-paste-variant",
+      "title": "Two hand-counted hex globs (64 and 16 repetitions) and one unnamed `cut -c1-16` express the same \"N lowercase hex characters\" rule",
+      "locations": [
+        "plugin/hooks/bootstrap.sh:423-427",
+        "plugin/lib/tmproot.sh:70-74"
+      ],
+      "evidence": "bootstrap.sh:\ncase \"$expected\" in\n    [0-9a-f][0-9a-f][0-9a-f][0-9a-f]… (64 repetitions on one line) ) ;;\n    *) give_up \"the published checksum for $archive_name is unreadable; installed nothing.\" ;;\nesac\ntmproot.sh:\n    short=$(printf %s \"$digest\" | cut -c1-16)\n    case \"$short\" in\n        [0-9a-f][0-9a-f]… (16 repetitions) ) ;;",
+      "problem": "The same idiom is hand-counted at two different lengths, in two files, and neither length is named anywhere: the reviewer has to count 64 (or 16) bracket groups on one unreadable line to know what is being asserted, and a mis-count would silently weaken the checksum shape check. The `16` also appears a second time in tmproot.sh as the bare `cut -c1-16`, while the Rust mirror names it `IDENTIFIER_HEX_LEN` (crates/ss-magic-plugin/src/tmproot.rs:105) and the file already names its other three cross-language constants (`SS_MAGIC_NAMESPACE_DIR`, `SS_MAGIC_INSTALL_LOCK_NAME`, `SS_MAGIC_DATA_ROOT_FILE`).",
+      "proposal": "Replace each glob with an explicit length test plus a character-class rejection, and name the length in tmproot.sh so the cross-language mirror is complete:\n\ntmproot.sh: `SS_MAGIC_IDENTIFIER_HEX_LEN=16` beside the other three constants; `short=$(printf %s \"$digest\" | cut -c1-\"$SS_MAGIC_IDENTIFIER_HEX_LEN\")`; then\n```\n    case \"$short\" in *[!0-9a-f]*) return 1 ;; esac\n    [ \"${#short}\" -eq \"$SS_MAGIC_IDENTIFIER_HEX_LEN\" ] || return 1\n```\nbootstrap.sh: `SHA256_HEX_LEN=64` beside the other top-level constants; then\n```\ncase \"$expected\" in *[!0-9a-f]*) give_up \"…\" ;; esac\n[ \"${#expected}\" -eq \"$SHA256_HEX_LEN\" ] || give_up \"…\"\n```\nA shared `ss_magic_is_lower_hex str len` in tmproot.sh is the tidier form but is NOT proposed: bootstrap.sh sources that file only tolerantly (115-117), so the checksum gate must not depend on it.",
+      "behavior_preservation": "`[0-9a-f]` repeated N times matches exactly the strings of length N drawn from that class; `${#s} -eq N` plus \"no character outside the class\" accepts exactly the same set (the empty string is excluded by the length test, as it is by the glob). `${#var}` is available in bash 3.2, which both files target. Both failure arms keep their existing message and exit path.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F8",
+      "category": "hardcoded-value",
+      "title": "The release URL prefix is spelled in full twice in bootstrap.sh",
+      "locations": ["plugin/hooks/bootstrap.sh:42-43"],
+      "evidence": "RELEASE_DOWNLOAD_BASE=\"https://github.com/ViktorStiskala/superset-magic/releases/download\"\nRELEASE_PAGE_BASE=\"https://github.com/ViktorStiskala/superset-magic/releases/tag\"",
+      "problem": "The owner/repo identity and the `/releases` path are written out twice; the two constants differ only in the last segment. Moving the repository (or a fork used for testing) means editing the slug in two places in one file, with no check that they stay the same repository – and a mismatch would download from one repository while disclosing another in the R79 notice.",
+      "proposal": "Introduce one base and derive the two: `RELEASE_BASE=\"https://github.com/ViktorStiskala/superset-magic/releases\"`, then `RELEASE_DOWNLOAD_BASE=\"$RELEASE_BASE/download\"` and `RELEASE_PAGE_BASE=\"$RELEASE_BASE/tag\"`. Keep both derived names, since both are used far from here (415 and 495) and reading `$RELEASE_BASE/tag` at the printf site would be worse.",
+      "behavior_preservation": "Plain string concatenation evaluated at the same point in the script; both derived variables hold byte-identical values, so the composed URL at 415 and the disclosure line at 494-495 are unchanged. scripts/test-bootstrap.sh:797 asserts the substring `releases/tag/ss-magic-plugin-v0.10.0`, which still appears.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F9",
+      "category": "const-location",
+      "title": "The supported-platform matrix is maintained independently in bootstrap.sh and dist-workspace.toml with nothing linking them",
+      "locations": [
+        "plugin/hooks/bootstrap.sh:274-282",
+        "dist-workspace.toml:13-13"
+      ],
+      "evidence": "case \"$uname_s\" in\n    Darwin) os_part=\"apple-darwin\" ;;\n    Linux) os_part=\"unknown-linux-gnu\" ;;\nesac\n--- dist-workspace.toml\ntargets = [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\", \"x86_64-apple-darwin\", \"x86_64-unknown-linux-gnu\"]",
+      "problem": "cargo-dist's `targets` list decides which archives a release actually publishes; bootstrap.sh's two case statements decide which triples this script will try to download. They are the same fact stated twice in two languages. Adding a target (say `aarch64-unknown-linux-musl`) publishes an archive nothing downloads; removing one leaves the bootstrap composing a URL that 404s and printing a download failure per session on that platform. Nothing in the five-check CI suite compares them – `build-plugin-zip.py --check` enumerates version surfaces and the hooks shim, not this.",
+      "proposal": "Add an eighth assertion line to `scripts/build-plugin-zip.py --check`, beside `check_hooks_shim`: parse `targets = [...]` out of dist-workspace.toml, parse the `os_part=`/`arch_part=` case arms out of plugin/hooks/bootstrap.sh, form the cross product the script can construct, and require the two sets to be equal – reporting the difference in each direction. This mirrors how the hooks-shim invariant is already enforced from that script.",
+      "behavior_preservation": "Adds a release-time assertion only; no runtime shell path changes, so bootstrap.sh behaves identically. The check is a pure comparison and cannot alter what gets published.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F10",
+      "category": "naming",
+      "title": "`give_up` names two different contracts in two sibling hook scripts",
+      "locations": [
+        "plugin/hooks/bootstrap.sh:69-73",
+        "plugin/hooks/run-hook.sh:44-46"
+      ],
+      "evidence": "bootstrap.sh:\ngive_up() {\n    [ -n \"$state_file\" ] && rm -f \"$state_file\" 2>/dev/null\n    printf 'ss-magic: %s\\n' \"$1\" >&2\n    exit 0\n}\nrun-hook.sh:\ngive_up() {\n    exit 0\n}",
+      "problem": "Two files that ship side by side in `plugin/hooks/` define a function with the same name and materially different contracts: one takes a required message argument, prints it and removes the success marker; the other takes none and is silent by design. Reading them together, `give_up` in run-hook.sh looks like a call that lost its argument. The wrapper's equivalent is a third name, `explain`, whose contract (print one line, exit 0) is the closer sibling of bootstrap's `give_up`.",
+      "proposal": "Rename run-hook.sh's helper to say what it does – `be_inert()` (the word R77 and the file header already use: \"Inert, not an error\") – and update its nine call sites in that file. Leave bootstrap's `give_up` and the wrapper's `explain` alone; the differing postures are deliberate (CLAUDE.md), the names should just stop colliding.",
+      "behavior_preservation": "A rename of a file-private shell function with no callers outside run-hook.sh (verified: the string does not appear in hooks.json, the wrapper, tmproot.sh or execguard.sh). Same body, same exit status, same silence on both streams; scripts/test-bootstrap.sh drives the script as a process and asserts on exit code and stream contents, not on function names.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F11",
+      "category": "efficiency",
+      "title": "mark-latest.sh forks printf+grep once per listed release inside the selection loop",
+      "locations": ["scripts/mark-latest.sh:58-60", "scripts/mark-latest.sh:97-97"],
+      "evidence": "is_bare_cli_tag() {\n    printf '%s\\n' \"$1\" | grep -Eq '^v[0-9]+\\.[0-9]+\\.[0-9]+$'\n}\n...\n            if is_bare_cli_tag \"$candidate\"; then",
+      "problem": "`is_bare_cli_tag` is called once per object in a loop that can see up to 200 releases (`--limit 200`, line 76), and each call spawns a subshell, a printf and a grep – roughly 400 processes for a shape test bash can answer internally. The script already targets bash specifically (`#!/usr/bin/env bash`, bash-3.2 constraints documented at 43-45), so the fork buys nothing in portability.",
+      "proposal": "Answer with bash's own ERE matcher, keeping the pattern in a variable (the portable form across bash 3.2 and later, where a quoted right-hand side would be treated literally):\n\n```\nBARE_CLI_TAG_RE='^v[0-9]+\\.[0-9]+\\.[0-9]+$'\nis_bare_cli_tag() {\n    [[ $1 =~ $BARE_CLI_TAG_RE ]]\n}\n```\n\nThe impact is small – this runs once per release – so treat it as a simplification (one pipeline and two forks per candidate disappear) rather than a performance fix.",
+      "behavior_preservation": "`[[ =~ ]]` and `grep -E` both use POSIX EREs, the pattern is byte-identical and anchored at both ends, and the function is used only as a boolean in `if`/`if !` positions, so a 0/1 status is all any caller observes. The one behavioral edge – a tag containing a newline – cannot occur: `newest_cli_tag_in` extracts `$candidate` from a single line of a `tr`-flattened stream, and the announced `$tag` comes from an environment variable naming a git ref.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F12",
+      "category": "duplication",
+      "title": "test-bootstrap.sh defines the SHA-256 tool-detection branch twice, once for files and once for stdin",
+      "locations": [
+        "scripts/test-bootstrap.sh:59-62",
+        "scripts/test-bootstrap.sh:133-136"
+      ],
+      "evidence": "sha256_of() {\n    if command -v shasum >/dev/null 2>&1; then shasum -a 256 \"$1\" | cut -d' ' -f1\n    else sha256sum \"$1\" | cut -d' ' -f1; fi\n}\n...\nsha256_stdin() {\n    if command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d' ' -f1\n    else sha256sum | cut -d' ' -f1; fi\n}",
+      "problem": "One test file holds two copies of the same tool-detection branch, differing only in whether the input arrives as an argument or on stdin – and both are third and fourth copies of the production chain in plugin/lib/tmproot.sh:54 (see shell-F4). `sha256_stdin` exists solely to reproduce the identifier derivation, which is exactly what `ss_magic_sha256_hex` does.",
+      "proposal": "Keep the stdin form and derive the file form from it: `sha256_of() { sha256_stdin <\"$1\"; }`, with `sha256_stdin` defined before its first use (move it up beside `sha256_of` at line 59; it is currently defined at 133 but first called at 96, which works only because the call happens inside `new_sandbox`). If the suite is willing to depend on the packaged tree it is already copying, the stronger form is `. \"$PLUGIN_SRC/lib/tmproot.sh\"` and `sha256_stdin() { ss_magic_sha256_hex; }`, which makes the test compute the sandbox identifier with the same code the bootstrap uses.",
+      "behavior_preservation": "`shasum -a 256 FILE | cut -d' ' -f1` and `shasum -a 256 <FILE | cut -d' ' -f1` yield the same digest; only the filename column, already cut away, differs. Same for sha256sum. Every call site compares digests to other digests produced by the same helper.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F13",
+      "category": "hardcoded-value",
+      "title": "The bootstrap's four timeout constants are sized against hooks.json's 90 s budget by comment only",
+      "locations": [
+        "plugin/hooks/bootstrap.sh:45-52",
+        "plugin/hooks/hooks.json:11-11"
+      ],
+      "evidence": "# Bounded so the whole run fits comfortably inside the 90 s timeout hooks.json\n# declares for this entry.\nCONNECT_TIMEOUT=8\nARCHIVE_MAX_TIME=40\nDIGEST_MAX_TIME=15\nLOCK_WAIT_SECONDS=20",
+      "problem": "The stated invariant is `LOCK_WAIT_SECONDS + ARCHIVE_MAX_TIME + DIGEST_MAX_TIME <= hooks.json's SessionStart bootstrap timeout` (20 + 40 + 15 = 75, with 8 s of connect time inside the two fetches). Nothing checks it: the budget lives in a different file, in a different format, and the four numbers can be raised – or the JSON timeout lowered – without any of the five CI checks noticing. A breach turns the failure mode from \"one stderr line, exit 0\" into a killed hook, which is the one outcome this script exists to avoid.",
+      "proposal": "Assert it once. The cheapest home is `scripts/test-bootstrap.sh` (it already reads both files' trees): grep the four assignments out of plugin/hooks/bootstrap.sh and the bootstrap entry's `\"timeout\"` out of plugin/hooks/hooks.json, and assert the worst-case sum is at most the timeout, as one `assert_eq`-style case. `scripts/build-plugin-zip.py --check` is the alternative home if the assertion should gate releases rather than tests.",
+      "behavior_preservation": "Adds an assertion; no runtime path changes. Reported at 50 because I verified the numbers and the absence of any existing cross-check, but not that the worst-case model (lock wait then both fetches, connect time inside each) is the one the author intends to pin.",
+      "confidence": 50,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "shell-F14",
+      "category": "const-location",
+      "title": "The `bin/ss-magic-plugin` relative path is spelled in three shell files and named once in Rust (lead, probably not worth applying)",
+      "locations": [
+        "plugin/hooks/bootstrap.sh:108-108",
+        "plugin/hooks/run-hook.sh:80-80",
+        "plugin/bin/ss-magic-plugin:89-89",
+        "crates/ss-magic-plugin/src/status.rs:129-129"
+      ],
+      "evidence": "bootstrap.sh:  bin_path=\"$data/bin/ss-magic-plugin\"\nrun-hook.sh:   bin=\"$data/bin/ss-magic-plugin\"\nwrapper:       bin=\"$data/bin/ss-magic-plugin\"\nstatus.rs:     const BINARY_REL: &str = \"bin/ss-magic-plugin\";",
+      "problem": "Where the installed binary sits under the data directory is one fact stated four times: the writer (bootstrap), the two readers, and `status.rs`'s drift probe, which alone gives it a name. The other cross-language contract values in this tree (`ss-magic-plugin`, `install.lock`, `data-root`) are all named constants in plugin/lib/tmproot.sh with a comment pointing at their Rust twin; this one is not.",
+      "proposal": "I could not find a safe home for it, and record that rather than a fix. tmproot.sh is the natural file, but run-hook.sh sources it ONLY in the fallback branch (58-62) – on the common path where `CLAUDE_PLUGIN_DATA` is set it is never sourced, so a `$SS_MAGIC_BINARY_REL` reference there would hit an unset variable under `set -u` (line 40) and abort the script non-zero, breaking the one guarantee run-hook.sh exists to provide. execguard.sh is sourced unconditionally by both readers but not by bootstrap.sh (deliberately, per the file header). So the honest options are: leave the three spellings alone, or share the constant between the two READERS only via execguard.sh and leave the writer's literal in place – a two-of-three fix whose value is doubtful. Recommend leaving as is unless the reviewer sees a fourth option.",
+      "behavior_preservation": "No change proposed; the analysis above is the finding. Reported at 50 as an unresolved lead so the sweep records why it was not acted on.",
+      "confidence": 50,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 2 (standard-library or runtime primitives): the deliberate non-builtin choices here are all justified in place – `cat \"$state_file\" | tr` over a redirect (bootstrap.sh:193-197, to keep the shell's own diagnostic off stderr), `printf %s` over `echo` (tmproot.sh:20-22, a trailing newline would change the digest), and GNU `stat -c` tried before BSD `stat -f` (tmproot.sh:86-90).",
+    "Rubric 1 item 3 (platform/framework/downstream guarantees hand-maintained): nothing found. The one candidate, execguard.sh's magic-number test, exists precisely because the platform guarantee (`test -x`, `shopt -s execfail`) does NOT cover ENOEXEC; its comment documents the measurement.",
+    "Rubric 2 item 1 (redundant state): none. The bootstrap's markers (`state_file`, `disclosed_marker`, `unsupported_marker`) each record a distinct one-time fact, and `already_installed` deliberately requires marker AND binary to agree rather than trusting either alone.",
+    "Rubric 2 item 2 (parameter sprawl): none. `ss_magic_resolve_root`'s single `create`/read-only mode and `ss_magic_valid_component(path, euid)` are minimal.",
+    "Rubric 2 item 4 (leaky abstractions): none. tmproot.sh and execguard.sh expose functions and named constants only; no caller reaches past them into a path they rebuild by hand.",
+    "Rubric 2 item 5 (stringly-typed code): none beyond shell-F7/F14, which are reported.",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable – no component-tree UI framework in this partition.",
+    "Rubric 2 item 7 (nested conditionals 3+ deep): none. The deepest nesting is bootstrap.sh's lock block (318-346), two levels.",
+    "Rubric 2 item 8 (unnecessary comments): none. Every comment block in these files states a measured constraint or a failure mode (the ENOEXEC measurement, the porcelain/redirect stderr traps, why the lock is not `exec`ed, why the markers keep their historical spelling); plan ids appear only alongside their explanation, never alone.",
+    "Rubric 2 item 9 (dead code / unused exports): none. run-hook.sh:118's `exit 0` after `exec` is reachable – `shopt -s execfail` (116) returns control on a genuine exec failure – and the flat-layout fallback at bootstrap.sh:443 is a deliberate degradation path, not dead.",
+    "Rubric 2 item 10 (context-dependent vocabulary): none beyond shell-F10. The tree consistently says pin, handoff, data root, staged, triple.",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): none to remove. bootstrap.sh:29-38 explains why the pre-split `bin/ss-magic` is deliberately NOT cleaned up, and the historical `.ss-magic-` marker names (103-107) are load-bearing for already-installed machines.",
+    "Rubric 3 item 2 (missed concurrency): none. The two fetches are strictly ordered (archive then its digest) and both are inside a single bounded budget.",
+    "Rubric 3 item 3 (hot-path bloat): none added. run-hook.sh's per-tool-call cost is one source of execguard.sh plus the `od`/`tr` magic check, which is a fail-closed format guard and must not be thinned.",
+    "Rubric 3 item 4 (recurring no-op updates): none – no polling or reducer surface in shell.",
+    "Rubric 3 item 6 (memory): none. No unbounded accumulation; `mark-latest.sh` holds one bounded `--limit 200` listing in a variable.",
+    "Rubric 3 item 7 (overly broad operations): none worth flagging. The `.sha256` sibling is read whole but is a single short line."
+  ]
+}

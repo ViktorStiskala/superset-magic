@@ -4,12 +4,12 @@
 #
 # This file is SOURCED by both `hooks/bootstrap.sh` and `bin/ss-magic-plugin`.
 # It is deliberately one file rather than two copies: the two scripts must
-# derive byte-identically the same directory as `src/plugin/tmproot.rs` does in
-# Rust, and a lock or a handoff that lands in two different directories is a bug
-# that only shows up under the concurrency the lock exists for. One copy cannot
-# drift from itself.
+# derive byte-identically the same directory that
+# `crates/ss-magic-plugin/src/tmproot.rs` derives in Rust, and a lock or a
+# handoff that lands in two different directories is a bug that only shows up
+# under the concurrency the lock exists for. One copy cannot drift from itself.
 #
-# The contract, mirrored from `src/plugin/tmproot.rs`:
+# The contract, mirrored from `crates/ss-magic-plugin/src/tmproot.rs`:
 #
 #   <base>/ss-magic-plugin/<identifier>/
 #

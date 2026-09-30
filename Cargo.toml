@@ -1,32 +1,32 @@
-[package]
-name = "ss-magic"
-version = "0.10.0"
+# Virtual workspace root. There is no [package] here: the crates live under
+# `crates/`, and every version surface a release check reads is on a member
+# manifest (`crates/ss-magic/Cargo.toml` for the CLI line), never on this file.
+#
+# `ss-magic-core` is the shared library (git plumbing, hashing, the palette, the
+# sync engine's pure half, the `.superset` contract I/O, the repo-name stem, the
+# plugin state-tree constant and its gitignore rule, and the per-line GitHub
+# release check). `ss-magic` is the interactive sync CLI. `ss-magic-plugin` is
+# the Claude Code plugin's hook runtime and verb tree.
+#
+# The two binaries release independently, on distinct tag shapes: `vX.Y.Z` for
+# `ss-magic`, `ss-magic-plugin-vX.Y.Z` for `ss-magic-plugin`. Their versions
+# must therefore always DIFFER — cargo-dist reads a bare tag as "every dist-able
+# package at that version", so equal versions would make one tag release both.
+# `scripts/build-plugin-zip.py --check` refuses a tree where they match.
+[workspace]
+resolver = "2"
+members = ["crates/ss-magic-core", "crates/ss-magic", "crates/ss-magic-plugin"]
+
+[workspace.package]
 edition = "2021"
 repository = "https://github.com/ViktorStiskala/superset-magic"
 license = "MIT OR Apache-2.0"
 
-[[bin]]
-name = "ss-magic"
-path = "src/main.rs"
-
-[dependencies]
-anyhow = "1"
-bzip2 = "0.6"
-directories = { version = "6.0.0", default-features = false }
-fd-lock = "4.0.4"
-globset = "0.4"
-inquire = "0.9"
-ratatui = "0.30.2"
-self_update = { version = "0.44.0", default-features = false, features = ["ureq", "rustls", "archive-tar", "compression-flate2"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-similar = { version = "3.1.1", features = ["inline"] }
-supports-color = "3"
-tar = "0.4"
-tempfile = "3"
-ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
-walkdir = "2"
-
+# The two profiles below apply to every member. They moved here from the
+# single-crate manifest unchanged: `opt-level = "z"` is a measured decision
+# (KTD9 of the workspace-split plan – `opt-level = 3` was measured at
+# ~0.13 ms faster for a hook binary 47 percent LARGER), so do not tune it per
+# crate.
 [profile.release]
 opt-level = "z"
 lto = true

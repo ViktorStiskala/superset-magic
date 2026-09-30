@@ -27,7 +27,7 @@ tags:
 
 ## Problem
 
-The plugin's Read gate has a one-shot escape hatch: `ss-magic plugin bypass
+The plugin's Read gate has a one-shot escape hatch: `ss-magic-plugin bypass
 <FILE>` records a claim, and **exactly the next** gated `Read` of that file goes
 through. The same shape backs `expect-artifact`, where taking the pending
 declaration is what guarantees a subagent's stop is blocked at most once.

@@ -1,0 +1,364 @@
+{
+  "partition": "plugin-verbs-a",
+  "findings": [
+    {
+      "id": "plugin-verbs-a-F1",
+      "category": "duplication",
+      "title": "Nine copies of the \"complain, print usage, exit 2\" tail, in two incompatible argument orders",
+      "locations": [
+        "crates/ss-magic-plugin/src/config.rs:938-942",
+        "crates/ss-magic-plugin/src/cache.rs:1006-1010",
+        "crates/ss-magic-plugin/src/ledger.rs:1250-1254",
+        "crates/ss-magic-plugin/src/compact_window.rs:837-841",
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:1438-1442",
+        "crates/ss-magic-plugin/src/main.rs:469-481",
+        "crates/ss-magic-plugin/src/setup_ci.rs:213-217",
+        "crates/ss-magic-plugin/src/release_check.rs:682-686"
+      ],
+      "evidence": "config.rs:938  fn usage_error(usage: &str, message: &str) -> ExitCode {\nconfig.rs:939      eprintln!(\"{}\", style::err(format!(\"error: {message}\")));\nconfig.rs:940      eprintln!(\"{usage}\");\nconfig.rs:941      ExitCode::from(2)\ncache.rs:1006  fn usage_error(message: &str, usage: &str) -> Result<ExitCode> {\nrelease_check.rs:683      eprintln!(\"{}\", style::err(format!(\"error: {message}\")));",
+      "problem": "The same three statements (err-prefixed message on stderr, usage banner on stderr, exit code 2) are written out five times as a private `usage_error` helper and four more times inline (main.rs twice, setup_ci.rs once, release_check.rs once). Worse than the repetition: `config.rs`'s helper is `(usage, message)` while `cache.rs`'s is `(message, usage)` — both are `&str`, so moving a call site between the two files compiles silently and swaps which string is printed first.",
+      "proposal": "Add one `pub(crate) fn usage_error(message: &str, usage: &str) -> ExitCode` to the crate root (`crates/ss-magic-plugin/src/main.rs`, which already owns `USAGE`/`usage()`), with the majority argument order `(message, usage)`. Have config.rs, cache.rs, ledger.rs, compact_window.rs and checklist/verbs.rs call it (the two that return `Result<ExitCode>` wrap it in `Ok(...)`; checklist/verbs.rs keeps `refused()` for its non-usage refusals, which is a different message shape), and replace the four inline copies in main.rs/setup_ci.rs/release_check.rs with the same call. Delete the five private helpers.",
+      "behavior_preservation": "Every copy emits exactly `style::err(format!(\"error: {message}\"))` then the usage text, both on stderr, and yields exit code 2 (checklist/verbs.rs reaches 2 via `refused()`, verified at verbs.rs:1449). Line order, stream and code are unchanged; only the definition site moves. The `(message, usage)` order matches four of the five existing helpers, so only config.rs's call sites reorder their two arguments.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F2",
+      "category": "copy-paste-variant",
+      "title": "`run_toggle_core` and `run_config_set_core` repeat the same root-resolution and ignore-rule block verbatim",
+      "locations": [
+        "crates/ss-magic-plugin/src/config.rs:623-637",
+        "crates/ss-magic-plugin/src/config.rs:730-749"
+      ],
+      "evidence": "config.rs:624      let cwd_root = git::cwd_repo_root(cwd).unwrap_or_else(|_| cwd.to_path_buf());\nconfig.rs:625      let target_root = if local {\nconfig.rs:626          main_checkout_or_self(&cwd_root)\nconfig.rs:627      } else {\nconfig.rs:628          cwd_root.clone()\nconfig.rs:629      };\n(config.rs:738-743 is the same five lines; config.rs:636 and config.rs:748 are both `scratchpad::ensure_state_ignored(&cwd_root).context(\"gitignoring .superset/.magic/\")?;`)",
+      "problem": "The two write verbs each spell out: resolve the cwd repo root with the same fallback, pick `target_root` from `local`, write under `write_locked`, then conditionally add the `.superset/.magic/` ignore rule with a byte-identical `.context(\"gitignoring .superset/.magic/\")`. R40's lazy ignore-rule trigger therefore lives in two places; a change to the fallback or to the context string has to be made twice, and the ignore rule is the one part of this that is a safety-relevant side effect.",
+      "proposal": "Extract `fn write_roots(cwd: &Path, local: bool) -> (PathBuf, PathBuf)` returning `(cwd_root, target_root)` (the five duplicated lines), and `fn ensure_ignored_after_enable(cwd_root: &Path) -> Result<()>` holding the `scratchpad::ensure_state_ignored(cwd_root).context(\"gitignoring .superset/.magic/\")` call. Both callers keep their own `turns_on`/`enabled` predicate and their own success message; only the shared mechanics move.",
+      "behavior_preservation": "Pure code motion: same `git::cwd_repo_root` fallback, same `main_checkout_or_self` branch, same context string, and each caller keeps deciding for itself whether the ignore rule runs (`enabled` at 635, `turns_on` at 747). The ignore rule is still added at `cwd_root`, never at the `--local` target, and is still never removed — no gate is thinned.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F3",
+      "category": "efficiency",
+      "title": "`resolve_with_roots` reads and parses the overlaid magic.json twice on the hook hot path",
+      "locations": [
+        "crates/ss-magic-plugin/src/config.rs:194-199",
+        "crates/ss-magic-plugin/src/hook/mod.rs:513"
+      ],
+      "evidence": "config.rs:194  pub fn resolve_with_roots(cwd_root: &Path, main_root: Option<&Path>) -> PluginConfig {\nconfig.rs:195      PluginConfig {\nconfig.rs:196          enabled: enabled_from_value(plugin_value(main_root.unwrap_or(cwd_root)).as_ref()),\nconfig.rs:197          gate: gate_from_value(plugin_value(cwd_root).as_ref()),\nconfig.rs:198      }",
+      "problem": "In the main checkout (and whenever `main_root` is `None`) both `plugin_value` calls resolve the same root, so `superset_files::load_overlaid` opens and JSON-parses `.superset/magic.json` and `.superset/magic.local.json` twice — four file reads instead of two. `hook/mod.rs:513` calls this before the enablement gate on every hook invocation, which is nearly every `PreToolUse`, i.e. nearly every tool call; the whole point of the U2 root discovery was to make that gate cheap.",
+      "proposal": "Load the cwd root's value once and reuse it when the main root is the same path:\n```rust\nlet cwd_value = plugin_value(cwd_root);\nlet enabled = match main_root {\n    Some(main) if main != cwd_root => enabled_from_value(plugin_value(main).as_ref()),\n    _ => enabled_from_value(cwd_value.as_ref()),\n};\nPluginConfig { enabled, gate: gate_from_value(cwd_value.as_ref()) }\n```",
+      "behavior_preservation": "Same inputs produce the same `PluginConfig`: the reused value comes from the identical path, and `plugin_value` is a pure read that swallows every error into `None`, so a second read of the same file yields the same result. The only difference is the order of the two reads when the roots differ (cwd first instead of main first), observable only to a writer racing between them — and the single-read case is strictly more coherent, never less. `enabled` still comes from the main root's overlay and `gate` still from the cwd root's (R7/R53 unchanged).",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F4",
+      "category": "efficiency",
+      "title": "`status::collect` resolves the plugin config twice for the same root, spawning a second `git rev-parse`",
+      "locations": [
+        "crates/ss-magic-plugin/src/status.rs:920-927",
+        "crates/ss-magic-plugin/src/status.rs:1102"
+      ],
+      "evidence": "status.rs:920      let (enablement, harness_regs) = collect_enablement(\nstatus.rs:921          repo_root.as_deref().unwrap_or(&inputs.cwd),\nstatus.rs:927      let cfg = config::resolve(repo_root.as_deref().unwrap_or(&inputs.cwd));\nstatus.rs:1102      let cfg = config::resolve(cwd_root);",
+      "problem": "`collect_enablement` is handed `repo_root.as_deref().unwrap_or(&inputs.cwd)` and calls `config::resolve(cwd_root)` internally; ten lines later `collect` calls `config::resolve` again on the exact same expression. `config::resolve` probes `git::main_checkout_root` (a subprocess) and then loads the overlay twice (see F3), so one `status` run pays for two subprocesses and up to eight file reads to answer one question.",
+      "proposal": "Resolve once in `collect` — `let cfg = config::resolve(repo_root.as_deref().unwrap_or(&inputs.cwd));` before the `collect_enablement` call — and pass `&cfg` into `collect_enablement` instead of having it resolve. `collect_enablement` keeps every other parameter and reads `cfg.enabled` as it does now.",
+      "behavior_preservation": "Both calls pass the identical path expression, and `config::resolve` is a pure read with no side effect other than the probe, so one call returns what both calls return today. Report fields, ordering of the printed sections and the `problems` list are untouched; only the number of probes/reads drops.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F5",
+      "category": "reuse",
+      "title": "`report` re-prefixes a pin onto the line tag to ask whether it is a plain triple; `release::parse_bare_triple` answers directly",
+      "locations": [
+        "crates/ss-magic-plugin/src/release_check.rs:524"
+      ],
+      "evidence": "release_check.rs:524              } else if release::parse_line_tag(&PLUGIN_LINE, &format!(\"{}{pinned}\", PLUGIN_LINE.tag_prefix)).is_some() {",
+      "problem": "This builds a synthetic tag by gluing `PLUGIN_LINE.tag_prefix` onto the pin, only so `parse_line_tag` can strip that same prefix straight back off (core's `parse_line_tag` is literally `tag.strip_prefix(line.tag_prefix)?` then `parse_bare_triple(rest)`, release.rs:242-245). The public primitive for the actual question — \"is this pin `MAJOR.MINOR.PATCH`?\" — already exists and is what `status.rs` uses through its `parse_semver` wrapper (status.rs:1697).",
+      "proposal": "Replace the condition with `release::parse_bare_triple(pinned).is_some()`.",
+      "behavior_preservation": "`format!(\"{prefix}{pinned}\").strip_prefix(prefix)` always yields exactly `pinned`, so `parse_line_tag(&PLUGIN_LINE, &that)` and `parse_bare_triple(pinned)` return the same `Option` for every input; the branch taken, the `UpdateReport` produced and its note text are identical. One `String` allocation disappears.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F6",
+      "category": "duplication",
+      "title": "\"Is an update available?\" is derived twice, by two different code shapes, in release_check and status",
+      "locations": [
+        "crates/ss-magic-plugin/src/release_check.rs:517-534",
+        "crates/ss-magic-plugin/src/status.rs:1683-1686"
+      ],
+      "evidence": "release_check.rs:519              if release::is_newer(&PLUGIN_LINE, tag, pinned) {  … available: Some(true)\nrelease_check.rs:524              } else if release::parse_line_tag(… pinned …).is_some() { … available: Some(false)\nrelease_check.rs:531              } else { … available: None\nstatus.rs:1684      let available = pin\nstatus.rs:1685          .filter(|pinned| parse_semver(pinned).is_some())\nstatus.rs:1686          .map(|pinned| release::is_newer(&release::PLUGIN_LINE, &cache.tag_name, pinned));",
+      "problem": "Both modules turn (newest plugin tag, pin) into the same tri-state `Option<bool>` — `None` when the pin is not a plain triple, otherwise `Some(is_newer)` — with two independently written implementations. status.rs already reuses `release_check::cached_plugin_tag` for the tag half and even documents the rule as \"shared with it so the two can never disagree\", but the comparison half is not shared, so a change to the unknown-pin rule has to be made in two places to keep that claim true.",
+      "proposal": "Add `pub fn update_available(newest_tag: &str, pinned: &str) -> Option<bool>` to `release_check.rs` (the module that owns the plugin line's cache and already exports `cached_plugin_tag` to status) implemented as `release::parse_bare_triple(pinned).map(|_| release::is_newer(&PLUGIN_LINE, newest_tag, pinned))`. `report` uses it and keeps its three note strings by matching on the returned `Option<bool>`; `status::collect_newest_release` calls it in place of the `filter`/`map` chain (and `parse_semver` can then go, or stay for its other callers).",
+      "behavior_preservation": "The two forms are already equivalent: `is_newer` returns `true` only when both the tag and the pin parse, so release_check's `Some(true)` arm implies a triple pin, its second arm is exactly \"triple pin and not newer\" = `Some(false)`, and its third is a non-triple pin = `None` — which is precisely status's `filter(...).map(is_newer)`. Every emitted note string stays where it is; only the boolean derivation is shared.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F7",
+      "category": "duplication",
+      "title": "`release_check::render_text` re-implements status.rs's label/value row helper, its width, and its \"unknown — …\" text",
+      "locations": [
+        "crates/ss-magic-plugin/src/release_check.rs:575-608",
+        "crates/ss-magic-plugin/src/status.rs:1953-1968"
+      ],
+      "evidence": "release_check.rs:576      const WIDTH: usize = 22;\nrelease_check.rs:577      let row = |out: &mut String, label: &str, value: String| {\nrelease_check.rs:578          let _ = writeln!(out, \"  {label:<WIDTH$}{value}\");\nstatus.rs:1953  const LABEL_WIDTH: usize = 22;\nstatus.rs:1966  fn row(out: &mut String, label: &str, value: impl AsRef<str>) {\nstatus.rs:1967      let _ = writeln!(out, \"  {label:<LABEL_WIDTH$}{}\", value.as_ref());",
+      "problem": "Two report renderers in the same crate each carry their own copy of the row format and of the column width `22`; the two must stay equal for `status` and `release-check` to line up, and nothing says so. `release_check` additionally spells `format!(\"unknown — {}\", note.as_deref().unwrap_or(\"no reason recorded\"))` twice (lines 592-595 and 604-607), which is status.rs's `unknown()` helper (status.rs:1958-1963) written a third and fourth time.",
+      "proposal": "Make `status.rs`'s `LABEL_WIDTH` and `row` `pub(crate)` (status.rs already exposes `read_pin_file` that way and release_check already imports `status::{locate_plugin_root, probe_harness, read_pin_file}`), or move both plus `unknown` into a small `report_text.rs`. Have `render_text` call `status::row(out, label, value)` and add ONE local `fn unknown_info(note: Option<&str>) -> String` for its two sites. Do NOT reuse status's `unknown`: it paints with `style::warn` while release_check paints with `style::info`.",
+      "behavior_preservation": "`row` writes the identical format string with the identical width, and `impl AsRef<str>` accepts the `String` values release_check passes, so every rendered line is byte-identical. The two \"unknown\" sites keep `style::info` by using a local helper, so no output changes color.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F8",
+      "category": "hardcoded-value",
+      "title": "The release cache is written with a bare `Some(0o600)` while every other owner-only writer names a `FILE_MODE` constant",
+      "locations": [
+        "crates/ss-magic-plugin/src/release_check.rs:108-116"
+      ],
+      "evidence": "release_check.rs:113          Some(\"the plugin release cache\"),\nrelease_check.rs:114          Some(0o600),\nrelease_check.rs:115          false,",
+      "problem": "Nine modules in this crate declare `const FILE_MODE: u32 = 0o600;` next to their writer and pass `Some(FILE_MODE)` (bypass.rs:68, cache.rs:107, expect_artifact.rs:93, heartbeat.rs:73, ledger.rs:101, scratchpad.rs:122, hook/file_changed.rs:95, hook/pre_compact.rs:67, hook/subagent_stop.rs:86). `release_check.rs` is the one owner-only writer that inlines the octal, so a grep for the crate's owner-only files misses the release cache and the intent (\"this file is deliberately not world-readable\") is only in the digits.",
+      "proposal": "Either declare `const FILE_MODE: u32 = 0o600;` beside `LOCK_NAME` in release_check.rs and pass `Some(FILE_MODE)` (the local convention), or, together with F9, use the hoisted `atomic::OWNER_ONLY_MODE`.",
+      "behavior_preservation": "Same numeric mode reaches `atomic::write_atomically`; the written file's permissions and every error message are unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F9",
+      "category": "const-location",
+      "title": "Twelve modules each declare their own file-mode constant for the same two values",
+      "locations": [
+        "crates/ss-magic-plugin/src/setup_ci.rs:82-84",
+        "crates/ss-magic-plugin/src/compact_window.rs:132",
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:111",
+        "crates/ss-magic-plugin/src/atomic.rs:52-60"
+      ],
+      "evidence": "setup_ci.rs:83  /// world-readable, unlike anything under the plugin's state tree.\nsetup_ci.rs:84  const FILE_MODE: u32 = 0o644;\ncompact_window.rs:132  const NEW_FILE_MODE: u32 = 0o644;\nchecklist/verbs.rs:111  const NEW_FILE_MODE: u32 = 0o644;\n(plus nine `const FILE_MODE: u32 = 0o600;` — see F8)",
+      "problem": "The crate has exactly two file-mode policies — owner-only for state under `.superset/.magic/` and the machine store, world-readable for content the repository commits — but they are spelled out in twelve module-private constants under two different names (`FILE_MODE`, `NEW_FILE_MODE`), with the same identifier `FILE_MODE` carrying `0o600` in nine files and `0o644` in setup_ci.rs. Reading one file gives no way to tell which policy is meant, and a reviewer grepping `FILE_MODE` finds two different values.",
+      "proposal": "Declare the two policies once in `crates/ss-magic-plugin/src/atomic.rs`, which already owns the shared `write_atomically` and its `mode: Option<u32>` parameter: `pub(crate) const OWNER_ONLY_MODE: u32 = 0o600;` and `pub(crate) const COMMITTED_FILE_MODE: u32 = 0o644;`, each carrying the policy rationale currently repeated in twelve doc comments. Replace the per-module constants with those names (compact_window.rs:326 and checklist/verbs.rs:1290 keep their \"preserve the existing mode, else this default\" logic, just using the shared name).",
+      "behavior_preservation": "Pure renaming of constants that already hold identical values; every call site passes the same `Option<u32>` to `write_atomically` or `OpenOptions::mode`, so every written file's permissions are unchanged.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F10",
+      "category": "const-location",
+      "title": "`.superset/magic.json` and its siblings are re-spelled as literals in three crates while core owns private constants for them",
+      "locations": [
+        "crates/ss-magic-plugin/src/config.rs:886-891",
+        "crates/ss-magic-plugin/src/config.rs:926-932",
+        "crates/ss-magic-core/src/superset_files.rs:26-35",
+        "crates/ss-magic-plugin/src/hook/pre_tool_use.rs:100"
+      ],
+      "evidence": "config.rs:888          Err(_) => match target_root.join(\".superset\").canonicalize() {\nconfig.rs:928          \".superset/magic.local.json\"\nconfig.rs:930          \".superset/magic.json\"\nsuperset_files.rs:26  const SUPERSET_DIR: &str = \".superset\";\nsuperset_files.rs:30  const MAGIC_JSON: &str = \"magic.json\";\npre_tool_use.rs:100  const ROOT_MARKER: &str = \".superset/magic.json\";",
+      "problem": "`ss_magic_core::superset_files` is the module that reads and writes these files and owns `SUPERSET_DIR`/`MAGIC_JSON`/`MAGIC_LOCAL_JSON` — but they are private, so every other caller retypes the path: config.rs's `magic_file_label`, config.rs's `landing` (`\".superset\"`), hook/pre_tool_use.rs's `ROOT_MARKER`, and ss-magic/src/main.rs:205. `magic_file_label` also doubles as a real path component at config.rs:886 while being documented as \"the relative path a message names\", so a purely cosmetic reword of that label would silently retarget the containment check.",
+      "proposal": "Export the relative paths from core beside the existing constants — `pub const SUPERSET_DIR: &str = \".superset\";`, `pub const MAGIC_JSON_REL: &str = \".superset/magic.json\";`, `pub const MAGIC_LOCAL_JSON_REL: &str = \".superset/magic.local.json\";` (the latter is already there privately as `MAGIC_LOCAL_PATTERN`) — and have `config::magic_file_label` return those two, `landing` join `superset_files::SUPERSET_DIR`, and `pre_tool_use::ROOT_MARKER` be `superset_files::MAGIC_JSON_REL`.",
+      "behavior_preservation": "The constants hold byte-identical strings to the literals they replace, so every joined path, printed label and error message is unchanged. Only visibility in core widens; no reader or writer logic moves.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F11",
+      "category": "hardcoded-value",
+      "title": "setup-github-ci's usage banner re-types the workflow path that `WORKFLOW_REL` owns",
+      "locations": [
+        "crates/ss-magic-plugin/src/setup_ci.rs:75",
+        "crates/ss-magic-plugin/src/setup_ci.rs:102"
+      ],
+      "evidence": "setup_ci.rs:75  pub const WORKFLOW_REL: &str = \".github/workflows/ss-magic-checklist.yml\";\nsetup_ci.rs:102  The workflow is written to .github/workflows/ss-magic-checklist.yml.\";",
+      "problem": "Every other message in the module interpolates `{WORKFLOW_REL}` (lines 258, 275, 286, 298, 308, 325, 341, 346, 352, 359), but `USAGE` — being a `const` — spells the path out again. Renaming the workflow file would leave the help text naming a path the verb never writes.",
+      "proposal": "Turn the banner into `fn usage() -> String` built with `format!(\"…written to {WORKFLOW_REL}.\")` (the crate root already uses a `usage()` accessor for the same reason), and print `usage()` at setup_ci.rs:204 and :216. A lower-churn alternative that keeps the `const`: add a test asserting `USAGE.contains(WORKFLOW_REL)`, matching the existing tie-down tests in setup_ci/tests.rs (`the_workflow_globs_the_checklist_convention`).",
+      "behavior_preservation": "The rendered banner text is identical because the constant holds exactly the literal that is currently typed; only where the bytes come from changes.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F12",
+      "category": "efficiency",
+      "title": "`run_core` renders the whole embedded workflow up to three times per run",
+      "locations": [
+        "crates/ss-magic-plugin/src/setup_ci.rs:264",
+        "crates/ss-magic-plugin/src/setup_ci.rs:286",
+        "crates/ss-magic-plugin/src/setup_ci.rs:321"
+      ],
+      "evidence": "setup_ci.rs:264      let state = classify(existing.as_deref(), version);\nsetup_ci.rs:286          print_diff(existing.as_deref().unwrap_or(\"\"), &render(version));\nsetup_ci.rs:321      write_workflow(&path, &render(version))?;\n(render is `TEMPLATE.replace(VERSION_PLACEHOLDER, version)`, setup_ci.rs:112, and classify calls it again at :179)",
+      "problem": "`render(version)` copies the ~200-line embedded template into a fresh `String` each time. On a `Differs` run it is built three times (inside `classify`, for the diff, and — if `--force` — for the write) with the same argument and no possible difference between the results.",
+      "proposal": "Compute `let proposed = render(version);` once at the top of `run_core` and pass `&proposed` to `print_diff` (line 286) and `write_workflow` (line 321). Leave `classify` alone: it is the pure, independently tested decision and re-renders at a *different* version for the `PinStale` probe.",
+      "behavior_preservation": "`render` is a pure `str::replace` on a compile-time constant, so all three calls return equal strings for the same `version`; the diff printed and the bytes written are identical.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F13",
+      "category": "quality",
+      "title": "`REFRESH_ARGV`'s doc claims a coupling with the verb's parser that does not exist",
+      "locations": [
+        "crates/ss-magic-plugin/src/release_check.rs:55-57",
+        "crates/ss-magic-plugin/src/release_check.rs:658-665"
+      ],
+      "evidence": "release_check.rs:55  /// The argv the `SessionStart` hook spawns detached when the cache is stale.\nrelease_check.rs:56  /// Spelled once here so the hook's spawn and the verb's parse agree.\nrelease_check.rs:57  pub const REFRESH_ARGV: [&str; 3] = [\"release-check\", \"--refresh\", \"--quiet\"];\nrelease_check.rs:661              \"--refresh\" => flags.refresh = true,\nrelease_check.rs:663              \"--quiet\" => flags.quiet = true,",
+      "problem": "`parse_args` matches its own string literals and never mentions `REFRESH_ARGV`; the hook does not reference the constant either (it calls `spawn_refresh`). So the comment states an invariant nothing enforces — the class of comment that misleads the next reader into thinking a rename is safe.",
+      "proposal": "Reword to what is true (\"the one argv `spawn_refresh` uses; `parse_args` below must keep accepting these flags\") and, to make it true rather than aspirational, add a test asserting `matches!(parse_args(&REFRESH_ARGV[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>()), ParsedArgs::Run(Flags { refresh: true, quiet: true, json: false }))` beside the existing `parse_args_accepts_the_three_flags_in_any_order` (release_check/tests.rs:540).",
+      "behavior_preservation": "Documentation and test-only change; no production code path is touched.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F14",
+      "category": "copy-paste-variant",
+      "title": "Three different flag-parsing idioms for the same job inside one crate",
+      "locations": [
+        "crates/ss-magic-plugin/src/release_check.rs:646-668",
+        "crates/ss-magic-plugin/src/setup_ci.rs:199-220",
+        "crates/ss-magic-plugin/src/config.rs:609-617",
+        "crates/ss-magic-plugin/src/config.rs:514-523"
+      ],
+      "evidence": "release_check.rs:652  fn parse_args(args: &[String]) -> ParsedArgs {   // Flags struct + ParsedArgs enum\nsetup_ci.rs:201      for arg in args {                            // mutable bools, inline error arm\nconfig.rs:609      let local = match args {                       // slice patterns, [] / [flag] / _\nconfig.rs:514      if args.iter().any(|a| a == \"-h\" || a == \"--help\") {  // a fourth shape, same file",
+      "problem": "Four shapes for \"accept these flags, answer `-h`/`--help` with usage, reject anything else with usage plus exit 2\", two of them in the same file (config.rs). None is wrong, but a person fixing a flag-handling defect in one has no cue that three siblings handle it differently — e.g. `setup_ci` and `release_check` accept a repeated flag while config's slice patterns reject a second argument outright.",
+      "proposal": "Lead, not a settled fix: survey all verb parsers in the crate (also compact_window.rs and checklist/verbs.rs) and converge on release_check's shape — a private `Flags` struct plus a `Parsed{Run,Help,Error}` enum returned by a pure `parse_args`, which is the only one of the four that is testable without a process. Any consolidation must be done per verb with its existing tests green, because the error TEXT differs per verb (setup_ci distinguishes an unknown flag from a stray positional at :210-213) and those strings are asserted.",
+      "behavior_preservation": "Not established — this is a convergence proposal, and each verb's accepted argument set and error wording differ today. Behavior can only be preserved verb by verb, which is why the confidence is low.",
+      "confidence": 50,
+      "effort": "L",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F15",
+      "category": "naming",
+      "title": "Bare `LOCK_NAME` and `SCHEMA_VERSION` identifiers hold different values in different modules, beside a prefixed convention for the same role",
+      "locations": [
+        "crates/ss-magic-plugin/src/release_check.rs:53",
+        "crates/ss-magic-plugin/src/release_check.rs:60",
+        "crates/ss-magic-plugin/src/config.rs:51",
+        "crates/ss-magic-plugin/src/tmproot.rs:97",
+        "crates/ss-magic-plugin/src/status.rs:74"
+      ],
+      "evidence": "release_check.rs:53  pub const LOCK_NAME: &str = \"release-check.lock\";\nrelease_check.rs:60  pub const SCHEMA_VERSION: u32 = 1;\nconfig.rs:51  const CONFIG_LOCK_NAME: &str = \"magic-json.lock\";\ntmproot.rs:97  pub const INSTALL_LOCK_NAME: &str = \"install.lock\";\nstatus.rs:74  pub const SCHEMA_VERSION: u32 = 2;",
+      "problem": "Every lock file under the one shared temp root is named by a constant, but three of them are the bare `LOCK_NAME` (release_check.rs, checklist/verbs.rs:105, hook/file_changed.rs:106) while three use the `<THING>_LOCK_NAME` form (config.rs, tmproot.rs, scratchpad.rs:104 `POINTER_LOCK_NAME`). Likewise `SCHEMA_VERSION` names two unrelated report schemas with different values. Nothing is broken — each is module-scoped — but \"list every lock this plugin takes\" and \"what is the schema version\" are both ungreppable, and a `use release_check::*`-style import would collide.",
+      "proposal": "Rename the three bare lock constants to the prefixed convention already used by their siblings (`RELEASE_CHECK_LOCK_NAME`, `CHECKLIST_LOCK_NAME`, `FILE_CHANGED_LOCK_NAME`), and the two report-schema constants to `RELEASE_CHECK_SCHEMA_VERSION` / `STATUS_SCHEMA_VERSION`. Keep them in their own modules — per structure-pins the values themselves must stay separate; this is naming only.",
+      "behavior_preservation": "Identifier renames only: the lock file names and the emitted `schema` numbers are unchanged, so the on-disk lock paths and both `--json` payloads are byte-identical.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F16",
+      "category": "const-location",
+      "title": "`bootstrap.sh` re-spells the `seed-config` verb token and swallows the exit status that would report a rename",
+      "locations": [
+        "crates/ss-magic-plugin/src/main.rs:217-238",
+        "plugin/hooks/bootstrap.sh:252-255",
+        "scripts/test-bootstrap.sh:553"
+      ],
+      "evidence": "bootstrap.sh:252  seed_config() {\nbootstrap.sh:253      \"$bin_path\" seed-config >/dev/null 2>&1\nbootstrap.sh:254      return 0\nmain.rs:231              \"seed-config\" => Self::SeedConfig,\ntest-bootstrap.sh:553  assert_eq \"seed-config\" \"$(cat \"$sb/fakebin.log\")\" \"R3a: invoked seed-config exactly once after the install\"",
+      "problem": "`HumanVerb::from_token` owns the verb vocabulary, but the shell re-types one of its tokens and discards both streams and the exit status, so if the token were ever renamed the binary would answer `error: unknown plugin verb` with exit 2 and the bootstrap would report success while seeding nothing, for every repository, silently. The shell suite's assertion runs against a FAKE binary recording its argv, so it pins the shell's spelling against itself rather than against the Rust vocabulary — there is no tie between the two.",
+      "proposal": "Add a test in `crates/ss-magic-plugin/src/tests.rs` that scans the bootstrap for its verb invocations and asserts each is real — the file is reachable with the same `include_str!` idiom already used in this crate (`include_str!(\"main.rs\")` at tests.rs:391 and `include_str!(\"../../../assets/workflow/checklist.yml\")` at setup_ci.rs:62): `for line in include_str!(\"../../../plugin/hooks/bootstrap.sh\").lines()` take the token after `\"$bin_path\" ` and assert `HumanVerb::from_token(token).is_some()`, with a `checked >= 1` guard so a reformatted script cannot silently retire the scan.",
+      "behavior_preservation": "Test-only addition; no production code, no shell script and no output changes.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-a-F17",
+      "category": "const-location",
+      "title": "The hook-event token vocabulary exists in four hand-maintained copies; the Rust-side pair is untied",
+      "locations": [
+        "crates/ss-magic-plugin/src/main.rs:136-146",
+        "crates/ss-magic-plugin/src/status.rs:76-89",
+        "plugin/hooks/hooks.json:21-71",
+        "scripts/test-bootstrap.sh:620-626"
+      ],
+      "evidence": "main.rs:138              \"session-start\" => Self::SessionStart,\nstatus.rs:82  pub const DECLARED_EVENTS: [&str; 5] = [\nstatus.rs:83      \"session-start\",\nhooks.json:21              \"args\": [\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\", \"session-start\"],\ntest-bootstrap.sh:621      \"SessionStart\": \"session-start\",",
+      "problem": "The five event tokens are spelled in `HookEvent::from_token`/`as_str`, again in `status::DECLARED_EVENTS`, again in the shipped manifest, and again in the bash suite's `SHIM_TOKENS` map (whose own comment admits it is a copy of `from_token`). `test-bootstrap.sh` ties the manifest to its copy, but nothing ties either to the Rust enum or to `DECLARED_EVENTS` — whose doc comment claims it \"lists the events the shipped hooks/hooks.json actually registers\", an assertion no check makes. A manifest token that drifts routes to `HookEvent::Unknown`, which by contract exits 0 and prints nothing: silently inert.",
+      "proposal": "Add a test in `crates/ss-magic-plugin/src/tests.rs` that reads the manifest with the `include_str!` idiom this crate already uses (`include_str!(\"../../../plugin/hooks/hooks.json\")`), parses it with `serde_json`, and asserts that the `args[1]` of every `run-hook.sh` entry (a) parses to a `HookEvent` other than `Unknown`/`Missing` and (b) equals, as a set, `status::DECLARED_EVENTS`. That makes the Rust enum the single source and turns `DECLARED_EVENTS`'s doc claim into a checked fact; the bash suite's copy can then stay as the deliberate second gate.",
+      "behavior_preservation": "Test-only addition; the manifest, the enum and the status report are untouched.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 3 (platform/framework/downstream guarantees hand-maintained): nothing — the crate deliberately hand-rolls only what it must (core's release line filter and cache derivation are already reused rather than re-implemented).",
+    "Rubric 2 item 1 (redundant state): nothing — `PluginConfig`/`GateConfig`/`Flags`/`State` each hold only what is not derivable.",
+    "Rubric 2 item 2 (parameter sprawl): nothing — the injected-environment seams here are pinned as deliberate testability seams.",
+    "Rubric 2 item 4 (leaky abstractions): nothing beyond the `magic_file_label`-as-path note folded into F10.",
+    "Rubric 2 item 5 (stringly-typed code): nothing — verb and event tokens are already closed enums; the remaining string issues are naming (F15) and cross-language copies (F16, F17).",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable — no component-tree UI framework in this crate.",
+    "Rubric 2 item 7 (nested conditionals 3+ deep): nothing — the deepest is the two-level match in `release_check::report`.",
+    "Rubric 2 item 8 (unnecessary comments): nothing beyond F13 — the comments here state reasons and measured facts, not restatements.",
+    "Rubric 2 item 9 (dead code / unused imports): nothing reportable — `HumanVerb::as_str`, `writes_config` and `can_set_enabled` have no production caller but are documented as kept for the round-trip and hook-safety assertions in tests.rs:138/285/336, which is a verified purpose.",
+    "Rubric 2 item 10 (context-dependent vocabulary): nothing — the vocabulary matches CLAUDE.md's established terms.",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): nothing — the one superseded form (the CLI's `plugin` subcommand) is already fully removed.",
+    "Rubric 3 item 2 (missed concurrency): nothing — the one long operation is already a detached spawn.",
+    "Rubric 3 item 4 (recurring no-op updates): not applicable — no polling or reducer loops.",
+    "Rubric 3 item 5 (unnecessary existence checks): nothing — `setup_ci::run_core` operates and handles `NotFound`, and `seed_config_at`'s old `is_file()` precheck was already removed; `landing`'s canonicalize IS the containment check, not a pre-check.",
+    "Rubric 3 item 6 (memory / unbounded structures): nothing — the only unbounded read is the workflow file, bounded on print by `DIFF_LINE_BUDGET`.",
+    "Rubric 3 item 7 (overly broad operations): nothing — each whole-file read is needed whole (byte comparison, diff, JSON parse).",
+    "Test helpers duplicating ss_magic_core::testutil: nothing — config/tests.rs imports `git_run`/`init_main_repo`/`make_worktree`/`write_file`/`exit_code_to_u8` from testutil, and its local `git_out` and setup_ci/tests.rs's `repo()` are documented, behaviourally distinct helpers (stdout capture; an empty repo with no initial commit)."
+  ]
+}

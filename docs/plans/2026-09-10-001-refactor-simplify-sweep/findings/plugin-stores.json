@@ -1,0 +1,350 @@
+{
+  "partition": "plugin-stores",
+  "findings": [
+    {
+      "id": "plugin-stores-F1",
+      "category": "duplication",
+      "title": "The state-tree bootstrap-and-refusal block is copied verbatim into all three verbs (and near-verbatim into checklist init)",
+      "locations": [
+        "crates/ss-magic-plugin/src/bypass.rs:238-247",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:492-501",
+        "crates/ss-magic-plugin/src/cache.rs:838-847",
+        "crates/ss-magic-plugin/src/checklist/verbs.rs:514-529"
+      ],
+      "evidence": "    let report = scratchpad::ensure(cwd)?;\n    if !report.wrote_state {\n        for refusal in &report.refusals {\n            eprintln!(\"{}\", style::err(format!(\"refused: {refusal}\")));\n        }\n        return Ok(ExitCode::from(1));\n    }",
+      "problem": "bypass::run_core, expect_artifact::run_core and cache::conclude_core each carry a byte-identical ten-line block (hard refusal prints every refusal through style::err and exits 1; a soft refusal prints the same list through style::warn and continues), preceded by three near-identical prose comments explaining the same rule. checklist/verbs.rs:514 carries the same block with one extra info line before its return. This is the verb-level half of a fail-closed gate: four independent copies means a change to the posture (say, adding the state root to the message) has to be made in four places, and a copy that drifts silently weakens one verb's reporting of a refusal.",
+      "proposal": "Add one helper to crates/ss-magic-plugin/src/scratchpad.rs, which already owns Report/Refusal and already prints refusals with style in run_ensure: `pub enum Bootstrap { Ready(Report), Refused(Report) }` and `pub fn ensure_for_verb(cwd: &Path) -> Result<Bootstrap>` that calls `ensure`, prints the hard-refusal list through style::err and returns `Refused` when `!wrote_state`, otherwise prints the soft list through style::warn and returns `Ready(report)`. The three run_core sites become `let report = match scratchpad::ensure_for_verb(cwd)? { Bootstrap::Ready(r) => r, Bootstrap::Refused(_) => return Ok(ExitCode::from(1)) };`. checklist/verbs.rs keeps its extra info line in the `Refused` arm, printed after the helper's err lines, which is exactly where it is printed today.",
+      "behavior_preservation": "Same calls in the same order on the same streams: err lines first, then either exit 1 or the warn lines. The `!wrote_state` test and the exit code stay at the call site (or in the Refused arm), so the gate itself is not moved into shared code and cannot be bypassed by a caller that forgets it – the enum forces every caller to handle Refused. checklist's extra info line keeps its position because the helper prints only the err lines before returning.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": true,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F2",
+      "category": "duplication",
+      "title": "The owner-only recursive directory create is hand-written in all three stores (and in five more modules)",
+      "locations": [
+        "crates/ss-magic-plugin/src/bypass.rs:117-121",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:219-223",
+        "crates/ss-magic-plugin/src/cache.rs:372-376",
+        "crates/ss-magic-plugin/src/scratchpad.rs:510-514",
+        "crates/ss-magic-plugin/src/hook/subagent_stop.rs:454-458",
+        "crates/ss-magic-plugin/src/heartbeat.rs:225-229",
+        "crates/ss-magic-plugin/src/ledger.rs:1084-1088",
+        "crates/ss-magic-plugin/src/ledger.rs:1140-1144"
+      ],
+      "evidence": "    fs::DirBuilder::new()\n        .recursive(true)\n        .mode(DIR_MODE)\n        .create(dir)\n        .with_context(|| format!(\"creating {}\", dir.display()))?;",
+      "problem": "Eight copies of the same five-line builder chain, six of them with the identical context string `format!(\"creating {}\", dir.display())`. This is precisely the shape that produced crate::atomic: several modules had each hand-rolled the same tempfile -> write -> flush -> chmod -> persist sequence until it was pulled into one helper. The directory half of the same 0700 story was left behind, so the mode a state directory gets is decided in eight places instead of one.",
+      "proposal": "Add a sibling to the existing primitive in crates/ss-magic-plugin/src/atomic.rs: `pub fn create_dir(path: &Path, mode: u32) -> Result<()>` containing exactly the chain above (recursive, `.mode(mode)`, `.with_context(|| format!(\"creating {}\", path.display()))`). The three in-partition sites become `atomic::create_dir(dir, DIR_MODE)?;`. The two ledger/heartbeat sites whose context string reads \"creating the plugin store at {}\" keep their own wording by passing through a second helper or by keeping their call site – do not silently change their error text.",
+      "behavior_preservation": "Same DirBuilder, same recursive flag, same mode argument, same context message, same `?` propagation. Nothing about the 0700 mode changes – it stays an explicit argument at every call site, so a reader still sees which mode a given store uses.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F3",
+      "category": "const-location",
+      "title": "DIR_MODE / FILE_MODE for the state tree are redeclared in each store instead of coming from scratchpad, which owns the tree",
+      "locations": [
+        "crates/ss-magic-plugin/src/bypass.rs:66-68",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:91-93",
+        "crates/ss-magic-plugin/src/cache.rs:105-107",
+        "crates/ss-magic-plugin/src/scratchpad.rs:115-122"
+      ],
+      "evidence": "/// Owner-only modes, matching the rest of the state tree (R58).\nconst DIR_MODE: u32 = 0o700;\nconst FILE_MODE: u32 = 0o600;",
+      "problem": "All three stores in this partition declare the pair privately with a doc comment that literally says \"matching the rest of the state tree (R58)\" – i.e. each one asserts it is a copy of a value someone else owns. scratchpad.rs:119/122 declares the same pair with the fuller R58 rationale and is the module that creates the state root and the three claim directories in the first place. Three copies of a value whose only definition of correctness is \"equal to scratchpad's\" is a value with no owner.",
+      "proposal": "Make scratchpad's pair public (`pub const DIR_MODE: u32 = 0o700; pub const FILE_MODE: u32 = 0o600;`, keeping its existing rationale comment) and have bypass.rs, expect_artifact.rs and cache.rs use `scratchpad::{DIR_MODE, FILE_MODE}` – they already import `crate::scratchpad`. Do NOT fold in heartbeat.rs:71/73, ledger.rs:100/101 or tmproot.rs:101: those cover the machine-level store and the temp root, which are not the state tree and whose modes justify themselves separately.",
+      "behavior_preservation": "Identical numeric values at identical call sites; only the declaration moves. Nothing about the modes themselves changes, so the defence-in-depth property R58 describes is untouched.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F4",
+      "category": "const-location",
+      "title": "scratchpad::CLAIM_DIRS re-spells the three DIR_NAME constants the stores own",
+      "locations": [
+        "crates/ss-magic-plugin/src/scratchpad.rs:113",
+        "crates/ss-magic-plugin/src/cache.rs:84",
+        "crates/ss-magic-plugin/src/bypass.rs:56",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:72"
+      ],
+      "evidence": "const CLAIM_DIRS: [&str; 3] = [\"conclusions\", \"bypass\", \"expect-artifact\"];",
+      "problem": "Each store declares `pub const DIR_NAME` and its doc comment says \"`scratchpad::ensure` already creates it, so neither the verb nor the gate has to bootstrap a directory mid-flight\" – yet scratchpad creates them from three string literals of its own. Renaming any DIR_NAME leaves scratchpad creating the old directory while the store reads and writes the new one: the store silently loses the guarantee its own doc comment claims, and the failure only shows up as a mid-flight create in whichever verb happens to run first.",
+      "proposal": "In crates/ss-magic-plugin/src/scratchpad.rs write `const CLAIM_DIRS: [&str; 3] = [cache::DIR_NAME, bypass::DIR_NAME, expect_artifact::DIR_NAME];` (all three are `pub const &'static str`, so this is a legal const initializer) and add the `use` lines. Leave status.rs:2110-2113 alone – those are human-facing row labels for the status report, not the directory names.",
+      "behavior_preservation": "Same three strings in the same order, so the same three directories are created in the same sequence with the same modes.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F5",
+      "category": "duplication",
+      "title": "bypass::claim_path and expect_artifact::record_path are the same function twice",
+      "locations": [
+        "crates/ss-magic-plugin/src/bypass.rs:106-109",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:199-202"
+      ],
+      "evidence": "pub fn claim_path(dir: &Path, realpath: &Path) -> PathBuf {\n    let hash = hashing::fnv1a_64(realpath.as_os_str().as_bytes());\n    dir.join(format!(\"{hash:016x}.{CLAIM_EXT}\"))\n}\n// expect_artifact.rs:199 – identical, with RECORD_EXT (also \"json\")",
+      "problem": "Two structurally identical bodies differing only in an extension constant whose value is the same string (`CLAIM_EXT` and `RECORD_EXT` are both \"json\"). expect_artifact's own doc comment at line 193 says the naming is \"for the reason [`crate::bypass::claim_path`] gives\" – the code already declares which one is the source of truth, but does not use it. Both stores are already built on the shared crate::claim mechanism precisely so the two one-shot stores cannot drift on the property that matters; the file-naming half was left duplicated.",
+      "proposal": "Add to crates/ss-magic-plugin/src/claim.rs (the module both stores already share): `pub fn hashed_path(dir: &Path, target: &Path, ext: &str) -> PathBuf { let hash = hashing::fnv1a_64(target.as_os_str().as_bytes()); dir.join(format!(\"{hash:016x}.{ext}\")) }` with the naming rationale as its doc comment. `bypass::claim_path` becomes `claim::hashed_path(dir, realpath, CLAIM_EXT)` and `expect_artifact::record_path` becomes `claim::hashed_path(dir, resolved, RECORD_EXT)`, each keeping its own doc comment and its own extension constant.",
+      "behavior_preservation": "Same hash over the same bytes (`as_os_str().as_bytes()`, not a lossy string), same `{:016x}` formatting, same extension per caller – the produced paths are byte-identical, so existing claim and record files on disk still resolve.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F6",
+      "category": "reuse",
+      "title": "The char-boundary backwalk is copied between trim_note and bound; std has floor_char_boundary",
+      "locations": [
+        "crates/ss-magic-plugin/src/expect_artifact.rs:253-256",
+        "crates/ss-magic-plugin/src/cache.rs:572-575"
+      ],
+      "evidence": "    let mut end = MAX_NOTE_LEN;\n    while end > 0 && !note.is_char_boundary(end) {\n        end -= 1;\n    }\n// cache.rs:572 – the same three lines with `limit` and `text`",
+      "problem": "The identical 'walk back to a character boundary' loop appears in both files. It is also a std primitive: `str::floor_char_boundary` is stable on this toolchain (verified with rustc 1.98.0 in this workspace; the crates pin no rust-version and CI builds with dtolnay/rust-toolchain@stable), so this is hand-maintained behavior the standard library owns.",
+      "proposal": "Replace both loops with the std call. expect_artifact.rs:253-256 becomes `let end = note.floor_char_boundary(MAX_NOTE_LEN);`, cache.rs:572-575 becomes `let mut end = text.floor_char_boundary(limit);` (kept `mut`, since the line-boundary preference below still adjusts it). No shared helper is needed once std is used.",
+      "behavior_preservation": "`floor_char_boundary(i)` returns the greatest boundary <= i, clamping to len when i > len. Both call sites are already guarded by an early return for `len <= limit`, so i < len holds and the clamp never engages; for i inside a multi-byte scalar it returns exactly what the decrement loop converges to (checked: \"héllo\".floor_char_boundary(2) == 1, which is what the loop yields). The end==0 case is the same value in both forms.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F7",
+      "category": "naming",
+      "title": "Three sibling stores resolve their own directory three different ways",
+      "locations": [
+        "crates/ss-magic-plugin/src/bypass.rs:93-95",
+        "crates/ss-magic-plugin/src/cache.rs:203-205",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:187-189",
+        "crates/ss-magic-plugin/src/bypass.rs:249",
+        "crates/ss-magic-plugin/src/cache.rs:849",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:503"
+      ],
+      "evidence": "pub fn dir_for_root(root: &Path) -> PathBuf { root.join(STATE_REL).join(DIR_NAME) }   // bypass.rs:93 and cache.rs:203, identical\npub fn dir_in(state_root: &Path) -> PathBuf { state_root.join(DIR_NAME) }               // expect_artifact.rs:187\n    let dir = report.state_root.join(DIR_NAME);                                          // bypass.rs:249, cache.rs:849\n    let dir = dir_in(&report.state_root);                                                // expect_artifact.rs:503",
+      "problem": "One concept – 'where does my subdirectory live' – is spelled with two different names (`dir_for_root` vs `dir_in`), two different parameter conventions (worktree root vs already-resolved state root), and, at the verb call sites, twice inlined as `report.state_root.join(DIR_NAME)` bypassing the helper entirely. Someone reading one store cannot predict the other's shape, and the inline joins mean a store has two spellings of its own directory. Separately, `root.join(STATE_REL)` is re-spelled in five places (bypass.rs:94, cache.rs:204, scratchpad.rs:385, checklist/verbs.rs:140 and 726).",
+      "proposal": "Give all three stores the same pair: keep `dir_in(state_root)` as the primitive in each module, define `pub fn dir_for_root(root: &Path) -> PathBuf { dir_in(&scratchpad::state_root(root)) }` where needed (bypass and cache have external callers in hook/pre_tool_use.rs; expect_artifact needs none), and change the two inline call sites at bypass.rs:249 and cache.rs:849 to `dir_in(&report.state_root)`. Add `pub fn state_root(root: &Path) -> PathBuf { root.join(STATE_REL) }` to crates/ss-magic-plugin/src/scratchpad.rs, the module that owns the state-tree layout, and use it in the five `root.join(STATE_REL)` sites.",
+      "behavior_preservation": "Every path is assembled from the same two components in the same order, so all produced PathBufs are identical; only the spelling and the entry point change. `report.state_root` is already `root.join(STATE_REL)` (scratchpad.rs:385), so the inline sites and the helper agree by construction.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F8",
+      "category": "copy-paste-variant",
+      "title": "Three shapes of the same 'usage error, exit 2' tail inside this partition, and bypass has none at all",
+      "locations": [
+        "crates/ss-magic-plugin/src/bypass.rs:184-211",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:448-453",
+        "crates/ss-magic-plugin/src/cache.rs:1004-1010",
+        "crates/ss-magic-plugin/src/config.rs:938"
+      ],
+      "evidence": "fn refuse(message: impl std::fmt::Display) -> ExitCode {          // expect_artifact.rs:449\nfn usage_error(message: &str, usage: &str) -> Result<ExitCode> {   // cache.rs:1006\nfn usage_error(usage: &str, message: &str) -> ExitCode {           // config.rs:938  (arguments reversed)\n                eprintln!(\"{}\", style::err(format!(\"error: unknown `bypass` flag `{flag}`\")));\n                eprintln!(\"{BYPASS_USAGE}\");\n                return Ok(ExitCode::from(2));                      // bypass.rs:185-190, repeated at 193-200 and 204-211",
+      "problem": "The same three-statement tail (style::err with an `error: ` prefix, the usage text, exit 2) exists in four shapes across three files in this partition plus config.rs. bypass.rs repeats it inline three times rather than factoring it at all; expect_artifact returns a bare ExitCode; cache wraps it in Result; config.rs takes the same two arguments in the opposite order, which is a live trap for anyone moving a call site between the two `usage_error`s. Workspace-wide there are five further reimplementations (ledger.rs:1250, checklist/verbs.rs:1438, compact_window.rs:837).",
+      "proposal": "Two steps. (1) In-partition, give bypass.rs the helper its sibling already has: `fn refuse(message: impl Display) -> ExitCode` printing `error: {message}` then `BYPASS_USAGE` then `ExitCode::from(2)`, and replace the three inline blocks with `return Ok(refuse(format!(\"unknown `bypass` flag `{flag}`\")))` etc. (2) Crate-wide, add one `pub(crate) fn usage_error(usage: &str, message: impl Display) -> ExitCode` (a small `crate::verbs` module, or beside the dispatch table in main.rs) and make each module's local helper a one-line wrapper that supplies its own usage constant – fixing the reversed-argument hazard by having exactly one order.",
+      "behavior_preservation": "Every call site keeps its own message text and its own usage constant, so stderr is byte-identical; the exit code stays 2. Only the `Ok(..)` wrapping differs per module, and each wrapper keeps its module's current return type.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F9",
+      "category": "quality",
+      "title": "Stale narration comment on Budget::Bytes: the Read gate does construct it now",
+      "locations": [
+        "crates/ss-magic-plugin/src/cache.rs:437-439"
+      ],
+      "evidence": "    // Constructed by the Read gate, which passes the configured inline byte\n    // budget; the tests here exercise it in the meantime.\n    Bytes(usize),",
+      "problem": "\"the tests here exercise it in the meantime\" is iteration-bound narration from when the gate had not landed yet, and it is now false: hook/pre_tool_use.rs:838 constructs `cache::Budget::Bytes(body_budget)` from `ctx.config.gate.inline_byte_budget`. A reader is told the variant is effectively test-only, which is the opposite of the truth, and the doc comment immediately above already explains what the variant means.",
+      "proposal": "Delete the two `//` lines, or reduce them to the still-true half – `// Constructed by the Read gate from the configured inline byte budget.` – placed inside the doc comment rather than after it.",
+      "behavior_preservation": "Comment-only change; no code moves.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F10",
+      "category": "hardcoded-value",
+      "title": "Claim and declaration lifetimes are re-spelled in prose that no test ties to MAX_AGE_SECS",
+      "locations": [
+        "crates/ss-magic-plugin/src/bypass.rs:64",
+        "crates/ss-magic-plugin/src/bypass.rs:77-78",
+        "crates/ss-magic-plugin/src/bypass.rs:257-260",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:84",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:109-110"
+      ],
+      "evidence": "pub const MAX_AGE_SECS: u64 = 24 * 60 * 60;                                     // bypass.rs:64\nfile; claims older than 24 hours are discarded unused.\";                        // bypass.rs:78 (BYPASS_USAGE)\n        style::info(\"  The read after that is gated again. Unused claims expire after 24 hours.\")  // bypass.rs:259\nworktree, and declarations expire after six hours.\";                            // expect_artifact.rs:110 (USAGE)",
+      "problem": "The bypass lifetime is stated three times (the constant, the usage text, the success notice) and the declaration lifetime twice, with nothing linking the prose to the constant. Changing MAX_AGE_SECS leaves both user-facing strings asserting a duration the code no longer honours – and these strings are exactly what a person reads to decide whether a claim is still live.",
+      "proposal": "Cheapest behaviour-preserving fix: pin the relationship with a unit test in each module's sibling tests.rs – `assert!(BYPASS_USAGE.contains(&format!(\"{} hours\", MAX_AGE_SECS / 3600)))` and the same over the success notice, extracted into a `fn expiry_notice() -> String` so the notice is testable. For expect_artifact, whose prose spells the number as a word (\"six hours\"), either switch the text to \"6 hours\" and pin it the same way, or add `const MAX_AGE_HOURS: u64 = 6;` with `MAX_AGE_SECS = MAX_AGE_HOURS * 60 * 60` and a test asserting the word matches.",
+      "behavior_preservation": "Adding tests changes no output. If the notice is extracted into a function it must produce the identical string it prints today, including the two leading spaces and the trailing period.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F11",
+      "category": "efficiency",
+      "title": "cache::list calls age_stamp (which can stat the file) from inside the sort comparator",
+      "locations": [
+        "crates/ss-magic-plugin/src/cache.rs:343-347",
+        "crates/ss-magic-plugin/src/cache.rs:283-292",
+        "crates/ss-magic-plugin/src/cache.rs:648"
+      ],
+      "evidence": "    out.sort_by(|a, b| {\n        b.age_stamp()\n            .cmp(&a.age_stamp())\n            .then_with(|| a.key.cmp(&b.key))\n    });\n// age_stamp (283): recorded_epoch.unwrap_or_else(|| fs::metadata(&self.path)...)",
+      "problem": "`age_stamp` falls back to `fs::metadata(&self.path)` for any entry this module did not stamp (hand-written notes, half-written entries). Calling it inside the comparator means O(n log n) stat syscalls for those entries on every `list`, and `list` is on the `gc`, `prune` and `conclusions` paths. `prune` then calls `age_stamp()` once more per entry at line 648, repeating the stat.",
+      "proposal": "Compute the ordering key once per element: `out.sort_by_cached_key(|e| (std::cmp::Reverse(e.age_stamp()), e.key.clone()));`. If prune's second pass matters, have `list` return entries already paired with their stamp, or cache the stamp on `Entry` at parse time.",
+      "behavior_preservation": "`(Reverse(age), key)` ascending is the same order as `b.age.cmp(&a.age).then(a.key.cmp(&b.key))`: newest first, key ascending as tie-break. Keys are unique within a directory (they are the file stems), so no two elements compare equal and sort stability is not load-bearing. `age_stamp` is deterministic for the duration of a sort, so caching it cannot change the result.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F12",
+      "category": "efficiency",
+      "title": "gc reads and parses every entry twice: once itself, once through prune",
+      "locations": [
+        "crates/ss-magic-plugin/src/cache.rs:712",
+        "crates/ss-magic-plugin/src/cache.rs:727"
+      ],
+      "evidence": "    for entry in list(dir)? {\n        ...\n    report.pruned = prune(dir, ENTRIES_KEPT, MAX_AGE_SECS, now_secs(), None)?;",
+      "problem": "`gc` calls `list(dir)` (a read_dir plus a full `read_to_string` and header parse of every entry – up to ENTRIES_KEPT = 200 files) and then calls `prune`, whose first statement is another `list(dir)?`. Every surviving entry is read off disk and parsed twice per `gc` run.",
+      "proposal": "Split prune into `prune_entries(entries: &[Entry], keep, max_age, now, protect) -> Result<Vec<PathBuf>>` holding the current selection-and-remove loop, with `prune(dir, ..)` staying as `prune_entries(&list(dir)?, ..)` for its other caller (prune_best_effort). `gc` then keeps the entries it did not remove in a Vec and calls `prune_entries` on that.",
+      "behavior_preservation": "The selection rule, the protect check, the removal order and the returned paths are unchanged. One difference to state plainly: today prune re-reads the directory, so an entry written by a concurrent `conclude` between gc's list and prune's list is considered by prune; with the in-memory list it is not. That is a widening of gc's existing race (an entry written mid-gc is already invisible to the orphan sweep), and prune is best-effort retention, not a safety gate – but it is why this is 75 and not 100.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F13",
+      "category": "dead-code",
+      "title": "record_path and claim_path are pub with no caller outside their own module",
+      "locations": [
+        "crates/ss-magic-plugin/src/expect_artifact.rs:199",
+        "crates/ss-magic-plugin/src/bypass.rs:106"
+      ],
+      "evidence": "pub fn record_path(dir: &Path, resolved: &Path) -> PathBuf {   // expect_artifact.rs:199\npub fn claim_path(dir: &Path, realpath: &Path) -> PathBuf {    // bypass.rs:106",
+      "problem": "Grepped crate-wide: `record_path` is referenced only at its definition and at expect_artifact.rs:233 – not by the SubagentStop handler, not by status, not even by its own tests. `claim_path` is referenced only inside bypass.rs and bypass/tests.rs:92. Both are `pub`, which in a binary crate advertises them as part of the store's interface and invites a caller to derive a record path instead of going through `record`/`consume`, whose one-shot semantics are the point of these modules.",
+      "proposal": "Drop `pub` from both. The sibling `tests.rs` files are child modules under the pinned test layout, so bypass/tests.rs:92 keeps its access to a private `claim_path` with no change. Leave `cache::entry_path` and both `dir_for_root`s public – hook/pre_tool_use.rs:817/824/825 calls them.",
+      "behavior_preservation": "Visibility-only change inside a binary crate; no external API and no call site is affected.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F14",
+      "category": "hardcoded-value",
+      "title": "\"a u64 in hex is 16 characters\" is expressed four different ways",
+      "locations": [
+        "crates/ss-magic-plugin/src/cache.rs:103",
+        "crates/ss-magic-plugin/src/cache.rs:448",
+        "crates/ss-magic-plugin/src/cache.rs:160",
+        "crates/ss-magic-plugin/src/bypass.rs:108",
+        "crates/ss-magic-plugin/src/expect_artifact.rs:201"
+      ],
+      "evidence": "const KEY_HEX_LEN: usize = 16;      // cache.rs:103, used by is_key\nconst NONCE_HEX_LEN: usize = 16;    // cache.rs:448, used for the marker placeholder\n        format!(\"{:016x}\", hashing::fnv1a_64(self.key_material().as_bytes()))   // cache.rs:160\n    dir.join(format!(\"{hash:016x}.{CLAIM_EXT}\"))                                // bypass.rs:108",
+      "problem": "The same fact – an FNV-1a u64 rendered as hex occupies exactly 16 characters – underwrites two named constants used for different jobs and two bare `016` widths in format strings, with nothing tying the width that PRODUCES a key to the length that VALIDATES one (`is_key`, cache.rs:1001) or that measures a nonce placeholder (cache.rs:527). No test pins the relationship.",
+      "proposal": "Add `pub const HEX64_LEN: usize = 16;` to crates/ss-magic-core/src/hashing.rs beside `fnv1a_64`, with a doc line saying it is the width `{:016x}` of a u64 produces; define `KEY_HEX_LEN` and `NONCE_HEX_LEN` as `hashing::HEX64_LEN` (keeping both names, since they document different uses). Leave the `{:016x}` format literals alone – a `{:0width$x}` form would be less readable – and add one test asserting `FileIdentity::key().len() == KEY_HEX_LEN` so the producing width and the validating length are pinned together.",
+      "behavior_preservation": "Same numeric value everywhere; the format strings are untouched, so every produced key, nonce and file name is byte-identical.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F15",
+      "category": "duplication",
+      "title": "ignored_repo() is re-implemented in all three sibling test modules (eight copies crate-wide) with a divergent root derivation",
+      "locations": [
+        "crates/ss-magic-plugin/src/bypass/tests.rs:154-161",
+        "crates/ss-magic-plugin/src/cache/tests.rs:28-39",
+        "crates/ss-magic-plugin/src/expect_artifact/tests.rs:30-41"
+      ],
+      "evidence": "fn ignored_repo() -> (TempDir, PathBuf) {\n    let dir = init_main_repo(\"main\");\n    fs::write(dir.path().join(\".gitignore\"), \"target/\\n.superset/.magic/\\n\").unwrap();\n    git_run(&[\"add\", \".gitignore\"], dir.path());\n    git_run(&[\"commit\", \"-q\", \"-m\", \"gitignore\"], dir.path());\n    let root = dir.path().canonicalize().unwrap();   // expect_artifact/tests.rs:40 uses git::cwd_repo_root instead",
+      "problem": "Every module that exercises a verb past scratchpad::ensure needs a repository whose state tree git already ignores, and eight of them build it by hand (also scratchpad/tests.rs:23, hook/{subagent_stop,pre_compact,session_start}/tests.rs, checklist/verbs/tests.rs). The helper is a thin composition of testutil's own `init_main_repo` + `git_run`, which is exactly what testutil is for, and the copies have already drifted: two derive the root with `canonicalize`, expect_artifact's with `crate::git::cwd_repo_root`. The gitignore line also re-spells `.superset/.magic/`, which core's `state_tree::STATE_REL` owns.",
+      "proposal": "Add `pub fn ignored_repo(branch: &str) -> (TempDir, PathBuf)` to crates/ss-magic-core/src/testutil.rs (already feature-gated and dev-dependency-only), building the rule from `state_tree::STATE_REL` rather than a literal, and have the three modules here call it. Pick one root derivation and state it in the doc comment.",
+      "behavior_preservation": "Test-only change. The root derivations must be checked before collapsing: `canonicalize` and `git rev-parse --show-toplevel` agree on the macOS /tmp symlink in practice but are not the same call, which is why this is 75 – the consolidated helper should return the canonicalized root and expect_artifact's tests re-run to confirm.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-stores-F16",
+      "category": "duplication",
+      "title": "Lead, unverified: 'mtime, else content hash' file identity exists independently in cache::identify and the CLI's reverse-sync baseline",
+      "locations": [
+        "crates/ss-magic-plugin/src/cache.rs:186-193",
+        "crates/ss-magic/src/sync/reverse_sync.rs:880-899"
+      ],
+      "evidence": "    let stamp = match meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()) {\n        Some(d) => Stamp::Mtime(d.as_nanos()),\n        None => match hashing::hash_file(&realpath) {\n            Ok(h) => Stamp::Content(h),\n            Err(_) => Stamp::Unknown,\n        },\n    };",
+      "problem": "cache.rs:127-130 says the fallback is \"the same choice `sync::reverse_sync` makes for its TOCTOU baseline\", and reverse_sync::meta_of does implement the same idea (mtime when the filesystem reports one, otherwise a content hash, because a bare length must not pass as unchanged). Two crates encode the same rule with no shared primitive, so a change to it lands in one and not the other.",
+      "proposal": "If unified at all, extract only the stamp derivation into ss_magic_core::hashing – e.g. `pub enum Stamp { Mtime(u128), Content(u64), Unknown }` plus `pub fn stamp_of(meta: &fs::Metadata, path: &Path) -> Result<Stamp>` – and let each caller keep its own error posture: cache maps an Err to `Stamp::Unknown`, reverse_sync propagates it with `?`. Do not move meta_of's NotFound-versus-other-error distinction or metas_match: those are the TOCTOU guard itself.",
+      "behavior_preservation": "Not fully traced – reported as a lead. The two differ in error handling (cache swallows a hash failure into Unknown; meta_of propagates it, deliberately, so a non-NotFound stat error can never read as 'missing' and skip a mandatory backup) and in output (a hash key versus a comparable snapshot). Any consolidation that blurred those two postures would thin a data-loss guard, so the extraction has to stop at the stamp derivation.",
+      "confidence": 50,
+      "effort": "L",
+      "touches_safety_check": true,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 3 (platform/framework/downstream guarantees hand-maintained): nothing beyond the std char-boundary primitive already reported as F6 – the atomic write, the rename claim and the FNV/SHA hashing are all pinned decisions with documented reasons.",
+    "Rubric 2 item 1 (redundant state): Entry's parsed fields are derived once at parse time and carried, not recomputed; Entry.key duplicating the file stem is deliberate so a listed entry can name itself.",
+    "Rubric 2 item 2 (parameter sprawl): the `now: u64` and `dir: &Path` injections in record/write/prune are the pinned testability seams, not sprawl.",
+    "Rubric 2 item 4 (leaky abstractions): the stores expose only their directory, their record shape and their claim/consume pair; cache::envelope is correctly the one shared wrapper used by subagent_stop and checklist/render.",
+    "Rubric 2 item 5 (stringly-typed code): the store directory names, extensions and markers are all named constants already; the one place a literal escaped is scratchpad::CLAIM_DIRS, reported as F4.",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable – no component-tree UI framework in this partition.",
+    "Rubric 2 item 7 (nested conditionals 3+ deep): cache::conclusions_core reaches three levels (which -> is_key/identify -> render_cached), but each level does a distinct job and flattening it would cost comprehension; nothing else nests past two.",
+    "Rubric 2 item 10 (context-dependent vocabulary): terms are consistent with the codebase (claim, record, declaration, entry, key, stamp); the one naming inconsistency found is the dir_for_root/dir_in split reported as F7.",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): none found – no superseded forms or shims in these three modules.",
+    "Rubric 3 item 2 (missed concurrency): every operation here is a small local filesystem call on a hook or verb path; parallelising them would add coordination cost for no measurable gain.",
+    "Rubric 3 item 4 (recurring no-op updates): not applicable – no polling, event or reducer loop in this partition.",
+    "Rubric 3 item 5 (unnecessary existence checks): none. expect_artifact's `while !existing.exists()` walk is a deliberate ancestor search for a file that does not exist yet, not a pre-check before an operation, and cache::list handles NotFound from the operation itself.",
+    "Rubric 3 item 6 (memory): both one-shot stores are bounded by expiry sweeps and the cache by ENTRIES_KEPT plus MAX_AGE_SECS; no unbounded structure or leaked handle found.",
+    "Rubric 3 item 7 (overly broad operations): the only whole-file reads are hashing::hash_file on a filesystem that reports no mtime (documented and unavoidable) and the entry bodies, which are read in full because they are rendered in full."
+  ]
+}

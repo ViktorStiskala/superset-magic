@@ -1,0 +1,163 @@
+{
+  "partition": "python",
+  "findings": [
+    {
+      "id": "python-F1",
+      "category": "duplication",
+      "title": "The extra-artifact filename resolution (plugin manifest, then dist-workspace.toml) is implemented twice: once in Python, once in bash",
+      "locations": [
+        "scripts/build-plugin-zip.py:278-302",
+        ".github/workflows/ci.yml:295-301"
+      ],
+      "evidence": "build-plugin-zip.py:287-296\n    plugin_text = _read_text(root, PLUGIN_MANIFEST, \"the plugin crate manifest\")\n    versions = _artifact_versions(plugin_text)\n    if versions:\n        return str(PLUGIN_MANIFEST), versions\n    dist_path = root / \"dist-workspace.toml\"\n    if dist_path.is_file():\nci.yml:296-299\n          pattern='ss-magic-plugin-v[0-9]+\\.[0-9]+\\.[0-9]+\\.zip'\n          artifact=$(grep -oE \"$pattern\" crates/ss-magic-plugin/Cargo.toml | head -1 || true)\n          if [ -z \"$artifact\" ]; then\n            artifact=$(grep -oE \"$pattern\" dist-workspace.toml | head -1 || true)",
+      "problem": "Two independent implementations of the same rule – 'the published zip filename is the one the plugin crate's [[package.metadata.dist.extra-artifacts]] declares, falling back to dist-workspace.toml' – with the same two-source order and the same regex shape (ARTIFACT_RE at line 76 vs the `pattern` variable). The ci.yml comment even says 'the same order scripts/build-plugin-zip.py uses', i.e. the drift risk is already known. A change to the artifact naming rule or the fallback order must be made in two languages or CI's asset step and `--check`'s surface enumeration silently disagree, and only a release would show it.",
+      "proposal": "Give the builder one more read-only flag, e.g. `--print-declared-artifact`, whose body is `source, versions = _extra_artifact_versions(root); print(f\"ss-magic-plugin-v{versions[0]}.zip\")` (raising the existing BuildError when neither source declares one), and replace the ci.yml `pattern=`/`grep -oE`/fallback block with `artifact=$(python3 scripts/build-plugin-zip.py --print-declared-artifact)`. ARTIFACT_RE stays the single owner of the filename shape.",
+      "behavior_preservation": "The assertion CI makes is unchanged and still crosses two independent derivations: the DECLARED name (regex over the manifests, `_extra_artifact_versions`) versus the name the builder actually writes (`default_out_path`, derived from the crate version) – the two code paths stay separate, so the cross-check is not thinned. The only behavior that changes is the failure TEXT and exit status of the 'no entry declared' case: today the step echoes three lines and exits 1; afterwards the builder's own BuildError message is printed and the step exits 2 via `set -e`. Both still fail the job. If exact text must be preserved, keep the bash echo block and gate it on the python call's non-zero exit.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "python-F2",
+      "category": "const-location",
+      "title": "Repository data paths are named constants for four files but re-spelled inline at ten call sites, including inside the selftest fixture builder",
+      "locations": [
+        "scripts/build-plugin-zip.py:255-261",
+        "scripts/build-plugin-zip.py:232",
+        "scripts/build-plugin-zip.py:334",
+        "scripts/build-plugin-zip.py:582",
+        "scripts/build-plugin-zip.py:845",
+        "scripts/build-plugin-zip.py:927-943",
+        "scripts/build-plugin-zip.py:966-972",
+        "scripts/build-plugin-zip.py:999"
+      ],
+      "evidence": "255-261\nCLI_MANIFEST = Path(\"crates\") / \"ss-magic\" / \"Cargo.toml\"\nPLUGIN_MANIFEST = Path(\"crates\") / \"ss-magic-plugin\" / \"Cargo.toml\"\nCORE_MANIFEST = Path(\"crates\") / \"ss-magic-core\" / \"Cargo.toml\"\nPLUGIN_PIN = Path(\"plugin\") / \"ss-magic-plugin.version\"\n232:    path = root / \".claude-plugin\" / \"marketplace.json\"\n970:    (root / \"plugin\" / \"ss-magic-plugin.version\").write_text(f\"{plugin}\\n\", encoding=\"utf-8\")",
+      "problem": "The file already establishes a constants block for the paths it reads, and the selftest uses it in two places (`root / CLI_MANIFEST` at 1166, `bare / PLUGIN_MANIFEST` at 1244). Everywhere else the same paths are typed out again: `.claude-plugin/marketplace.json` at 232, 845 and 999 (plus in prose inside the refusals at 352 and 361), `plugin/.claude-plugin/plugin.json` at 334, 826, 831 and 967, `plugin/hooks/hooks.json` at 582 and 972, the crate manifests at 927-943, and PLUGIN_PIN's own filename at 970 and 1157. A renamed data file has to be found by grep in three spellings, and the fixture builder can drift from the constant the production reader uses without any check noticing.",
+      "proposal": "Add to the same block: `MARKETPLACE_MANIFEST = Path(\".claude-plugin\") / \"marketplace.json\"`, `PLUGIN_JSON_REL = Path(\".claude-plugin\") / \"plugin.json\"` (relative to a PLUGIN tree, so `check_bump` can use it against the extracted tree), `PLUGIN_JSON = Path(\"plugin\") / PLUGIN_JSON_REL`, and `HOOKS_MANIFEST = Path(\"plugin\") / \"hooks\" / \"hooks.json\"`. Use them at 232, 334, 582, 826, 831, 845, and in the fixture writes at 927-943, 966-972, 999, 1157 (`root / PLUGIN_PIN`, `root / CLI_MANIFEST`, ...).",
+      "behavior_preservation": "Every constant spells exactly the same relative path, and the two places whose value reaches a message – `_read_text`'s `f\"{rel}: {what} is missing.\"` and `check_hooks_shim`'s `rel` prefix – render `str(Path(\"plugin\")/\"hooks\"/\"hooks.json\") == \"plugin/hooks/hooks.json\"`, byte-identical to today's literals. The fixture builder writes to the same locations, so every selftest assertion sees the same tree.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "python-F3",
+      "category": "copy-paste-variant",
+      "title": "check_bump spells 'digest and declared version of a plugin tree' twice, and a third variant of the plugin.json read lives in version_surfaces",
+      "locations": [
+        "scripts/build-plugin-zip.py:824-832",
+        "scripts/build-plugin-zip.py:333-336"
+      ],
+      "evidence": "824-832\n        base_digest = digest_of(build_zip_bytes(extracted))\n        base_version = json.loads(\n            (extracted / \".claude-plugin\" / \"plugin.json\").read_text(encoding=\"utf-8\")\n        )[\"version\"]\n    cur_digest = digest_of(build_zip_bytes(root / \"plugin\"))\n    cur_version = json.loads(\n        (root / \"plugin\" / \".claude-plugin\" / \"plugin.json\").read_text(encoding=\"utf-8\")\n    )[\"version\"]",
+      "problem": "The two halves of the bump comparison are the same five-line expression with a different tree root, and the pair `digest_of(build_zip_bytes(X))` recurs eight times in the file (732, 824, 829, 1047, 1052, 1082, 1085, 1088). The two sides must stay derived identically or the comparison is meaningless, and today nothing but the copy-paste guarantees that.",
+      "proposal": "Add one private helper next to `digest_of`: `def _tree_digest_and_version(plugin_dir: Path) -> tuple[str, str]: return digest_of(build_zip_bytes(plugin_dir)), json.loads((plugin_dir / PLUGIN_JSON_REL).read_text(encoding=\"utf-8\"))[\"version\"]` (using F2's `PLUGIN_JSON_REL`), and call it twice in `check_bump`: `base_digest, base_version = _tree_digest_and_version(extracted)` / `cur_digest, cur_version = _tree_digest_and_version(root / \"plugin\")`.",
+      "behavior_preservation": "Same reads in the same order, same `json.loads` and same `[\"version\"]` subscript – a missing key still raises KeyError and a missing file still raises FileNotFoundError, exactly as today (deliberately NOT routed through `_read_text`, whose named refusal `version_surfaces` uses and `check_bump` does not). Note the deliberate difference from `version_surfaces`, which uses `_read_text` plus `.get(\"version\", \"\")` so an absent key becomes a surface-disagreement report rather than a traceback: leave that call site alone.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "python-F4",
+      "category": "reuse",
+      "title": "_version_repo hand-rolls mkdir + write_text eight times while the file's own _write helper does exactly that",
+      "locations": [
+        "scripts/build-plugin-zip.py:868-871",
+        "scripts/build-plugin-zip.py:927-1018"
+      ],
+      "evidence": "868-871\ndef _write(path: Path, data: str, mode: int) -> None:\n    path.parent.mkdir(parents=True, exist_ok=True)\n    path.write_text(data, encoding=\"utf-8\")\n    os.chmod(path, mode)\n927-930\n    (root / \"crates\" / \"ss-magic\").mkdir(parents=True)\n    (root / \"crates\" / \"ss-magic\" / \"Cargo.toml\").write_text(\n        f'[package]\\nname = \"ss-magic\"\\nversion = \"{cli}\"\\n', encoding=\"utf-8\"\n    )",
+      "problem": "`_version_repo` repeats the `mkdir(parents=True)` + `write_text(..., encoding=\"utf-8\")` pair eight times (crates/ss-magic, crates/ss-magic-plugin, crates/ss-magic-core, Cargo.lock, dist-workspace.toml, README.md, plugin/.claude-plugin/plugin.json, plugin/ss-magic-plugin.version, plugin/hooks/hooks.json, .claude-plugin/marketplace.json), while `_write` – already used by the sibling fixture builder `_sample_tree` – is that exact sequence plus a chmod. The two fixture builders in the same selftest section therefore write files in two different ways, and each new surface added to the fixture repeats the boilerplate again.",
+      "proposal": "Make the chmod optional: `def _write(path: Path, data: str, mode: int | None = None)` with `if mode is not None: os.chmod(path, mode)`, then replace each pair in `_version_repo` with `_write(root / CLI_MANIFEST, ...)` etc. (combined with F2's constants). `_sample_tree`'s calls, which always pass a mode, are untouched.",
+      "behavior_preservation": "`_write` creates the same parents (`exist_ok=True` only relaxes a case the fresh tempdir fixture never hits – no final directory in `_version_repo` pre-exists) and writes the same bytes with the same encoding. With `mode=None` no chmod happens, so the fixture's file modes stay umask-derived exactly as they are today; nothing in `check_versions`, `check_hooks_shim`, `check_workspace_shape` or `version_surfaces` reads a mode.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "python-F5",
+      "category": "hardcoded-value",
+      "title": "The marketplace release-tag regex is inline in version_surfaces while every sibling pattern is a module constant",
+      "locations": [
+        "scripts/build-plugin-zip.py:349",
+        "scripts/build-plugin-zip.py:75-78"
+      ],
+      "evidence": "349\n    tag = re.search(r\"/download/ss-magic-plugin-v(\\d+\\.\\d+\\.\\d+)/\", url)\n358\n    asset = ARTIFACT_RE.search(url)\n76\nARTIFACT_RE = re.compile(r\"ss-magic-plugin-v(\\d+\\.\\d+\\.\\d+)\\.zip\")",
+      "problem": "The two halves of the marketplace URL check sit two lines apart and are spelled inconsistently: the asset half uses the module constant ARTIFACT_RE, the tag half compiles a literal in place. The literal re-encodes both the plugin tag prefix (`PLUGIN_LINE` + `-v`) and the MAJOR.MINOR.PATCH shape that VERSION_RE/TAG_RE/ARTIFACT_RE already own, and it is recompiled on every call because it is not a module-level `re.compile`.",
+      "proposal": "Hoist it next to ARTIFACT_RE as `MARKETPLACE_TAG_RE = re.compile(r\"/download/ss-magic-plugin-v(\\d+\\.\\d+\\.\\d+)/\")` and call `MARKETPLACE_TAG_RE.search(url)` at line 349, so both halves of the URL assertion read the same way and the tag shape has one owner in the constants block.",
+      "behavior_preservation": "Identical pattern, identical `search` call, identical `group(1)`; `re` caches compiled patterns anyway, so even the (tiny) compile cost is unchanged in substance. The refusal text at 351-356 is untouched.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "python-F6",
+      "category": "const-location",
+      "title": "_semver is defined under the R98 section header but its first caller is the R95 README pin check 270 lines earlier",
+      "locations": [
+        "scripts/build-plugin-zip.py:748-754",
+        "scripts/build-plugin-zip.py:481"
+      ],
+      "evidence": "748-754\n# ------------------------------------------------------------------\n# R98 / AE81: a content change requires a version bump\n# ------------------------------------------------------------------\n\n\ndef _semver(v: str) -> tuple[int, int, int]:\n    return tuple(int(part) for part in v.split(\".\"))\n481:    if _semver(m.group(1)) > _semver(cli_version):",
+      "problem": "`_semver` is the file's one numeric version comparison and is used by two sections – `_readme_pin_problems` (R95, line 481) and `bump_verdict` (R98, line 782) – but it is filed under the R98 banner, so a reader of the R95 section meets a helper defined nowhere above it, and a reader tidying the R98 section cannot see that removing it would break the README pin check. It also sits far from VERSION_RE/TAG_RE, the constants that decide which strings are safe to pass it.",
+      "proposal": "Move the `_semver` definition up beside VERSION_RE/TAG_RE (or to the top of the 'The release assertions CI runs' section, above `_readme_pin_problems`), leaving the R98 section header directly above `bump_verdict`. Add one line to its docstring saying it is only ever called on a string VERSION_RE/TAG_RE has already matched – which is why it may raise ValueError on anything else (the guard at 519-524 exists for exactly that).",
+      "behavior_preservation": "A pure move of a module-level function definition in a file whose call sites all resolve at call time; no call site, argument or return value changes.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "python-F7",
+      "category": "dead-code",
+      "title": "--plugin-dir is neither documented nor used by any caller",
+      "locations": [
+        "scripts/build-plugin-zip.py:1271-1273",
+        "scripts/build-plugin-zip.py:44-51"
+      ],
+      "evidence": "1271-1273\n    parser.add_argument(\n        \"--plugin-dir\", type=Path, default=None, help=\"tree to package (default: <root>/plugin)\"\n    )\n1303\n    plugin_dir: Path = (args.plugin_dir or (root / \"plugin\")).resolve()",
+      "problem": "The module docstring's Usage block (44-51) lists every flag except `--root` and `--plugin-dir`, and no caller in the repository passes either: the only real invocations are bare (crates/ss-magic-plugin/Cargo.toml:65, .github/workflows/ci.yml:307), `--selftest`, `--check`, `--check-bump REF` and `--update-manifest`. The selftest exercises `build_zip_bytes(tree)` directly rather than through the flag, so `--plugin-dir` has no test either. (The `--plugin-dir` hits in docs/plans/ are the `claude --plugin-dir` harness flag, unrelated.)",
+      "proposal": "Either drop the `--plugin-dir` option and inline `plugin_dir = (root / \"plugin\").resolve()`, or – if it is a deliberate manual escape hatch for packaging a tree elsewhere – add it (and `--root`) to the docstring's Usage block so its absence from every caller reads as intent rather than rot. Do not remove `--root`: it is the seam `main` resolves everything else from and is the natural pair to keep if either is kept.",
+      "behavior_preservation": "Removing the option changes only the argparse surface (an unknown `--plugin-dir` would then exit 2 from argparse); every documented invocation resolves `plugin_dir` to the same `<root>/plugin` it does today, and `check_pin(root, plugin_dir)` receives the identical path. Because it is an intentional-versus-vestigial judgement the sweep cannot settle from the source alone, the documentation option is the safer half of the fix.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 2 (standard-library or runtime primitives): the hand-rolled `_cargo_toml_version` / `_cargo_lock_version` / `_declared_dependency_names` scanners exist because `tomllib` is 3.11+ and the file is deliberately stdlib-only (docstring line 41); no behavior-equivalent stdlib swap is available on the supported interpreters.",
+    "Rubric 1 item 3 (platform/framework guarantees): `zipfile` is already doing the archive work; the per-entry normalisation (fixed date_time, create_system, external_attr, flag_bits, STORED) is not a guarantee zipfile provides – it is exactly what the digest pin requires the script to override.",
+    "Rubric 2 item 1 (redundant state): none – the script holds no cached derived state; every check reads from disk.",
+    "Rubric 2 item 4 (leaky abstractions): none found; the private helpers are consistently `_`-prefixed and nothing imports this file as a module.",
+    "Rubric 2 item 5 (stringly-typed code): the release-line strings already go through CLI_LINE / PLUGIN_LINE, and the surface labels are report text rather than keys with an existing enum.",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable – no component-tree UI framework here.",
+    "Rubric 2 item 7 (nested conditionals): the deepest nesting is `check_hooks_shim`'s three LOOPS (593-627), each with an early `continue`; no ternary/if-else nest reaches three levels.",
+    "Rubric 2 item 8 (unnecessary comments): every long comment states a non-obvious release-mechanics invariant (why the digest must be tree-pure, why the README pin is `<=`, why the two lines' versions must differ, why the shim assertion is duplicated in test-bootstrap.sh); none merely restates the code or narrates a change. The R-ids are accompanied by their explanation, as the review rules require.",
+    "Rubric 2 item 10 (context-dependent vocabulary): terms (`surface`, `line`, `pin`, `shim`, `bump`) match CLAUDE.md's vocabulary.",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): the `dist-workspace.toml` fallback in `_extra_artifact_versions` is documented (282-286) as deliberately kept so a stale workspace-level entry stays CHECKED rather than unchecked; removing it would thin a release gate.",
+    "Rubric 3 item 1 (unnecessary work / repeated file reads): marketplace.json is parsed three times and the plugin manifest read three times per `--check`, but memoising would break the selftest, which deliberately rewrites fixture files between calls (1157, 1224) and re-runs the same check; the files are a few KB in a one-shot CI script, so the cache would trade a real correctness hazard for nothing measurable.",
+    "Rubric 3 item 2 (missed concurrency): none worth flagging – the checks are ordered on purpose so earlier ok/FAIL lines survive a later refusal (comment at 1317-1319).",
+    "Rubric 3 item 3 (hot-path bloat): not applicable; this runs in CI and at release time only.",
+    "Rubric 3 item 4 (recurring no-op updates): not applicable – no polling, events or reducers.",
+    "Rubric 3 item 5 (unnecessary existence checks): the two pre-checks are load-bearing rather than TOCTOU – `collect_entries`' `is_dir()` produces the named 'plugin tree does not exist' refusal the selftest asserts (1107-1110), and `check_bump`'s `git rev-parse` / `git cat-file -e` probes decide to SKIP the check rather than to proceed.",
+    "Rubric 3 item 6 (memory): bounded by the plugin tree; the zip is built in memory once and written through a temp file.",
+    "Rubric 3 item 7 (overly broad operations): the whole-file reads are of small manifests, and the zip genuinely needs every byte under plugin/."
+  ]
+}

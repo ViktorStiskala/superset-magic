@@ -6,3 +6,12 @@
 # root. It is published from CI, never committed; the digest in
 # .claude-plugin/marketplace.json is what the repository carries instead.
 /ss-magic-plugin-v*.zip
+
+# Python bytecode. `scripts/build-plugin-zip.py` is run directly by CI, by
+# cargo-dist's extra-artifact step and by hand, and each run drops a
+# __pycache__/ beside it. Untracked and unignored, it shows up as noise in every
+# `git status` and has been staged by accident at least once.
+__pycache__/
+
+# Compound Engineering local scratch
+.context/compound-engineering/

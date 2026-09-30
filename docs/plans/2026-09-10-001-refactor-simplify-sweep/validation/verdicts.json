@@ -1,0 +1,1481 @@
+[
+  {
+    "id": "cli-commands-F1",
+    "verdict": "accepted",
+    "reason": "Verified: pack_core and menu.rs re-spell resolve_sync_roots root resolution and its two error messages. Split resolve_sync_roots into resolve_cwd_root and resolve_main_root; pack_core and menu.rs call them; messages unchanged.",
+    "unit": "U3"
+  },
+  {
+    "id": "cli-commands-F2",
+    "verdict": "accepted",
+    "reason": "Verified: the empty-files guard in sync_core and pack_core differs only in the verb word. One empty_files_notice(cfg, verb); message text unchanged.",
+    "unit": "U3"
+  },
+  {
+    "id": "cli-commands-F3",
+    "verdict": "merged",
+    "reason": "Same literals and same \"make core the owner\" proposal as the cross-cutting .superset-path finding.",
+    "merged_into": "cross-F6"
+  },
+  {
+    "id": "cli-commands-F4",
+    "verdict": "accepted",
+    "reason": "Verified: rename_setup_config re-implements copy_into_repo's delete set with the same \"deleting {}\" semantics, and run_migrate already passes a delete slice. Pass SETUP_CONFIG_REL in that slice, delete the function; its two direct test callers are restated against the new call.",
+    "unit": "U3"
+  },
+  {
+    "id": "cli-commands-F5",
+    "verdict": "accepted",
+    "reason": "Verified: run_init and run_init_noninteractive duplicate the stage-and-materialize sequence verbatim. One helper; run_init_noninteractive loads its inputs in the same order as today by passing a closure for the load step.",
+    "unit": "U3"
+  },
+  {
+    "id": "cli-commands-F6",
+    "verdict": "accepted",
+    "reason": "Verified: \"ss-magic-\" and \".tar.bz2\" appear in archive_file_name and is_pack_archive_rel. Two consts; the legacy test literal stays frozen.",
+    "unit": "U3"
+  },
+  {
+    "id": "cli-commands-F7",
+    "verdict": "accepted",
+    "reason": "Verified: apply_update and apply_update_unlocked repeat the same run_self_update match. One swap_outcome(target_tag).",
+    "unit": "U3"
+  },
+  {
+    "id": "cli-commands-F8",
+    "verdict": "rejected",
+    "reason": "try_lock_state_at is a test-only seam that returns a verdict and drops the lock guard, while apply_update must keep the RwLock alive across the swap; sharing the three-line prelude means reshaping the seam. Low value."
+  },
+  {
+    "id": "cli-commands-F9",
+    "verdict": "merged",
+    "reason": "Same locations and proposal as the cross-cutting lock-opener finding.",
+    "merged_into": "cross-F2"
+  },
+  {
+    "id": "cli-commands-F10",
+    "verdict": "merged",
+    "reason": "Same test files and same \"import from testutil\" proposal as the cross-cutting finding.",
+    "merged_into": "cross-F14"
+  },
+  {
+    "id": "cli-commands-F11",
+    "verdict": "rejected",
+    "reason": "Dropping the is_file() pre-check changes stderr for a .superset/magic.json that is a directory (today a one-line \"not initialized\" notice, afterwards load_overlaid's read error). Not behavior-preserving."
+  },
+  {
+    "id": "cli-commands-F12",
+    "verdict": "merged",
+    "reason": "Same literals and same \"make core the owner\" proposal as the cross-cutting .superset-path finding.",
+    "merged_into": "cross-F6"
+  },
+  {
+    "id": "cli-commands-F13",
+    "verdict": "rejected",
+    "reason": "A test retyping STALE_TTL's 60 seconds; confidence-50 lead with no reader benefit. Low value."
+  },
+  {
+    "id": "cli-sync-F1",
+    "verdict": "merged",
+    "reason": "Same locations and proposal as the cross-cutting civil-date finding.",
+    "merged_into": "cross-F3"
+  },
+  {
+    "id": "cli-sync-F2",
+    "verdict": "merged",
+    "reason": "Same locations and proposal as the cross-cutting backups-path finding.",
+    "merged_into": "cross-F5"
+  },
+  {
+    "id": "cli-sync-F3",
+    "verdict": "accepted",
+    "reason": "Verified: the cockpit help text hand-types \".superset/backups\" and \"10 newest kept\". Build it from core BACKUPS_REL and BACKUP_BATCHES_KEPT; rendered length unchanged at the current value.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-sync-F4",
+    "verdict": "merged",
+    "reason": "Same proposal (one atomic-write helper); folded into the cross-cutting finding, which is rejected.",
+    "merged_into": "cross-F1"
+  },
+  {
+    "id": "cli-sync-F5",
+    "verdict": "accepted",
+    "reason": "Verified: apply_decision's Merge and Delete arms carry the same two-sided guard and two-sided backup block. Two private helpers; Push/Pull arms untouched; order (worktree then main) preserved.",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-sync-F6",
+    "verdict": "accepted",
+    "reason": "Verified: backup_forward_targets repeats finish_batch's print-backups and prune tail, differing only in the header and the \"Pruned N\" line. Two helpers (print list; prune returning Option<usize>) so each caller keeps its own header and its own summary lines.",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-sync-F7",
+    "verdict": "accepted",
+    "reason": "Verified: \"Nothing selected\" and its return appear twice six lines apart. Map Cancel to an empty vector; one message site.",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-sync-F8",
+    "verdict": "accepted",
+    "reason": "Verified: legacy side names \"local\"/\"main\" are bare literals at 795 and 830. One LEGACY_SIDE_DIRS const.",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-sync-F9",
+    "verdict": "merged",
+    "reason": "Same test files and same \"import from testutil\" proposal as the cross-cutting finding.",
+    "merged_into": "cross-F14"
+  },
+  {
+    "id": "cli-sync-F10",
+    "verdict": "accepted",
+    "reason": "Verified: merge.rs module doc still says only worktree-only files auto-push; default_decision returns Undecided for every state. Doc fix.",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-sync-F11",
+    "verdict": "accepted",
+    "reason": "Verified: default_decision ignores its FileState parameter and cockpit::file_state exists only to compute it. Remove the parameter, file_state and FileState; CLAUDE.md's mention of FileState is updated.",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-sync-F12",
+    "verdict": "accepted",
+    "reason": "Verified: plan-id-only comments and stale \"picker\" vocabulary in reverse_sync.rs and merge.rs. Delete/reword.",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-sync-F13",
+    "verdict": "accepted",
+    "reason": "Verified: eleven pub items in reverse_sync.rs/merge.rs have no caller outside their module or crate. Narrow to fn / pub(crate) as each signature requires.",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-sync-F14",
+    "verdict": "accepted",
+    "reason": "Verified: reverse_sync::is_safe_rel and parse_ls_files_z's string test are two spellings of the same absolute/\"..\" rejection. One core sync::is_safe_rel used by both; the reverse_sync filter application stays (defense in depth). checklist::contained_join is untouched (it also rejects empty).",
+    "unit": "U1"
+  },
+  {
+    "id": "cli-sync-F15",
+    "verdict": "accepted",
+    "reason": "Verified: classify reads both files fully even when their sizes differ, and a read error on either side already yields Differs. A stat-first length check returning Differs is byte-equal in outcome (differing lengths cannot be Identical) and falls through to the read pair whenever a stat fails.",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-sync-F16",
+    "verdict": "accepted",
+    "reason": "Verified: backup_if_exists calls exists() then is_dir(). One metadata call; both error paths still answer Ok(None).",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-sync-F17",
+    "verdict": "accepted",
+    "reason": "Verified: the review-baseline capture loop is written twice. One capture_baselines helper; run_bulk keeps its decisions loop.",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-sync-F18",
+    "verdict": "accepted",
+    "reason": "Verified: ApplyOutcome names two unrelated types in the CLI crate. Rename the sync-engine one to DecisionOutcome; the update one stays.",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-sync-F19",
+    "verdict": "rejected",
+    "reason": "Unverified lead (confidence 50) about removing the legacy 0.4.0 backup-layout fold; removing it changes prune behavior for existing backup trees."
+  },
+  {
+    "id": "cli-tui-F1",
+    "verdict": "accepted",
+    "reason": "Verified: the three direction labels are typed in reverse_sync::apply_batch and cockpit::destructive_overwrites. WriteDirection::label() owns them.",
+    "unit": "U4"
+  },
+  {
+    "id": "cli-tui-F2",
+    "verdict": "merged",
+    "reason": "The menu.rs half of the same duplication.",
+    "merged_into": "cli-commands-F1"
+  },
+  {
+    "id": "cli-tui-F3",
+    "verdict": "accepted",
+    "reason": "Verified: the usize-to-u16 scroll bound is written three times. One scroll_bound helper.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F4",
+    "verdict": "accepted",
+    "reason": "Verified: max_content_width and diff_line_count are recomputed per frame/keypress from an immutable diff. Precompute once in load_entry and store on FileEntry; the two functions stay as tested constructors.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F5",
+    "verdict": "accepted",
+    "reason": "Verified: render_confirm clones every decision to count them. Count without cloning; decisions() unchanged.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F6",
+    "verdict": "accepted",
+    "reason": "Verified: the merge preview is assembled twice per frame. Cache it on MergeOverlay and refresh in cycle_choice, the only mutation.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F7",
+    "verdict": "accepted",
+    "reason": "Verified: \"Local file\" / \"Main branch\" are typed twice. Two consts.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F8",
+    "verdict": "accepted",
+    "reason": "Verified: HIGHLIGHT_SYMBOL_WIDTH must equal the symbol's column count with nothing pinning it. A test.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F9",
+    "verdict": "accepted",
+    "reason": "Verified: SPLIT_GUTTER = 5, UNIFIED_GUTTER = 12, NEW_GUTTER = 7 and num()'s 4-wide field all derive from one width (5 = 4+1, 12 = 2*5+2, 7 = 5+2). Derive them; values unchanged.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F10",
+    "verdict": "accepted",
+    "reason": "Verified: the merge overlay legend is an inline literal beside the named FOOTER_LEGEND. Name it.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F11",
+    "verdict": "accepted",
+    "reason": "Verified: format_mtime uses bare 60/3600/86400. Three local consts.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F12",
+    "verdict": "accepted",
+    "reason": "Verified: ui.rs and menu.rs docs describe a removed second picker and removed flows. Reword.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F13",
+    "verdict": "accepted",
+    "reason": "Verified: cockpit::is_interactive restates the both-ttys rule that main::menu_blocked_reason owns (None iff both). Define one in terms of the other; probes stay in the cockpit.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F14",
+    "verdict": "accepted",
+    "reason": "Verified: the focus glyph is HIGHLIGHT_SYMBOL in one site and an inline literal in render_merge_hunk_list. Use the const.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F15",
+    "verdict": "accepted",
+    "reason": "Verified: handle_key's Merge arm repeats `if let Some(m) = app.merge.as_mut()` six times. Take the overlay once for the overlay-only keys.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F16",
+    "verdict": "accepted",
+    "reason": "Verified: render_created takes eight parameters under allow(too_many_arguments). A CreatedView struct with two consts.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F17",
+    "verdict": "accepted",
+    "reason": "Verified: Seg is reached by full path although diffmodel is imported. Import it.",
+    "unit": "U5"
+  },
+  {
+    "id": "cli-tui-F18",
+    "verdict": "rejected",
+    "reason": "The two rect-centering helpers compute different things (percentage-sized vs absolute-sized rects); unifying them is a layout decision, not a duplication removal."
+  },
+  {
+    "id": "cli-tui-F19",
+    "verdict": "rejected",
+    "reason": "Confidence-50 lead; the three gutter builders differ in sign column and numbering, so a shared builder would need parameters that read worse than the three inline forms. Low value."
+  },
+  {
+    "id": "core-git-F1",
+    "verdict": "accepted",
+    "reason": "Verified: join-if-relative plus canonicalize with the same context message appears in git::resolve, main_checkout_root and discover::resolve_against. Two private helpers; error text unchanged.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-git-F2",
+    "verdict": "accepted",
+    "reason": "Verified: status_porcelain repeats git()'s success check and bail message. A checked-spawn helper returning the raw Output keeps the status_porcelain-on-git_raw pin (no trim).",
+    "unit": "U2"
+  },
+  {
+    "id": "core-git-F3",
+    "verdict": "accepted",
+    "reason": "Verified ten spellings of String::from_utf8_lossy(..).trim().to_string() in git/mod.rs and gitignore.rs. One trimmed_utf8 helper.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-git-F4",
+    "verdict": "accepted",
+    "reason": "Verified: nothing_to_commit and pr_create hand-roll Command::new with their own \"failed to spawn\" contexts beside git_raw. Narrowed to a spawn_output(program, args, cwd) -> io::Result<Output> primitive so every caller keeps its exact context string and exit-status handling.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-git-F5",
+    "verdict": "accepted",
+    "reason": "Verified: repository_format_check duplicates the read/NotFound/unscannable block for config and config.worktree. One scan_config_file helper; decline strings unchanged.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-git-F6",
+    "verdict": "accepted",
+    "reason": "Verified: GITFILE_MAX_BYTES is pub with no user outside discover.rs and its tests. Drop pub.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-git-F7",
+    "verdict": "accepted",
+    "reason": "Verified: two decline reasons restate \"4 KiB\" in prose. Doc-form fix: the constant names the two reasons that must change with it.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-git-F8",
+    "verdict": "accepted",
+    "reason": "Verified: \".gitignore\" is spelled in gitignore.rs (x2) and migrate.rs stage_paths (x2). gitignore::GITIGNORE_FILE with the CLI callers migrated in U3.",
+    "unit": "U1"
+  },
+  {
+    "id": "core-git-F9",
+    "verdict": "accepted",
+    "reason": "Verified: #[allow(dead_code)] on a pub field of a pub struct in a library crate suppresses nothing. Remove it.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-git-F10",
+    "verdict": "accepted",
+    "reason": "Verified: ensure_entry stats before reading; matching NotFound on the read keeps both existing branches and their contexts.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-git-F11",
+    "verdict": "rejected",
+    "reason": "The ancestor walk's per-directory stat order is part of the discover module's pinned \"byte-equal to git or decline\" behavior (structure-pins: git::discover declines); collapsing the two stats changes which race windows the equivalence matrix observes. Efficiency on a path that is already subprocess-free; not worth the risk."
+  },
+  {
+    "id": "core-git-F12",
+    "verdict": "accepted",
+    "reason": "Verified: three \"consumed by U11 / wired by U10\" plan-id comments whose content the doc comments already carry. Delete.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-git-F13",
+    "verdict": "accepted",
+    "reason": "Verified: git/tests.rs write is byte-identical to testutil::write_file. Import it.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-git-F14",
+    "verdict": "accepted",
+    "reason": "Verified: gitignore/tests.rs git_init hand-rolls Command where testutil::git_run exists. Use git_run.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-git-F15",
+    "verdict": "accepted",
+    "reason": "Verified: git/tests.rs init_repo and discover/tests.rs pair() re-implement init_main_repo, one dropping gc.auto 0. testutil::init_repo_at(root, branch) with init_main_repo built on it.",
+    "unit": "U1"
+  },
+  {
+    "id": "core-rest-F1",
+    "verdict": "accepted",
+    "reason": "Verified: four #[allow(dead_code)] plus \"consumed by U9/U11\" comments on pub items of a library crate. Delete both.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-rest-F2",
+    "verdict": "accepted",
+    "reason": "Verified: four load_* functions are the same three lines. One private load_superset_json; public signatures and contexts unchanged.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-rest-F3",
+    "verdict": "accepted",
+    "reason": "Verified: write_magic_json and write_magic_local_json have identical four-line bodies. One private write_magic_file.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-rest-F4",
+    "verdict": "accepted",
+    "reason": "Verified: Glob::new plus \"compiling glob\" context in apply.rs and repo_scan.rs. One pattern::compile_glob.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-rest-F5",
+    "verdict": "accepted",
+    "reason": "Verified: expand_patterns validates via check_syntax then rebuilds the same Glob. pattern::checked_glob returns the compiled Glob; check_syntax stays as a wrapper so the picker validator is untouched.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-rest-F6",
+    "verdict": "accepted",
+    "reason": "Verified: sync/apply/tests.rs and repo_scan/tests.rs re-implement testutil::write_file. Import it.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-rest-F7",
+    "verdict": "merged",
+    "reason": "Same test files and same \"import from testutil\" proposal as the cross-cutting finding.",
+    "merged_into": "cross-F14"
+  },
+  {
+    "id": "core-rest-F8",
+    "verdict": "merged",
+    "reason": "Same test files and same \"import from testutil\" proposal as the cross-cutting finding.",
+    "merged_into": "cross-F14"
+  },
+  {
+    "id": "core-rest-F9",
+    "verdict": "accepted",
+    "reason": "Verified: superset_files/tests.rs re-declares repo_scan::OPTIONS byte for byte. Import it.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-rest-F10",
+    "verdict": "merged",
+    "reason": "Same literals and same \"make core the owner\" proposal as the cross-cutting .superset-path finding.",
+    "merged_into": "cross-F6"
+  },
+  {
+    "id": "core-rest-F11",
+    "verdict": "merged",
+    "reason": "Same literals and same \"make core the owner\" proposal as the cross-cutting .superset-path finding.",
+    "merged_into": "cross-F6"
+  },
+  {
+    "id": "core-rest-F12",
+    "verdict": "accepted",
+    "reason": "Verified: DEFAULT_EXCLUDES and SKIP_DIRS overlap with no cross-reference. Doc cross-reference only (defining SKIP_DIRS by indexing DEFAULT_EXCLUDES is optional); no behavior change.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-rest-F13",
+    "verdict": "accepted",
+    "reason": "Verified: repo_scan's walk does not apply under_excluded_tree. Only option (b) is behavior-preserving: document on skip_excluded that this scan deliberately descends into the excluded trees (it answers \"does this pattern match anything\", not \"what is copied\"). Option (a) would change matches_for_patterns results and is out.",
+    "unit": "U2"
+  },
+  {
+    "id": "core-rest-F14",
+    "verdict": "merged",
+    "reason": "Same proposal (one atomic-write helper); folded into the cross-cutting finding, which is rejected.",
+    "merged_into": "cross-F1"
+  },
+  {
+    "id": "core-rest-F15",
+    "verdict": "rejected",
+    "reason": "The proposed cross-language pin adds a new assertion line to build-plugin-zip.py --check, whose seven-line output is enumerated by the verification contract and CLAUDE.md; a refactor sweep must not change that surface."
+  },
+  {
+    "id": "core-rest-F16",
+    "verdict": "rejected",
+    "reason": "A durability-policy decision (which writers fsync, which stage), not a simplification; confidence 50."
+  },
+  {
+    "id": "cross-F1",
+    "verdict": "rejected",
+    "reason": "Not behavior-preserving as proposed: the three writers differ in staged-file naming, error-context strings, mode preservation (reverse_sync::write_bytes copies the existing mode), fsync policy and symlink handling (core canonicalizes the target first). One helper would change at least two of them; core-vs-plugin write_atomically is legitimately reportable per structure-pins.md but the honest answer is \"different contracts\"."
+  },
+  {
+    "id": "cross-F2",
+    "verdict": "accepted",
+    "reason": "Verified: update/apply.rs::open_lock_file, tmproot::open_lock_file and scratchpad::write_pointer all build the same OpenOptions (read+write+create, optional mode). One core opener with an Option<u32> mode; the CLI keeps its create_dir_all and every caller keeps its own error context.",
+    "unit": "U1"
+  },
+  {
+    "id": "cross-F3",
+    "verdict": "accepted",
+    "reason": "Verified byte-equal civil-from-days bodies in reverse_sync::format_timestamp and scratchpad::format_rfc3339, and the inverse days_from_civil in checklist::schema. Pure arithmetic moves to core; each formatter keeps its own format! string, so output is unchanged.",
+    "unit": "U1"
+  },
+  {
+    "id": "cross-F4",
+    "verdict": "accepted",
+    "reason": "Verified: hook/mod.rs and scratchpad.rs both declare STATE_QUERY = \".superset/.magic/\" while status.rs derives the same string from STATE_REL. core::state_tree is the documented one owner of the path; a derived constant plus a pinning test removes the two literals.",
+    "unit": "U1"
+  },
+  {
+    "id": "cross-F5",
+    "verdict": "accepted",
+    "reason": "Verified: reverse_sync::BACKUPS_REL = \".superset/backups\" and EXCLUDED_TREES[0] = [\".superset\", \"backups\"] encode one path twice with nothing pinning them. A core BACKUPS_REL beside EXCLUDED_TREES plus a test equal to the joined components.",
+    "unit": "U1"
+  },
+  {
+    "id": "cross-F6",
+    "verdict": "accepted",
+    "reason": "Verified: superset_files owns SUPERSET_DIR / MAGIC_JSON / MAGIC_LOCAL_JSON privately (plus a hand-concatenated MAGIC_LOCAL_PATTERN) while main.rs, pre_tool_use.rs, config.rs, migrate.rs (a const plus three inline joins), scratchpad.rs and testutil.rs re-spell the literals. Core publishes the names and two derived relative paths; every caller references them; values unchanged.",
+    "unit": "U1"
+  },
+  {
+    "id": "cross-F7",
+    "verdict": "accepted",
+    "reason": "Verified 17 declarations of 0o700/0o600 (and FILE_MODE meaning 0o644 in setup_ci) across the plugin crate. A plugin-local modes module with three policy-named constants; tmproot keeps its own DIR_MODE because it is the shell-mirrored ownership contract, not the state-tree policy.",
+    "unit": "U6"
+  },
+  {
+    "id": "cross-F8",
+    "verdict": "accepted",
+    "reason": "Verified nine copies of \"error line, usage, exit 2\" with two argument orders (config.rs usage-first, cache.rs message-first) and three no-usage fail variants; every copy prints style::err(format!(\"error: {message}\")) then the usage text and returns 2. One plugin verb module with usage_error(usage, message) and fail(message); each verb keeps its own USAGE text and messages.",
+    "unit": "U6"
+  },
+  {
+    "id": "cross-F9",
+    "verdict": "accepted",
+    "reason": "Verified six byte-equivalent strip_prefix-then-lossy-else-lossy helpers under four names (display_rel x2, display_path, rel_to_repo, rel_to_state, Ctx::rel_of). One pathnorm::rel_display; subagent_stop keeps its own state-root derivation in front of it.",
+    "unit": "U6"
+  },
+  {
+    "id": "cross-F10",
+    "verdict": "accepted",
+    "reason": "Verified: spill_index::projects_root and ledger::transcript_root are the same body, and status.rs / compact_window.rs resolve ${CLAUDE_CONFIG_DIR:-$HOME/.claude} the same way through non_empty_env. One status::harness_config_dir; projects_root builds on it; transcript_root is deleted.",
+    "unit": "U6"
+  },
+  {
+    "id": "cross-F11",
+    "verdict": "accepted",
+    "reason": "Verified byte-identical fn plural in ledger.rs and spill_index.rs plus three inline `if n == 1 { \"\" } else { \"s\" }` sites (status.rs, compact_window.rs, session_end.rs). One verb::plural.",
+    "unit": "U6"
+  },
+  {
+    "id": "cross-F12",
+    "verdict": "accepted",
+    "reason": "Verified 14 plugin sites of std::env::current_dir().context(\"reading the current directory\"). One verb::cwd(); config.rs:525 keeps its different \"getting current directory\" context so no message changes; the CLI crate is untouched.",
+    "unit": "U6"
+  },
+  {
+    "id": "cross-F13",
+    "verdict": "accepted",
+    "reason": "Verified: release_check::render_text redeclares status.rs LABEL_WIDTH (22) as a local WIDTH and re-implements row() as a closure. status::row and LABEL_WIDTH become pub(crate) and release_check calls them; output is byte-identical.",
+    "unit": "U9"
+  },
+  {
+    "id": "cross-F14",
+    "verdict": "accepted",
+    "reason": "Verified: pack/tests.rs and sync/reverse_sync/tests.rs re-implement init_main_repo (without the gc.auto 0 race fix), write_magic, write_file and make_worktree from ss_magic_core::testutil; feature/rs-test is asserted by no test. structure-pins.md explicitly makes re-implementing a testutil helper a finding.",
+    "unit": "U2"
+  },
+  {
+    "id": "cross-F15",
+    "verdict": "rejected",
+    "reason": "The three shell files do not all source lib/tmproot.sh unconditionally (bootstrap.sh sources it only when readable; run-hook.sh only on its fallback path), so a shared shell constant would either change the sourcing contract or leave at least one literal in place; the Rust BINARY_REL cannot be read from shell at all. Low value."
+  },
+  {
+    "id": "cross-F16",
+    "verdict": "accepted",
+    "reason": "Verified: tmproot.sh names three contract constants but inlines `cut -c1-16`, a 16-fold hex glob and the literal mode \"700\" that tmproot.rs names as IDENTIFIER_HEX_LEN and DIR_MODE. Two more named constants plus explicit length tests; every decision the script makes stays the same.",
+    "unit": "U10"
+  },
+  {
+    "id": "cross-F17",
+    "verdict": "accepted",
+    "reason": "Verified: run-hook.sh:57-78 and bin/ss-magic-plugin:72-88 resolve the same handoff file the same way, and the `[ -r ]` pre-check in each is redundant with the cat failure branch that follows. One ss_magic_read_data_root in lib/tmproot.sh with distinct return codes; each caller keeps its own messages and posture.",
+    "unit": "U10"
+  },
+  {
+    "id": "cross-F18",
+    "verdict": "rejected",
+    "reason": "CI re-implements the artifact-name lookup on purpose: the workflow step verifies that the builder produced the filename cargo-dist declares, and reading that name through the builder under test would make the check circular. Not a simplification."
+  },
+  {
+    "id": "cross-F19",
+    "verdict": "accepted",
+    "reason": "Verified: STATE_FILES (scratchpad.rs), STATE_FILE_NOTES (session_start.rs) and state_file_body (scratchpad.rs) each retype the six file names, with only a test pinning two of the three. Two index-aligned tables derived from one owner; the rendered guidance and the scaffolded bodies are unchanged.",
+    "unit": "U8"
+  },
+  {
+    "id": "cross-F20",
+    "verdict": "accepted",
+    "reason": "Verified: session_start.rs declares CHECKLIST_POINTER_NAME = \"checklist.json\" under a stale \"not yet written (U27)\" comment while checklist::POINTER_NAME already exports the same value. Import the export.",
+    "unit": "U8"
+  },
+  {
+    "id": "cross-F21",
+    "verdict": "accepted",
+    "reason": "Verified: cache::MAX_AGE_SECS and heartbeat::MAX_AGE_SECS are both 30 * 24 * 60 * 60 and the cache doc says it matches the heartbeat log. Define the cache bound in terms of the heartbeat one; value unchanged.",
+    "unit": "U7"
+  },
+  {
+    "id": "cross-F22",
+    "verdict": "accepted",
+    "reason": "Verified: heartbeat::now_secs_or(fallback) is core release::now_secs with the 0 fallback parameterized. Core gains now_secs_or and defines now_secs as now_secs_or(0); heartbeat calls core.",
+    "unit": "U1"
+  },
+  {
+    "id": "cross-F23",
+    "verdict": "merged",
+    "reason": "Same call sites and same one-helper proposal as the cross-cutting usage-tail finding (cross-F23 is the argv-loop half of the same tail and folds in with it).",
+    "merged_into": "cross-F8"
+  },
+  {
+    "id": "cross-F24",
+    "verdict": "rejected",
+    "reason": "Settled by structure-pins.md: per-binary version_line and usage are the crate-independence pin."
+  },
+  {
+    "id": "cross-F25",
+    "verdict": "rejected",
+    "reason": "Settled by structure-pins.md: the hand-rolled SHA-256 mirroring the shell shasum is a deliberate cross-language contract."
+  },
+  {
+    "id": "plugin-checklist-F1",
+    "verdict": "merged",
+    "reason": "The render.rs copy of the same loop; folded into the identity finding so both delegations land together.",
+    "merged_into": "plugin-state-F2"
+  },
+  {
+    "id": "plugin-checklist-F2",
+    "verdict": "merged",
+    "reason": "Same helpers and same proposal as the cross-cutting rel-display finding.",
+    "merged_into": "cross-F9"
+  },
+  {
+    "id": "plugin-checklist-F3",
+    "verdict": "merged",
+    "reason": "Same call sites and same one-helper proposal as the cross-cutting usage-tail finding (cross-F23 is the argv-loop half of the same tail and folds in with it).",
+    "merged_into": "cross-F8"
+  },
+  {
+    "id": "plugin-checklist-F4",
+    "verdict": "merged",
+    "reason": "Same locations and same proposal as the cross-cutting pointer-name finding.",
+    "merged_into": "cross-F20"
+  },
+  {
+    "id": "plugin-checklist-F5",
+    "verdict": "accepted",
+    "reason": "Verified: DOCUMENT_ID and the validator's \"document\" location are two literals a comment asks to keep equal. One const in schema.rs.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-checklist-F6",
+    "verdict": "accepted",
+    "reason": "Verified: ItemKind and Priority wire tokens are re-spelled in verbs.rs. from_token beside as_str; bail! texts unchanged.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-checklist-F7",
+    "verdict": "accepted",
+    "reason": "Verified: Document::section and Document::items are reachable from nothing; Priority::as_str gains a caller through F6's from_token. Delete the two accessors.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-checklist-F8",
+    "verdict": "accepted",
+    "reason": "Verified: \"blank field renders a placeholder, else prose_inline\" four times. One prose_or helper; placeholders unchanged.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-checklist-F9",
+    "verdict": "accepted",
+    "reason": "Verified: the reference-list block is written twice. One render_refs.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-checklist-F10",
+    "verdict": "accepted",
+    "reason": "Verified: the error-count expression is inlined twice beside validate::has_errors. One error_count.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-checklist-F11",
+    "verdict": "rejected",
+    "reason": "Two four-line constructors differing in one enum value; a shared helper used twice buys nothing. Low value."
+  },
+  {
+    "id": "plugin-checklist-F12",
+    "verdict": "merged",
+    "reason": "Same locations and proposal as the cross-cutting civil-date finding.",
+    "merged_into": "cross-F3"
+  },
+  {
+    "id": "plugin-checklist-F13",
+    "verdict": "merged",
+    "reason": "Same fixtures and same testutil proposal.",
+    "merged_into": "plugin-stores-F15"
+  },
+  {
+    "id": "plugin-hook-core-F1",
+    "verdict": "merged",
+    "reason": "Same helpers and same proposal as the cross-cutting rel-display finding.",
+    "merged_into": "cross-F9"
+  },
+  {
+    "id": "plugin-hook-core-F2",
+    "verdict": "merged",
+    "reason": "Same locations and proposal as the cross-cutting STATE_QUERY finding.",
+    "merged_into": "cross-F4"
+  },
+  {
+    "id": "plugin-hook-core-F3",
+    "verdict": "accepted",
+    "reason": "Verified: hook/mod.rs::state_tree_refusal and scratchpad's ignore probe spell the same two refusal sentences, the hook adding \". No state was written.\". One scratchpad::ignore_refusal; the hook appends its suffix.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-core-F4",
+    "verdict": "rejected",
+    "reason": "The second probe is scratchpad::ensure's own fail-closed gate; passing the pipeline's verdict across that boundary thins a safety check that structure-pins.md keeps fail-closed."
+  },
+  {
+    "id": "plugin-hook-core-F5",
+    "verdict": "accepted",
+    "reason": "Verified: version_drift_notice and release_suggestion each call read_pin on the same root. Read once in handle_with and pass the value; no new I/O on any path.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-core-F6",
+    "verdict": "accepted",
+    "reason": "Verified: the cache_dir closure (which runs create_dir_all) is invoked twice per SessionStart. Memoize with a OnceCell inside handle_with; laziness and order preserved.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-core-F7",
+    "verdict": "accepted",
+    "reason": "Verified: the trigger_display fallback is computed twice in pre_compact.rs. One helper.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-core-F8",
+    "verdict": "accepted",
+    "reason": "Verified: three handlers repeat the \"not inside a git repository; nothing to do\" detail. One const in hook/mod.rs; each handler keeps its own guard shape.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-core-F9",
+    "verdict": "merged",
+    "reason": "Same two functions; the gates finding carries the shape that preserves both predicates.",
+    "merged_into": "plugin-hook-gates-F7"
+  },
+  {
+    "id": "plugin-hook-core-F10",
+    "verdict": "merged",
+    "reason": "Same constants and same shared-module proposal as the cross-cutting mode-constant finding.",
+    "merged_into": "cross-F7"
+  },
+  {
+    "id": "plugin-hook-core-F11",
+    "verdict": "accepted",
+    "reason": "Verified: \"unroutable-event\" is owned by both REASON_UNROUTABLE and DecodeError::class. One owner in event.rs.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-core-F12",
+    "verdict": "merged",
+    "reason": "Same three tables and same \"derive from STATE_FILES\" proposal as the cross-cutting finding.",
+    "merged_into": "cross-F19"
+  },
+  {
+    "id": "plugin-hook-core-F13",
+    "verdict": "accepted",
+    "reason": "Verified: the 10,000-character cliff is a bare number in four comments and one test. One named const in event.rs.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-core-F14",
+    "verdict": "accepted",
+    "reason": "Verified: four pre-U12 narration comments in hook/mod.rs. Delete; restate the live fact where one exists.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-core-F15",
+    "verdict": "accepted",
+    "reason": "Verified: `base` names two row builders in pipeline and a third identical closure is redeclared in gate_and_dispatch. Rename and pass down.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-gates-F1",
+    "verdict": "merged",
+    "reason": "Same helpers and same proposal as the cross-cutting rel-display finding.",
+    "merged_into": "cross-F9"
+  },
+  {
+    "id": "plugin-hook-gates-F2",
+    "verdict": "accepted",
+    "reason": "Verified: the gate's worktree-root fallback is spelled twice verbatim. One gate_root; actor_root untouched.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-gates-F3",
+    "verdict": "accepted",
+    "reason": "Verified: the bypass paragraph is repeated verbatim in both deny reasons. One bypass_paragraph(lead_in, shown); text unchanged.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-gates-F4",
+    "verdict": "merged",
+    "reason": "Same literals and same \"make core the owner\" proposal as the cross-cutting .superset-path finding.",
+    "merged_into": "cross-F6"
+  },
+  {
+    "id": "plugin-hook-gates-F5",
+    "verdict": "merged",
+    "reason": "Same constants and same shared-module proposal as the cross-cutting mode-constant finding.",
+    "merged_into": "cross-F7"
+  },
+  {
+    "id": "plugin-hook-gates-F6",
+    "verdict": "merged",
+    "reason": "The subagent_stop half of the same finding.",
+    "merged_into": "plugin-state-F20"
+  },
+  {
+    "id": "plugin-hook-gates-F7",
+    "verdict": "accepted",
+    "reason": "Verified: pre_compact::is_tracked and subagent_stop::tracked_under both scan Refusal::TrackedPaths by hand. Report::tracked_paths() iterator; each caller keeps its own predicate (exact match vs prefix rule).",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-gates-F8",
+    "verdict": "accepted",
+    "reason": "Verified: every Bash command is copied to strip heredocs. A `contains(\"<<\")` short-circuit; strip_heredocs is the identity on such input.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-gates-F9",
+    "verdict": "accepted",
+    "reason": "Verified: direnv_export returns Result<Option<Option<String>>> for three named outcomes. A three-variant enum; detail strings unchanged.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-gates-F10",
+    "verdict": "accepted",
+    "reason": "Verified: commit_nudge builds its response inline. An advise() helper structurally unable to set a decision, beside allow/deny.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-gates-F11",
+    "verdict": "accepted",
+    "reason": "Verified: the case-folding comparison is written twice with the same non-UTF-8 fallback rationale. One os_str_equal_ignoring_case; paths_equal_ignoring_case keeps its Path fallback.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-hook-gates-F12",
+    "verdict": "rejected",
+    "reason": "Memoizing the checklist pointer for the process lifetime changes a safety gate's reads-per-decision, and the pre_tool_use tests rewrite the pointer mid-process."
+  },
+  {
+    "id": "plugin-hook-gates-F13",
+    "verdict": "accepted",
+    "reason": "Verified: pre_tool_use/tests.rs Repo::write re-implements testutil::write_file. Delegate.",
+    "unit": "U8"
+  },
+  {
+    "id": "plugin-state-F1",
+    "verdict": "merged",
+    "reason": "Same helpers and same proposal as the cross-cutting rel-display finding.",
+    "merged_into": "cross-F9"
+  },
+  {
+    "id": "plugin-state-F2",
+    "verdict": "accepted",
+    "reason": "Verified: identity::slugify (after its diacritic fold) and checklist::render::slugify are the same loop as core reponame::sanitize_segment (ASCII alnum lowercased, other runs collapse to one hyphen, none leading or trailing). Delegate; identity keeps its fold and its truncation, render keeps its doc and gains a property test.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-state-F3",
+    "verdict": "accepted",
+    "reason": "Verified: identity::slugify's trim_matches('-') runs on a string the loop already guarantees has no leading or trailing hyphen. Drop it; the trim is NOT moved after the truncation.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-state-F4",
+    "verdict": "merged",
+    "reason": "Same locations and proposal as the cross-cutting STATE_QUERY finding.",
+    "merged_into": "cross-F4"
+  },
+  {
+    "id": "plugin-state-F5",
+    "verdict": "accepted",
+    "reason": "Verified: scratchpad::CLAIM_DIRS retypes \"conclusions\", \"bypass\", \"expect-artifact\" that cache/bypass/expect_artifact each own as pub const DIR_NAME. Build the array from the three consts in the same order.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-state-F6",
+    "verdict": "merged",
+    "reason": "Same constants and same shared-module proposal as the cross-cutting mode-constant finding.",
+    "merged_into": "cross-F7"
+  },
+  {
+    "id": "plugin-state-F7",
+    "verdict": "merged",
+    "reason": "Same functions and same proposal as the cross-cutting now_secs finding.",
+    "merged_into": "cross-F22"
+  },
+  {
+    "id": "plugin-state-F8",
+    "verdict": "merged",
+    "reason": "Same locations and proposal as the cross-cutting civil-date finding.",
+    "merged_into": "cross-F3"
+  },
+  {
+    "id": "plugin-state-F9",
+    "verdict": "merged",
+    "reason": "Same locations and proposal as the cross-cutting lock-opener finding.",
+    "merged_into": "cross-F2"
+  },
+  {
+    "id": "plugin-state-F10",
+    "verdict": "accepted",
+    "reason": "Verified: heartbeat::prune filters the log twice. One pass; kept rows and counts unchanged.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-state-F11",
+    "verdict": "merged",
+    "reason": "Same directory-creation sites; plugin-state-F11 is accepted for its heartbeat half only (the scratchpad half stays, see the canonical reason).",
+    "merged_into": "plugin-stores-F2"
+  },
+  {
+    "id": "plugin-state-F12",
+    "verdict": "rejected",
+    "reason": "The two calls are exists() (which swallows errors) and metadata(); replacing them with one metadata() call would propagate an error exists() hid. Not behavior-preserving on the error path."
+  },
+  {
+    "id": "plugin-state-F13",
+    "verdict": "merged",
+    "reason": "Same three tables and same \"derive from STATE_FILES\" proposal as the cross-cutting finding.",
+    "merged_into": "cross-F19"
+  },
+  {
+    "id": "plugin-state-F14",
+    "verdict": "accepted",
+    "reason": "Verified: tmproot::INSTALL_LOCK_NAME has no Rust caller and nothing pins it to the shell; the shell owns that lock exclusively. Delete the const and its allow; the cross-language note moves to NAMESPACE_DIR's doc.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-state-F15",
+    "verdict": "accepted",
+    "reason": "Verified: three forward-looking unit-history comments, one (tmproot.rs:84-88) now factually wrong. Delete the notes; correct the tmproot one.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-state-F16",
+    "verdict": "accepted",
+    "reason": "Verified: Refusal::code() has no production caller (subagent_stop.rs:153 calls expect_artifact::Unmet::code, a different type) and the comment claiming the heartbeat writer consumes it is false. Delete code(), its allow and the eight test assertions.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-state-F17",
+    "verdict": "accepted",
+    "reason": "Verified: write_atomically takes seven positional parameters and every call site reads as a row of literals. An AtomicWrite options struct with Default; same one function underneath.",
+    "unit": "U6"
+  },
+  {
+    "id": "plugin-state-F18",
+    "verdict": "merged",
+    "reason": "Same proposal (one atomic-write helper); folded into the cross-cutting finding, which is rejected.",
+    "merged_into": "cross-F1"
+  },
+  {
+    "id": "plugin-state-F19",
+    "verdict": "merged",
+    "reason": "Same constants and same proposal as the cross-cutting retention-bound finding.",
+    "merged_into": "cross-F21"
+  },
+  {
+    "id": "plugin-state-F20",
+    "verdict": "accepted",
+    "reason": "Verified: identity.rs truncate(40) and subagent_stop.rs .take(40) are bare literals among named bounds. Two named consts, one per module; the bounds stay independent.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-stores-F1",
+    "verdict": "accepted",
+    "reason": "Verified: the bootstrap-and-refusal block (ensure, print hard refusals as errors and exit 1, else print soft refusals as warnings) is verbatim in bypass, expect_artifact and cache, and near-verbatim in checklist init (one extra info line after the refusals). One scratchpad::ensure_for_verb returning a Ready/Refused enum; checklist prints its extra line in the Refused arm, so every stream keeps its order.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-stores-F2",
+    "verdict": "accepted",
+    "reason": "Verified: DirBuilder::new().recursive(true).mode(DIR_MODE).create(dir) is hand-written in bypass, expect_artifact, cache, subagent_stop, heartbeat::ensure_store, ledger::ensure_store and ledger::snapshot_prices; the is_dir() pre-checks in front of the last three are redundant because a recursive create of an existing directory already succeeds. One atomic::create_dir(path, mode); callers keep their contexts. scratchpad's per-component loop is NOT folded in: its pre-check precedes a containment verification that must run before creation.",
+    "unit": "U6"
+  },
+  {
+    "id": "plugin-stores-F3",
+    "verdict": "merged",
+    "reason": "Same constants and same shared-module proposal as the cross-cutting mode-constant finding.",
+    "merged_into": "cross-F7"
+  },
+  {
+    "id": "plugin-stores-F4",
+    "verdict": "merged",
+    "reason": "Same locations and same proposal.",
+    "merged_into": "plugin-state-F5"
+  },
+  {
+    "id": "plugin-stores-F5",
+    "verdict": "accepted",
+    "reason": "Verified: bypass::claim_path and expect_artifact::record_path are the same body with different extensions. One claim::hashed_path(dir, target, ext).",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-stores-F6",
+    "verdict": "accepted",
+    "reason": "Verified: trim_note and bound hand-roll the char-boundary backwalk that str::floor_char_boundary implements identically (toolchain 1.98, no rust-version pin).",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-stores-F7",
+    "verdict": "accepted",
+    "reason": "Verified: the three stores resolve their directory three ways. Uniform dir_in / dir_for_root pair over a new scratchpad::state_root(root); paths unchanged.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-stores-F8",
+    "verdict": "merged",
+    "reason": "Same call sites and same one-helper proposal as the cross-cutting usage-tail finding (cross-F23 is the argv-loop half of the same tail and folds in with it).",
+    "merged_into": "cross-F8"
+  },
+  {
+    "id": "plugin-stores-F9",
+    "verdict": "accepted",
+    "reason": "Verified: the Budget::Bytes narration says the Read gate does not construct it yet; it does. Fix the comment.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-stores-F10",
+    "verdict": "rejected",
+    "reason": "Prose in usage banners and success lines restating MAX_AGE_SECS; turning them into format! strings or tests gives the reader nothing. Low value."
+  },
+  {
+    "id": "plugin-stores-F11",
+    "verdict": "accepted",
+    "reason": "Verified: cache::list calls the possibly-statting age_stamp inside the sort comparator. sort_by_cached_key with the same (Reverse(stamp), key) order; keys are unique so stability is moot.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-stores-F12",
+    "verdict": "rejected",
+    "reason": "gc lists, removes orphans, then prune re-lists; a single listing would prune against a set that still counts the entries gc just removed, changing which entries survive. Not behavior-preserving."
+  },
+  {
+    "id": "plugin-stores-F13",
+    "verdict": "accepted",
+    "reason": "Verified: claim_path and record_path are pub with no caller outside their modules (the sibling tests are child modules). Drop pub.",
+    "unit": "U7"
+  },
+  {
+    "id": "plugin-stores-F14",
+    "verdict": "rejected",
+    "reason": "\"16 hex characters\" expressed as KEY_HEX_LEN, NONCE_HEX_LEN, {:016x} and a glob are four different local facts; a shared const would couple unrelated formats. Low value."
+  },
+  {
+    "id": "plugin-stores-F15",
+    "verdict": "accepted",
+    "reason": "Verified: ignored_repo() is re-implemented in eight plugin test modules (bypass, cache, expect_artifact, checklist/verbs, session_start, pre_compact, subagent_stop, scratchpad) with the same .gitignore body and commit; the root is either canonicalize() or cwd_repo_root(), which agree because git reports the resolved path. One testutil::ignored_repo.",
+    "unit": "U1"
+  },
+  {
+    "id": "plugin-stores-F16",
+    "verdict": "rejected",
+    "reason": "Unverified lead (confidence 50): cache::identify keys on nanosecond mtime plus size with a content-hash fallback, reverse_sync::FileMeta on length plus mtime with a hash fallback captured only when mtime is absent; the two do not behave the same."
+  },
+  {
+    "id": "plugin-verbs-a-F1",
+    "verdict": "merged",
+    "reason": "Same call sites and same one-helper proposal as the cross-cutting usage-tail finding (cross-F23 is the argv-loop half of the same tail and folds in with it).",
+    "merged_into": "cross-F8"
+  },
+  {
+    "id": "plugin-verbs-a-F2",
+    "verdict": "accepted",
+    "reason": "Verified: run_toggle_core and run_config_set_core repeat the root-resolution and ignore-rule block verbatim. Two helpers; each caller keeps its predicate and message.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-a-F3",
+    "verdict": "accepted",
+    "reason": "Verified: resolve_with_roots reads the cwd overlay twice when main_root is the same path. Reuse the value when the paths are equal; otherwise unchanged.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-a-F4",
+    "verdict": "accepted",
+    "reason": "Verified: status::collect calls config::resolve(root) at 926 and collect_enablement calls it again at 1102 for the same root, each spawning git rev-parse. Resolve once and pass the PluginConfig into collect_enablement; the report is unchanged.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-a-F5",
+    "verdict": "accepted",
+    "reason": "Verified: report re-prefixes the pin onto the line tag to test for a plain triple; release::parse_bare_triple answers directly.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-a-F6",
+    "verdict": "accepted",
+    "reason": "Verified: \"update available?\" is derived in release_check::report and status::collect_newest_release by two shapes with the same answer. One release_check::update_available; each keeps its notes.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-a-F7",
+    "verdict": "merged",
+    "reason": "Same locations and same proposal as the cross-cutting row-helper finding.",
+    "merged_into": "cross-F13"
+  },
+  {
+    "id": "plugin-verbs-a-F8",
+    "verdict": "merged",
+    "reason": "Same constants and same shared-module proposal as the cross-cutting mode-constant finding.",
+    "merged_into": "cross-F7"
+  },
+  {
+    "id": "plugin-verbs-a-F9",
+    "verdict": "merged",
+    "reason": "Same constants and same shared-module proposal as the cross-cutting mode-constant finding.",
+    "merged_into": "cross-F7"
+  },
+  {
+    "id": "plugin-verbs-a-F10",
+    "verdict": "merged",
+    "reason": "Same literals and same \"make core the owner\" proposal as the cross-cutting .superset-path finding.",
+    "merged_into": "cross-F6"
+  },
+  {
+    "id": "plugin-verbs-a-F11",
+    "verdict": "accepted",
+    "reason": "Verified: setup-github-ci's usage banner retypes WORKFLOW_REL. A usage() fn formatting the const; text unchanged.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-a-F12",
+    "verdict": "accepted",
+    "reason": "Verified: run_core renders the template up to three times. Render once; classify keeps its own PinStale re-render.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-a-F13",
+    "verdict": "accepted",
+    "reason": "Verified: REFRESH_ARGV's doc claims a parser coupling that nothing enforces. Reword and add the parse test.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-a-F14",
+    "verdict": "rejected",
+    "reason": "Three argv-parsing idioms across verbs is a style decision (confidence 50); cross-F8 already unifies the tail they share."
+  },
+  {
+    "id": "plugin-verbs-a-F15",
+    "verdict": "rejected",
+    "reason": "Renaming module-private LOCK_NAME / SCHEMA_VERSION identifiers that never collide in scope; no reader benefit. Low value."
+  },
+  {
+    "id": "plugin-verbs-a-F16",
+    "verdict": "accepted",
+    "reason": "Verified: bootstrap.sh spells \"seed-config\" with nothing pinning it to HumanVerb. A test scanning the bootstrap via include_str! and asserting each invoked verb parses.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-a-F17",
+    "verdict": "accepted",
+    "reason": "Verified: the event tokens exist in HookEvent::from_token/as_str, status::DECLARED_EVENTS, plugin/hooks/hooks.json and test-bootstrap.sh with nothing pinning the Rust pair to the manifest. A test in the plugin crate parses hooks.json via include_str! and asserts every registered event round-trips through HookEvent::from_token and is listed in DECLARED_EVENTS (and vice versa, minus file-changed). No production code changes.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-b-F1",
+    "verdict": "merged",
+    "reason": "Same functions and same proposal as the cross-cutting harness-config-dir finding (plugin-verbs-b-F13 is resolved by the same change: projects_root becomes pub(crate) with a real second caller).",
+    "merged_into": "cross-F10"
+  },
+  {
+    "id": "plugin-verbs-b-F2",
+    "verdict": "merged",
+    "reason": "Same function and same proposal as the cross-cutting plural finding.",
+    "merged_into": "cross-F11"
+  },
+  {
+    "id": "plugin-verbs-b-F3",
+    "verdict": "merged",
+    "reason": "Same locations and same proposal as the cross-cutting row-helper finding.",
+    "merged_into": "cross-F13"
+  },
+  {
+    "id": "plugin-verbs-b-F4",
+    "verdict": "merged",
+    "reason": "Same call sites and same one-helper proposal as the cross-cutting usage-tail finding (cross-F23 is the argv-loop half of the same tail and folds in with it).",
+    "merged_into": "cross-F8"
+  },
+  {
+    "id": "plugin-verbs-b-F5",
+    "verdict": "accepted",
+    "reason": "Verified: \"unknown — <reason>\" is spelled three times because unknown() bakes in the style. Split unknown_text from the styling; output unchanged.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-b-F6",
+    "verdict": "accepted",
+    "reason": "Verified: \"no reason recorded\" is a bare literal at eleven sites. One NO_REASON const.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-b-F7",
+    "verdict": "merged",
+    "reason": "Same two call sites and same proposal.",
+    "merged_into": "plugin-verbs-a-F4"
+  },
+  {
+    "id": "plugin-verbs-b-F8",
+    "verdict": "merged",
+    "reason": "The DECLARED_EVENTS half of the same vocabulary finding.",
+    "merged_into": "plugin-verbs-a-F17"
+  },
+  {
+    "id": "plugin-verbs-b-F9",
+    "verdict": "accepted",
+    "reason": "Verified: heartbeat_store_if_present is a one-line pass-through with one caller. Inline; keep the explanatory comment.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-b-F10",
+    "verdict": "accepted",
+    "reason": "Verified: the empty Index is built field-by-field twice. One Index::empty constructor.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-b-F11",
+    "verdict": "accepted",
+    "reason": "Verified: status/tests.rs repo() re-implements testutil::init_main_repo. Build on it; the enabled overlay stays verbatim.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-b-F12",
+    "verdict": "accepted",
+    "reason": "Verified: bare_inputs retypes the NOW epoch. Use the const.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-b-F13",
+    "verdict": "merged",
+    "reason": "Same functions and same proposal as the cross-cutting harness-config-dir finding (plugin-verbs-b-F13 is resolved by the same change: projects_root becomes pub(crate) with a real second caller).",
+    "merged_into": "cross-F10"
+  },
+  {
+    "id": "plugin-verbs-c-F1",
+    "verdict": "merged",
+    "reason": "Same function and same proposal as the cross-cutting plural finding.",
+    "merged_into": "cross-F11"
+  },
+  {
+    "id": "plugin-verbs-c-F2",
+    "verdict": "merged",
+    "reason": "Same directory-creation sites; plugin-state-F11 is accepted for its heartbeat half only (the scratchpad half stays, see the canonical reason).",
+    "merged_into": "plugin-stores-F2"
+  },
+  {
+    "id": "plugin-verbs-c-F3",
+    "verdict": "merged",
+    "reason": "Same functions and same proposal as the cross-cutting harness-config-dir finding (plugin-verbs-b-F13 is resolved by the same change: projects_root becomes pub(crate) with a real second caller).",
+    "merged_into": "cross-F10"
+  },
+  {
+    "id": "plugin-verbs-c-F4",
+    "verdict": "merged",
+    "reason": "Same functions and same proposal as the cross-cutting harness-config-dir finding (plugin-verbs-b-F13 is resolved by the same change: projects_root becomes pub(crate) with a real second caller).",
+    "merged_into": "cross-F10"
+  },
+  {
+    "id": "plugin-verbs-c-F5",
+    "verdict": "merged",
+    "reason": "Same call sites and same one-helper proposal as the cross-cutting usage-tail finding (cross-F23 is the argv-loop half of the same tail and folds in with it).",
+    "merged_into": "cross-F8"
+  },
+  {
+    "id": "plugin-verbs-c-F6",
+    "verdict": "accepted",
+    "reason": "Verified: two operator messages retype WINDOW_KEY and SETTINGS_LOCAL_REL. Format from the consts; text unchanged.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-c-F7",
+    "verdict": "accepted",
+    "reason": "Verified: the USAGE banner hand-types the window bounds and both settings paths. A usage() fn; text unchanged.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-c-F8",
+    "verdict": "accepted",
+    "reason": "Verified: a bare 64 * 1024 beside the named READ_BUF_BYTES. Name it.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-c-F9",
+    "verdict": "accepted",
+    "reason": "Verified: rows_for_repository resolves every root before truncating. Filter, sort, then resolve lazily with take(limit); the same rows come out in the same order because the sort key does not depend on attribution.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-c-F10",
+    "verdict": "accepted",
+    "reason": "Verified: --recommend parses each project settings file twice. Parse once and share the ExistingSettings; every note string stays.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-c-F11",
+    "verdict": "accepted",
+    "reason": "Verified: read_settings_object pre-checks exists(); matching NotFound on the read gives the same Absent answer.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-c-F12",
+    "verdict": "accepted",
+    "reason": "Verified: the BTreeSet-to-comma-list chain is written twice with clones. One comma_list; the \"-\" arm stays.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-c-F13",
+    "verdict": "accepted",
+    "reason": "Verified: two .json writers stage through a .jsonl temp suffix copied from the ledger writer. Pass \".json\"; the temp name is never observable after the rename.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-c-F14",
+    "verdict": "merged",
+    "reason": "Same constants and same shared-module proposal as the cross-cutting mode-constant finding.",
+    "merged_into": "cross-F7"
+  },
+  {
+    "id": "plugin-verbs-c-F15",
+    "verdict": "accepted",
+    "reason": "Verified: nine pub items in ledger.rs/compact_window.rs have no consumer outside their module. Narrow.",
+    "unit": "U9"
+  },
+  {
+    "id": "plugin-verbs-c-F16",
+    "verdict": "accepted",
+    "reason": "Verified: format_rfc3339 and now_secs live in scratchpad and are imported by twelve unrelated modules. A plugin clock module; bodies unchanged (format_rfc3339 built on core civil arithmetic).",
+    "unit": "U6"
+  },
+  {
+    "id": "python-F1",
+    "verdict": "merged",
+    "reason": "Same locations and same proposal as the cross-cutting CI-lookup finding, which is rejected.",
+    "merged_into": "cross-F18"
+  },
+  {
+    "id": "python-F2",
+    "verdict": "accepted",
+    "reason": "Verified: four path constants exist while ten call sites re-spell sibling paths. Add the missing constants and use them.",
+    "unit": "U10"
+  },
+  {
+    "id": "python-F3",
+    "verdict": "accepted",
+    "reason": "Verified: check_bump spells digest-and-version of a tree twice. One helper.",
+    "unit": "U10"
+  },
+  {
+    "id": "python-F4",
+    "verdict": "accepted",
+    "reason": "Verified: _version_repo hand-rolls mkdir+write_text eight times beside _write. Make _write's chmod optional and use it.",
+    "unit": "U10"
+  },
+  {
+    "id": "python-F5",
+    "verdict": "accepted",
+    "reason": "Verified: the marketplace tag regex is inline while its siblings are module constants. Hoist it.",
+    "unit": "U10"
+  },
+  {
+    "id": "python-F6",
+    "verdict": "accepted",
+    "reason": "Verified: _semver sits under the R98 header but is first used by the R95 README check. Move it; document its precondition.",
+    "unit": "U10"
+  },
+  {
+    "id": "python-F7",
+    "verdict": "accepted",
+    "reason": "Verified: --plugin-dir is neither documented nor used. Document it in the Usage block (kept as the deliberate packaging seam beside --root).",
+    "unit": "U10"
+  },
+  {
+    "id": "shell-F1",
+    "verdict": "accepted",
+    "reason": "Verified: all sixteen give_up messages end in \"; installed nothing.\" Move the suffix into give_up; stderr text unchanged.",
+    "unit": "U10"
+  },
+  {
+    "id": "shell-F2",
+    "verdict": "accepted",
+    "reason": "Verified: the pin-shape rejection message is written three times across two case statements. One pin_is_triple predicate and one give_up; same accept/reject set.",
+    "unit": "U10"
+  },
+  {
+    "id": "shell-F3",
+    "verdict": "accepted",
+    "reason": "Verified: the --version | head -1 | awk probe is spelled twice. One version_of helper.",
+    "unit": "U10"
+  },
+  {
+    "id": "shell-F4",
+    "verdict": "rejected",
+    "reason": "bootstrap.sh sources lib/tmproot.sh only when readable, so depending on its sha256 helper changes behavior when the lib is absent or unreadable."
+  },
+  {
+    "id": "shell-F5",
+    "verdict": "merged",
+    "reason": "Same shell blocks and same shared-function proposal as the cross-cutting handoff finding (shell-F6 is the pre-check half of the same block).",
+    "merged_into": "cross-F17"
+  },
+  {
+    "id": "shell-F6",
+    "verdict": "merged",
+    "reason": "Same shell blocks and same shared-function proposal as the cross-cutting handoff finding (shell-F6 is the pre-check half of the same block).",
+    "merged_into": "cross-F17"
+  },
+  {
+    "id": "shell-F7",
+    "verdict": "merged",
+    "reason": "Same hex-length globs and same named-constant proposal as the cross-cutting tmproot-mirror finding.",
+    "merged_into": "cross-F16"
+  },
+  {
+    "id": "shell-F8",
+    "verdict": "accepted",
+    "reason": "Verified: the release URL prefix is spelled in full twice. One base, two derived names.",
+    "unit": "U10"
+  },
+  {
+    "id": "shell-F9",
+    "verdict": "rejected",
+    "reason": "Pinning the platform matrix against dist-workspace.toml is a new gate, not a simplification."
+  },
+  {
+    "id": "shell-F10",
+    "verdict": "accepted",
+    "reason": "Verified: give_up in run-hook.sh means \"be inert\" while in bootstrap.sh it drops the install marker and reports. Rename the shim's helper; behavior unchanged.",
+    "unit": "U10"
+  },
+  {
+    "id": "shell-F11",
+    "verdict": "accepted",
+    "reason": "Verified: mark-latest.sh (bash) forks printf+grep per release for an ERE bash can match natively. [[ =~ ]] with the pattern in a variable (bash 3.2 safe).",
+    "unit": "U10"
+  },
+  {
+    "id": "shell-F12",
+    "verdict": "accepted",
+    "reason": "Verified: test-bootstrap.sh defines the sha256 detection twice. Derive the file form from the stdin form.",
+    "unit": "U10"
+  },
+  {
+    "id": "shell-F13",
+    "verdict": "rejected",
+    "reason": "Asserting the timeout sum against hooks.json's 90 s is a new assertion (confidence 50), not a simplification."
+  },
+  {
+    "id": "shell-F14",
+    "verdict": "merged",
+    "reason": "Same literals and same proposal as the cross-cutting bin-path finding, which is rejected.",
+    "merged_into": "cross-F15"
+  }
+]

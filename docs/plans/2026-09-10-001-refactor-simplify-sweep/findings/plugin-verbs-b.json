@@ -1,0 +1,281 @@
+{
+  "partition": "plugin-verbs-b",
+  "findings": [
+    {
+      "id": "plugin-verbs-b-F1",
+      "category": "duplication",
+      "title": "`projects_root` and `ledger::transcript_root` are the same function body under two names",
+      "locations": [
+        "crates/ss-magic-plugin/src/spill_index.rs:116-124",
+        "crates/ss-magic-plugin/src/ledger.rs:1162-1170"
+      ],
+      "evidence": "spill_index.rs:116-124\npub fn projects_root() -> Option<PathBuf> {\n    if let Ok(dir) = std::env::var(\"CLAUDE_CONFIG_DIR\") {\n        if !dir.is_empty() {\n            return Some(PathBuf::from(dir).join(\"projects\"));\n        }\n    }\n    let home = std::env::var(\"HOME\").ok().filter(|h| !h.is_empty())?;\n    Some(PathBuf::from(home).join(\".claude\").join(\"projects\"))\n}\n— ledger.rs:1162-1170 `fn transcript_root()` is the identical body, statement for statement.",
+      "problem": "Both answer \"where does the harness keep per-project session state\" as `$CLAUDE_CONFIG_DIR/projects` else `$HOME/.claude/projects`, and `projects_root`'s own doc comment says so (\"Deliberately the same resolution `plugin::ledger` uses for transcripts … two different answers to 'where does the harness keep this' would be a bug waiting to happen\") — while the code is copy-pasted rather than shared, which is exactly the drift the comment warns about. The env var name, the `.claude` segment and the `projects` segment are each spelled twice.",
+      "proposal": "Keep one definition and delete the other. `spill_index::projects_root` is already `pub` and the better-documented of the two, so: delete `ledger::transcript_root` (crates/ss-magic-plugin/src/ledger.rs:1162-1170) and change its single caller (the backfill path, the only user of `transcript_root`) to `crate::spill_index::projects_root()`. Both live in the same crate, so no crate boundary is crossed and nothing moves into core.",
+      "behavior_preservation": "The two bodies are token-for-token identical, so every input maps to the same `Option<PathBuf>`; the only change is which function name produces it. No ordering, error or side effect exists in either (both are pure env reads).",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-b-F2",
+      "category": "duplication",
+      "title": "`plural` exists twice as a private fn and a third time inline",
+      "locations": [
+        "crates/ss-magic-plugin/src/spill_index.rs:459-465",
+        "crates/ss-magic-plugin/src/ledger.rs:1525-1531",
+        "crates/ss-magic-plugin/src/status.rs:2298"
+      ],
+      "evidence": "spill_index.rs:459-465 / ledger.rs:1525-1531 (byte-identical bodies)\nfn plural(n: usize) -> &'static str {\n    if n == 1 {\n        \"\"\n    } else {\n        \"s\"\n    }\n}\nstatus.rs:2298 (the same rule, spelled inline)\n            if status.hooks.rows == 1 { \"\" } else { \"s\" }",
+      "problem": "One three-line English-pluralisation rule is written three times in one crate: twice as an identical private `fn plural`, once inline in `status`'s Hooks header.",
+      "proposal": "Add `pub(crate) fn plural(n: usize) -> &'static str` once at the crate root (`crates/ss-magic-plugin/src/main.rs`, beside the other small crate-wide helpers), delete the two private copies, and replace status.rs:2298 with `plural(status.hooks.rows)`. It stays in the plugin crate — the CLI has no caller, so it does not belong in `ss-magic-core`.",
+      "behavior_preservation": "All three sites already compute `\"\"` for exactly `1` and `\"s\"` otherwise over the same `usize`; the shared function returns the same `&'static str` for every input, so every rendered string is byte-identical.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-b-F3",
+      "category": "duplication",
+      "title": "`LABEL_WIDTH` + `row()` re-declared as a local const and closure in release_check",
+      "locations": [
+        "crates/ss-magic-plugin/src/status.rs:1953",
+        "crates/ss-magic-plugin/src/status.rs:1966-1968",
+        "crates/ss-magic-plugin/src/release_check.rs:576-579"
+      ],
+      "evidence": "status.rs:1953,1966-1968\nconst LABEL_WIDTH: usize = 22;\nfn row(out: &mut String, label: &str, value: impl AsRef<str>) {\n    let _ = writeln!(out, \"  {label:<LABEL_WIDTH$}{}\", value.as_ref());\n}\nrelease_check.rs:576-579\n    const WIDTH: usize = 22;\n    let row = |out: &mut String, label: &str, value: String| {\n        let _ = writeln!(out, \"  {label:<WIDTH$}{value}\");\n    };",
+      "problem": "The same report-row layout — two leading spaces, a label padded to 22 columns, then the value — is defined twice under two names. The two reports are meant to line up visually (`status`'s Versions section and `release-check` report the same release-cache facts), so a change to one silently misaligns the other.",
+      "proposal": "Make status.rs's `LABEL_WIDTH` and `row` `pub(crate)` and have `release_check::render_text` call `crate::status::row(out, label, value)` instead of declaring `const WIDTH` and the local closure. `release_check` already depends on `status` (it calls `status::locate_plugin_root`, `status::probe_harness`, `status::read_pin_file`), so no new coupling is introduced. `row`'s `impl AsRef<str>` accepts every `String` the closure is passed today.",
+      "behavior_preservation": "Both format strings are `\"  {label:<22}{value}\"`; the shared `row` writes the identical bytes for identical arguments, and `impl AsRef<str>` renders a `String` exactly as `{value}` does. compact_window's `{:<30}` row is deliberately a different table and is left alone.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-b-F4",
+      "category": "duplication",
+      "title": "The usage-error tail is inlined in status/spill-index/bypass while `usage_error` already exists twice",
+      "locations": [
+        "crates/ss-magic-plugin/src/status.rs:1888-1895",
+        "crates/ss-magic-plugin/src/spill_index.rs:345-352",
+        "crates/ss-magic-plugin/src/bypass.rs:193-200",
+        "crates/ss-magic-plugin/src/cache.rs:1006-1010",
+        "crates/ss-magic-plugin/src/ledger.rs:1250-1254"
+      ],
+      "evidence": "status.rs:1888-1895 (spill_index.rs:345-352 is the same block with a different USAGE const)\n            other => {\n                eprintln!(\n                    \"{}\",\n                    style::err(format!(\"error: unexpected argument `{other}`\"))\n                );\n                eprintln!(\"{STATUS_USAGE}\");\n                return Ok(ExitCode::from(2));\n            }\ncache.rs:1006-1010 already generalises exactly this:\nfn usage_error(message: &str, usage: &str) -> Result<ExitCode> {\n    eprintln!(\"{}\", style::err(format!(\"error: {message}\")));\n    eprintln!(\"{usage}\");\n    Ok(ExitCode::from(2))\n}",
+      "problem": "Five verbs agree on one contract — `error: <message>` in the error style on stderr, the usage text on stderr, exit 2 — and three of them (status, spill-index, bypass) inline it while `cache.rs` and `ledger.rs` each keep their own `usage_error` helper (ledger's with the usage text hardcoded). The exact string `error: unexpected argument \\`{x}\\`` is spelled four times.",
+      "proposal": "Promote `cache.rs`'s two-argument form to a crate-level `pub(crate) fn usage_error(message: &str, usage: &str) -> Result<ExitCode>` (crates/ss-magic-plugin/src/main.rs, beside `version_line`), delete the `cache.rs` and `ledger.rs` copies (ledger's callers pass `COST_USAGE`), and replace the inline blocks at status.rs:1888-1895, spill_index.rs:345-352 and bypass.rs:193-200 with `return usage_error(&format!(\"unexpected argument `{other}`\"), STATUS_USAGE)` (respectively `SPILL_INDEX_USAGE`, `BYPASS_USAGE`).",
+      "behavior_preservation": "The helper emits `style::err(format!(\"error: {message}\"))` then the usage text, both on stderr, then `ExitCode::from(2)` — byte-for-byte and stream-for-stream what each inline block does today, with the same two `eprintln!` calls in the same order. `bypass.rs`'s other arm (`unknown \\`bypass\\` flag`) converts the same way.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-b-F5",
+      "category": "copy-paste-variant",
+      "title": "\"unknown — <reason>\" is spelled three times in status.rs because `unknown()` bakes in the style",
+      "locations": [
+        "crates/ss-magic-plugin/src/status.rs:197-201",
+        "crates/ss-magic-plugin/src/status.rs:1958-1963",
+        "crates/ss-magic-plugin/src/status.rs:2283-2286"
+      ],
+      "evidence": "status.rs:197-201 (Field::render)\n            (None, Some(note)) => format!(\"unknown — {note}\"),\n            (None, None) => \"unknown — no reason recorded\".to_string(),\nstatus.rs:1959-1962 (fn unknown)\n    style::warn(format!(\n        \"unknown — {}\",\n        note.unwrap_or(\"no reason recorded\")\n    ))\nstatus.rs:2283-2286 (the newest-release row)\n            style::info(format!(\n                \"unknown — {}\",\n                note.as_deref().unwrap_or(\"no reason recorded\")\n            )),",
+      "problem": "`unknown()`'s doc says \"One function so no row can accidentally grow its own spelling of 'we don't know'\" — and two rows already have, because `unknown()` couples the text to `style::warn` and the newest-release row wants `style::info` while `Field::render` wants no style at all. The same has happened in release_check.rs:593 and 605.",
+      "proposal": "Split the text from the styling in status.rs: add `fn unknown_text(note: Option<&str>) -> String { format!(\"unknown — {}\", note.unwrap_or(\"no reason recorded\")) }`, make `unknown(note)` return `style::warn(unknown_text(note))`, have `Field::render`'s two `None` arms return `unknown_text(self.note.as_deref())`, and have status.rs:2283 render `style::info(unknown_text(note.as_deref()))`. Make `unknown_text` `pub(crate)` and use it at release_check.rs:593 and 605 too.",
+      "behavior_preservation": "Every call site produces the same string it produces today: `Field::render`'s `(None, Some(n))` arm gives `unknown — {n}` and its `(None, None)` arm gives `unknown — no reason recorded` (identical to `unknown_text(None)`); the styling wrapper at each site is unchanged, so colored output is identical too. The existing test `assert_eq!(unknown(None), \"unknown — no reason recorded\")` (status/tests.rs:1122) still holds.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-b-F6",
+      "category": "hardcoded-value",
+      "title": "`\"no reason recorded\"` is a bare literal at nine sites in status.rs and two in release_check.rs",
+      "locations": [
+        "crates/ss-magic-plugin/src/status.rs:201",
+        "crates/ss-magic-plugin/src/status.rs:1207",
+        "crates/ss-magic-plugin/src/status.rs:1343",
+        "crates/ss-magic-plugin/src/status.rs:1387",
+        "crates/ss-magic-plugin/src/status.rs:1962",
+        "crates/ss-magic-plugin/src/release_check.rs:594"
+      ],
+      "evidence": "status.rs:1341-1343 (one of nine)\n            inputs\n                .plugin_root\n                .note\n                .clone()\n                .unwrap_or_else(|| \"no reason recorded\".to_string())\nstatus.rs:1962\n        note.unwrap_or(\"no reason recorded\")",
+      "problem": "The module's stated invariant is \"a `null` value always has a non-`null` `note` beside it\", and this literal is the one fallback that keeps that invariant when a note is missing anyway. It is retyped eleven times across two modules, so a reword (or a typo) lands in some rows and not others, and a grep for the invariant's escape hatch finds a string rather than a symbol.",
+      "proposal": "Add `pub(crate) const NO_REASON: &str = \"no reason recorded\";` beside the other constants in status.rs (the \"Constants\" block at status.rs:65-154) and replace every literal with it — including the two in release_check.rs:594 and 606, which already import from `status`.",
+      "behavior_preservation": "A `const &str` substituted for the identical literal produces the same bytes at every site; `\"...\".to_string()` becomes `NO_REASON.to_string()`, same allocation and same content.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-b-F7",
+      "category": "efficiency",
+      "title": "`config::resolve` is called twice per `status` run, each call spawning `git rev-parse` and reading both overlay files twice",
+      "locations": [
+        "crates/ss-magic-plugin/src/status.rs:920-927",
+        "crates/ss-magic-plugin/src/status.rs:1102"
+      ],
+      "evidence": "status.rs:920-927\n    let (enablement, harness_regs) = collect_enablement(\n        repo_root.as_deref().unwrap_or(&inputs.cwd),\n        …\n    );\n\n    let cfg = config::resolve(repo_root.as_deref().unwrap_or(&inputs.cwd));\nstatus.rs:1102 (inside collect_enablement, same root)\n    let cfg = config::resolve(cwd_root);",
+      "problem": "`config::resolve` (config.rs:175-177) spawns `git rev-parse --git-common-dir` and then `resolve_with_roots` loads the `magic.json` + `magic.local.json` overlay twice (once at the main root for `enabled`, once at the cwd root for `gate`). `collect` performs the whole thing twice with byte-identical arguments — one extra subprocess and two extra overlay loads on every `status` invocation — and `collect` has ALREADY probed `main_checkout_root` at status.rs:889-891, so the subprocess is a third redundant one.",
+      "proposal": "Resolve once: hoist `let cfg = config::resolve(repo_root.as_deref().unwrap_or(&inputs.cwd));` above the `collect_enablement` call and pass `&cfg` in as a parameter, deleting the call at status.rs:1102 and using `cfg.enabled` there. (A further step, verifiable separately: pass the already-known `main_root` through `config::resolve_with_roots(root, main_root.as_deref())` so the third `git rev-parse` goes away too — `resolve` computes exactly `git::main_checkout_root(cwd_root).ok()`, which is what `main_root` already holds when `repo_root` is `Some`, and `None` in both paths when it is not.)",
+      "behavior_preservation": "`config::resolve` is a read-only, deterministic function of its single `&Path` argument (a git probe plus two overlay reads); both calls pass the identical path, so one call yields the same `PluginConfig` both sites use today. `Gate` and `SsMagicLayer` are built from the same fields as before, and no output, note or problem line changes — only the number of reads.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-b-F8",
+      "category": "const-location",
+      "title": "`DECLARED_EVENTS` re-spells the five event tokens `HookEvent` already owns",
+      "locations": [
+        "crates/ss-magic-plugin/src/status.rs:82-88",
+        "crates/ss-magic-plugin/src/main.rs:138-142",
+        "crates/ss-magic-plugin/src/main.rs:152-156"
+      ],
+      "evidence": "status.rs:82-88\npub const DECLARED_EVENTS: [&str; 5] = [\n    \"session-start\",\n    \"pre-tool-use\",\n    \"pre-compact\",\n    \"subagent-stop\",\n    \"session-end\",\n];\nmain.rs:152-156 spells the same five as `HookEvent::as_str`'s arms.",
+      "problem": "The five wire names live in `HookEvent::from_token`/`as_str` (the closed vocabulary), in `plugin/hooks/hooks.json` (the manifest that decides what actually fires), and a third time as raw strings here. Nothing structurally ties status's copy to either, and no test compares it with the manifest — a renamed event token would leave `status` reporting a hook that no longer exists under a name nothing routes.",
+      "proposal": "Type the list: `pub const DECLARED_EVENTS: [crate::HookEvent; 5] = [HookEvent::SessionStart, HookEvent::PreToolUse, HookEvent::PreCompact, HookEvent::SubagentStop, HookEvent::SessionEnd];` in status.rs, with the two use sites becoming `DECLARED_EVENTS.iter().map(|e| e.as_str().to_string())` (status.rs:1784) and `DECLARED_EVENTS.iter().any(|e| e.as_str() == name)` (status.rs:1794). The deliberate exclusion of `FileChanged` stays exactly as documented, now as an omitted variant rather than an omitted string.",
+      "behavior_preservation": "`HookEvent::as_str` returns the identical five literals, so the derived names, their order, the `declared` predicate and the JSON are unchanged. Only the spelling's owner moves. (Confidence 75: the `HookEvent` enum carries a `String` payload in `Unknown`, so a `const` array of it must be checked to compile in const context; if it does not, the equivalent fix is a `fn declared_events() -> [HookEvent; 5]` or a test asserting each entry round-trips through `HookEvent::from_token` to a non-`Unknown` variant and matches `plugin/hooks/hooks.json`.)",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-b-F9",
+      "category": "quality",
+      "title": "`heartbeat_store_if_present` is a one-line pass-through with a single caller",
+      "locations": [
+        "crates/ss-magic-plugin/src/status.rs:1929-1938",
+        "crates/ss-magic-plugin/src/status.rs:1908"
+      ],
+      "evidence": "status.rs:1936-1938\nfn heartbeat_store_if_present() -> Option<PathBuf> {\n    heartbeat::existing_store_dir()\n}\nstatus.rs:1908 (its only caller)\n        store: heartbeat_store_if_present(),",
+      "problem": "A private wrapper that renames `heartbeat::existing_store_dir` and adds nothing; the name it introduces is a second vocabulary for a fact `heartbeat` already names, and the reason it exists (do not create the store you are diagnosing) is carried by its doc comment, not by any code.",
+      "proposal": "Delete the wrapper and call `heartbeat::existing_store_dir()` directly at status.rs:1908, moving its doc comment to the `store:` line as the inline comment already present there (status.rs:1904-1907 explains the same rule). `parse_semver` (status.rs:1694-1696, a pass-through to `release::parse_bare_triple` with two callers) is the same shape but carries a real explanation of the comparability rule, so it is worth keeping.",
+      "behavior_preservation": "The wrapper's body is exactly the call it is replaced by; there is one caller and no other reference, so the resolved `Option<PathBuf>` and every downstream field are unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-b-F10",
+      "category": "copy-paste-variant",
+      "title": "spill-index's empty `Index` is built field-by-field twice",
+      "locations": [
+        "crates/ss-magic-plugin/src/spill_index.rs:174-182",
+        "crates/ss-magic-plugin/src/spill_index.rs:364-377"
+      ],
+      "evidence": "spill_index.rs:364-370 (in run)\n        let index = Index {\n            root: root.display().to_string(),\n            projects_root: None,\n            project_dir: None,\n            sessions: Vec::new(),\n            files: 0,\n            bytes: 0,\nspill_index.rs:174-181 repeats the same seven fields with `projects_root: Some(...)` and `note: None`.",
+      "problem": "The seven-field zero value of `Index` is written out twice; a field added to `Index` has to be remembered in two places, and the two initializers differ only in `projects_root` and `note`.",
+      "proposal": "Add `impl Index { fn empty(root: &Path, projects_root: Option<String>) -> Self }` filling `project_dir: None, sessions: Vec::new(), files: 0, bytes: 0, note: None`, then `collect` starts from `Index::empty(root, Some(projects_root.display().to_string()))` and `run`'s failure path from `Index::empty(&root, None)` followed by `index.note = Some(...)`.",
+      "behavior_preservation": "Both constructions set the same seven fields to the same values; `collect` already mutates `note` and `project_dir` afterwards, and `run`'s path only needs its note assigned after construction — the serialized JSON and the rendered text are identical.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-b-F11",
+      "category": "duplication",
+      "title": "status/tests.rs's `repo()` re-implements `testutil::init_main_repo`",
+      "locations": [
+        "crates/ss-magic-plugin/src/status/tests.rs:37-49",
+        "crates/ss-magic-core/src/testutil.rs:82-97"
+      ],
+      "evidence": "status/tests.rs:38-44\n    let dir = tempfile::tempdir().unwrap();\n    git_run(&[\"init\", \"-q\", \"-b\", branch], dir.path());\n    neutralize_global_excludes(dir.path());\n    fs::write(dir.path().join(\"README.md\"), \"hi\\n\").unwrap();\n    git_run(&[\"add\", \".\"], dir.path());\n    git_run(&[\"commit\", \"-qm\", \"initial\"], dir.path());",
+      "problem": "`testutil::init_main_repo(branch)` already does exactly this (tempdir, `init -q -b`, `neutralize_global_excludes`, a README, add, commit) and additionally sets `gc.auto 0`, which the testutil comment records as the fix for an intermittent failure when a test walks the tree while background `gc --auto` repacks `.git`. This fixture walks the tree (`tree()` at status/tests.rs:122, used by `collecting_creates_no_state`), so it is re-implementing the helper without the protection the helper was given.",
+      "proposal": "Rewrite the fixture as `fn repo(branch: &str, enabled: bool) -> TempDir { let dir = ss_magic_core::testutil::init_main_repo(branch); fs::create_dir_all(dir.path().join(\".superset\")).unwrap(); fs::write(…magic.json…, body).unwrap(); dir }`, keeping the `enabled` overlay write verbatim.",
+      "behavior_preservation": "The only differences are the README body (`\"hi\\n\"` vs `\"hi\"`) and the commit message (`initial` vs `init`), neither of which any test in status/tests.rs asserts on — `tree()` collects paths, not contents, and no test reads the log. `gc.auto 0` only removes a flake source. Confidence 75 because the equivalence rests on no test asserting the README's bytes, which I verified by reading the file's assertions but not by running the suite.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-b-F12",
+      "category": "hardcoded-value",
+      "title": "`bare_inputs` retypes the epoch the file's `NOW` const already holds",
+      "locations": [
+        "crates/ss-magic-plugin/src/status/tests.rs:31",
+        "crates/ss-magic-plugin/src/status/tests.rs:69"
+      ],
+      "evidence": "status/tests.rs:31\nconst NOW: u64 = 1_788_091_200;\nstatus/tests.rs:69\n        now: 1_788_091_200, // 2026-08-30 12:00:00 UTC, arbitrary and fixed.",
+      "problem": "The same fixed instant is a named const at the top of the file and a bare literal (with a duplicated explanatory comment) fourteen lines later, so the two can drift and a reader cannot tell they are the same clock.",
+      "proposal": "Use the const: `now: NOW,` at status/tests.rs:69, and drop the repeated comment — `NOW`'s own doc at status/tests.rs:29-31 already says what the value is.",
+      "behavior_preservation": "`NOW` is `1_788_091_200`, the identical literal; the `Inputs.now` field receives the same `u64`.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "plugin-verbs-b-F13",
+      "category": "dead-code",
+      "title": "`spill_index::projects_root` is `pub` with no caller outside its own module",
+      "locations": [
+        "crates/ss-magic-plugin/src/spill_index.rs:116"
+      ],
+      "evidence": "spill_index.rs:116\npub fn projects_root() -> Option<PathBuf> {",
+      "problem": "Nothing outside `spill_index.rs` (and its tests) calls it, while the module's genuinely shared items elsewhere in the crate are spelled `pub(crate)` (`status::PIN_FILE`, `status::read_pin_file`, `status::non_empty_env`). A `pub` item in a binary crate with no external caller advertises an API that does not exist.",
+      "proposal": "Either give it the caller its doc comment argues for — F1's fix, where `ledger` calls it, and it becomes correctly `pub(crate)` — or, if F1 is declined, narrow it to `pub(crate)`. Do the same audit for `status`'s `collect`, `parse_listing`, `parse_version_line`, `locate_data_dir`, `probe_binary_version`, `SCHEMA_VERSION` and `DECLARED_EVENTS`, which are `pub` but reached only from within `status.rs` and its tests (`locate_plugin_root`, `probe_harness` and `HarnessListing` genuinely are used by `release_check` and must stay reachable crate-wide).",
+      "behavior_preservation": "A visibility narrowing inside a binary crate changes no runtime behavior; `pub(crate)` still admits the sibling `tests` module and every in-crate caller.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 2 (standard-library or runtime primitives): nothing behavior-equivalent to swap in. `encode_root`, `human_bytes`, `format_age`-style formatting and the hand-rolled `run_bounded` all have no std equivalent with identical output; `run_bounded`'s temp-file-not-pipe design is load-bearing against a filling-pipe deadlock and its `try_wait` poll is what keeps the child killable.",
+    "Rubric 1 item 3 (platform, framework or downstream guarantees): none hand-maintained here. The 'a null value always carries a note' invariant is the module's own and is not owned by serde or any downstream layer.",
+    "Rubric 2 item 1 (redundant state): none. `SpillFile.modified` / `modified_ts` are two projections of one instant kept deliberately (the string for people, the integer for sorting and arithmetic, per the field doc), and `Index.files`/`bytes` are summed once at the end rather than tracked incrementally.",
+    "Rubric 2 item 2 (parameter sprawl): none. `status::Inputs` / `Probes` and `compact_window::Sources` are the injected-environment testability seams the sweep brief pins as deliberate.",
+    "Rubric 2 item 4 (leaky abstractions): none. `Registration` deliberately carries the harness's `errors`/`notes` verbatim, and `status` reaches other modules only through their own public names (`cache::DIR_NAME`, `checklist::pointer_path`, `heartbeat::existing_store_dir`).",
+    "Rubric 2 item 5 (stringly-typed code): the report's `state`/`drift`/`scope` fields are `&'static str` on purpose — they are the JSON contract's wire spellings and `SCHEMA_VERSION` governs them; `outcome_name` maps the `Outcome` enum to its wire form in one place. `DECLARED_EVENTS` is the one genuine case and is F8.",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable — no component-tree UI framework in this partition.",
+    "Rubric 2 item 7 (nested conditionals 3+ deep): none. The deepest are two-level `match`es (`derive_outcome`, `collect_versions`, `render_text`'s tuple matches), each a flat table over a tuple rather than nesting.",
+    "Rubric 2 item 8 (unnecessary comments): none. Every comment read here states a rule or an invariant (why `symlink_metadata` not `metadata`; why a note prints even when nothing was found; why `Unknown` beats `false`); no comment restates code or narrates a change, and none cites a plan id without explaining it.",
+    "Rubric 2 item 10 (context-dependent vocabulary): none. `spill`, `pin`, `drift`, `slug`, `state tree` and `harness` are used consistently with the rest of the crate.",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): none. `SCHEMA_VERSION = 2` is a released contract marker, not scaffolding, and the `RawListing::Wrapped` shape is a deliberate tolerance for a documented harness variant.",
+    "Rubric 2 item 3 (copy-paste with slight variation) — one checked and rejected: `Field::found`/`missing` versus `Located::found`/`missing` (status.rs:171-239). The pair is not worth unifying: `Located` carries a `PathBuf` callers join onto, `Field` carries the rendered `String`, `as_field` already bridges them, and a generic `Provenance<T>` would add a type parameter to every report field to save four three-line constructors.",
+    "Rubric 3 item 2 (missed concurrency): `probe_harness()` and the binary `--version` probe are both bounded subprocesses run sequentially, but `locate_plugin_root` consumes the harness listing, so the second cannot start until the first resolves; parallelising would need restructuring for at most 5 s of worst-case latency on a wedged CLI.",
+    "Rubric 3 item 4 (recurring no-op updates): not applicable — no polling, event or reducer loop in this partition.",
+    "Rubric 3 item 5 (unnecessary existence checks): the `is_dir` pre-checks in spill_index (`collect` at 184, `project_dir_for` at 157, the `tool-results` check at 214) look like TOCTOU pre-checks but each one selects a DIFFERENT reported outcome — an absent projects root gets its own note, a session with no `tool-results/` is silently skipped, an unreadable one gets 'could not list'. Operating directly and reading the error would collapse those three distinct answers, so they stay.",
+    "Rubric 3 item 6 (memory): bounded. Heartbeat rows are pruned by the store, the spill index is one machine's session directories, and `run_bounded`'s output goes to a `NamedTempFile` that drops with the call.",
+    "Rubric 3 item 7 (overly broad operations): none. `read_pin_file`/`read_marker` read small marker files whole, and the heartbeat read is the whole log by design because every row is counted."
+  ]
+}

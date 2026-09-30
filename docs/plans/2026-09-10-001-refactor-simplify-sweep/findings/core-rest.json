@@ -1,0 +1,336 @@
+{
+  "partition": "core-rest",
+  "findings": [
+    {
+      "id": "core-rest-F1",
+      "category": "dead-code",
+      "title": "Four `#[allow(dead_code)]` + plan-id-only comments on `pub` items that a library crate can never lint as dead",
+      "locations": [
+        "crates/ss-magic-core/src/superset_files.rs:241-243",
+        "crates/ss-magic-core/src/superset_files.rs:254-256",
+        "crates/ss-magic-core/src/superset_files.rs:355-357",
+        "crates/ss-magic-core/src/sync/apply.rs:173-175"
+      ],
+      "evidence": "// consumed by U9\n#[allow(dead_code)]\npub fn default_magic_files() -> Vec<String> {\n---\n// consumed by U11 (reverse sync candidate computation)\n#[allow(dead_code)]\npub fn match_paths(root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {",
+      "problem": "These four attributes are leftovers from before the workspace split, when the code lived in the `ss-magic` BINARY crate (where an unreached `pub fn` really is dead code). `ss-magic-core` is a library: `lib.rs` declares `pub mod superset_files;` and `pub mod sync;` (which declares `pub mod apply;`), so every one of these items is reachable from the crate's public API and rustc's `dead_code` lint never fires for it. Verified empirically: a lib crate with `#![deny(dead_code)]` and a `pub fn` in a `pub mod` that nothing calls compiles clean. All four are also genuinely called from `crates/ss-magic/src/workspace/migrate.rs`, `pack.rs` and `sync/reverse_sync.rs`. The accompanying `// consumed by U9` / `// consumed by U11` comments are plan-id-only comments, which the sweep brief lists as a `quality` finding in their own right, and one of them (`// consumed by U9`) sits above a doc comment that already says the same thing in prose (\"Consumed by the init/migration unit (U9)\").",
+      "proposal": "Delete the four `#[allow(dead_code)]` attributes and the four `// consumed by U9` / `// consumed by U11` line comments above them. Where the plan id carries information a reader needs, it is already in the doc comment above (`superset_files.rs:236-240`, `sync/apply.rs:162-172`); leave those doc comments alone.",
+      "behavior_preservation": "`#[allow(...)]` is a lint attribute with no effect on generated code, type-checking or run-time behavior, and a `//` comment none either. Nothing is renamed, moved or made non-`pub`. If a future refactor makes one of these crate-private, the lint would then be a real signal rather than pre-suppressed.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F2",
+      "category": "copy-paste-variant",
+      "title": "Four `load_*` functions are the same three lines, each joining the same path twice",
+      "locations": [
+        "crates/ss-magic-core/src/superset_files.rs:276-280",
+        "crates/ss-magic-core/src/superset_files.rs:286-293",
+        "crates/ss-magic-core/src/superset_files.rs:299-306",
+        "crates/ss-magic-core/src/superset_files.rs:310-317"
+      ],
+      "evidence": "pub fn load_config(root: &Path) -> Result<Option<Config>> {\n    read_json::<Config>(&superset_dir(root).join(CONFIG_JSON)).with_context(|| {\n        format!(\"reading {}\", superset_dir(root).join(CONFIG_JSON).display())\n    })\n}",
+      "problem": "`load_config`, `load_magic_json`, `load_magic_local_json` and `load_setup_config` are byte-identical apart from the type parameter and the file-name constant. Each one also builds the SAME `PathBuf` twice — once to hand to `read_json`, once inside the `with_context` closure to render it — so a rename of any file-name constant has to be made in two places per function, and the pair can silently drift (the context could end up naming a different file from the one that was read).",
+      "proposal": "Add one private helper beside `read_json` in the same file: `fn load_superset_json<T: serde::de::DeserializeOwned>(root: &Path, name: &str) -> Result<Option<T>> { let path = superset_dir(root).join(name); read_json::<T>(&path).with_context(|| format!(\"reading {}\", path.display())) }`, and make the four public functions one-liners over it (`load_superset_json::<Config>(root, CONFIG_JSON)` and so on). The public signatures, return types and doc comments stay exactly as they are.",
+      "behavior_preservation": "`superset_dir(root).join(NAME)` is a pure path join, so binding it once and reusing it yields the identical `PathBuf` both call sites build today; `Path::display()` on that same value renders the identical string, so the `anyhow` context chain is byte-identical. `read_json` is unchanged, so every `Ok(None)` / `bail!` / parse-error path is unchanged. Only one redundant `PathBuf` allocation per call disappears.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F3",
+      "category": "duplication",
+      "title": "`write_magic_json` and `write_magic_local_json` are the same four lines with a different file-name constant",
+      "locations": [
+        "crates/ss-magic-core/src/superset_files.rs:142-147",
+        "crates/ss-magic-core/src/superset_files.rs:158-163"
+      ],
+      "evidence": "pub fn write_magic_json(root: &Path, cfg: &MagicConfig) -> Result<()> {\n    ensure_superset_dir(root)?;\n    let path = superset_dir(root).join(MAGIC_JSON);\n    let body = format!(\"{}\\n\", serde_json::to_string_pretty(cfg)?);\n    write_atomically(&path, &body)\n}",
+      "problem": "The two writers differ only in `MAGIC_JSON` vs `MAGIC_LOCAL_JSON`. Any change to the write discipline (the trailing newline, the pretty printer, the `ensure_superset_dir` call, the atomic path) has to be made twice, and a change made once produces two files written under different rules — exactly the kind of drift the module's own `write_atomically` doc comment is about.",
+      "proposal": "Add a private `fn write_magic_file(root: &Path, name: &str, cfg: &MagicConfig) -> Result<()>` in this file holding the current four-line body, and make both public functions delegate (`write_magic_file(root, MAGIC_JSON, cfg)` / `write_magic_file(root, MAGIC_LOCAL_JSON, cfg)`). Keep both public functions and both doc comments — they document genuinely different files.",
+      "behavior_preservation": "The extracted body is the current body verbatim, with the only varying token passed in. Call order (`ensure_superset_dir` before serializing, serialize before `write_atomically`), the `?` on `to_string_pretty`, the trailing newline and the atomic staged-rename are all unchanged, so the bytes written and every error path are identical.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F4",
+      "category": "duplication",
+      "title": "The `Glob::new` + \"compiling glob\" error context is written twice in the sync engine",
+      "locations": [
+        "crates/ss-magic-core/src/sync/apply.rs:295-299",
+        "crates/ss-magic-core/src/sync/repo_scan.rs:25-29"
+      ],
+      "evidence": "fn build_matcher(pattern: &str) -> Result<GlobMatcher> {\n    Ok(Glob::new(pattern)\n        .with_context(|| format!(\"compiling glob `{pattern}`\"))?\n        .compile_matcher())\n}\n---\n        builder.add(Glob::new(pattern).with_context(|| format!(\"compiling glob `{pattern}`\"))?);",
+      "problem": "Two modules of the same `sync` tree each spell `Glob::new(pattern).with_context(|| format!(\"compiling glob `{pattern}`\"))?`, including the identical user-facing message literal. `sync/pattern.rs` — the module whose whole stated purpose is \"the two layers must agree on what counts as a valid pattern\" — compiles a third `Glob::new(pattern)` at line 55 with a different error shape (`SyntaxError::BadGlob`). Three glob-compile sites, one shared message literal, no owner.",
+      "proposal": "Add `pub fn compile_glob(pattern: &str) -> anyhow::Result<Glob>` to `crates/ss-magic-core/src/sync/pattern.rs` holding the shared `Glob::new(pattern).with_context(|| format!(\"compiling glob `{pattern}`\"))` body (`anyhow` is already a core dependency). Have `apply::build_matcher` become `Ok(pattern::compile_glob(pattern)?.compile_matcher())` and `repo_scan::matches_for_patterns` call `builder.add(pattern::compile_glob(pattern)?)`. `pattern::check_syntax` keeps its own `SyntaxError::BadGlob` mapping — see core-rest-F5 for the fuller version of that half.",
+      "behavior_preservation": "`globset::Glob::new` is called with the same argument at both sites and the context closure produces the identical string, so both the returned `Glob` and the `anyhow` error chain are unchanged. `compile_matcher()` and `GlobSetBuilder::add` still receive exactly what they receive today, in the same order.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F5",
+      "category": "efficiency",
+      "title": "Every glob pattern is compiled twice per `run`/`match_paths` — once to validate it, once to use it",
+      "locations": [
+        "crates/ss-magic-core/src/sync/apply.rs:210-214",
+        "crates/ss-magic-core/src/sync/pattern.rs:54-58"
+      ],
+      "evidence": "        if pattern::has_glob_meta(pat) {\n            // `pattern::check_syntax` above already verified the glob\n            // compiles, so build_matcher can't fail here.\n            let matcher = build_matcher(pat).expect(\"glob compiled in check_syntax\");",
+      "problem": "`expand_patterns` calls `pattern::check_syntax(pat)` (which runs `Glob::new(pattern)` and throws the result away, `pattern.rs:55`), then immediately calls `build_matcher(pat)`, which runs `Glob::new(pattern)` a second time on the same string. The comment at `apply.rs:211-213` states the redundancy outright and then leans on it with an `.expect()` — an `.expect()` whose safety depends on two separate call sites staying in agreement about which patterns compile.",
+      "proposal": "In `crates/ss-magic-core/src/sync/pattern.rs`, add `pub fn checked_glob(pattern: &str) -> Result<Option<Glob>, SyntaxError>` holding today's `check_syntax` body but returning `Ok(Some(glob))` when `has_glob_meta(pattern)` and it compiles, and `Ok(None)` when the pattern has no glob metacharacter. Redefine `check_syntax(pattern)` as `checked_glob(pattern).map(|_| ())` so the `inquire` validator in `crates/ss-magic/src/tui/ui.rs` is untouched. In `apply::expand_patterns`, replace the `check_syntax` call with `checked_glob`, and use the returned `Some(glob).compile_matcher()` for the glob branch and `None` for the literal branch — which also removes `build_matcher` and its `.expect()`.",
+      "behavior_preservation": "`check_syntax` compiles a glob if and only if `has_glob_meta(pattern)` is true (pattern.rs:54), which is the exact predicate `expand_patterns` uses at apply.rs:210 to pick its branch — so `Some`/`None` selects the same branch the boolean does today, for every input. The empty / leading-`/` / `..` rejections keep their order and their `SyntaxError` variants, so the `SkipReason` mapping at apply.rs:195-199 is unchanged. `Glob::new` is deterministic, so the single surviving compile yields the matcher the second compile produces today. Net effect: one `Glob::new` per pattern instead of two, and one fewer `.expect()`.",
+      "confidence": 100,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F6",
+      "category": "duplication",
+      "title": "Two test helpers in this partition re-implement `testutil::write_file`",
+      "locations": [
+        "crates/ss-magic-core/src/sync/apply/tests.rs:4-8",
+        "crates/ss-magic-core/src/sync/repo_scan/tests.rs:5-9",
+        "crates/ss-magic-core/src/testutil.rs:112-116"
+      ],
+      "evidence": "fn write(root: &Path, rel: &str, body: &str) {\n    let p = root.join(rel);\n    fs::create_dir_all(p.parent().unwrap()).unwrap();\n    fs::write(p, body).unwrap();\n}",
+      "problem": "`sync/apply/tests.rs`'s `write` is a byte-for-byte copy of `ss_magic_core::testutil::write_file` (only the name differs), and `sync/repo_scan/tests.rs`'s `write_file` is a third variant of the same idiom with a narrower signature (`&TempDir` instead of `&Path`, no body parameter, a hardcoded `\"x\"` payload). The brief pins this exact case as a finding: a test helper re-implemented in a module's `tests.rs` when `testutil` already provides it. `testutil` is compiled under `cfg(test)` for core's own suite, so both files can reach it as `crate::testutil::write_file`.",
+      "proposal": "In `sync/apply/tests.rs`, delete the local `write` and add `use crate::testutil::write_file;`, renaming the ~30 call sites' `write(` to `write_file(`. In `sync/repo_scan/tests.rs`, delete the local `write_file` and call `crate::testutil::write_file(dir.path(), rel, \"x\")` at its call sites (they all pass a `&TempDir` today, so each site gains `.path()` and the literal `\"x\"`).",
+      "behavior_preservation": "`testutil::write_file` performs the identical `join` -> `create_dir_all(parent)` -> `fs::write` sequence with the same `unwrap()`s, so every test writes the same bytes to the same paths and panics on the same failures. The `repo_scan` variant's hardcoded `\"x\"` body becomes an explicit argument with the same value, so file contents are unchanged. Test-only code; no production path is touched.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F7",
+      "category": "duplication",
+      "title": "`ss-magic`'s test files re-implement four `testutil` helpers verbatim",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync/tests.rs:16-45",
+        "crates/ss-magic/src/pack/tests.rs:30-44",
+        "crates/ss-magic-core/src/testutil.rs:100-137"
+      ],
+      "evidence": "fn write_magic(root: &Path, patterns: &[&str]) {\n    fs::create_dir_all(root.join(\".superset\")).unwrap();\n    let files: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();\n    let cfg = superset_files::MagicConfig { files, ..Default::default() };\n    let body = format!(\"{}\\n\", serde_json::to_string_pretty(&cfg).unwrap());\n    fs::write(root.join(\".superset/magic.json\"), body).unwrap();\n}",
+      "problem": "`crates/ss-magic/src/pack/tests.rs` re-declares `write_magic` (line 30) and `write_file` (line 40) as byte-for-byte copies of `testutil::write_magic` / `testutil::write_file`, and `crates/ss-magic/src/sync/reverse_sync/tests.rs` re-declares `write_magic` (line 38), `write` (line 32, `testutil::write_file` renamed) and `make_worktree` (line 16, `testutil::make_worktree` with the branch literal changed from `feature/sync-flow-test` to `feature/rs-test`). Both files ALREADY import `ss_magic_core::testutil::git_run` and `neutralize_global_excludes` from that same module, so the helpers were simply not carried over when the rest was.",
+      "proposal": "In both files, delete the local `write_magic`, `write_file` / `write` and import them from `ss_magic_core::testutil` (the `testutil` feature is already enabled in `crates/ss-magic`'s `[dev-dependencies]`, which is what makes `git_run` reachable there today). For `make_worktree`, either import `testutil::make_worktree` — the doc comment on it says \"The branch name is arbitrary (no test asserts on it)\", which a grep of `reverse_sync/tests.rs` for `feature/rs-test` should confirm before the swap — or, if a distinct branch name is wanted, leave it and note why.",
+      "behavior_preservation": "The `write_magic` / `write_file` bodies are identical character for character, so the same JSON and the same file bytes land at the same paths. `make_worktree` differs only in the branch literal passed to `git worktree add -b`; swapping it is behavior-preserving only if no assertion reads the branch name, which is why the proposal makes that a checked precondition rather than an assumption. Test-only code.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F8",
+      "category": "copy-paste-variant",
+      "title": "Two local `init_main_repo` copies are missing the `gc.auto 0` race fix that `testutil` already carries",
+      "locations": [
+        "crates/ss-magic/src/sync/reverse_sync/tests.rs:6-13",
+        "crates/ss-magic/src/pack/tests.rs:20-27",
+        "crates/ss-magic-core/src/testutil.rs:82-97"
+      ],
+      "evidence": "fn init_main_repo() -> TempDir {\n    let dir = tempfile::tempdir().unwrap();\n    git_run(&[\"init\", \"-q\", \"-b\", \"main\"], dir.path());\n    ss_magic_core::testutil::neutralize_global_excludes(dir.path());\n    fs::write(dir.path().join(\"README.md\"), \"hi\").unwrap();\n    git_run(&[\"add\", \".\"], dir.path());",
+      "problem": "`testutil::init_main_repo` runs `git_run(&[\"config\", \"gc.auto\", \"0\"], …)` with a long comment explaining that without it `git commit` can spawn a background `gc --auto`, which repacks `.git/objects` while a test walks or copies `.git` — an intermittent failure that only shows up under parallel load. Both local copies (`reverse_sync/tests.rs:6`, and `pack/tests.rs:20` under the name `init_repo`) omit that call, so a fix already made upstream does not apply to the two suites that most heavily walk and archive `.git` (`pack`'s archive tests and reverse sync's worktree tests). Both copies also hardcode `\"main\"` where `testutil`'s version takes `branch: &str`.",
+      "proposal": "Replace both local functions with `ss_magic_core::testutil::init_main_repo(\"main\")` (adding the import; `git_run` and `neutralize_global_excludes` are already imported from that module in both files) and delete the local definitions.",
+      "behavior_preservation": "`testutil::init_main_repo(\"main\")` performs the same `git init -q -b main`, `neutralize_global_excludes`, `README.md` write, `git add .` and `git commit -q -m init` in the same order, returning the same `TempDir`. The one added step, `git config gc.auto 0`, is local repository configuration that only disables background housekeeping; it changes no ref, object, index or working-tree content the tests assert on, and its purpose is precisely to remove a nondeterministic failure. Test-only code.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F9",
+      "category": "duplication",
+      "title": "`superset_files/tests.rs` re-declares `repo_scan::OPTIONS` byte for byte, under the same name",
+      "locations": [
+        "crates/ss-magic-core/src/superset_files/tests.rs:63",
+        "crates/ss-magic-core/src/sync/repo_scan.rs:14"
+      ],
+      "evidence": "const OPTIONS: [&str; 4] = [\".env\", \"**/.env\", \".env.local\", \"**/.dev.vars\"];\n---\npub const OPTIONS: [&str; 4] = [\".env\", \"**/.env\", \".env.local\", \"**/.dev.vars\"];",
+      "problem": "`sync::repo_scan::OPTIONS` is a `pub const` in the SAME crate, documented as \"The four patterns offered in bootstrap mode by default. Order is load-bearing.\" The test at `superset_files/tests.rs:195` exercises `existing_unknown_entries(&existing, &OPTIONS)` — i.e. the behavior of preserving a user-typed pattern that is NOT one of the offered defaults — against a private copy of that array, so a change to the real default set would leave this test asserting against the old one and still passing.",
+      "proposal": "Delete the local `const OPTIONS` at `superset_files/tests.rs:63` and add `use crate::sync::repo_scan::OPTIONS;` to the test module's imports.",
+      "behavior_preservation": "The two arrays are identical in element order, element values and type (`[&str; 4]`), so `existing_unknown_entries(&existing, &OPTIONS)` receives the same slice and the assertion at line 195 evaluates the same way. Test-only code.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F10",
+      "category": "const-location",
+      "title": "`.superset` has two private owners in two crates (`SUPERSET_DIR` / `SUPERSET_REL`) and is re-spelled again in `testutil`",
+      "locations": [
+        "crates/ss-magic-core/src/superset_files.rs:26",
+        "crates/ss-magic-plugin/src/scratchpad.rs:70",
+        "crates/ss-magic-core/src/testutil.rs:101"
+      ],
+      "evidence": "const SUPERSET_DIR: &str = \".superset\";\n---\n/// The `.superset` parent, checked for containment on its own so a symlinked\n/// `.superset` is caught before anything is created beneath it.\nconst SUPERSET_REL: &str = \".superset\";\n---\n    fs::create_dir_all(root.join(\".superset\")).unwrap();",
+      "problem": "The workspace-contract directory name is declared twice as a private const under two different names in two different crates, and spelled as a bare literal a third time in core's own `testutil`. The workspace otherwise has a settled pattern for exactly this: `state_tree::STATE_REL` lives in core as one `pub const`, the plugin's `scratchpad` re-exports it (`pub use ss_magic_core::state_tree::STATE_REL;`, scratchpad.rs:60), and a test pins it equal to the `EXCLUDED_TREES` entry. `.superset` — the parent of that very path, and the directory both crates create, containment-check and walk — has no such shared owner.",
+      "proposal": "Make core's const public and canonical: `pub const SUPERSET_DIR: &str = \".superset\";` in `crates/ss-magic-core/src/superset_files.rs`. In `crates/ss-magic-plugin/src/scratchpad.rs`, replace the private `SUPERSET_REL` with `use ss_magic_core::superset_files::SUPERSET_DIR as SUPERSET_REL;` (keeping the local name so scratchpad.rs:413, 486 and its tests are untouched) or rename the three uses. In `testutil::write_magic`, replace the two bare literals with `superset_files::SUPERSET_DIR` and `Path::join` of `SUPERSET_DIR` + `MAGIC_JSON` (which requires `MAGIC_JSON` to be `pub` too, or a small `pub fn magic_json_path(root) -> PathBuf` beside it).",
+      "behavior_preservation": "All three sites hold the identical string `\".superset\"`; replacing a literal with a const of the same value changes no byte at run time. Visibility widening (`const` -> `pub const`) affects only what other modules may name. The scratchpad's containment check and the plugin's `.superset` handling still see the same path, so the fail-closed symlink guard at scratchpad.rs:413 is unchanged — this moves where the string is DEFINED, never what any gate compares.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F11",
+      "category": "const-location",
+      "title": "`MAGIC_LOCAL_PATTERN` hardcodes a concatenation of two constants declared four lines above it, and its doc comment names a caller that does not exist",
+      "locations": [
+        "crates/ss-magic-core/src/superset_files.rs:26-35",
+        "crates/ss-magic-core/src/superset_files.rs:243-245",
+        "crates/ss-magic-core/src/superset_files.rs:265"
+      ],
+      "evidence": "const SUPERSET_DIR: &str = \".superset\";\nconst MAGIC_LOCAL_JSON: &str = \"magic.local.json\";\n\n/// Relative path of `magic.local.json` as it appears inside the repo.\n/// Referenced by [`default_magic_files`] and the bootstrap helper.\nconst MAGIC_LOCAL_PATTERN: &str = \".superset/magic.local.json\";",
+      "problem": "Two problems in one place. (1) `MAGIC_LOCAL_PATTERN` re-spells `SUPERSET_DIR` + `\"/\"` + `MAGIC_LOCAL_JSON` as a fresh literal rather than deriving it, so renaming either constituent silently leaves this one — the pattern seeded into every freshly-written `magic.json` — pointing at the old path. (2) The doc comment says it is \"Referenced by [`default_magic_files`] and the bootstrap helper\", but the bootstrap helper (`bootstrap_magic_local_json`, line 256) does not reference it: it writes a hand-built JSON string at line 265 that never mentions the pattern at all. Its only reference is `default_magic_files` (line 244).",
+      "proposal": "Delete `MAGIC_LOCAL_PATTERN` and have `default_magic_files` build the string from the constants it is made of: `vec![format!(\"{SUPERSET_DIR}/{MAGIC_LOCAL_JSON}\")]`. If a const is preferred, keep it but fix its doc comment to name `default_magic_files` alone. Either way, correct the stale \"and the bootstrap helper\" clause.",
+      "behavior_preservation": "`format!(\"{SUPERSET_DIR}/{MAGIC_LOCAL_JSON}\")` evaluates to `\".superset/magic.local.json\"`, character for character the current literal, and `default_magic_files` already returns `Vec<String>` (it calls `.to_string()` on the const today), so the returned value is identical. The doc-comment fix changes no code.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F12",
+      "category": "const-location",
+      "title": "Two overlapping directory-exclusion lists in the `sync` tree with no cross-reference between them",
+      "locations": [
+        "crates/ss-magic-core/src/sync/apply.rs:27-28",
+        "crates/ss-magic-core/src/sync/repo_scan.rs:16"
+      ],
+      "evidence": "/// Directory names that drop matches at any depth, matching `setup.sh`.\nconst DEFAULT_EXCLUDES: [&str; 2] = [\"node_modules\", \".venv\"];\n---\nconst SKIP_DIRS: [&str; 4] = [\"node_modules\", \".venv\", \".git\", \"target\"];",
+      "problem": "Two sibling modules of the same `sync` tree each own a directory-name exclusion list. They agree on `node_modules` and `.venv` and diverge on `.git` and `target`, with no comment in either naming the other, so a reader cannot tell whether the divergence is deliberate (`repo_scan` walks for UI preselection and can afford a wider prune; `apply` drops COPY matches and must not silently drop a `.git`-named user file) or drift. `SKIP_DIRS` also carries no doc comment at all, while `EXCLUDED_TREES` (sync/mod.rs:38-39) documents its relationship to `DEFAULT_EXCLUDES` explicitly — the one cross-reference of the three that exists.",
+      "proposal": "Make `DEFAULT_EXCLUDES` `pub(crate)` in `sync/apply.rs` and define the shared head in terms of it in `sync/repo_scan.rs`: `const SKIP_DIRS: [&str; 4] = [apply::DEFAULT_EXCLUDES[0], apply::DEFAULT_EXCLUDES[1], \".git\", \"target\"];` (array indexing is const-evaluable). Give `SKIP_DIRS` a doc comment saying what the extra two entries are for and why this walk may prune wider than a copy path may. If the indexed form reads worse than the literal, keep the literal and add the doc cross-reference alone — the cross-reference is the load-bearing half.",
+      "behavior_preservation": "`apply::DEFAULT_EXCLUDES[0]` and `[1]` evaluate at compile time to `\"node_modules\"` and `\".venv\"`, so `SKIP_DIRS` holds the identical four strings in the identical order; `skip_excluded` (repo_scan.rs:69-76) compares them the same way. Widening `DEFAULT_EXCLUDES` from private to `pub(crate)` changes only who may name it. Neither list's CONTENTS change, so no walk prunes anything it does not prune today.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F13",
+      "category": "quality",
+      "title": "`repo_scan`'s walk is the one enumeration in `sync/` that never asks `under_excluded_tree`",
+      "locations": [
+        "crates/ss-magic-core/src/sync/repo_scan.rs:69-76",
+        "crates/ss-magic-core/src/sync/apply.rs:273-283"
+      ],
+      "evidence": "fn skip_excluded(entry: &walkdir::DirEntry) -> bool {\n    // Always descend into the user-provided root.\n    if entry.depth() == 0 {\n        return true;\n    }\n    let name = entry.file_name();\n    !SKIP_DIRS.iter().any(|s| name == std::ffi::OsStr::new(s))\n}",
+      "problem": "Every other walk in this crate's `sync` tree prunes via `crate::sync::under_excluded_tree` (`apply::walk_source` at apply.rs:278-283, `apply::copy_dir_recursive` at apply.rs:337-341). `repo_scan`'s does not: it prunes only the four `SKIP_DIRS` names, so a scan for `.env` can descend into `.superset/backups/` (recovered secrets) and `.superset/.magic/` (plugin state) and let a file found there set a preselect bit. Nothing is read, copied or displayed from inside those trees, so the stakes are low — but this is the one walk in the tree that does not apply the shared predicate, and the reader has no marker saying whether that is a decision or an oversight.",
+      "proposal": "Either (a) add the predicate: in `skip_excluded`, strip the entry's path against the scan root and return false when `crate::sync::under_excluded_tree(rel)` — which requires threading `root` in, e.g. by replacing the free `skip_excluded` with a closure over `root` in `matches_for_patterns` (`filter_entry(|e| skip_excluded(root, e))`); or (b) if descending is deliberate, add a doc comment on `skip_excluded` saying so and naming `under_excluded_tree` as the rule this walk intentionally does not apply. Option (a) is preferred; note it is NOT behavior-preserving.",
+      "behavior_preservation": "Option (a) CHANGES behavior: a pattern whose only match lives inside `.superset/backups/`, `.superset/.magic/`, `.scratchpad/` or `.git/` would stop being preselected in the bootstrap picker (it would move from `true` to `false` in the returned vector). That is the direction the rest of the crate's rules point, and it affects only which checkbox starts ticked, but it is a behavior change and must be landed as one, with a test. Option (b) preserves behavior exactly and is the safe half of this finding.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F14",
+      "category": "duplication",
+      "title": "Two independent atomic-write implementations, one per crate",
+      "locations": [
+        "crates/ss-magic-core/src/superset_files.rs:180-213",
+        "crates/ss-magic-plugin/src/atomic.rs:52-88"
+      ],
+      "evidence": "fn write_atomically(path: &Path, body: &str) -> Result<()> {\n    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());\n---\npub(crate) fn write_atomically(\n    path: &Path, body: &str, prefix: &str, suffix: &str,\n    what: Option<&str>, mode: Option<u32>, sync: bool,\n) -> Result<()> {",
+      "problem": "Two functions with the same name and the same purpose — stage a sibling, write it, rename it over the target — exist in two crates. Core's hand-rolls the staging file name (`.{name}.{pid}.{seq}.tmp`) with a function-local `AtomicU64` counter; the plugin's uses `tempfile::Builder` and adds mode/fsync/label parameters. The brief lists this explicitly as legitimate to report (core cannot depend on the plugin, so a shared copy would have to live in core). The plugin's copy is already generalized to the union of eight call sites' needs, so it is the one that would move.",
+      "proposal": "Move the plugin's `atomic::write_atomically` into core as `ss_magic_core::atomic::write_atomically` (a new `pub mod atomic;` in `lib.rs`), leave `crates/ss-magic-plugin/src/atomic.rs` as a `pub(crate) use ss_magic_core::atomic::write_atomically;` re-export so its eight call sites are untouched, and consider routing `superset_files::write_atomically` through it. The one thing that must NOT be lost in the merge is core's `path.canonicalize()` step (superset_files.rs:187-188), which deliberately writes THROUGH a symlink onto its resolved target — the plugin's version has no such step, and dropping it would turn a symlinked `.superset/magic.json` into a plain file.",
+      "behavior_preservation": "Not fully argued, which is why the confidence is 75: the two implementations differ in staging-file naming, in whether they chmod, in whether they fsync, and — load-bearingly — in the symlink resolution above. A merge that keeps core's canonicalize as an explicit opt-in parameter and passes today's values at every existing call site would preserve behavior, but that has to be shown per call site (nine of them), not asserted. The safe first step is the move + re-export with the plugin's semantics unchanged, deferring the `superset_files` unification.",
+      "confidence": 75,
+      "effort": "L",
+      "touches_safety_check": true,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F15",
+      "category": "const-location",
+      "title": "The release-line tag prefix and repo slug that `release.rs` owns are re-spelled in shell, YAML and JSON with nothing asserting they agree",
+      "locations": [
+        "crates/ss-magic-core/src/release.rs:50",
+        "crates/ss-magic-core/src/release.rs:91-94",
+        "plugin/hooks/bootstrap.sh:42-43",
+        "plugin/hooks/bootstrap.sh:415",
+        "assets/workflow/checklist.yml:116"
+      ],
+      "evidence": "pub const REPO_SLUG: &str = \"ViktorStiskala/superset-magic\";\n---\npub const PLUGIN_LINE: Line = Line {\n    tag_prefix: \"ss-magic-plugin-v\",\n---\narchive_url=\"$RELEASE_DOWNLOAD_BASE/ss-magic-plugin-v$pin/$archive_name\"",
+      "problem": "`release.rs` is documented as the owner of both release lines' tag shapes, and `PLUGIN_LINE.tag_prefix` is the anchored filter the updater and the `SessionStart` notice both key on. The same two strings are re-spelled outside Rust with no mechanical link: `plugin/hooks/bootstrap.sh:42-43` hardcodes the slug in `RELEASE_DOWNLOAD_BASE`/`RELEASE_PAGE_BASE` and line 415 rebuilds `ss-magic-plugin-v$pin`; `assets/workflow/checklist.yml:116` rebuilds `ss-magic-plugin-v$SS_MAGIC_PLUGIN_VERSION`; `.claude-plugin/marketplace.json:10` and `scripts/mark-latest.sh:50` carry the slug too. A change to either string in `release.rs` — the one place a reviewer would look — leaves the install path and the CI workflow pointing at tags that do not exist, and `scripts/build-plugin-zip.py --check`, which already enumerates seven cross-file assertions, does not check this one.",
+      "proposal": "Add an eighth assertion line to `scripts/build-plugin-zip.py --check` — call it `release line tag shape` — that parses `PLUGIN_LINE.tag_prefix` and `REPO_SLUG` out of `crates/ss-magic-core/src/release.rs` and asserts every non-Rust spelling matches: the `ss-magic-plugin-v` occurrences in `plugin/hooks/bootstrap.sh`, `assets/workflow/checklist.yml` and `.claude-plugin/marketplace.json`, and the slug in `plugin/hooks/bootstrap.sh`, `scripts/mark-latest.sh` (its default), `assets/magic.sh`, `assets/workflow/checklist.yml` and `plugin/.claude-plugin/plugin.json`. This is additive: it does not collapse any of the pinned version surfaces, it only pins the tag SHAPE and the slug, neither of which is a version.",
+      "behavior_preservation": "Nothing in the shipped code changes — the proposal adds a check, it does not move or rewrite a string. `--check` is already a CI gate, so the only run-time effect is that a future divergence fails the build instead of shipping.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-rest-F16",
+      "category": "quality",
+      "title": "Five writers in `superset_files` use three different durability postures with no stated rule",
+      "locations": [
+        "crates/ss-magic-core/src/superset_files.rs:142-163",
+        "crates/ss-magic-core/src/superset_files.rs:256-268",
+        "crates/ss-magic-core/src/superset_files.rs:384-390"
+      ],
+      "evidence": "pub fn write_config_json(root: &Path, cfg: &Config) -> Result<()> {\n    ensure_superset_dir(root)?;\n    let path = superset_dir(root).join(CONFIG_JSON);\n    let body = format!(\"{}\\n\", serde_json::to_string_pretty(cfg)?);\n    fs::write(&path, body).with_context(|| format!(\"writing {}\", path.display()))?;\n    Ok(())\n}",
+      "problem": "`write_magic_json` / `write_magic_local_json` go through the staged-rename `write_atomically`; `write_config_json`, `write_magic_sh` and `bootstrap_magic_local_json` use a plain truncating `fs::write`. The 15-line doc comment on `write_atomically` (lines 165-179) argues the atomic path from a general premise — a tracked file with an unattended writer must never be left as a prefix — but nothing in the module says why `config.json`, which is equally tracked and equally load-modify-written by the CLI's init/migrate flows, is exempt. `bootstrap_magic_local_json` additionally hand-writes its JSON body as a string literal (line 265) rather than serializing a `MagicConfig`, so it bypasses both the typed writer and the atomic one.",
+      "proposal": "Decide and record the rule rather than change the code blind. If atomicity is genuinely `magic.json`-specific (only that file has the `seed-config` unattended writer), add one sentence to `write_config_json`'s doc comment saying so, naming `write_atomically` and why it does not apply. If it is not specific, route `write_config_json` through `write_atomically` as well. Do not touch `bootstrap_magic_local_json`'s hand-written body: rebuilding it through `MagicConfig` + `extras` would reorder the `_comment` key after `files` and change the file's bytes.",
+      "behavior_preservation": "The documentation-only half preserves behavior exactly. Routing `write_config_json` through `write_atomically` would NOT: it adds a `canonicalize` step (writing through a symlink instead of over it), changes the error context strings (\"moving X over Y\" instead of \"writing Y\"), and leaves a different residue on failure — which is why this finding proposes deciding first, and is filed at low confidence.",
+      "confidence": 50,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 3 (platform / framework / downstream guarantees hand-maintained): nothing found. The hand-rolled SHA-256 and FNV-1a in hashing.rs are pinned as deliberate (structure-pins: the shell bootstrap must reproduce SHA-256 with `shasum`, and std does not promise a stable DefaultHasher), and release.rs's ureq usage already delegates status/ETag handling to the transport.",
+    "Rubric 2 item 1 (redundant state): nothing found. release.rs's `Cache` carries no derivable field; `style::COLOR_ENABLED` is a single OnceLock read by every accessor rather than a duplicated copy.",
+    "Rubric 2 item 2 (parameter sprawl): nothing found. `run_check(cache_file, client, line, current_version)` and `refresh_cache(prior, client, line, now)` are the injected-environment testability seams the brief pins as not-sprawl.",
+    "Rubric 2 item 4 (leaky abstractions): nothing found in this partition.",
+    "Rubric 2 item 5 (stringly-typed code): nothing found. `Line`, `Kind`, `SkipReason`, `SyntaxError`, `UpdateCheck`, `FetchOutcome` and `RefreshOutcome` are all already typed enums/structs where a string would have been easy.",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable — no component-tree UI framework in this partition.",
+    "Rubric 2 item 7 (nested conditionals 3+ deep): nothing found. The deepest nesting is two levels (`expand_patterns`'s per-pattern loop, `run_check`'s fresh-cache guard).",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): nothing beyond core-rest-F1's stale `#[allow(dead_code)]`. `Cache`'s superset-of-the-old-shape fields and `CLI_LINE.cache_file = \"version-check.json\"` are deliberate on-disk compatibility with already-released binaries, documented as such, and must stay.",
+    "Rubric 3 item 2 (missed concurrency): nothing found. The one network call is a single bounded fetch; the walks are single-pass over one tree.",
+    "Rubric 3 item 4 (recurring no-op updates): not applicable — no polling, event or reducer loops in this partition.",
+    "Rubric 3 item 6 (memory / unbounded structures / listener leaks): nothing found. `expand_patterns`'s `all_files` walk cache is per-call and bounded by the tree; nothing here registers a listener.",
+    "Rubric 3 item 7 (overly broad reads): nothing found. `hashing::hash_file` reads whole files by design and is documented as only for small files; `read_json` reads whole config files that are wholly parsed."
+  ]
+}

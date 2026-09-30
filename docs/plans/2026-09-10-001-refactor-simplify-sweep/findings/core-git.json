@@ -1,0 +1,324 @@
+{
+  "partition": "core-git",
+  "findings": [
+    {
+      "id": "core-git-F1",
+      "category": "duplication",
+      "title": "join-if-relative + canonicalize is written three times inside the git module",
+      "locations": [
+        "crates/ss-magic-core/src/git/mod.rs:48-57",
+        "crates/ss-magic-core/src/git/mod.rs:86-91",
+        "crates/ss-magic-core/src/git/discover.rs:619-629"
+      ],
+      "evidence": "mod.rs:50-56  let abs = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };\n              abs.canonicalize().with_context(|| format!(\"could not canonicalize {}\", abs.display()))\nmod.rs:89-91  parent.canonicalize().with_context(|| format!(\"could not canonicalize {}\", parent.display()))\ndiscover.rs:623-628  let joined = if path.is_absolute() { path.to_path_buf() } else { base.join(path) };\n              joined.canonicalize()",
+      "problem": "The same two-step (resolve a possibly-relative path against a base, then canonicalize) is spelled out in `git::resolve` and again in `discover::resolve_against`, and the canonicalize-with-this-exact-context-message tail is spelled a third time inline in `main_checkout_root`. The `.is_absolute()` / `base.join()` pair and the literal message `could not canonicalize {}` are copied, not shared.",
+      "proposal": "In `crates/ss-magic-core/src/git/mod.rs` add two private helpers: `fn join_if_relative(path: &Path, base: &Path) -> PathBuf` (the if/else body verbatim) and `fn canonicalize_ctx(path: &Path) -> Result<PathBuf>` (the `canonicalize().with_context(|| format!(\"could not canonicalize {}\", path.display()))` tail). `resolve` becomes `canonicalize_ctx(&join_if_relative(Path::new(path), base))`; `main_checkout_root` line 89-91 becomes `canonicalize_ctx(parent)`; `discover::resolve_against` keeps its own UTF-8 check and `io::Result` and calls `super::join_if_relative(path, base).canonicalize()`. `discover` is a child module of `git`, so a private `join_if_relative` is already in scope via `super::`.",
+      "behavior_preservation": "Each helper is the extracted body verbatim: the same branch order, the same `PathBuf`, the same `canonicalize()` call and the same context string built from the same path value (`abs`/`parent` are exactly what the helper receives). `resolve_against` keeps returning `io::Result` with no added context, so discover's `let Ok(..) else` decline arms are unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F2",
+      "category": "copy-paste-variant",
+      "title": "`status_porcelain` re-implements `git()`'s success check and bail message verbatim",
+      "locations": [
+        "crates/ss-magic-core/src/git/mod.rs:27-31",
+        "crates/ss-magic-core/src/git/mod.rs:359-363"
+      ],
+      "evidence": "mod.rs:27-31   let out = git_raw(args, cwd)?;\n               if !out.status.success() {\n                   let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();\n                   bail!(\"`git {}` failed: {stderr}\", args.join(\" \"));\n               }\nmod.rs:359-363 (byte-identical four lines)",
+      "problem": "Four lines including the error-message format string are duplicated. `status_porcelain` must not use `git()` (its blanket `.trim()` corrupts porcelain's leading column – a documented incident), but the part it actually needs to avoid is only the final trim, not the success check. Today the two error texts can drift.",
+      "proposal": "Add a private `fn git_raw_checked(args: &[&str], cwd: Option<&Path>) -> Result<std::process::Output>` in `crates/ss-magic-core/src/git/mod.rs` holding exactly the spawn + `if !out.status.success() { … bail!(…) }` block, returning the untouched `Output`. `git()` becomes `Ok(String::from_utf8_lossy(&git_raw_checked(args, cwd)?.stdout).trim().to_string())`; `status_porcelain` calls `git_raw_checked` and keeps its `lines()` parse plus the existing comment explaining why the trim is not applied. This keeps the pin (`status_porcelain` still never goes through the trimming `git()` helper) while removing the duplicated bail.",
+      "behavior_preservation": "The extracted block is byte-identical in both callers, including `args.join(\" \")` and the stderr trim, so both error paths produce the same message from the same inputs. `status_porcelain` still receives the raw `stdout` bytes and applies `lines()` itself — no trim is introduced.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F3",
+      "category": "duplication",
+      "title": "`String::from_utf8_lossy(..).trim().to_string()` is spelled ten times across the module",
+      "locations": [
+        "crates/ss-magic-core/src/git/mod.rs:29",
+        "crates/ss-magic-core/src/git/mod.rs:32",
+        "crates/ss-magic-core/src/git/mod.rs:43",
+        "crates/ss-magic-core/src/git/mod.rs:202",
+        "crates/ss-magic-core/src/git/mod.rs:205",
+        "crates/ss-magic-core/src/git/mod.rs:317",
+        "crates/ss-magic-core/src/git/mod.rs:361",
+        "crates/ss-magic-core/src/git/mod.rs:414",
+        "crates/ss-magic-core/src/git/mod.rs:417",
+        "crates/ss-magic-core/src/git/gitignore.rs:129"
+      ],
+      "evidence": "mod.rs:29   let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();\nmod.rs:202  let err = String::from_utf8_lossy(&out.stderr).trim().to_string();\nmod.rs:317  let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();\ngitignore.rs:129  let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();",
+      "problem": "One idiom, ten copies, and two different local names for it (`stderr` / `err`). It is the shape every subprocess result in the module goes through, but there is no name for it.",
+      "proposal": "Add `pub(super) fn trimmed_utf8(bytes: &[u8]) -> String { String::from_utf8_lossy(bytes).trim().to_string() }` in `crates/ss-magic-core/src/git/mod.rs` (visible to `gitignore`, which already reaches `super::git_raw`). Replace each site with `trimmed_utf8(&out.stderr)` / `trimmed_utf8(&out.stdout)`. Note F2 already removes two of these sites; apply F2 first.",
+      "behavior_preservation": "`from_utf8_lossy` + `trim` + `to_string` on the same byte slice yields the same `String` at every site; nothing about ordering, error text or the values passed on changes.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F4",
+      "category": "reuse",
+      "title": "Four subprocess spawns bypass `git_raw` and hand-roll its shape, against the stated convention",
+      "locations": [
+        "crates/ss-magic-core/src/git/mod.rs:145-152",
+        "crates/ss-magic-core/src/git/mod.rs:182-189",
+        "crates/ss-magic-core/src/git/mod.rs:195-200",
+        "crates/ss-magic-core/src/git/mod.rs:408-412"
+      ],
+      "evidence": "mod.rs:145-152  let status = Command::new(\"git\")\n                    .current_dir(repo_root)\n                    .args([\"diff\", \"--cached\", \"--quiet\"])\n                    .stdin(Stdio::null())…\nmod.rs:195-200  let out = Command::new(\"gh\")\n                    .current_dir(repo_root)\n                    .args([\"pr\", \"create\", \"--fill\", \"--base\", base])",
+      "problem": "CLAUDE.md's Conventions say every `git` and `gh` command shells out through the shared `git_raw` helper, but `nothing_to_commit` (git), `gh_available` (gh), `pr_create` (gh) and `timestamp_branch_suffix` (date) each build a `Command` by hand and re-derive the stdin-null / success-check / stderr-trim sequence. `pr_create` in particular re-implements the whole of `git()` for a different program.",
+      "proposal": "Generalize the existing private helper in `crates/ss-magic-core/src/git/mod.rs` to `fn run_raw(program: &str, args: &[&str], cwd: Option<&Path>) -> Result<std::process::Output>` (the current body with `Command::new(program)` and the context string `format!(\"failed to spawn `{program} {}`\", args.join(\" \"))`), and keep `git_raw(args, cwd)` as a one-liner delegating with `\"git\"`. Then `nothing_to_commit` becomes `Ok(git_raw(&[\"diff\", \"--cached\", \"--quiet\"], Some(repo_root))?.status.success())`, and `pr_create` becomes `run_raw(\"gh\", &[\"pr\", \"create\", \"--fill\", \"--base\", base], Some(repo_root))` plus its existing bail. `gh_available` and `timestamp_branch_suffix` can stay as they are (one wants only an exit status with no capture, the other is not a git/gh call) if the applier prefers a narrower change.",
+      "behavior_preservation": "Exit-code semantics and captured stdout/stderr are identical: `.status()` with stdout/stderr set to `Stdio::null()` and `.output()` (which captures then drops) both discard the child's output and yield the same `ExitStatus`. ONE deviation must be decided deliberately: the `.context(..)` string emitted when the SPAWN itself fails changes from \"failed to spawn `git diff --cached`\" / \"failed to spawn `gh`\" to the args-derived form. If that string must be preserved byte-for-byte, keep the current `.context(..)` by mapping the error at the call site rather than relying on `run_raw`'s.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F5",
+      "category": "copy-paste-variant",
+      "title": "`repository_format_check` duplicates the read/NotFound/unparseable block and two error strings",
+      "locations": [
+        "crates/ss-magic-core/src/git/discover.rs:479-486",
+        "crates/ss-magic-core/src/git/discover.rs:495-507"
+      ],
+      "evidence": "discover.rs:479-486  let scan = match fs::read(common.join(\"config\")) {\n      Ok(bytes) => scan_format(&String::from_utf8_lossy(&bytes)),\n      Err(e) if e.kind() == io::ErrorKind::NotFound => FormatScan::default(),\n      Err(_) => return Err(\"repository config could not be read\"),\n  };\n  if scan.unparseable { return Err(\"repository config could not be scanned\"); }",
+      "problem": "The second half (lines 495-507) repeats the same read-and-scan match, the same `NotFound` tolerance, the same `\"repository config could not be read\"` and `\"repository config could not be scanned\"` strings and the same `core_override` check, nested one level deeper inside a `match` arm. Three decline-reason literals now exist twice each and can drift.",
+      "proposal": "Add a private `fn scan_config_file(path: &Path) -> Result<FormatScan, &'static str>` in `crates/ss-magic-core/src/git/discover.rs` holding the read match (NotFound -> `FormatScan::default()`, other error -> `Err(\"repository config could not be read\")`) followed by the `unparseable` -> `Err(\"repository config could not be scanned\")` check. `repository_format_check` becomes: `let scan = scan_config_file(&common.join(\"config\"))?;` then the existing `unsupported_format` and `honors_core && core_override` checks, then `let worktree_scan = scan_config_file(&git_dir.join(\"config.worktree\"))?;` then `if worktree_scan.core_override { return Err(\"repository config sets core.bare or core.worktree\"); }` and `Ok(())`.",
+      "behavior_preservation": "The check ORDER is unchanged: common config read, unparseable, unsupported_format, gated core_override, then worktree config read, unparseable, core_override. A missing `config.worktree` produces `FormatScan::default()`, whose `core_override` is `false`, so control falls through to `Ok(())` exactly as the current empty `Err(NotFound) => {}` arm does. The worktree scan's `unsupported_format` / `worktree_config` fields are still not consulted, matching today. All four decline strings are byte-identical.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": true,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F6",
+      "category": "const-location",
+      "title": "`GITFILE_MAX_BYTES` is `pub` with no user outside `discover.rs`, while its sibling cap is private",
+      "locations": [
+        "crates/ss-magic-core/src/git/discover.rs:107",
+        "crates/ss-magic-core/src/git/discover.rs:112"
+      ],
+      "evidence": "discover.rs:107  pub const GITFILE_MAX_BYTES: usize = 4096;\ndiscover.rs:112  const HEAD_READ_BYTES: usize = 255;",
+      "problem": "Two constants of exactly the same kind (byte caps handed to `read_capped`) carry different visibility. Grepping the workspace, `GITFILE_MAX_BYTES` is referenced only at `discover.rs:337`, `discover.rs:359` and `discover/tests.rs:630`; the module doc's KTD8 walk description says \"at most 4 KiB\" in prose and does not intra-doc-link the constant. Being `pub` publishes an internal cap on the crate's API surface for no consumer. (Contrast `DECLINING_ENV`, also `pub`, which IS used cross-crate at `crates/ss-magic-plugin/src/hook/tests.rs:18` and must stay `pub`.)",
+      "proposal": "Drop `pub` from `crates/ss-magic-core/src/git/discover.rs:107`, matching `HEAD_READ_BYTES` on line 112.",
+      "behavior_preservation": "`discover/tests.rs` is a child module of `discover` and reaches the constant through `use super::*;`, which imports the parent's private items too, so the test at line 630 continues to compile. No non-test, non-`discover.rs` reference exists. Runtime behavior is untouched — visibility only.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F7",
+      "category": "hardcoded-value",
+      "title": "Two decline reasons restate `GITFILE_MAX_BYTES`'s magnitude as prose",
+      "locations": [
+        "crates/ss-magic-core/src/git/discover.rs:339",
+        "crates/ss-magic-core/src/git/discover.rs:361",
+        "crates/ss-magic-core/src/git/discover.rs:107"
+      ],
+      "evidence": "discover.rs:339  Ok(None) => return Step::Decline(\"gitfile is larger than 4 KiB\"),\ndiscover.rs:361  Ok(None) => return Step::Decline(\"commondir is larger than 4 KiB\"),\ndiscover.rs:107  pub const GITFILE_MAX_BYTES: usize = 4096;",
+      "problem": "The number in the operator-visible decline reason (which lands in the heartbeat row) is a free-standing literal in prose, derived from `GITFILE_MAX_BYTES` only by a human. Changing the constant silently leaves both messages lying about the limit.",
+      "proposal": "`Step::Decline` carries `&'static str`, so a `format!` is not available; the cheap fix is to make the coupling explicit at the constant. In `crates/ss-magic-core/src/git/discover.rs`, add to `GITFILE_MAX_BYTES`'s doc comment a line naming the two decline reasons that restate this value in words (\"gitfile is larger than 4 KiB\" at line 339 and \"commondir is larger than 4 KiB\" at line 361) and must change with it. Alternatively define `const GITFILE_TOO_LARGE: &str = \"gitfile is larger than 4 KiB\";` and `const COMMONDIR_TOO_LARGE: &str = …` next to the constant so the value and its wording sit together.",
+      "behavior_preservation": "Either form emits the identical `&'static str` in the identical arm; a doc-only change emits nothing at all.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F8",
+      "category": "hardcoded-value",
+      "title": "The module that owns `.gitignore` handling does not name the file, so callers re-spell it",
+      "locations": [
+        "crates/ss-magic-core/src/git/gitignore.rs:47",
+        "crates/ss-magic-core/src/git/gitignore.rs:261",
+        "crates/ss-magic/src/workspace/migrate.rs:613",
+        "crates/ss-magic/src/workspace/migrate.rs:628"
+      ],
+      "evidence": "gitignore.rs:47   let path = git_root.join(\".gitignore\");\ngitignore.rs:261  if cur.join(\".gitignore\").is_file() {\nmigrate.rs:613    git::stage_paths(repo_root, &[\".superset\", \".gitignore\"])?;\nmigrate.rs:628    git::stage_paths(repo_root, &[\".superset\", \".gitignore\"])?;",
+      "problem": "`git::gitignore` is the module that owns reading and writing this file, yet the filename is a bare literal twice inside it and re-spelled twice in the CLI's migrate flow. This is the same shape as the `STATE_REL` / `PIN_FILE` constants the workspace already uses to give an owned path exactly one spelling.",
+      "proposal": "Add `pub const GITIGNORE_FILE: &str = \".gitignore\";` at the top of `crates/ss-magic-core/src/git/gitignore.rs` with a one-line doc saying it is the file every helper in the module reads and appends to. Use it at lines 47 and 261, and have `crates/ss-magic/src/workspace/migrate.rs:613,628` pass `gitignore::GITIGNORE_FILE` in the `stage_paths` slice.",
+      "behavior_preservation": "A `&'static str` constant substituted for the identical literal produces the same `Path::join` result and the same pathspec string. No control flow changes.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": true,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F9",
+      "category": "dead-code",
+      "title": "`#[allow(dead_code)]` on a `pub` field of a `pub` struct in a library crate suppresses nothing",
+      "locations": [
+        "crates/ss-magic-core/src/git/discover.rs:155-156"
+      ],
+      "evidence": "discover.rs:151-156  /// What `git rev-parse --git-common-dir` prints, resolved: …\n    #[allow(dead_code)]\n    pub common_dir: PathBuf,",
+      "problem": "`ss-magic-core` is a library crate and `git::discover::Roots` is publicly reachable from the crate root, so rustc's `dead_code` pass never considers `common_dir` unused. The attribute reads as \"this field is unused\", which contradicts the doc comment right above it (\"part of the answer this walk reproduces, and the matrix pins it against git\") and would keep suppressing a real warning if the struct were ever made private.",
+      "proposal": "Remove the `#[allow(dead_code)]` line at `crates/ss-magic-core/src/git/discover.rs:155`, keeping the doc comment, which already explains why the field exists though the pipeline does not read it.",
+      "behavior_preservation": "A lint attribute has no runtime effect. Verify with `cargo test --workspace --locked` (or `cargo check --workspace`) that no new warning appears; if one does, the attribute is load-bearing and this finding should be dropped. I did not compile-verify, hence confidence 75.",
+      "confidence": 75,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F10",
+      "category": "efficiency",
+      "title": "`ensure_entry` pre-checks existence before reading (extra stat + TOCTOU window)",
+      "locations": [
+        "crates/ss-magic-core/src/git/gitignore.rs:49-77"
+      ],
+      "evidence": "gitignore.rs:49-51  if path.exists() {\n      let contents =\n          fs::read_to_string(&path).with_context(|| format!(\"reading {}\", path.display()))?;\n…\ngitignore.rs:73-76  } else {\n      fs::write(&path, format!(\"{}\\n\", line))",
+      "problem": "The `exists()` probe is a separate stat whose answer is immediately re-derived by the `read_to_string` that follows, and the gap between them is the classic check-then-act window: a `.gitignore` created by a concurrent writer between the two makes this call take the create branch and truncate it via `fs::write`, losing the other writer's rules. Rubric 3 item 5 names this pattern directly.",
+      "proposal": "Operate directly and branch on the error in `crates/ss-magic-core/src/git/gitignore.rs`: `match fs::read_to_string(&path) { Ok(contents) => { …existing append branch… } Err(e) if e.kind() == io::ErrorKind::NotFound => { fs::write(&path, format!(\"{}\\n\", line)).with_context(|| format!(\"creating {}\", path.display()))?; } Err(e) => return Err(e).with_context(|| format!(\"reading {}\", path.display())), }` — the two existing bodies move into the arms unchanged.",
+      "behavior_preservation": "The three observable outcomes are unchanged. A present, readable file takes the same append path with the same `already_present` / trailing-newline logic. An absent file: `exists()` is false today and `read_to_string` returns `NotFound` in the new form, both landing on the create branch with the same `creating {}` context. A present-but-unreadable file (a directory, EACCES): today `exists()` is true and `read_to_string` fails with the `reading {}` context — the new `Err(e)` arm produces the same error with the same context. A dangling symlink behaves identically in both forms (`exists()` follows and reports false; `read_to_string` follows and reports `NotFound`), so `fs::write` still creates through the link in both. One stat syscall is removed and the create/append decision becomes atomic with the read.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F11",
+      "category": "efficiency",
+      "title": "The ancestor walk stats every intermediate directory twice on the hook fast path",
+      "locations": [
+        "crates/ss-magic-core/src/git/discover.rs:224-229",
+        "crates/ss-magic-core/src/git/discover.rs:639-641"
+      ],
+      "evidence": "discover.rs:224-229  match same_device(dir, parent) {\n      Ok(true) => {}\n      Ok(false) => return Discovery::Undecided(\"filesystem boundary\"),\n      Err(_) => return Discovery::Undecided(\"an ancestor could not be inspected\"),\n  }\n  dir = parent;\ndiscover.rs:640  Ok(fs::metadata(a)?.dev() == fs::metadata(b)?.dev())",
+      "problem": "`same_device(dir, parent)` stats both operands, and the next loop iteration calls `same_device(parent, grandparent)`, which stats `parent` again. Every intermediate ancestor of `cwd` is therefore stat'd twice. This runs on the `PreToolUse` path that fires on nearly every tool call, which is the whole reason this module exists.",
+      "proposal": "Carry the device id forward in `discover_with_env`'s loop in `crates/ss-magic-core/src/git/discover.rs`: obtain `dir`'s `dev` once before the loop (declining with `\"an ancestor could not be inspected\"` if that stat fails), and in the loop tail stat only `parent`, compare against the carried value, and assign the parent's dev to the carried variable together with `dir = parent`. `same_device` can then be replaced by a `fn device_of(path: &Path) -> io::Result<u64>` used at both places.",
+      "behavior_preservation": "The comparison and all three decline reasons are unchanged, and the number of ancestors visited is unchanged. One deviation to accept knowingly: today `dir` is re-stat'd on each iteration, so a directory that becomes unstattable DURING the walk is caught; with the value carried forward, only `parent` is stat'd afresh, so that narrow race is no longer observed for `dir`. `dir` was stat'd successfully moments earlier in the same walk, so this changes only race timing, never a steady-state answer. Confidence 75 because that race behavior differs; if strict preservation is required, drop this finding.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F12",
+      "category": "quality",
+      "title": "Plan-id-only comments (`consumed by U11`, `wired into the menu by U10`) record task history, and one is stale",
+      "locations": [
+        "crates/ss-magic-core/src/git/mod.rs:237",
+        "crates/ss-magic-core/src/git/mod.rs:272",
+        "crates/ss-magic-core/src/git/gitignore.rs:115"
+      ],
+      "evidence": "mod.rs:237  // consumed by U11 (reverse sync candidates); wired into the menu by U10\nmod.rs:272  // consumed by U11\ngitignore.rs:115  // consumed by reverse sync (gitignore safety), reachable via the worktree menu",
+      "problem": "These say which plan step introduced the caller, not a rule or an invariant, and the doc comments directly above already state what each function is for. `gitignore.rs:115` is additionally stale: `find_covering_rule` is now reached through `ensure_path_ignored` from `state_tree.rs:46`, `compact_window.rs:259` and `migrate.rs:90` as well, not only \"via the worktree menu\".",
+      "proposal": "Delete the three comment lines. `mod.rs:237`'s and `:272`'s content is already carried by the `///` docs above them (`untracked_files` and `is_ignored` both say they are used by reverse sync) and by the section header at `mod.rs:209`. If a caller list is wanted for `find_covering_rule`, replace `gitignore.rs:115` with a line naming `ensure_path_ignored` as its only caller, which is verifiable in-file.",
+      "behavior_preservation": "Comment-only change; no code is touched.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F13",
+      "category": "duplication",
+      "title": "Test helper `write` in git/tests.rs is byte-identical to `testutil::write_file`",
+      "locations": [
+        "crates/ss-magic-core/src/git/tests.rs:19-23",
+        "crates/ss-magic-core/src/testutil.rs:112-116"
+      ],
+      "evidence": "git/tests.rs:19-23  fn write(root: &Path, rel: &str, body: &str) {\n      let p = root.join(rel);\n      fs::create_dir_all(p.parent().unwrap()).unwrap();\n      fs::write(p, body).unwrap();\n  }\ntestutil.rs:112-116  pub fn write_file(root: &Path, rel: &str, body: &str) { … identical body … }",
+      "problem": "`crates/ss-magic-core/src/testutil.rs` already provides this exact helper, and this same tests.rs already imports from `crate::testutil` (line 2, `git_run`). The pin explicitly makes a re-implemented helper a finding.",
+      "proposal": "Delete `fn write` from `crates/ss-magic-core/src/git/tests.rs:19-23`, add `write_file` to the existing `use crate::testutil::git_run;` import on line 2, and rename the call sites in this file from `write(` to `write_file(`.",
+      "behavior_preservation": "The two bodies are character-for-character the same three statements; every call site passes the same three arguments. Test outcomes are unchanged.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F14",
+      "category": "duplication",
+      "title": "Test helper `git_init` in gitignore/tests.rs hand-rolls a git spawn instead of `testutil::git_run`",
+      "locations": [
+        "crates/ss-magic-core/src/git/gitignore/tests.rs:99-111",
+        "crates/ss-magic-core/src/testutil.rs:42-66"
+      ],
+      "evidence": "gitignore/tests.rs:99-107  fn git_init(root: &Path) {\n      let status = std::process::Command::new(\"git\")\n          .args([\"init\", \"-q\"])\n          .current_dir(root)\n          .stdout(std::process::Stdio::null())\n          .stderr(std::process::Stdio::null())\n          .status().unwrap();",
+      "problem": "`testutil::git_run(args, cwd)` is exactly this — run git in a directory and assert success — and additionally isolates the machine's git identity and `commit.gpgsign`, the isolation every other fixture in the workspace gets. This file already reaches `crate::testutil::neutralize_global_excludes` two lines later (line 110), so the module is already in scope.",
+      "proposal": "In `crates/ss-magic-core/src/git/gitignore/tests.rs`, replace the hand-rolled `Command` block at lines 100-108 with `crate::testutil::git_run(&[\"init\", \"-q\"], root);`, keeping the `neutralize_global_excludes` call and its comment at lines 109-111.",
+      "behavior_preservation": "Both forms run `git init -q` in `root` and panic when it fails; `git init` produces no stdout beyond what `-q` suppresses. The only differences are that git's stderr is captured rather than discarded (it is shown only in the panic message on failure, which is strictly better) and that the child gets the isolating `GIT_CONFIG_*` / identity env — which cannot change the result of `git init` itself and matches every other fixture repo in the suite.",
+      "confidence": 100,
+      "effort": "S",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    },
+    {
+      "id": "core-git-F15",
+      "category": "duplication",
+      "title": "Two test fixtures re-implement `testutil::init_main_repo`, one of them dropping its deliberate `gc.auto 0` guard",
+      "locations": [
+        "crates/ss-magic-core/src/git/tests.rs:6-15",
+        "crates/ss-magic-core/src/git/discover/tests.rs:150-158",
+        "crates/ss-magic-core/src/testutil.rs:82-98"
+      ],
+      "evidence": "discover/tests.rs:152-158  let main = dir.path().join(\"main\");\n  fs::create_dir(&main).unwrap();\n  git_run(&[\"init\", \"-q\", \"-b\", \"main\"], &main);\n  neutralize_global_excludes(&main);\n  fs::write(main.join(\"README.md\"), \"hi\").unwrap();\n  git_run(&[\"add\", \".\"], &main);\n  git_run(&[\"commit\", \"-q\", \"-m\", \"init\"], &main);",
+      "problem": "`testutil::init_main_repo` is the same seven-step sequence (init on a branch, neutralize global excludes, write README.md, add, commit) and additionally sets `gc.auto 0` — added there precisely because a fixture whose `.git` a test walks can otherwise race a background `gc --auto` and fail intermittently. `discover/tests.rs` is exactly such a suite (it stats `.git`, `objects/`, `refs/`, `commondir` on every scenario) and its `pair()` omits that guard; `git/tests.rs::init_repo` repeats the sequence too. Neither can call `init_main_repo` directly because it owns its own tempdir, which is the actual gap.",
+      "proposal": "In `crates/ss-magic-core/src/testutil.rs`, extract the body of `init_main_repo` into `pub fn init_repo_at(root: &Path, branch: &str)` (create nothing; run init/`gc.auto 0`/neutralize/README/add/commit against `root`) and make `init_main_repo(branch)` create the tempdir and call it. Then `discover/tests.rs::pair()` calls `init_repo_at(&main, \"main\")` after its `fs::create_dir(&main)`, and `git/tests.rs::init_repo` calls `init_repo_at(dir.path(), initial_branch)`. `pair()` keeps its sibling layout and its `git worktree add`, which is the part it genuinely needs to control.",
+      "behavior_preservation": "The commands and their order are identical; the fixtures gain the `git config gc.auto 0` call, which only disables background repacking in a throwaway tempdir and cannot change what `discover` or the git probes observe. Confidence 75 rather than 100 because the added config call is a (deliberate, flake-reducing) change to the fixtures rather than a pure no-op.",
+      "confidence": 75,
+      "effort": "M",
+      "touches_safety_check": false,
+      "cross_partition": false,
+      "settled": false,
+      "settled_pin": null
+    }
+  ],
+  "nothing_to_flag": [
+    "Rubric 1 item 2 (standard-library or runtime primitives): nothing. `trim_trailing_newlines`, `head_content_is_valid`, `is_c_space` and `scan_format` deliberately reproduce git's own C semantics byte for byte; a std or crate substitute would not be behavior-equivalent, and the module doc pins them to the equivalence matrix.",
+    "Rubric 1 item 3 (platform, framework, or downstream guarantees): nothing. The one place a platform guarantee is hand-maintained is `discover`'s reimplementation of git's discovery rules, and that is the module's stated purpose (a fast answer byte-equal to git's, or none) — pinned by structure-pins.md.",
+    "Rubric 2 item 1 (redundant state): nothing. `FormatScan`, `Roots`, `Resolved` and `CoveringRule` each carry only fields their consumers read; no cached value duplicates a derivable one.",
+    "Rubric 2 item 2 (parameter sprawl): nothing. `discover_with_env`'s injected `env` closure and `repository_format_check`'s `has_common` are testability/semantic seams of the kind structure-pins.md names as not sprawl.",
+    "Rubric 2 item 4 (leaky abstractions): nothing beyond the visibility point already filed as core-git-F6.",
+    "Rubric 2 item 6 (unnecessary wrapper elements): not applicable — no component-tree UI framework in this partition.",
+    "Rubric 2 item 7 (nested conditionals 3+ levels): nothing. The deepest nesting is `scan_format`'s loop plus one `match`, and `repository_format_check`'s two-level match, which core-git-F5 flattens for a different reason.",
+    "Rubric 2 item 11 (pre-release compatibility scaffolding): nothing. No superseded form is kept for compatibility in these three files.",
+    "Rubric 3 item 2 (missed concurrency): nothing. `ensure_path_ignored`'s probes are strictly ordered (each one's answer decides whether the next runs), and `discover`'s walk is inherently sequential from cwd upward.",
+    "Rubric 3 item 3 (hot-path bloat): nothing new added. The hot path here is `discover`, whose whole design is to remove blocking work; the only wasted work found is filed as core-git-F11.",
+    "Rubric 3 item 4 (recurring no-op updates): not applicable — no polling, event or reducer surface in this partition.",
+    "Rubric 3 item 6 (memory): nothing. Every read is bounded (`read_capped`), and no long-lived structure grows without a bound.",
+    "Rubric 3 item 7 (overly broad operations): nothing. `read_capped` already reads only `cap + 1` bytes; `untracked_files` / `tracked_files` are pathspec-scoped by their callers, and `status_porcelain` short-circuits an empty pathspec list rather than listing the repository.",
+    "Recon leads L2 and L3 (`git::push` and `git::is_ignored` as dead code) were checked and are FALSE: `git::push` is called at crates/ss-magic/src/workspace/migrate.rs:623 and `git::is_ignored` at crates/ss-magic/src/sync/reverse_sync.rs:276. Not reported as findings.",
+    "Recon lead L4 (`is_worktree` reusing `discover::roots`) is out of scope: structure-pins.md and CLAUDE.md's R22 keep every CLI command on the subprocess probes. Not reported.",
+    "Recon lead L6 (`read_capped` shared elsewhere) was checked: no bounded-read equivalent exists in the workspace (`ledger.rs`'s BufReader and `subagent_stop.rs`'s transcript read are different shapes). Not reported.",
+    "Recon lead L12 (`ensure_path_ignored` spawning up to four git processes) is the documented verify-after-write correctness requirement at a secret-safety boundary; thinning it would weaken a safety check. Not reported.",
+    "Recon lead L13 (three timestamp strategies) belongs to the partitions owning sync/reverse_sync.rs and checklist/schema.rs; `timestamp_branch_suffix`'s local-timezone requirement is documented and cannot reuse the UTC helpers. Not reported here."
+  ]
+}

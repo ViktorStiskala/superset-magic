@@ -1,0 +1,66 @@
+[package]
+name = "ss-magic-plugin"
+version = "1.0.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ss-magic-plugin"
+path = "src/main.rs"
+
+# What is absent here is a requirement, not an accident (R2): no `self_update`,
+# no `inquire`, no `ratatui`. The plugin cannot update itself or open a terminal
+# UI by construction rather than by convention, and `ss-magic-core` links none
+# of the three either, so the guarantee survives the shared dependency.
+# `scripts/build-plugin-zip.py --check` asserts the `self_update` half
+# mechanically, and CI runs `cargo tree -i` for all three.
+[dependencies]
+ss-magic-core = { path = "../ss-magic-core" }
+anyhow = "1"
+directories = { version = "6.0.0", default-features = false }
+fd-lock = "4.0.4"
+globset = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Line diffs only, for `setup-github-ci`'s "here is what would change" output.
+# The `ss-magic` CLI declares `features = ["inline"]` for its merge cockpit's
+# intra-line highlighting; nothing here needs that, so it is not asked for.
+similar = { version = "3.1.1", default-features = false, features = ["text"] }
+tempfile = "3"
+walkdir = "2"
+
+[dev-dependencies]
+# The shared test helpers (`ss_magic_core::testutil`): git fixtures and the
+# run-one-test-in-a-child-process seam. A dev-dependency so the feature never
+# reaches a release build.
+ss-magic-core = { path = "../ss-magic-core", features = ["testutil"] }
+
+# The plugin zip rides the plugin's own release, never the CLI's. `working-dir`
+# is load-bearing and easy to omit: a package-level extra-artifact's build
+# command runs with its working directory resolved against the CRATE root, so
+# without it cargo-dist looks for the script at
+# `crates/ss-magic-plugin/scripts/build-plugin-zip.py` and fails — in
+# `build-global-artifacts`, i.e. AFTER the tag is pushed, and invisibly to
+# `dist plan`, which lists the artifact happily and never runs the command.
+# Verify a change here with `dist build --artifacts=global`, never `dist plan`.
+#
+# `artifacts` must name a literal filename (cargo-dist does not template it), so
+# it is a version surface `--check` asserts against the crate version. The build
+# command takes no `--out`: `scripts/build-plugin-zip.py` derives the filename
+# from this manifest's version, so the value is copied here rather than invented
+# twice.
+#
+# dist gives an extra artifact no `.sha256` sibling and no line in `sha256.sum`
+# — both are hardcoded to the per-target archives plus the source tarball. That
+# is why the plugin's integrity pin lives in `.claude-plugin/marketplace.json`,
+# which the Claude Code client verifies before extracting anything.
+[package.metadata.dist]
+# The CLI ships the shell installer; the plugin is delivered by the marketplace,
+# so an installer script for it would be a second, unpinned delivery path.
+installers = []
+
+[[package.metadata.dist.extra-artifacts]]
+artifacts = ["ss-magic-plugin-v1.0.0.zip"]
+build = ["python3", "scripts/build-plugin-zip.py"]
+working-dir = "../.."

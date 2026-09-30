@@ -1,0 +1,33 @@
+[package]
+name = "ss-magic"
+version = "0.11.1"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ss-magic"
+path = "src/main.rs"
+
+[dependencies]
+ss-magic-core = { path = "../ss-magic-core" }
+anyhow = "1"
+bzip2 = "0.6"
+directories = { version = "6.0.0", default-features = false }
+fd-lock = "4.0.4"
+globset = "0.4"
+inquire = "0.9"
+ratatui = "0.30.2"
+self_update = { version = "0.44.0", default-features = false, features = ["ureq", "rustls", "archive-tar", "compression-flate2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = { version = "3.1.1", features = ["inline"] }
+tar = "0.4"
+tempfile = "3"
+walkdir = "2"
+
+[dev-dependencies]
+# The shared test helpers (`ss_magic_core::testutil`): git fixtures and the
+# run-one-test-in-a-child-process seam. A dev-dependency so the feature never
+# reaches a release build.
+ss-magic-core = { path = "../ss-magic-core", features = ["testutil"] }
