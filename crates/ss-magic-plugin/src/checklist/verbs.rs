@@ -588,13 +588,9 @@ fn run_core_with(
 
     match sub {
         Sub::Init { slug } => run_init(&root, cwd, slug, now),
-        Sub::List => run_render(&root, Budget::Bytes(LIST_BYTE_BUDGET), true, out, err),
-        Sub::RenderMd { files, max_bytes } if files.is_empty() && max_bytes.is_none() => {
-            run_render(&root, Budget::Unbounded, false, out, err)
-        }
-        Sub::RenderMd { files, max_bytes } => run_render_files(&root, files, *max_bytes, out, err),
-        Sub::Verify { files } if files.is_empty() => run_verify(&root, out, err),
-        Sub::Verify { files } => run_verify_files(&root, files, out, err),
+        Sub::List => run_list(&root, out, err),
+        Sub::RenderMd { files, max_bytes } => run_render_md(&root, files, *max_bytes, out, err),
+        Sub::Verify { files } => run_verify(&root, files, out, err),
         _ => run_mutation(&root, sub, now),
     }
 }
@@ -748,49 +744,50 @@ fn title_from_slug(stem: &str) -> String {
 
 // ── Reading verbs ─────────────────────────────────────────────────────────────
 
-/// `checklist list` and `checklist render-md`, which differ only in their
-/// destination: `list` is read by whoever ran it and is bounded, `render-md`
-/// is the exact body a CI job posts on a pull request and is not.
-fn run_render(
-    root: &Path,
-    budget: Budget,
-    note_findings: bool,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> Result<ExitCode> {
+/// `checklist list`: the active checklist, rendered for whoever ran the verb
+/// and therefore bounded to [`LIST_BYTE_BUDGET`]. Its sibling `render-md`
+/// ([`run_render_md`]) shares the renderer but is the exact body a CI job
+/// posts on a pull request, unbounded unless `--max-bytes` says otherwise.
+fn run_list(root: &Path, out: &mut dyn Write, err: &mut dyn Write) -> Result<ExitCode> {
     let Some((path, doc)) = load_active(root, err)? else {
         return Ok(refused());
     };
 
     let repo_url = browsable_origin(root);
-    out.write_all(render_markdown(&doc, &path, repo_url.as_deref(), budget).as_bytes())
-        .context("writing the rendered checklist")?;
+    out.write_all(
+        render_markdown(
+            &doc,
+            &path,
+            repo_url.as_deref(),
+            Budget::Bytes(LIST_BYTE_BUDGET),
+        )
+        .as_bytes(),
+    )
+    .context("writing the rendered checklist")?;
 
     // The render is honest about a broken document rather than hiding it, but
     // it is not the gate — `verify` is, and it is what CI runs.
-    if note_findings {
-        let findings = validate(&doc);
-        if has_errors(&findings) {
-            writeln!(
-                err,
-                "{}",
-                style::warn(format!(
-                    "{} error(s) in this checklist — run `ss-magic-plugin checklist verify`",
-                    findings
-                        .iter()
-                        .filter(|f| f.severity == Severity::Error)
-                        .count()
-                ))
-            )?;
-        }
+    let findings = validate(&doc);
+    if has_errors(&findings) {
+        writeln!(
+            err,
+            "{}",
+            style::warn(format!(
+                "{} error(s) in this checklist — run `ss-magic-plugin checklist verify`",
+                findings
+                    .iter()
+                    .filter(|f| f.severity == Severity::Error)
+                    .count()
+            ))
+        )?;
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// `checklist render-md [--max-bytes N] [FILE...]` past the plain
-/// active-checklist form: explicit documents, a byte budget, or both. With no
-/// `FILE` the budget applies to the active checklist alone.
-fn run_render_files(
+/// `checklist render-md [--max-bytes N] [FILE...]`. With no `FILE` it renders
+/// the active checklist, and the budget, when given, applies to it alone; with
+/// no `FILE` and no budget the body is exactly that one document's render.
+fn run_render_md(
     root: &Path,
     files: &[String],
     max_bytes: Option<usize>,
@@ -820,7 +817,8 @@ fn run_render_files(
 }
 
 /// Each document's own [`render_markdown`] output, in order, joined by
-/// [`DOCUMENT_SEPARATOR`] and bounded by `max_bytes` (R16, KTD6).
+/// [`DOCUMENT_SEPARATOR`] and bounded by `max_bytes` (R16, KTD6: the budget
+/// is a document-level cut, so no envelope is ever split mid-text by it).
 ///
 /// The bound covers the whole body, the marker included. When everything fits
 /// nothing is cut. Otherwise the documents are cut only at a document
@@ -839,13 +837,14 @@ fn render_documents(docs: &[Selected], repo_url: Option<&str>, max_bytes: Option
         .iter()
         .map(|d| render_markdown(&d.doc, &d.path, repo_url, Budget::Unbounded))
         .collect();
-    let whole = renders.join(DOCUMENT_SEPARATOR);
-    let Some(max_bytes) = max_bytes else {
-        return whole;
+    // The joined length, without building the join: only a body that fits is
+    // ever emitted whole.
+    let whole_len = renders.iter().map(String::len).sum::<usize>()
+        + DOCUMENT_SEPARATOR.len() * renders.len().saturating_sub(1);
+    let max_bytes = match max_bytes {
+        Some(max_bytes) if whole_len > max_bytes => max_bytes,
+        _ => return renders.join(DOCUMENT_SEPARATOR),
     };
-    if whole.len() <= max_bytes {
-        return whole;
-    }
 
     // The marker naming every document from `first` on. Capped at
     // `MARKER_RESERVE`, separator included, which the flag guarantees is
@@ -947,36 +946,44 @@ fn omitted_marker(omitted: &[&str], max_bytes: usize, limit: usize) -> String {
 /// should be acting on yet. Warnings are printed but do not fail the run —
 /// they describe shape defects the next CLI write repairs on its own, and no
 /// repository's CI should go red over something no reader would notice.
-fn run_verify(root: &Path, out: &mut dyn Write, err: &mut dyn Write) -> Result<ExitCode> {
-    let Some((path, doc)) = load_active(root, err)? else {
-        return Ok(refused());
-    };
-
-    let invalid = report_findings(&display_rel(root, &path), &validate(&doc), false, out, err)?;
-    Ok(if invalid {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    })
-}
-
-/// `checklist verify FILE...`: every document is read before any is judged,
-/// so a refused path stops the run (exit 2) before a verdict is printed, then
-/// each is verified in turn and the run exits 1 when any of them has an error.
-/// Every finding names its document, since several share the stream.
-fn run_verify_files(
+///
+/// With no `FILE` it verifies the active checklist. With `FILE`s, every
+/// document is read before any is judged, so a refused path stops the run
+/// (exit 2) before a verdict is printed, then each is verified in turn and the
+/// run exits 1 when any of them has an error; every finding then names its
+/// document, since several share the stream.
+fn run_verify(
     root: &Path,
     files: &[String],
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<ExitCode> {
-    let Some(docs) = load_explicit(root, files, err)? else {
-        return Ok(refused());
+    let (docs, attribute) = if files.is_empty() {
+        let Some((path, doc)) = load_active(root, err)? else {
+            return Ok(refused());
+        };
+        let active = Selected {
+            display: display_rel(root, &path),
+            path,
+            doc,
+        };
+        (vec![active], false)
+    } else {
+        let Some(docs) = load_explicit(root, files, err)? else {
+            return Ok(refused());
+        };
+        (docs, true)
     };
 
     let mut invalid = false;
     for selected in &docs {
-        invalid |= report_findings(&selected.display, &validate(&selected.doc), true, out, err)?;
+        invalid |= report_findings(
+            &selected.display,
+            &validate(&selected.doc),
+            attribute,
+            out,
+            err,
+        )?;
     }
     Ok(if invalid {
         ExitCode::from(1)
@@ -1600,8 +1607,9 @@ fn load_explicit(
     Ok(Some(docs))
 }
 
-/// R15's checks on one explicit `FILE`, in order, returning the canonical path
-/// the read must use – or the refusal, naming the rule the path broke.
+/// The checks R15 sets for one explicit `FILE`, in order, returning the
+/// canonical path the read must use – or the refusal, naming the rule the path
+/// broke.
 ///
 /// 1. Lexical, the shape [`contained_join`] applies to the pointer: an
 ///    absolute path or a `..` component could name anything on the machine.

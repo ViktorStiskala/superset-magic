@@ -28,9 +28,8 @@
 #   always-loaded budget           CLAUDE.md plus every rule file WITHOUT a
 #                                  `paths:` list totals at most 50,000 bytes
 #
-# The first three used to be inline grep steps in .github/workflows/ci.yml; they
-# live here so they can be run locally before pushing. A guard nobody can run
-# locally is one nobody runs before pushing.
+# They live in a script rather than as inline workflow steps because a guard
+# nobody can run locally is one nobody runs before pushing.
 #
 # docs/plans/ and docs/brainstorms/ are deliberately OUT of every guard's
 # scope: a plan is a historical record and quotes the spellings, links and file
@@ -133,7 +132,7 @@ check_plugin_data() { # root
 check_installer_pin() { # root
     local root=$1
     [ -f "$root/README.md" ] || return 0
-    (cd "$root" && grep -nF -- 'releases/latest/download/' README.md) | sed 's/^/README.md:/' |
+    (cd "$root" && grep -nHF -- 'releases/latest/download/' README.md) |
         sed 's/$/ (latest can resolve to a plugin release with no installer; pin a vX.Y.Z release)/'
     return 0
 }
@@ -154,11 +153,11 @@ check_installer_pin() { # root
 check_bugbot() { # root
     local root=$1 f=".cursor/BUGBOT.md"
     [ -f "$root/$f" ] || return 0
-    (cd "$root" && grep -nF -- '](' "$f") | sed "s|^|$f:|" |
+    (cd "$root" && grep -nHF -- '](' "$f") |
         sed 's/$/ (Markdown link; BUGBOT cannot follow links, restate the rule inline)/'
-    (cd "$root" && grep -nE -- '^ *\[[^]]+\]:' "$f") | sed "s|^|$f:|" |
+    (cd "$root" && grep -nHE -- '^ *\[[^]]+\]:' "$f") |
         sed 's/$/ (Markdown reference definition; BUGBOT cannot follow links, restate the rule inline)/'
-    (cd "$root" && grep -nE -- '\.claude/rules/[A-Za-z0-9._/-]+\.md' "$f") | sed "s|^|$f:|" |
+    (cd "$root" && grep -nHE -- '\.claude/rules/[A-Za-z0-9._/-]+\.md' "$f") |
         sed 's/$/ (names an individual rule file; restate the rule inline)/'
     return 0
 }
@@ -201,7 +200,8 @@ link_scope_files() { # root -> repo-relative paths, one per line
     for p in CLAUDE.md README.md CONTRIBUTING.md CONCEPTS.md; do
         [ -f "$root/$p" ] && printf '%s\n' "$p"
     done
-    for d in .claude/rules docs/runbooks docs/solutions plugin/skills; do
+    rule_files "$root"
+    for d in docs/runbooks docs/solutions plugin/skills; do
         [ -d "$root/$d" ] || continue
         (cd "$root" && find -L "$d" -type f -name '*.md' | LC_ALL=C sort)
     done
