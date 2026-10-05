@@ -406,7 +406,7 @@ fn escape_inline_char(ch: char, out: &mut String) {
 /// that is quoting it, no matter what its author wrote. `<br>` is the only
 /// literal HTML this function ever emits, and it carries none of the input,
 /// so it cannot itself be turned into something else.
-fn prose_inline(text: &str) -> String {
+pub(super) fn prose_inline(text: &str) -> String {
     text.lines()
         .map(|line| {
             let mut escaped = String::with_capacity(line.len());

@@ -285,7 +285,7 @@ fn every_verb_round_trips_through_verify() {
     let (_dir, root) = initialized();
 
     assert_eq!(
-        run_core(&root, &Sub::Verify, NOW).unwrap(),
+        run_core(&root, &Sub::Verify { files: vec![] }, NOW).unwrap(),
         ExitCode::SUCCESS,
         "a freshly initialized checklist is valid"
     );
@@ -328,12 +328,20 @@ fn every_verb_round_trips_through_verify() {
     assert_eq!(done(&root, "check-dns"), ExitCode::SUCCESS);
 
     assert_eq!(
-        run_core(&root, &Sub::Verify, NOW).unwrap(),
+        run_core(&root, &Sub::Verify { files: vec![] }, NOW).unwrap(),
         ExitCode::SUCCESS
     );
     assert_eq!(run_core(&root, &Sub::List, NOW).unwrap(), ExitCode::SUCCESS);
     assert_eq!(
-        run_core(&root, &Sub::RenderMd, NOW).unwrap(),
+        run_core(
+            &root,
+            &Sub::RenderMd {
+                files: vec![],
+                max_bytes: None
+            },
+            NOW
+        )
+        .unwrap(),
         ExitCode::SUCCESS
     );
 
@@ -366,7 +374,7 @@ fn verify_fails_on_a_done_item_with_no_timestamp_and_a_null_expectation() {
     write_raw(&root, &raw);
 
     assert_eq!(
-        run_core(&root, &Sub::Verify, NOW).unwrap(),
+        run_core(&root, &Sub::Verify { files: vec![] }, NOW).unwrap(),
         ExitCode::from(1)
     );
 }
@@ -577,9 +585,12 @@ fn a_document_edited_into_invalid_json_stops_every_verb() {
     fs::write(checklist_path(&root), "{ not json").unwrap();
 
     for sub in [
-        Sub::Verify,
+        Sub::Verify { files: vec![] },
         Sub::List,
-        Sub::RenderMd,
+        Sub::RenderMd {
+            files: vec![],
+            max_bytes: None,
+        },
         Sub::Done {
             id: "check-dns".into(),
         },
@@ -608,7 +619,14 @@ fn a_document_edited_into_invalid_json_stops_every_verb() {
 #[test]
 fn a_repository_with_no_checklist_reports_it() {
     let (_dir, root) = ignored_repo();
-    for sub in [Sub::Verify, Sub::List, Sub::RenderMd] {
+    for sub in [
+        Sub::Verify { files: vec![] },
+        Sub::List,
+        Sub::RenderMd {
+            files: vec![],
+            max_bytes: None,
+        },
+    ] {
         assert_eq!(run_core(&root, &sub, NOW).unwrap(), ExitCode::from(2));
     }
     assert!(!root.join(ACTIONS_REL).exists());
@@ -723,7 +741,7 @@ fn set_keeps_the_two_optionality_conventions_apart() {
     );
     // A null expectation is legal on a record-kind item, so this validates.
     assert_eq!(
-        run_core(&root, &Sub::Verify, NOW).unwrap(),
+        run_core(&root, &Sub::Verify { files: vec![] }, NOW).unwrap(),
         ExitCode::SUCCESS
     );
 }
@@ -938,7 +956,7 @@ fn a_repository_with_no_pointer_falls_back_to_the_naming_convention() {
     fs::remove_file(pointer_path(&root)).unwrap();
 
     assert_eq!(
-        run_core(&root, &Sub::Verify, NOW).unwrap(),
+        run_core(&root, &Sub::Verify { files: vec![] }, NOW).unwrap(),
         ExitCode::SUCCESS
     );
     assert_eq!(
@@ -961,7 +979,7 @@ fn two_checklists_and_no_pointer_is_reported_rather_than_guessed() {
     .unwrap();
 
     assert!(
-        run_core(&root, &Sub::Verify, NOW).is_err(),
+        run_core(&root, &Sub::Verify { files: vec![] }, NOW).is_err(),
         "the ambiguity is surfaced, not resolved by picking one"
     );
 }
@@ -1130,8 +1148,17 @@ fn the_subverb_parse_covers_the_whole_documented_surface() {
         "a missing value is the signal to read stdin"
     );
     assert_eq!(argv(&["list"]), ParsedSub::Run(Sub::List));
-    assert_eq!(argv(&["verify"]), ParsedSub::Run(Sub::Verify));
-    assert_eq!(argv(&["render-md"]), ParsedSub::Run(Sub::RenderMd));
+    assert_eq!(
+        argv(&["verify"]),
+        ParsedSub::Run(Sub::Verify { files: vec![] })
+    );
+    assert_eq!(
+        argv(&["render-md"]),
+        ParsedSub::Run(Sub::RenderMd {
+            files: vec![],
+            max_bytes: None
+        })
+    );
     assert_eq!(argv(&["--help"]), ParsedSub::Help);
     assert_eq!(
         argv(&["init", "--help"]),
@@ -1221,4 +1248,562 @@ fn a_write_leaves_no_temp_file_behind() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(entries, [format!("{STEM}{CHECKLIST_SUFFIX}")]);
+}
+
+// ── Explicit paths (R15) and the render budget (R16) ─────────────────────────
+
+/// Parse `argv` the way `run` does and run the result through the same
+/// `run_core_with` it reaches, with both streams captured so the output itself
+/// can be asserted on. A parse error is returned as the message `run` would
+/// print beside its exit 2.
+fn run_argv(cwd: &Path, argv: &[&str]) -> Result<(ExitCode, String, String), String> {
+    let args: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+    let sub = match parse(&args) {
+        ParsedSub::Run(sub) => sub,
+        ParsedSub::Error(message) => return Err(message),
+        ParsedSub::Help => panic!("{argv:?} is not a help request"),
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_core_with(cwd, &sub, NOW, &mut out, &mut err).unwrap();
+    Ok((
+        code,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    ))
+}
+
+/// [`run_argv`] for an argv that must parse.
+fn run_ok(cwd: &Path, argv: &[&str]) -> (ExitCode, String, String) {
+    run_argv(cwd, argv).unwrap_or_else(|message| panic!("{argv:?} must parse: {message}"))
+}
+
+/// Write a checklist at `docs/actions/<stem>.checklist.json` without touching
+/// the pointer, and return its repository-relative path. `filler` bytes of
+/// description pad the render, so a test can make one document outgrow a
+/// budget while another fits.
+fn write_checklist(root: &Path, stem: &str, filler: usize) -> String {
+    let rel = format!("{ACTIONS_REL}/{stem}{CHECKLIST_SUFFIX}");
+    let mut doc = Document::new(
+        format!("Checklist {}", stem.len()),
+        stem,
+        Timestamp::from_epoch_secs(NOW),
+    );
+    if filler > 0 {
+        doc.sections[0].items.push(Item {
+            id: "pad".into(),
+            title: "padding".into(),
+            created: Timestamp::from_epoch_secs(NOW),
+            steps: vec!["read it".into()],
+            expected: Some(Some("it is long".into())),
+            // Many short lines rather than one long one, so the envelope's
+            // truncation has line boundaries to cut at.
+            description: Some("padding line\n".repeat(filler / 13 + 1)),
+            ..Item::default()
+        });
+    }
+    write_document(&root.join(&rel), &mut doc).unwrap();
+    rel
+}
+
+/// What `render-md` emits for one document on its own, unbounded — the unit
+/// every multi-document body is assembled from. The fixtures have no origin,
+/// so there is no repository line.
+fn single_render(root: &Path, rel: &str) -> String {
+    let path = root.join(rel);
+    render_markdown(
+        &read_document(&path).unwrap().unwrap(),
+        &path,
+        None,
+        Budget::Unbounded,
+    )
+}
+
+#[test]
+fn verify_with_one_explicit_valid_path_reports_it_valid() {
+    let (_dir, root) = ignored_repo();
+    let a = write_checklist(&root, "2026-08-a", 0);
+
+    let (code, out, _) = run_ok(&root, &["verify", &a]);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(out.contains(&format!("{a} is valid")), "{out}");
+}
+
+/// Several paths are verified one by one; an error in any of them fails the
+/// whole run with the "invalid document" code, and names the one at fault.
+#[test]
+fn verify_over_several_paths_exits_1_and_names_the_invalid_one() {
+    let (_dir, root) = ignored_repo();
+    let a = write_checklist(&root, "2026-08-a", 0);
+    let b = write_checklist(&root, "2026-08-b", 0);
+    let mut doc = read_document(&root.join(&b)).unwrap().unwrap();
+    // A check-kind item with no steps and a null expectation: two errors.
+    doc.sections[0].items.push(Item {
+        id: "unfinished".into(),
+        title: "not filled in".into(),
+        created: Timestamp::from_epoch_secs(NOW),
+        expected: Some(None),
+        ..Item::default()
+    });
+    write_document(&root.join(&b), &mut doc).unwrap();
+
+    let (code, out, err) = run_ok(&root, &["verify", &a, &b]);
+    assert_eq!(code, ExitCode::from(1));
+    assert!(out.contains(&format!("{a} is valid")), "{out}");
+    assert!(err.contains(&format!("{b} is not valid")), "{err}");
+    assert!(
+        err.lines()
+            .filter(|l| l.contains("error:"))
+            .all(|l| l.contains(&b)),
+        "every finding is attributed to the document it is in:\n{err}"
+    );
+}
+
+/// Several documents render as each one's own `render()`, in argument order,
+/// joined by the fixed separator and nothing else — no heading of the verb's
+/// own, since every render already carries its title inside its envelope.
+#[test]
+fn render_md_over_several_paths_joins_each_render_in_argument_order() {
+    let (_dir, root) = ignored_repo();
+    let a = write_checklist(&root, "2026-08-a", 0);
+    let b = write_checklist(&root, "2026-08-b", 0);
+
+    let whole = format!(
+        "{}{DOCUMENT_SEPARATOR}{}",
+        single_render(&root, &b),
+        single_render(&root, &a)
+    );
+    let (code, out, _) = run_ok(&root, &["render-md", &b, &a]);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(out, whole);
+    assert_eq!(out.matches("BEGIN-UNTRUSTED-DATA").count(), 2);
+
+    // A budget the whole body fits in cuts nothing, even though the room it
+    // would set aside for a marker leaves less than the body needs.
+    let max = whole.len().max(MARKER_RESERVE).to_string();
+    let (code, out, _) = run_ok(&root, &["render-md", "--max-bytes", &max, &b, &a]);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(out, whole);
+}
+
+/// AE2: the budget cuts at a document boundary. The first document fits and
+/// renders whole; the second is omitted entirely and named in the marker.
+#[test]
+fn render_md_budget_stops_before_a_document_that_would_cross_it() {
+    let (_dir, root) = ignored_repo();
+    let a = write_checklist(&root, "2026-08-a", 0);
+    let b = write_checklist(&root, "2026-08-b", 20_000);
+    let first = single_render(&root, &a);
+    let max = first.len() + MARKER_RESERVE + 100;
+
+    let (code, out, _) = run_ok(
+        &root,
+        &["render-md", "--max-bytes", &max.to_string(), &a, &b],
+    );
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(out.len() <= max, "{} > {max}", out.len());
+    assert!(
+        out.starts_with(&format!("{first}{DOCUMENT_SEPARATOR}")),
+        "{out}"
+    );
+    let marker = &out[first.len() + DOCUMENT_SEPARATOR.len()..];
+    assert!(marker.contains(&prose_inline(&b)), "{marker}");
+    assert!(
+        !out.contains("padding line"),
+        "nothing of the omitted document leaks in"
+    );
+}
+
+/// AE2 when the first document fills nearly the whole budget: the room set
+/// aside is the marker this cut actually needs, not a flat reserve, so a first
+/// document that fits beside its real marker renders whole rather than being
+/// truncated to make space nothing uses.
+#[test]
+fn render_md_budget_renders_a_first_document_whole_when_it_fits_beside_the_marker() {
+    let (_dir, root) = ignored_repo();
+    let a = write_checklist(&root, "2026-08-a", 3_000);
+    let b = write_checklist(&root, "2026-08-b", 20_000);
+    let first = single_render(&root, &a);
+    // Less slack than the flat reserve, but more than a one-name marker takes.
+    let max = first.len() + 1_000;
+    assert!(
+        max >= MARKER_RESERVE,
+        "the fixture must be a budget the flag accepts"
+    );
+
+    let (code, out, _) = run_ok(
+        &root,
+        &["render-md", "--max-bytes", &max.to_string(), &a, &b],
+    );
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(out.len() <= max, "{} > {max}", out.len());
+    assert!(
+        out.starts_with(&format!("{first}{DOCUMENT_SEPARATOR}")),
+        "the first document renders whole:\n{out}"
+    );
+    assert!(!out.contains("body truncated"), "{out}");
+    let marker = &out[first.len() + DOCUMENT_SEPARATOR.len()..];
+    assert!(marker.contains(&prose_inline(&b)), "{marker}");
+}
+
+/// When not even a truncated first document fits beside the marker, the
+/// marker is the whole body, and the run still succeeds: an over-budget
+/// comment is a fact to report, not a failure of the job. Enough long names
+/// follow the first document that the marker naming them fills the smallest
+/// budget the flag accepts, leaving no room for any of the first one.
+#[test]
+fn render_md_budget_with_nothing_fitting_emits_the_marker_alone() {
+    let (_dir, root) = ignored_repo();
+    let names: Vec<String> = (0..20)
+        .map(|i| {
+            write_checklist(
+                &root,
+                &format!("2026-08-{}-{i:03}", "n".repeat(180)),
+                20_000,
+            )
+        })
+        .collect();
+    let max = MARKER_RESERVE.to_string();
+    let mut argv = vec!["render-md", "--max-bytes", &max];
+    argv.extend(names.iter().map(String::as_str));
+
+    let (code, out, _) = run_ok(&root, &argv);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(out.len() <= MARKER_RESERVE, "{}", out.len());
+    assert!(!out.contains("BEGIN-UNTRUSTED-DATA"), "{out}");
+    assert!(!out.contains(DOCUMENT_SEPARATOR), "{out}");
+    assert!(
+        out.contains(&format!("{} checklist(s) left out", names.len())),
+        "{out}"
+    );
+    assert!(out.contains(&prose_inline(&names[0])), "{out}");
+}
+
+/// The marker is itself bounded: a hundred long names cannot push the body
+/// past the budget, and the names that did not fit are counted, not dropped
+/// silently.
+#[test]
+fn render_md_budget_caps_the_marker_listing() {
+    let (_dir, root) = ignored_repo();
+    let names: Vec<String> = (0..100)
+        .map(|i| write_checklist(&root, &format!("2026-08-{}-{i:03}", "n".repeat(180)), 0))
+        .collect();
+    let max = MARKER_RESERVE + 1_000;
+    let mut argv = vec!["render-md", "--max-bytes"];
+    let max_text = max.to_string();
+    argv.push(&max_text);
+    argv.extend(names.iter().map(String::as_str));
+
+    let (code, out, _) = run_ok(&root, &argv);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(out.len() <= max, "{} > {max}", out.len());
+
+    let last = out.trim_end().lines().last().unwrap();
+    let more: usize = last
+        .strip_prefix("- … and ")
+        .and_then(|rest| rest.strip_suffix(" more"))
+        .unwrap_or_else(|| panic!("the marker ends with the overflow count, not {last:?}"))
+        .parse()
+        .unwrap();
+    let rendered = out.matches("BEGIN-UNTRUSTED-DATA").count();
+    let listed = names
+        .iter()
+        .filter(|name| out.contains(&format!("- {}\n", prose_inline(name))))
+        .count();
+    assert!(listed > 0, "the marker lists what fits:\n{out}");
+    assert_eq!(rendered + listed + more, names.len(), "{out}");
+}
+
+/// A name the repository chose reaches the marker escaped: a backtick cannot
+/// open a code span and a newline cannot start a Markdown line of its own.
+#[test]
+fn an_omitted_name_cannot_break_out_of_the_marker() {
+    let (_dir, root) = ignored_repo();
+    let a = write_checklist(&root, "2026-08-a", 0);
+    let hostile = write_checklist(&root, "2026-08-a`b\n# c", 20_000);
+    // A lone carriage return is a CommonMark line ending too, though
+    // `str::lines` does not split on it: unescaped, it would start a fenced
+    // code block swallowing the rest of the comment.
+    let fence = write_checklist(&root, "2026-08-a\r~~~x", 20_000);
+    let max = single_render(&root, &a).len() + MARKER_RESERVE + 100;
+
+    let (code, out, _) = run_ok(
+        &root,
+        &[
+            "render-md",
+            "--max-bytes",
+            &max.to_string(),
+            &a,
+            &hostile,
+            &fence,
+        ],
+    );
+    assert_eq!(code, ExitCode::SUCCESS);
+    let marker = out.rsplit(DOCUMENT_SEPARATOR).next().unwrap();
+    assert!(marker.contains("a\\`b<br>\\# c"), "{marker}");
+    assert!(!marker.contains("a`b"), "{marker}");
+    assert!(marker.contains("a<br>~~~x"), "{marker:?}");
+    assert!(!marker.contains('\r'), "{marker:?}");
+    assert!(
+        !marker
+            .split(['\r', '\n'])
+            .any(|line| line.starts_with('#') || line.starts_with("~~~")),
+        "no line of the marker is a block the name opened:\n{marker}"
+    );
+}
+
+/// A first document too big for the budget on its own still shows its head:
+/// it is truncated INSIDE its envelope, with the envelope's own notice naming
+/// where the whole text is, and the body stays within the budget.
+#[test]
+fn render_md_budget_truncates_an_oversized_first_document_inside_its_envelope() {
+    let (_dir, root) = ignored_repo();
+    let big = write_checklist(&root, "2026-08-big", 40_000);
+    let max = 8_000;
+
+    let (code, out, _) = run_ok(&root, &["render-md", "--max-bytes", &max.to_string(), &big]);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(
+        single_render(&root, &big).len() > max,
+        "the fixture must outgrow the budget"
+    );
+    assert!(out.len() <= max, "{} > {max}", out.len());
+    assert!(out.contains("The whole text is at"), "{out}");
+    assert!(
+        out.contains("END-UNTRUSTED-DATA"),
+        "the envelope is closed:\n{out}"
+    );
+    assert!(out.contains("padding line"), "the document's head is shown");
+}
+
+/// Each lexical refusal of R15 exits 2 and says which rule the path broke.
+#[test]
+fn explicit_paths_that_break_a_lexical_rule_are_refused_with_the_reason() {
+    let (_dir, root) = ignored_repo();
+    let a = write_checklist(&root, "2026-08-a", 0);
+    fs::create_dir_all(root.join("docs/actions/sub")).unwrap();
+    fs::copy(
+        root.join(&a),
+        root.join("docs/actions/sub/x.checklist.json"),
+    )
+    .unwrap();
+    fs::copy(root.join(&a), root.join("docs/actions/notes.json")).unwrap();
+    let absolute = root.join(&a).to_string_lossy().into_owned();
+
+    for (path, reason) in [
+        (absolute.as_str(), "absolute"),
+        ("docs/actions/../actions/2026-08-a.checklist.json", "`..`"),
+        (
+            "docs/actions/notes.json",
+            "docs/actions/<stem>.checklist.json",
+        ),
+        (
+            "docs/actions/sub/x.checklist.json",
+            "docs/actions/<stem>.checklist.json",
+        ),
+    ] {
+        for verb in ["verify", "render-md"] {
+            let (code, out, err) = run_ok(&root, &[verb, path]);
+            assert_eq!(code, ExitCode::from(2), "{verb} {path}");
+            assert!(err.contains(reason), "{verb} {path}: {err}");
+            assert!(out.is_empty(), "{verb} {path} printed {out}");
+        }
+    }
+}
+
+/// AE3: a checklist path that is a symlink is refused before anything is read
+/// through it — the link's target never reaches the output.
+#[test]
+fn a_symlinked_checklist_path_is_refused_and_never_read() {
+    let (_dir, root) = ignored_repo();
+    let outside = TempDir::new().unwrap();
+    let target = outside.path().join("secret.checklist.json");
+    let mut doc = Document::new(
+        "OUTSIDE-SECRET-TITLE",
+        "secret",
+        Timestamp::from_epoch_secs(NOW),
+    );
+    write_document(&target, &mut doc).unwrap();
+    fs::create_dir_all(root.join(ACTIONS_REL)).unwrap();
+    let link = format!("{ACTIONS_REL}/2026-08-x{CHECKLIST_SUFFIX}");
+    std::os::unix::fs::symlink(&target, root.join(&link)).unwrap();
+
+    for verb in ["verify", "render-md"] {
+        let (code, out, err) = run_ok(&root, &[verb, &link]);
+        assert_eq!(code, ExitCode::from(2), "{verb}");
+        assert!(err.contains("is a symlink"), "{verb}: {err}");
+        assert!(!out.contains("OUTSIDE-SECRET") && !err.contains("OUTSIDE-SECRET"));
+    }
+
+    // A link is refused for being a link, not for where it leads: one to a
+    // valid checklist inside the repository is refused just the same.
+    let a = write_checklist(&root, "2026-08-a", 0);
+    let inner = format!("{ACTIONS_REL}/2026-08-y{CHECKLIST_SUFFIX}");
+    std::os::unix::fs::symlink(root.join(&a), root.join(&inner)).unwrap();
+    let (code, _, err) = run_ok(&root, &["verify", &inner]);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(err.contains("is a symlink"), "{err}");
+}
+
+/// The convention's case fold is shared with the checklist deny: an uppercase
+/// directory is never refused for its spelling. Whether it then reads depends
+/// only on whether the filesystem folds case too.
+#[test]
+fn an_uppercase_directory_is_treated_exactly_as_the_deny_treats_it() {
+    let (_dir, root) = ignored_repo();
+    let a = write_checklist(&root, "2026-08-a", 0);
+    let upper = a.replacen("docs", "DOCS", 1);
+    assert!(matches_convention(&root, &root.join(&upper)));
+
+    let (code, _, err) = run_ok(&root, &["verify", &upper]);
+    assert!(!err.contains("docs/actions/<stem>.checklist.json"), "{err}");
+    if root.join("DOCS").exists() {
+        assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    } else {
+        assert_eq!(code, ExitCode::from(2));
+        assert!(err.contains("does not exist"), "{err}");
+    }
+}
+
+/// Containment is judged on the canonical form: a `docs/actions` that is a
+/// symlinked directory leading out of the repository is refused, while a
+/// repository whose own root sits behind a symlink (as macOS's `/tmp` does)
+/// still accepts its own files.
+#[test]
+fn canonical_containment_refuses_an_escape_but_not_a_symlinked_root() {
+    let (dir, root) = ignored_repo();
+    let outside = TempDir::new().unwrap();
+    let mut doc = Document::new("OUTSIDE-SECRET-TITLE", "x", Timestamp::from_epoch_secs(NOW));
+    write_document(&outside.path().join("2026-08-x.checklist.json"), &mut doc).unwrap();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join(ACTIONS_REL)).unwrap();
+
+    let escaping = format!("{ACTIONS_REL}/2026-08-x{CHECKLIST_SUFFIX}");
+    let (code, out, err) = run_ok(&root, &["render-md", &escaping]);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(err.contains("outside the repository"), "{err}");
+    assert!(!out.contains("OUTSIDE-SECRET") && !err.contains("OUTSIDE-SECRET"));
+
+    // The same repository, entered through a link to its root.
+    fs::remove_file(root.join(ACTIONS_REL)).unwrap();
+    let a = write_checklist(&root, "2026-08-a", 0);
+    let links = TempDir::new().unwrap();
+    let via = links.path().join("repo");
+    std::os::unix::fs::symlink(dir.path(), &via).unwrap();
+    let (code, out, err) = run_ok(&via, &["verify", &a]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(out.contains(&format!("{a} is valid")), "{out}");
+
+    // `git` already hands back a physical root, so the entry point alone
+    // cannot show the root being canonicalized too; the loader is asked
+    // directly with the root spelled through the link.
+    let loaded = load_explicit(&via, &[a.clone()], &mut Vec::new()).unwrap();
+    assert_eq!(loaded.map(|docs| docs.len()), Some(1));
+}
+
+/// The explicit route neither reads nor writes the pointer: one naming a
+/// document that does not exist changes nothing about which file is read, and
+/// is left byte-for-byte as it was.
+#[test]
+fn the_explicit_route_never_reads_or_writes_the_pointer() {
+    let (_dir, root) = initialized();
+    let pointer = pointer_path(&root);
+    fs::write(
+        &pointer,
+        r#"{"path":"docs/actions/2026-08-gone.checklist.json","slug":"2026-08-gone","recorded_at":"2026-08-30T12:00:00Z"}"#,
+    )
+    .unwrap();
+    let before = fs::read(&pointer).unwrap();
+    let rel = format!("{ACTIONS_REL}/{STEM}{CHECKLIST_SUFFIX}");
+
+    let (code, out, _) = run_ok(&root, &["verify", &rel]);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(out.contains(&format!("{rel} is valid")), "{out}");
+    let (code, _, _) = run_ok(&root, &["render-md", &rel]);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(fs::read(&pointer).unwrap(), before);
+}
+
+/// Any `-`-prefixed token the verb does not know is a usage error, never a
+/// path — and `--max-bytes` belongs to `render-md` alone, needs a number, and
+/// refuses one too small to hold the marker the budget guarantees.
+#[test]
+fn unknown_flags_and_malformed_budgets_are_usage_errors() {
+    let (_dir, root) = ignored_repo();
+    for argv in [
+        vec!["verify", "--bogus"],
+        vec![
+            "render-md",
+            "--bogus",
+            "docs/actions/2026-08-a.checklist.json",
+        ],
+        vec!["verify", "--max-bytes", "60000"],
+        vec!["render-md", "--max-bytes"],
+        vec!["render-md", "--max-bytes", "lots"],
+        vec!["render-md", "--max-bytes", "10"],
+        vec!["render-md", "--max-bytes", "60000", "--max-bytes", "60000"],
+        vec!["list", "docs/actions/2026-08-a.checklist.json"],
+    ] {
+        assert!(run_argv(&root, &argv).is_err(), "{argv:?} must be refused");
+    }
+    let message = run_argv(&root, &["verify", "--bogus"]).unwrap_err();
+    assert!(message.contains("--bogus"), "{message}");
+
+    let max = (MARKER_RESERVE + 1).to_string();
+    let files = |sub: Sub| match sub {
+        Sub::RenderMd { files, max_bytes } => (files, max_bytes),
+        other => panic!("{other:?}"),
+    };
+    let ParsedSub::Run(sub) = parse(
+        &[
+            "render-md",
+            "--max-bytes",
+            &max,
+            "docs/actions/a.checklist.json",
+        ]
+        .map(String::from),
+    ) else {
+        panic!("the documented flag order must parse");
+    };
+    assert_eq!(
+        files(sub),
+        (
+            vec!["docs/actions/a.checklist.json".to_string()],
+            Some(MARKER_RESERVE + 1)
+        )
+    );
+}
+
+/// With no FILE the verbs keep today's route: two documents and no pointer is
+/// still the ambiguity it always was.
+#[test]
+fn with_no_paths_and_no_pointer_two_documents_are_still_ambiguous() {
+    let (_dir, root) = ignored_repo();
+    write_checklist(&root, "2026-08-a", 0);
+    write_checklist(&root, "2026-08-b", 0);
+
+    for argv in [["verify"], ["render-md"]] {
+        let args: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        let ParsedSub::Run(sub) = parse(&args) else {
+            panic!("{argv:?}")
+        };
+        let err = run_core_with(&root, &sub, NOW, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+        assert!(format!("{err:#}").contains("holds several"), "{err:#}");
+    }
+}
+
+/// With no FILE and a pointer, the pointed document is the one used.
+#[test]
+fn with_no_paths_the_pointer_still_picks_the_document() {
+    let (_dir, root) = ignored_repo();
+    write_checklist(&root, "2026-08-a", 0);
+    assert_eq!(init(&root, "2026-08-b"), ExitCode::SUCCESS);
+    let b = format!("{ACTIONS_REL}/2026-08-b{CHECKLIST_SUFFIX}");
+
+    let (code, out, _) = run_ok(&root, &["verify"]);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(out.contains(&format!("{b} is valid")), "{out}");
+
+    let (code, out, _) = run_ok(&root, &["render-md"]);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(out, single_render(&root, &b));
 }
