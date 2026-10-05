@@ -4,14 +4,14 @@ The unified sync engine is the ONE path that writes untracked (secret) files int
 the shared main checkout, and `pack` archives the configured files, so both are
 secret-leak surfaces. Two constraints are load-bearing here: violating either is a
 secret leak, not a cosmetic bug. Each is backed by a `docs/solutions/` write-up of
-the real incident this run fixed.
+a real incident.
 
 - **Determine "is this a secret?" POSITIVELY, and fail closed.** The
   gitignore-in-main gate must fire for a git-UNTRACKED worktree source, decided by
   POSITIVE tracked determination (`!git::tracked_files(...).contains(rel)`) so that
   anything NOT positively known-tracked (a non-UTF-8 / NFD-vs-NFC / otherwise
   unenumerable name) defaults to secret and runs the gate. NEVER derive
-  untracked-ness by ABSENCE from an untracked set (`untracked.contains(rel)`) — a
+  untracked-ness by ABSENCE from an untracked set (`untracked.contains(rel)`) – a
   lookup miss then lands on the permissive side and leaks. Rule for any security
   gate: phrase the question so the UNKNOWN answer is the SAFE one. See
   [docs/solutions/logic-errors/secret-gate-positive-tracked-determination-fail-closed.md](../../docs/solutions/logic-errors/secret-gate-positive-tracked-determination-fail-closed.md).
@@ -38,9 +38,10 @@ the real incident this run fixed.
 
 ## Plugin constraints (hard rules)
 
-The plugin adds three surfaces with their own failure modes. Each rule below is
-backed by a `docs/solutions/` write-up of the real incident behind it, except the
-last, which is backed by the eight-bypass sequence recorded in this file.
+The plugin adds three surfaces with their own failure modes. The first two rules
+below are each backed by a `docs/solutions/` write-up of the real incident behind
+it; the third records a design posture with no write-up; the last is backed by the
+eight-bypass sequence recorded in this file.
 
 - **Never build "consume exactly once" on `unlink`'s error, and never validate
   an exclusivity property sequentially.** Measured here: 8 threads racing to

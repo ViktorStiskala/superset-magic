@@ -65,12 +65,12 @@ use ss_magic_core::style;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Version of the `--json` shape. Bumped when a key changes meaning or goes
-/// away, so a caller pinned to an older reading can tell. `2` is the
-/// workspace-split shape: `versions.cli` became `versions.running` (the
-/// plugin's own version, on its own release line), and `versions` gained
-/// `newest_release` and `update_available` beside the new top-level
-/// `compaction` section. A reader of shape `1` looking for `versions.cli`
-/// finds nothing, which is why the number moved.
+/// away, so a caller pinned to an older reading can tell. Shape `2` reports the
+/// running plugin's own version (on its own release line) as
+/// `versions.running`, carries `newest_release` and `update_available` in
+/// `versions`, and has a top-level `compaction` section. A reader written for
+/// shape `1` expects `versions.cli`, which shape `2` does not have, so it can
+/// tell from this number that it is reading a different shape.
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// The events the shipped `hooks/hooks.json` actually registers.

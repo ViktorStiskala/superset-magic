@@ -12,8 +12,9 @@ Rust toolchain is provided by `rustup` (cargo on `~/.cargo/bin`).
 The repository is a Cargo **workspace with three members**: the root
 `Cargo.toml` is a virtual manifest (no `[package]`) owning `[workspace.package]`
 (edition, repository, license) and BOTH profiles – `[profile.release]` with
-`opt-level = "z"` (a measured decision, KTD9 of the workspace-split plan; do not
-tune it per crate) and `[profile.dist]` inheriting it. Members live under
+`opt-level = "z"` (a measured decision, KTD9 of the workspace-split plan:
+`opt-level = 3` ran about 0.13 ms faster for a hook binary 47 percent larger; do
+not tune it per crate) and `[profile.dist]` inheriting it. Members live under
 `crates/`:
 
 - `crates/ss-magic-core` – the shared library. `publish = false` plus
@@ -61,23 +62,25 @@ AFTER the tag is pushed and invisibly to `dist plan`. Verify a change there with
 
 The per-target release archives are attested (cargo-dist `github-attestations` →
 `actions/attest` in `build-local-artifacts`, Sigstore/Rekor provenance;
-user-facing verification via `gh attestation verify` – see README, which now
-covers BOTH archive names). The self-update path is unchanged and still trusts
-TLS + cargo-dist checksums, not attestations. Note the attesting build job
+user-facing verification via `gh attestation verify` – see
+[README.md](../../README.md), which covers BOTH archive names). The self-update
+path trusts TLS + cargo-dist checksums, not attestations. Note the attesting build job
 necessarily runs third-party build scripts with `id-token: write` live –
 inherent to the feature; the default (build-local) phase is deliberate because
 it signs same-job build output before artifacts transit Actions storage, and
 changing the phase is a security decision. End-user install instructions (the
-installer script and prebuilt-binary download) live in README.md; from-source
-builds and the rest of the contributor docs (tests, PR expectations, the
-per-line release procedure) live in CONTRIBUTING.md.
+installer script and prebuilt-binary download) live in
+[README.md](../../README.md); from-source builds and the rest of the contributor
+docs (tests, PR expectations, the per-line release procedure) live in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).
 
 ### The packaged plugin tree and its version surfaces
 
 `plugin/` is the packaged marketplace tree (`.claude-plugin/plugin.json`,
 `hooks/hooks.json`, `hooks/bootstrap.sh`, `hooks/run-hook.sh`,
-`bin/ss-magic-plugin`, `lib/tmproot.sh`, `lib/execguard.sh`, `skills/`,
-`ss-magic-plugin.version`); `scripts/build-plugin-zip.py` packs it
+`bin/ss-magic-plugin`, `lib/tmproot.sh`, `lib/execguard.sh`, `skills/` (three
+skills: `scratchpad`, `operator-checklist` with its `reference.md`, and
+`setup-github-ci`), `ss-magic-plugin.version`); `scripts/build-plugin-zip.py` packs it
 byte-reproducibly (sorted entries, fixed 1980-01-01 timestamps, normalized
 modes, STORED not deflated, `create_system` forced to unix, `.DS_Store`
 excluded, symlinks and non-ASCII names refused loudly), and
@@ -93,15 +96,14 @@ one group:
 
 The README pin is the one non-equality surface: it names the last PUBLISHED CLI
 release, so `--check` requires only that it be a well-formed `v` + triple not
-exceeding the crate version. Equality was the obvious rule and is wrong – the
-release procedure is bump → merge → tag, so an equality assertion would make
+exceeding the crate version. An equality rule would be wrong: the release
+procedure is bump → merge → tag, so an equality assertion would make
 main's README name an unreleased tag (and 404 the documented install command)
 for the whole window between a merged bump and a published release. A lagging
 pin names an older release that still works.
 
 Do not work from a remembered count – `--check` enumerates the surfaces and is
-the authority; this doc said "four" while the script checked seven, and the gap
-surfaced only when a release check failed. Verify with `python3
+the authority. Verify with `python3
 scripts/build-plugin-zip.py --check`; after any change under `plugin/`, re-pin
 with `--update-manifest` then re-run `--check`. `.gitattributes` marks
 `plugin/**` as `-text` so a checkout's line-ending conversion can never move the

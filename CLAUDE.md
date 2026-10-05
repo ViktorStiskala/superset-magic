@@ -2,13 +2,14 @@
 
 Two Rust binaries for the Superset workspace contract (standalone repo:
 `ViktorStiskala/superset-magic`): `ss-magic`, the interactive sync CLI, and
-`ss-magic-plugin`, the Claude Code plugin. See README.md for user-facing docs.
+`ss-magic-plugin`, the Claude Code plugin. See [README.md](./README.md) for
+user-facing docs.
 
 This file is the index. The contributor instructions live in `.claude/rules/`:
 three rule files load in every session, and four architecture maps load only
 when a file they cover is read, written or edited. A read through `cat` or
-`sed` in a shell does NOT load a map, so open the map named below before
-changing or explaining a file it covers.
+`sed` in a shell does NOT load a map, so open the map named in the table below
+before changing or explaining a file it covers.
 
 | Rule file | Loads | Read this before |
 |---|---|---|
@@ -64,50 +65,37 @@ flowchart TB
   plug --> core
 ```
 
-The two binaries depend on core and NEVER on each other. There is no code path
-from one to the other, and that is the whole point of the split: the plugin
-crate links neither `self_update` nor `inquire`/`ratatui`, so it cannot
-self-update or open a TUI even by mistake.
+The two binaries depend on core and never on each other, so no code path runs
+from one into the other. The plugin crate links neither `self_update` nor
+`inquire`/`ratatui`, so it cannot self-update or open a TUI even by mistake.
 
-`crates/ss-magic-core/src/` (library `ss-magic-core`, crate name
-`ss_magic_core`) owns what both binaries need: `git/` (probes, `gitignore`,
-`discover`), `hashing.rs`, `style.rs` (palette + color decision, NO `inquire`),
-`sync/` (the pure half: `EXCLUDED_TREES`, `pattern`, `repo_scan`, `apply`),
-`superset_files.rs`, `reponame.rs` (`repo_name_stem` and friends, extracted
-from `pack.rs`), `state_tree.rs` (`STATE_REL` and `ensure_state_ignored`, the
-`.superset/.magic` path's one owner) and `release.rs` (the per-line GitHub
-release check, formerly `update/check.rs`). `testutil.rs` holds the shared test
-helpers, compiled only under `cfg(test)` or the `testutil` feature.
+**`ss-magic-core`** (`crates/ss-magic-core/src/`, crate `ss_magic_core`) is
+the shared library: `git/`, `hashing.rs`, `style.rs` (no `inquire`), the pure
+half of `sync/`, `superset_files.rs`, `reponame.rs`, `state_tree.rs` (sole
+owner of the `.superset/.magic` path and its ignore rule), `release.rs` and
+`testutil.rs`. Map: [.claude/rules/architecture-core.md](./.claude/rules/architecture-core.md).
 
-`crates/ss-magic/src/` (binary `ss-magic`) keeps `main.rs`, `cli.rs`,
-`pack.rs` (the engine; it re-exports `repo_name_stem`), `sync/{mod,
-reverse_sync, merge}.rs` (the interactive half – they drive the cockpit – with
-`sync/mod.rs` re-exporting core's `apply`/`pattern`/`repo_scan`/
-`under_excluded_tree`), `tui/` (plus `tui/theme.rs`, which installs the
-`inquire` render config from `style::enabled()`; `tui/mod.rs` re-exports
-core's `style`), `workspace/{mod, migrate}.rs` (`workspace/mod.rs` re-exports
-core's `superset_files`), `update/{mod, apply}.rs`, and the crate-root tests
-under `tests/`. `main.rs` re-exports core's `git` and `hashing` under their old
-`crate::` names, so a path inside the CLI reads exactly as it did before the
-split.
+**`ss-magic`** (`crates/ss-magic/src/`) is the sync CLI: `main.rs`, `cli.rs`,
+`pack.rs`, `sync/`, `tui/`, `workspace/`, `update/`, `src/tests/`. `main.rs`
+re-exports core's `git` and `hashing` under `crate::`; other modules re-export
+the rest, except `release` and `state_tree`, which are imported by path.
+Map: [.claude/rules/architecture-cli.md](./.claude/rules/architecture-cli.md).
 
-`crates/ss-magic-plugin/src/` (binary `ss-magic-plugin`) is the former
-`crates/ss-magic/src/plugin/` tree moved wholesale, with the old `plugin/mod.rs`
-becoming the crate root `main.rs`; it has its own section below. It re-exports
-core's `git` and `hashing` under `crate::` too, so every `crate::git::…` path
-inside it still resolves, but it reaches the rest of core by real paths – the
-two names that MOVED are `ss_magic_core::style` (the plugin has no `tui/`
-module, so the CLI's old `crate::tui::style` spelling does not exist there) and
-`ss_magic_core::reponame::repo_name_stem` (the plugin's identity slug used to
-borrow it through `crate::pack`).
+**`ss-magic-plugin`** (`crates/ss-magic-plugin/src/`, root `main.rs`) is the
+hook runtime and verb tree. `main.rs` re-exports core's `git` and `hashing`,
+`scratchpad.rs` re-exports `STATE_REL`, `ensure_state_ignored` and `now_secs`;
+the rest (`style`, `superset_files`, `reponame`, `release`) is imported by path.
+Map: [.claude/rules/architecture-plugin.md](./.claude/rules/architecture-plugin.md).
 
-## Documented Solutions
+## Concepts and documented solutions
 
-`docs/solutions/` — documented solutions to past problems (bugs, best
-practices, design patterns, workflow learnings), organized by category
-with YAML frontmatter (`module`, `tags`, `problem_type`, `component`).
-Relevant when implementing or debugging in documented areas.
+[CONCEPTS.md](./CONCEPTS.md) is the shared domain vocabulary in two halves: the
+sync model (main checkout, forward and reverse sync, sync patterns, candidates,
+excluded trees, pack) and the Claude Code plugin (hooks, human verbs, the state
+tree, the Read gate, the operator checklist, release lines, the cost ledger).
+Read it when orienting to the codebase or discussing domain concepts.
 
-`CONCEPTS.md` (repo root) — shared domain vocabulary (the sync model:
-main checkout, forward/reverse sync, sync patterns, candidates).
-Relevant when orienting to the codebase or discussing domain concepts.
+[docs/solutions/](./docs/solutions/) holds documented solutions to past problems
+(bugs, best practices, design patterns, tooling decisions), organized by
+category with YAML frontmatter (`module`, `tags`, `problem_type`, `component`).
+Read the matching write-up when implementing or debugging in a documented area.

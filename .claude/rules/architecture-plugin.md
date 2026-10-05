@@ -6,11 +6,12 @@ paths:
 
 ## The Claude Code plugin (`crates/ss-magic-plugin/src/`)
 
-`ss-magic-plugin <VERB>` is a second, largely independent program sharing core's
-git, hashing and gitignore plumbing – and nothing else: it depends on
-`ss-magic-core`, never on the CLI crate. Module paths below are relative to
-`crates/ss-magic-plugin/src/`, and are the former `crates/ss-magic/src/plugin/`
-tree moved wholesale. Three facts shape every module in it:
+`ss-magic-plugin <VERB>` is a second, largely independent program built on
+`ss-magic-core`: it shares core's git plumbing (the probes, `gitignore` and
+`discover`), `hashing`, `style`, the per-line `release` check, `reponame`,
+`state_tree` and `superset_files`, and never depends on the CLI crate. Module
+paths below are relative to `crates/ss-magic-plugin/src/`. Three facts shape
+every module in it:
 
 - **Two callers, two postures.** The harness invokes `ss-magic-plugin hook
   <event>`: the envelope arrives on stdin, the answer is JSON on stdout (so
@@ -31,13 +32,13 @@ tree moved wholesale. Three facts shape every module in it:
 - **No update gate, no TUI, no install verb.** The marketplace is the only
   delivery path, and the binary is pinned alongside the skills, hooks and
   Markdown shipped with it; a mid-session self-update would leave the two
-  describing different behavior. Since the split this is STRUCTURAL rather than
-  a routing rule: the crate links neither `self_update` nor `inquire`/`ratatui`,
-  and `--check` plus `cargo tree -i` assert that mechanically. What the plugin
-  DOES do about releases is advise (R29–R33): `release-check` reports the
-  newest known plugin release against the pin and, with `--refresh`, rewrites
-  its cache from one bounded fetch; `SessionStart` reads that cache and tells
-  the operator once per release, on `systemMessage`, that `/plugin` has a newer
+  describing different behavior. This is structural rather than a routing
+  rule: the crate links neither `self_update` nor `inquire`/`ratatui`, and
+  `--check` plus `cargo tree -i` assert that mechanically. What the plugin DOES
+  do about releases is advise (R29–R33): `release-check` reports the newest
+  known plugin release against the pin and, with `--refresh`, rewrites its
+  cache from one bounded fetch; `SessionStart` reads that cache and tells the
+  operator once per release, on `systemMessage`, that `/plugin` has a newer
   one. Nothing in the crate downloads a binary.
 - **Fail-open, but fail-CLOSED on anything that could leak.** A hook that
   errors, panics or times out must look exactly like a hook that decided to do
@@ -46,8 +47,8 @@ tree moved wholesale. Three facts shape every module in it:
 
 ### Entry point
 
-- `main.rs` (the crate root; formerly `mod.rs`) – the argv parse and the
-  dispatch table, nothing else.
+- `main.rs` (the crate root) – the argv parse and the dispatch table, nothing
+  else.
   `HookEvent::from_token` and `HumanVerb::from_token` are the two closed
   vocabularies; `HookEvent::{Unknown, Missing}` are VALUES rather than parse
   errors, because a manifest from a newer plugin build can name an event this
@@ -57,8 +58,8 @@ tree moved wholesale. Three facts shape every module in it:
   UnknownVerb}`; `run` calls `style::init_no_color()` for a hook invocation (an
   ANSI escape would make the JSON unparseable) and the ordinary `style::init()`
   otherwise, then dispatches. Note `HookEvent::FileChanged` parses and routes,
-  but the shipped manifest declares no `FileChanged` entry – see the hook
-  section.
+  but the shipped manifest declares no `FileChanged` entry – see the
+  `hook/file_changed.rs` entry under Hooks.
   `-V`/`--version` prints `version_line()` – `ss-magic-plugin <version>` on ONE
   line, exit 0 – ahead of verb parsing, and both flags are recognized only as the
   FIRST token (unlike the CLI's whole-argv scan, because every verb here parses
@@ -67,13 +68,12 @@ tree moved wholesale. Three facts shape every module in it:
   `"$staged_bin" --version | head -1 | awk '{print $NF}'` equalling the pin, and
   `status.rs` probes the same flag for drift, so the version must stay LAST on
   line one and the flag must never answer with usage text.
-  `HumanVerb` gained `SeedConfig` (`seed-config`) and `ReleaseCheck`
-  (`release-check`), and the two predicates over it say different things:
-  `writes_config` is `Enable | Disable | Config | SeedConfig`, while
-  `can_set_enabled` is `Enable | Disable | Config`. Only the second carries the
-  safety property – `writes_config` used to double as "nothing reachable from a
-  hook may be one of these" and no longer can, since `SeedConfig` is invoked by
-  the `SessionStart` bootstrap and `ReleaseCheck` is spawned by the
+  The two predicates over `HumanVerb` say different things: `writes_config` is
+  `Enable | Disable | Config | SeedConfig`, while `can_set_enabled` is
+  `Enable | Disable | Config`. Only the second carries the safety property, and
+  `writes_config` cannot stand in for "nothing reachable from a hook may be one
+  of these": `SeedConfig` (`seed-config`) is invoked by the `SessionStart`
+  bootstrap, and `ReleaseCheck` (`release-check`) is spawned by the
   `SessionStart` handler itself (`release-check --refresh --quiet`, detached).
   The test `no_hook_invoked_verb_can_set_enabled` lists exactly those two as
   hook-invoked and asserts neither can set `enabled`. Do NOT re-derive
@@ -81,23 +81,22 @@ tree moved wholesale. Three facts shape every module in it:
 
 ### State: where the plugin keeps things, and why there
 
-- `atomic.rs` – the one atomic-write primitive every writer below (and
-  several modules outside this section) shares: create a temp file in the
-  target's own directory, write and flush it, chmod it when a mode is given,
-  fsync it when asked, then rename it over the target – so a reader never sees
-  a half-written file, and a crash mid-write leaves the previous file
-  untouched rather than truncated. `write_atomically(path, body, prefix,
-  suffix, what, mode, sync)` used to live in `heartbeat.rs` under a
-  narrower, hardcoded signature (a fixed `.jsonl` suffix, an always-owner-only
-  mode) shared only with `ledger.rs`. It moved out here, generalized to the
-  union of what every caller needed, once several more modules turned out to
-  have each hand-rolled the identical `tempfile::Builder` -> `write_all` ->
-  `flush` -> chmod -> `persist` sequence with their own suffix/mode/sync
-  choices: `heartbeat.rs`, `ledger.rs`, `cache.rs`, `bypass.rs`,
-  `expect_artifact.rs`, `scratchpad.rs` (the session pointer),
-  `compact_window.rs`, `setup_ci.rs` (the CI workflow writer), and
-  `checklist/verbs.rs` (the document and pointer writers) all call this one
-  copy now; nothing here changed what any of them actually wrote.
+- `atomic.rs` – the one atomic-write primitive the plugin's whole-file writers
+  share: create a temp file in the target's own directory, write and flush it,
+  chmod it when a mode is given, fsync it when asked, then rename it over the
+  target – so a reader never sees a half-written file, and a crash mid-write
+  leaves the previous file untouched rather than truncated.
+  `write_atomically(path, body, prefix, suffix, what, mode, sync)` takes the
+  temp-file suffix, the mode and the fsync choice as arguments because its
+  callers differ on all three; no module hand-rolls its own
+  `tempfile::Builder` -> `write_all` -> `flush` -> chmod -> `persist` sequence.
+  Its callers are `heartbeat.rs` (the prune rewrite only – an ordinary append
+  is not a rewrite), `ledger.rs` (replacing a session's existing row, the
+  offsets file and the price snapshot – a new row is a plain append),
+  `cache.rs`, `bypass.rs`, `expect_artifact.rs`, `scratchpad.rs`
+  (the session pointer), `compact_window.rs`, `setup_ci.rs` (the CI workflow
+  writer), `checklist/verbs.rs` (the document and pointer writers) and
+  `release_check.rs` (the release cache).
 - `pathnorm.rs` – the lexical path reduction every gate that decides from
   a path shares, and the reason the R88 checklist deny stopped growing new
   bypasses. `normalize` removes `.` and cancels `..` TEXTUALLY (the caller
@@ -125,33 +124,44 @@ tree moved wholesale. Three facts shape every module in it:
   non-UTF-8 `~name` is still caught (missing one would leave it unexpanded,
   which is the unsafe direction).
 - `tmproot.rs` – the private, per-machine, cross-session temporary root
-  for coordination that predates any repository or session context.
-  `resolve_root()` is `/tmp/ss-magic-plugin/<identifier>/`, falling back to
-  `$TMPDIR`; `identifier(home)` is the first 16 hex chars of SHA-256 of `$HOME`
-  exactly as read, matching the shell bootstrap's `shasum -a 256` byte for byte.
+  for coordination that predates any repository or session context (the "R80
+  temp root" other entries name). `resolve_root()` is
+  `/tmp/ss-magic-plugin/<identifier>/`, falling back to `$TMPDIR`;
+  `identifier(home)` is the first 16 hex chars of SHA-256 of `$HOME` exactly as
+  read, matching the shell bootstrap's `shasum -a 256` byte for byte.
   A predictable path is NOT evidence of ownership, so each managed component is
   `lstat`ed (never followed) and must be a real directory owned by this
   process's euid (raw `geteuid()`, not a shelled `id -u`) at mode exactly 0700;
   any failure makes that base entirely unusable rather than writing into a root
-  someone else could control. `with_lock` BLOCKS (unlike the self-updater's
-  skip-on-contention lock) because concurrent hook handlers must actually
-  coordinate, not silently skip; `try_with_lock` is the non-blocking variant.
-  `flock` releases on process death, so there is no stale-lock reclaim.
+  someone else could control. `with_lock(root, name, f)` BLOCKS (unlike the
+  self-updater's skip-on-contention lock) because concurrent hook handlers must
+  actually coordinate, not silently skip; `try_with_lock` is the non-blocking
+  variant. `flock` releases on process death, so there is no stale-lock
+  reclaim. Both take the directory to lock in, so not every lock lives here:
+  under this root are `install.lock` (the bootstrap's install), `magic-json.lock`
+  (`config.rs`), `release-check.lock` (`release_check.rs`) and
+  `file-changed.lock` (`hook/file_changed.rs`); `hooks.lock` and `cost.lock`
+  sit in the machine-level store beside the heartbeat log and the ledger, and
+  `current.lock` and `checklist.lock` in the `.superset/.magic/` state tree.
 - `identity.rs` – the deterministic `<repo>-<branch>` slug, derived from
   git alone and never from the Superset workspace name (which can be silently
   renamed). `resolve(cwd)` returns `None` outside a git repo – there is no
   fallback identity, and the plugin simply does nothing. The repo half reuses
   `ss_magic_core::reponame::repo_name_stem` – the same derivation the CLI's
   `pack.rs` re-exports, so the two can never disagree about what this repo is
-  called; the branch half slugifies HEAD,
-  falling back to
+  called; the branch half slugifies HEAD, falling back to
   `detached-<short-sha>`, and strips diacritics so a precomposed and an
   NFD-decomposed accented branch name resolve to the SAME directory.
 - `scratchpad.rs` – the per-worktree state tree at `.superset/.magic/`
-  (`STATE_REL`), holding `sessions/<slug>/` with the six model-owned
+  (`STATE_REL`), holding a `README.md` that explains the tree to anyone who
+  finds it in a working copy; `sessions/<slug>/` with the six model-owned
   `STATE_FILES` (`CONTEXT.md`, `DECISIONS.md`, `LEARNINGS.md`,
-  `OPERATOR-CHECKLIST.md`, `STATUS.md`, `TASKS.md`), the `current.json` pointer,
-  and the `conclusions/`, `bypass/` and `expect-artifact/` stores. Three hard
+  `OPERATOR-CHECKLIST.md`, `STATUS.md`, `TASKS.md`), beside which the hooks add
+  the tool-owned `PRE-COMPACT.md` (`hook/pre_compact.rs`) and the
+  `research-salvage/` directory (`hook/subagent_stop.rs`); the `current.json`
+  pointer and its `current.lock`; the `conclusions/`, `bypass/` and
+  `expect-artifact/` stores; and, written by the checklist verbs rather than
+  here, the `checklist.json` pointer and its `checklist.lock`. Three hard
   rules: (1) **scaffold, never rewrite** – an existing state file is left
   byte-for-byte alone and only a genuinely missing one is created, via
   `create_new` so a race cannot clobber; only `current.json` is rewritten each
@@ -169,35 +179,52 @@ tree moved wholesale. Three facts shape every module in it:
   `sync::EXCLUDED_TREES`. `Refusal` and `Report` carry the outcome outward;
   `STATE_REL` and `ensure_state_ignored` are re-exports of core's
   `state_tree`, the ONE place the `.superset/.magic/` gitignore rule is
-  written: `workspace/migrate.rs::ensure_bootstrap_gitignores` calls the core
-  function eagerly from init/migrate (before the split it reached into this
-  module – the one reverse dependency from CLI code into plugin code, now
-  gone), `ss-magic-plugin enable` / `config set` call it lazily through the
-  re-export,
-  and no hook ever calls it. A core test pins `STATE_REL` equal to the
-  `.superset/.magic` entry of `sync::EXCLUDED_TREES`.
+  written: the CLI's `workspace/migrate.rs::ensure_bootstrap_gitignores` calls
+  the core function eagerly from init/migrate, so no CLI code reaches into the
+  plugin crate; `ss-magic-plugin enable` / `config set` call it lazily through
+  the re-export; and no hook ever calls it. A core test pins `STATE_REL` equal
+  to the `.superset/.magic` entry of `sync::EXCLUDED_TREES`.
 - `claim.rs` – the exactly-once file claim both one-shot stores are built
   on. `take(dir, path)` creates a private landing file in the SAME directory and
   `fs::rename`s the claim onto it; since `rename` requires its source to exist,
   exactly one racing caller wins. It is deliberately NOT built on `unlink`'s
-  `ENOENT` – see the write-up linked under the plugin hard rules below.
+  `ENOENT` – see
+  [docs/solutions/logic-errors/unlink-is-not-an-exclusive-claim.md](../../docs/solutions/logic-errors/unlink-is-not-an-exclusive-claim.md),
+  the write-up behind the first plugin constraint in
+  [hard-rules.md](./hard-rules.md).
 - `heartbeat.rs` – the append-only machine-level `hooks.jsonl` every hook
   invocation leaves a `Row` in (including no-ops and failures), which is what
   `ss-magic-plugin status` reports last-fired-at and outcome counts from. It
-  lives under
-  `directories`' DATA dir, not the cache dir (a history swept by disk cleanup
-  would be worse than none) and outside any worktree, so rows outlive worktree
-  deletion. `append` holds an exclusive `tmproot::with_lock` covering append AND
-  prune together, since a prune rewrites the file wholesale. `prune` keeps the
-  newest `ROWS_KEPT` (2000) rows and drops anything older than 30 days, but a
-  row stamped in the FUTURE (a backward clock jump) is kept, not dropped; it
-  fires only once the file passes `PRUNE_TRIGGER_BYTES` (256 KiB), so the common
-  case costs one `stat`. A prune failure never fails an otherwise-good append.
-  Appends go through the shared `atomic::write_atomically` helper (see
-  `atomic.rs` above), which this module originally defined before it
-  moved out to serve the rest of the plugin.
+  lives under `directories`' DATA dir, not the cache dir (a history swept by
+  disk cleanup would be worse than none) and outside any worktree, so rows
+  outlive worktree deletion. `append` holds an exclusive `tmproot::with_lock`
+  on `hooks.lock` in that store, covering append AND prune together, since a
+  prune rewrites the file wholesale. An append is a plain `O_APPEND` write of
+  one line, creating the file owner-only (`FILE_MODE`, 0600) when absent and
+  leaving an existing file's mode alone; the prune rewrite goes through
+  `atomic::write_atomically`, so a prune that dies half-way leaves the previous
+  file intact. `prune` keeps the newest `ROWS_KEPT` (2000) rows and drops
+  anything older than 30 days, but a row stamped in the FUTURE (a backward
+  clock jump) is kept, not dropped; it fires only once the file passes
+  `PRUNE_TRIGGER_BYTES` (256 KiB), so the common case costs one `stat`. A prune
+  failure never fails an otherwise-good append.
 
 ### Hooks (`hook/`)
+
+The shipped `plugin/hooks/hooks.json` registers these entries; the
+`PreToolUse` matcher is the tool set `GateTool::from_name` must cover:
+
+| Event | Runs | Matcher | Timeout |
+|---|---|---|---|
+| `SessionStart` | `hooks/bootstrap.sh` | `startup` | 90 s |
+| `SessionStart` | `session-start` | `startup\|resume\|clear\|compact\|fork` | 10 s |
+| `PreToolUse` | `pre-tool-use` | `Read\|Edit\|MultiEdit\|Write\|NotebookEdit\|Grep\|Glob\|Bash` | 5 s |
+| `PreCompact` | `pre-compact` | `manual\|auto` | 10 s |
+| `SubagentStop` | `subagent-stop` | none | 10 s |
+| `SessionEnd` | `session-end` | none | none (the harness default) |
+
+Every entry except the bootstrap runs through `hooks/run-hook.sh` with the
+event token as its argument.
 
 - `hook/mod.rs` – the ONE pipeline: decode stdin, gate, dispatch, encode stdout,
   append a heartbeat row, always exit 0. `run` has no code path that produces a
@@ -213,19 +240,21 @@ tree moved wholesale. Three facts shape every module in it:
   hook that stops at that gate – nearly every `PreToolUse` – runs no `git` at
   all (a PATH-shim test proves it); when the walk declines, the `rev-parse`
   probes run and every row from that invocation ends its `detail` with
-  `discovery: fallback (<reason>)`, so the fallback rate is readable from
-  `status`. `HookContext` carries the discovered `main_root` beside
-  `repo_root`. The ignored-tree gate still asks git – it is fail-closed and
-  runs only past the enablement gate. `quiet_mode(envelope, entrypoint)`
-  (KTD12, R31) is the shared "is anybody watching" verdict every operator
-  notice consults: quiet when the envelope's `permission_mode` is
-  `bypassPermissions` or `dontAsk`, or when `CLAUDE_CODE_ENTRYPOINT`
-  (`ENTRYPOINT_ENV`) names an embedding other than `cli`; ABSENT signals mean
-  NOT quiet, deliberately – the notices are one operator line each and bounded
-  once-per-machine or once-per-release, so a wrong "not quiet" costs a line
-  while a wrong "quiet" hides the notice from every harness that omits a
-  field. No further heuristic is layered on; the entrypoint is injected so the
-  table is testable without touching the process environment.
+  `discovery: fallback (<reason>)`, so `grep -c 'discovery: fallback'` over
+  `hooks.jsonl` gives the fallback rate. `status` does not compute that rate;
+  it shows only each event's latest row detail. `HookContext` carries the
+  discovered `main_root` beside `repo_root`. The ignored-tree gate still asks
+  git – it is fail-closed and runs only past the enablement gate.
+  `quiet_mode(envelope, entrypoint)` (KTD12, R31) is the shared "is anybody
+  watching" verdict every operator notice consults: quiet when the envelope's
+  `permission_mode` is `bypassPermissions` or `dontAsk`, or when
+  `CLAUDE_CODE_ENTRYPOINT` (`ENTRYPOINT_ENV`) names an embedding other than
+  `cli`; ABSENT signals mean NOT quiet, deliberately – the notices are one
+  operator line each and bounded once-per-machine or once-per-release, so a
+  wrong "not quiet" costs a line while a wrong "quiet" hides the notice from
+  every harness that omits a field. No further heuristic is layered on; the
+  entrypoint is injected so the table is testable without touching the process
+  environment.
 - `hook/event.rs` – the pure wire format. Decoding is permissive (unknown keys
   ignored, only `cwd` required) but routing is not: the argv token picks the
   `Payload` variant, never the envelope's own `hook_event_name`. Two structural
@@ -233,14 +262,15 @@ tree moved wholesale. Three facts shape every module in it:
   has only a `Deny` variant (a hook can never GRANT a capability), and there is
   no `updatedInput` rewrite channel anywhere in `Response`. `PreCompact` and
   `SessionEnd` have no `Response` variant at all, so their silence is enforced
-  by the compiler. `Common.permission_mode` is typed `Option<String>`: both the
-  2.1.251 bundle the contract was measured on and the installed 2.1.259 build
-  the common envelope with a `permission_mode` key, but its value is whatever
-  the harness had and `JSON.stringify` drops an undefined one, so absence is
-  never read as any particular mode. `encode` emits the harness's field names –
-  `hookSpecificOutput`, `hookEventName`, `additionalContext`,
-  `permissionDecision`, `permissionDecisionReason`, `systemMessage`, and a
-  top-level `{decision: "block", reason}` for a `SubagentStop` block.
+  by the compiler. `Common.permission_mode` is typed `Option<String>`: the
+  2.1.251 bundle the contract was measured on and the 2.1.259 bundle installed
+  when it was written both put a `permission_mode` key in the common envelope,
+  but its value is whatever the harness had and `JSON.stringify` drops an
+  undefined one, so absence is never read as any particular mode. `encode`
+  emits the harness's field names – `hookSpecificOutput`, `hookEventName`,
+  `additionalContext`, `permissionDecision`, `permissionDecisionReason`,
+  `systemMessage`, and a top-level `{decision: "block", reason}` for a
+  `SubagentStop` block.
 - `hook/session_start.rs` – scaffolds the scratchpad and returns the operating
   guidance as `additionalContext`. A hard scratchpad refusal still returns a
   response, just a short "not set up yet" explanation – it never claims a state
@@ -257,13 +287,13 @@ tree moved wholesale. Three facts shape every module in it:
   moment on a fresh machine race for one creation and exactly one announces,
   `AlreadyExists` being the "already shown" answer; written only by a notice
   that actually went out, and resolved LAST so a plain `resume` never touches
-  the cache dir;
-  with no directory to record it in, the notice is withheld rather than
-  repeated. `release_suggestion` (R29–R31, KTD12) is the third notice on the
-  same channel and reads a FILE, never the network: on `startup` only, it
-  reads the plugin line's release cache (`release_check::cache_file`), decides
-  through the pure `release_check::suggestion(pinned, cache, source, quiet)`
-  – not startup, no pin, no cache, no plugin tag, not newer, already
+  the cache dir; with no directory to record it in, the notice is withheld
+  rather than repeated. `release_suggestion` (R29–R31, KTD12) is the third
+  notice on the same channel and reads a FILE, never the network: on `startup`
+  only, it reads the plugin line's release cache (`PLUGIN_LINE.cache_file`,
+  `plugin-release-check.json`, under the injected `Surroundings.cache_dir`),
+  decides through the pure `release_check::suggestion(pinned, cache, source,
+  quiet)` – not startup, no pin, no cache, no plugin tag, not newer, already
   suggested, then quiet mode LAST so a headless session with something to say
   records `release suggestion suppressed (quiet mode: …)` while one with
   nothing to say records "not newer" – and, when a newer release is due,
@@ -278,21 +308,24 @@ tree moved wholesale. Three facts shape every module in it:
   exists: if the cache is missing or older than 24 h it spawns
   `current_exe() release-check --refresh --quiet` detached
   (`release_check::spawn_detached`: own process group, every stream on
-  `/dev/null`, child dropped) and returns without waiting – AFTER the lock
-  above is released, so the refresh never contends with this invocation's own
-  marker write. A source-scan test in `hook/tests.rs` asserts no `hook/`
-  module names `UreqReleaseClient`, `ureq`, `fetch_releases`, `refresh_cache`,
-  `refresh_with`, `for_product` or `resolve_newest_uncached`. The three notices
-  join into one `systemMessage` a blank line apart (`join_system_messages`).
-  Everything the handler reads from outside the envelope – plugin root,
-  override, entrypoint, the cache dir (compaction marker AND release cache),
-  the lock root, and the spawner – arrives in one `Surroundings` value
-  (`handle` = `handle_with(ctx, &Surroundings::from_process())`), so no test
-  can write a once-per-machine marker into the developer's own cache
-  directory, which running the handler against the real environment would do
-  on a machine where the override is set, and no test ever spawns a real
-  refresh.
-- `hook/pre_tool_use.rs` – three jobs on one event, in a fixed decision order.
+  `/dev/null`, child dropped) and returns without waiting – AFTER the
+  `release-check.lock` is released, so the refresh never contends with this
+  invocation's own marker write. A source-scan test in `hook/tests.rs` asserts
+  no `hook/` module names `UreqReleaseClient`, `ureq`, `fetch_releases`,
+  `refresh_cache`, `refresh_with`, `for_product` or `resolve_newest_uncached`.
+  The three notices join into one `systemMessage` a blank line apart
+  (`join_system_messages`). Everything the handler reads from outside the
+  envelope – plugin root, override, entrypoint, the cache dir (compaction
+  marker AND release cache), the lock root, and the spawner – arrives in one
+  `Surroundings` value (`handle` = `handle_with(ctx,
+  &Surroundings::from_process())`), so no test can write a once-per-machine
+  marker into the developer's own cache directory, which running the handler
+  against the real environment would do on a machine where the override is
+  set, and no test ever spawns a real refresh.
+- `hook/pre_tool_use.rs` – three jobs on one event, in a fixed decision order:
+  the checklist deny first, then the commit nudge (a `Bash` call returns
+  there), then the Read gate, so the nudge and the Read gate never apply to
+  the same tool call.
   (1) The **checklist deny**: a Read / Edit / Write / NotebookEdit of a checklist
   file (matched by the `docs/actions/<stem>.checklist.json` convention or by the
   pointer's recorded target) is denied with instructions to use the checklist
@@ -306,35 +339,37 @@ tree moved wholesale. Three facts shape every module in it:
   ENVELOPE's cwd (the agent's, not this process's); an `Opaque` view is judged
   WITHOUT a root by the shape test, which then canonicalizes and re-asks only to
   ADD a denial, never to remove one – so a wrong answer costs a redirect to the
-  CLI rather than the deny itself. (2) The **Read gate**: a `Read` past the
-  configured byte threshold (`threshold_lines * BYTES_PER_LINE`) is denied and
-  routed to an Explore agent, or answered with the cached conclusion when one
-  exists. It never emits an allow – only `Silent` or `Deny` – so it can never
-  grant a capability, and every uncertain stat, path resolution or cache lookup
-  falls through to allow. Escape hatches: a bounded `offset`/`limit` window, a
-  subagent's own read, the `.superset/.magic/` state tree, non-text extensions,
-  configured exemption globs, and a one-shot `bypass` claim. `GateTool::from_name`
-  maps `Read`, then `Edit|MultiEdit|Write|NotebookEdit` (mutating), `Grep|Glob`
-  (inert), and `Bash`. (3) The **commit nudge**: a `Bash` command whose trailing
-  words are `git commit`, `git push`, or `gh pr create` – and NOT `gh pr view` /
-  `list` / `diff`, which open nothing – gets `additionalContext` reminding the
-  model to update the checklist, but ONLY when `git::status_porcelain` shows a
-  candidate checklist untracked or edited-but-unstaged. It never sets a decision;
-  the command is never blocked, and the text says so.
+  checklist verbs rather than the deny itself. (2) The **commit nudge**: a
+  `Bash` command whose trailing words are `git commit`, `git push`, or
+  `gh pr create` – and NOT `gh pr view` / `list` / `diff`, which open nothing –
+  gets `additionalContext` reminding the model to update the checklist, but
+  ONLY when a candidate checklist looks absent from the commit: named by the
+  pointer but never written (answered with no git call), or shown by
+  `git::status_porcelain` as untracked or edited-but-unstaged. It never sets a
+  decision; the command is never blocked, and the text says so. (3) The **Read
+  gate**: a `Read` past the configured byte threshold
+  (`threshold_lines * BYTES_PER_LINE`, with `BYTES_PER_LINE` = 40, so 120,000
+  bytes at the default 3000 lines) is denied and routed to an Explore agent, or
+  answered with the cached conclusion when one exists. It never emits an
+  allow – only `Silent` or `Deny` – so it can never grant a capability, and
+  every uncertain stat, path resolution or cache lookup falls through to allow.
+  Escape hatches: a bounded `offset`/`limit` window, a subagent's own read, the
+  `.superset/.magic/` state tree, non-text extensions, configured exemption
+  globs, and a one-shot `bypass` claim. `GateTool::from_name` maps `Read`, then
+  `Edit|MultiEdit|Write|NotebookEdit` (mutating), `Grep|Glob` (inert), and
+  `Bash`.
   Every command these three jobs put in front of the model is spelled
   `ss-magic-plugin`, the wrapper on the Bash tool's PATH, and NEVER a bare
   `ss-magic`: the model runs them through Bash, where `${CLAUDE_PLUGIN_DATA}` is
   not exported and the bootstrapped binary cannot be named directly.
-  `no_model_facing_deny_text_names_the_sync_cli`
-  asserts the rule over every deny reason rather than per-string, because the
-  checklist deny carried the wrapper from the start while the size gate did not.
-  It checks each LINE for a leading `ss-magic ` (with the space that
-  `ss-magic-plugin` does not have there), so it catches a command line without
-  flagging prose or the conclusion cache's own `# ss-magic conclusion` heading.
-  The human verbs' own `Usage:` strings USED to be a deliberate exception,
-  keeping the bare spelling on the reasoning that a person runs those in a
-  terminal. They are not an exception any more: nobody runs a verb in a terminal
-  at all, and every `Usage:` string in the crate now spells `ss-magic-plugin`.
+  `no_model_facing_deny_text_names_the_sync_cli` asserts the rule over every
+  deny reason at once rather than string by string, so a new or reworded deny
+  cannot slip the bare spelling past it. It checks each LINE for a leading
+  `ss-magic ` (with the space that `ss-magic-plugin` does not have there), so it
+  catches a command line without flagging prose or the conclusion cache's own
+  `# ss-magic conclusion` heading. The human verbs' `Usage:` strings follow the
+  same rule: nobody runs a verb in a terminal, so every `Usage:` string in the
+  crate spells `ss-magic-plugin`.
 - `hook/pre_compact.rs` – appends one timestamped entry to a tool-owned
   `PRE-COMPACT.md` in the session dir and returns silence. That file is
   deliberately NOT one of `STATE_FILES`: those are model-owned and never
@@ -342,17 +377,20 @@ tree moved wholesale. Three facts shape every module in it:
   edit. It re-checks the tracked-path refusal for its own file, since
   `scratchpad::ensure` only guards the paths IT writes. Compaction is never
   blocked or slowed.
-- `hook/subagent_stop.rs` – two independent jobs. The **artifact contract**:
+- `hook/subagent_stop.rs` – two independent jobs, both skipped when the
+  handler returns early: on a `stop_hook_active` re-entry, outside a
+  repository, and when the scratchpad refuses. The **artifact contract**:
   `expect_artifact::take_oldest` removes a pending declaration and, if the named
   file is missing / empty / not a file, blocks the stop once. With nothing
   declared, nothing is EVER blocked; "at most once" is guaranteed twice over, by
   the `stop_hook_active` short-circuit and by the fact that taking the record IS
-  the one-shot flag. The **salvage**: an agent's assistant-message text is pulled
-  from its transcript, tail-kept to `SALVAGE_BYTE_BUDGET` and written to
-  `research-salvage/<ts>-<slug>.md` with `create_new`, so an earlier salvage is
-  never overwritten. Salvage runs unconditionally and independently of the block
-  decision, because data loss is irreversible while a block is retriable, and it
-  can never fail the stop.
+  the one-shot flag. The **salvage** acts only for a resultless agent – one
+  whose `last_assistant_message` is absent or blank: its assistant-message text
+  is pulled from its transcript, tail-kept to `SALVAGE_BYTE_BUDGET` (64 KiB) and
+  written to `research-salvage/<ts>-<slug>.md` in the session dir with
+  `create_new`, so an earlier salvage is never overwritten. When it runs, it
+  runs BEFORE the block decision and independently of it, because data loss is
+  irreversible while a block is retriable, and it can never fail the stop.
 - `hook/session_end.rs` – the only moment the ledger row can be written, since
   the payload carries no usage data: it scans the session's transcript tree and
   appends one row. Heavily budgeted against the hook timeout (measured ~0.85 s
@@ -377,9 +415,15 @@ tree moved wholesale. Three facts shape every module in it:
 
 - `config.rs` – the typed `plugin` key in the overlaid `magic.json`, and
   the write path behind `enable` / `disable` / `config get` / `config set
-  [--local]`. `resolve` is infallible by design: every malformed field degrades
-  to a safe default and an out-of-range number CLAMPS rather than rejecting, so
-  a typo can never turn the gate into something more permissive than configured.
+  [--local]`. The gate's three knobs live under `plugin.gate`:
+  `threshold_lines` (default 3000, clamped to 500..=20000) is the size above
+  which a `Read` is gated; `inline_byte_budget` (default 10000, clamped to
+  1000..=100000) bounds only the inline cached conclusion on
+  `additionalContext`; `exemptions` (globs the gate never applies its
+  threshold to) is empty by default. `resolve` is infallible by design: every
+  malformed field degrades to a safe default and an out-of-range number CLAMPS
+  rather than rejecting, so a typo can never turn the gate into something more
+  permissive than configured.
   `enabled` is always read from the MAIN CHECKOUT's overlay regardless of cwd,
   because a worktree's own `magic.local.json` is itself a forward-sync target;
   `gate` resolves against the cwd root. `resolve(cwd_root)` finds the main
@@ -405,22 +449,21 @@ tree moved wholesale. Three facts shape every module in it:
   as a link to a JSON file the person owns (a harness settings file, say): a
   verb run in that checkout would load THAT file, fold a `plugin` key in and
   write it back through the link. Every writer in the crate also takes the one
-  `magic-json.lock` under the
-  R80 temp root around its load-modify-write (`write_locked`): the human verbs
-  BLOCK on it (a person asked for the write), while `seed-config` uses the
-  non-blocking `try_with_lock` and defers to the next session on contention,
-  because it runs from a hook. Without the lock a seed that loaded the file an
-  instant before `enable` wrote `plugin.enabled` would write its loaded copy
-  back and silently drop the key. `enable` prints `compact_window::enable_tip`
-  after its success line
-  (R27) – one line naming `compact-window --recommend`, only when neither
+  `magic-json.lock` under the R80 temp root around its load-modify-write
+  (`write_locked`): the human verbs BLOCK on it (a person asked for the write),
+  while `seed-config` uses the non-blocking `try_with_lock` and defers to the
+  next session on contention, because it runs from a hook. Without the lock a
+  seed that loaded the file an instant before `enable` wrote `plugin.enabled`
+  would write its loaded copy back and silently drop the key. `enable` prints
+  `compact_window::enable_tip` after its success line (R27, the compaction
+  advice) – one line naming `compact-window --recommend`, only when neither
   project settings file configures a window, and never a write.
   It also owns `seed-config` (R3a), the bootstrap's one-time gate-defaults
-  write, which exists because removing the CLI's `plugin` subcommand removed the
-  last terminal path to the configuration verbs: rather than document a command
-  nobody can type, the install makes the settings visible in the file the
-  repository already tracks. `seed_block()` is the ONE place the block's shape
-  is decided – `{"gate": {"threshold_lines", "inline_byte_budget",
+  write. There is no terminal path to the configuration verbs – the binary is
+  off `PATH` and the CLI has no `plugin` subcommand – so rather than document a
+  command nobody can type, the install makes the settings visible in the file
+  the repository already tracks. `seed_block()` is the ONE place the block's
+  shape is decided – `{"gate": {"threshold_lines", "inline_byte_budget",
   "exemptions"}}`, built field by field out of `GateConfig::default()` as a
   literal map rather than serialized from a struct, precisely so the writer is
   structurally incapable of emitting `enabled` (a `Serialize` derive would move
@@ -438,23 +481,26 @@ tree moved wholesale. Three facts shape every module in it:
   symlink that leaves the repository (`SeedOutcome::OutsideRepository`, the
   shared `landing` decision described above under the write path – `Existing`
   seeds, `Outside` is this outcome, `Fresh` is `NotAWorkspace` because the seed
-  never creates the file);
-  and it writes through the same typed load-modify-write, so `MagicConfig`'s
-  flattened `extras` preserve every other key – values, not byte order, since it
-  re-serializes rather than patching. All four `SeedOutcome` variants are normal
-  results, never errors – the verb runs unattended in whatever repository the
-  session happens to be in, and most of those are not ss-magic workspaces. It
-  seeds `root`, the
-  CURRENT checkout's root, not the main checkout's, because `gate` (unlike
-  `enabled`) resolves against the cwd root's own overlay.
-- `cache.rs` – the conclusion cache behind `conclude` / `conclusions` /
+  never creates the file); and it writes through the same typed
+  load-modify-write, so `MagicConfig`'s flattened `extras` preserve every other
+  key – values, not byte order, since it re-serializes rather than patching.
+  All four `SeedOutcome` variants are normal results, never errors – the verb
+  runs unattended in whatever repository the session happens to be in, and
+  most of those are not ss-magic workspaces. It seeds `root`, the CURRENT
+  checkout's root, not the main checkout's, because `gate` (unlike `enabled`)
+  resolves against the cwd root's own overlay.
+- `cache.rs` – the conclusion cache behind `conclude <FILE> [--from BODY_FILE]`
+  (the body is read from stdin without `--from`), `conclusions [KEY|FILE]` and
   `gc`. `identify` keys an entry on `(realpath, size, stamp)` – NEVER the read's
   offset or limit, so a conclusion about a file answers every later read of it.
   `envelope` wraps rendered content in nonce-keyed untrusted-data markers with
   the framing text placed BEFORE the quoted body; it is shared with the
   checklist renderer and the transcript salvage, because all three inject
-  repository-authored text into a model's context. `prune`/`gc` are best-effort
-  and never fail the caller.
+  repository-authored text into a model's context. `conclude` prunes after each
+  write through the private `prune_best_effort` (the newest `ENTRIES_KEPT`, 200,
+  entries within 30 days, never the one just written), which warns and never
+  fails the verb; `prune` and `gc` themselves return errors, so a sweep that
+  cannot remove an entry makes `gc` exit non-zero.
 - `bypass.rs` / `expect_artifact.rs` – the two one-shot stores
   built on `claim::take`. `bypass <FILE>` lets exactly the next gated Read of a
   resolved path through (`MAX_AGE_SECS` 24 h; an expired claim is still consumed
@@ -468,14 +514,20 @@ tree moved wholesale. Three facts shape every module in it:
   as an untracked file in the working copy.
 - `ledger.rs` – the machine-level `cost.jsonl` and the `cost [--here]
   [--backfill REF] [--json]` verb. One row per session id, enforced under an
-  fd-lock held for the commit only (the scan runs outside it). The scan is
-  incremental via a byte-offset store keyed on inode plus size, so a rotated
-  transcript forces a full rescan instead of reading garbage. Two pricing rules
-  matter: the harness's own `cost-state` figure is a cumulative FLOOR (take the
-  max, and add table pricing for the main thread only when no harness figure
-  exists, or the cost double-counts); and cache-write tokens are split 5 m
-  (1.25x) versus 1 h (2x), because reading only the flat total undercounts.
-  `Basis` records which of the two priced a row. Each row also carries
+  fd-lock (`cost.lock`, beside the ledger) held for the commit only (the scan
+  runs outside it). The scan is incremental via a byte-offset store
+  (`transcript-offsets.json`, beside the ledger) keyed on inode plus size, so a
+  rotated transcript forces a full rescan instead of reading garbage. Two
+  pricing rules matter: the harness's own `cost-state` figure is a cumulative
+  FLOOR (take the max, and add table pricing for the main thread only when no
+  harness figure exists, or the cost double-counts); and cache-write tokens are
+  split 5 m (1.25x) versus 1 h (2x), because reading only the flat total
+  undercounts. `Basis` records what priced a row: `Harness` (the harness figure
+  alone), `Table` (the bundled price table alone, when there is no harness
+  figure) or `Mixed` (the harness priced the main thread and the table priced
+  the subagents, which no `cost-state` record covers). A row priced from the
+  table names the table's version, and that version's rates are snapshotted
+  once under `prices/<version>.json` in the store. Each row also carries
   `peak_context_tokens` (R26): the largest `input + cache_read +
   cache_creation` of any ONE assistant message on the MAIN transcript –
   subagents run in their own windows – kept as a running maximum across
@@ -488,39 +540,46 @@ tree moved wholesale. Three facts shape every module in it:
   repository pools together and a deleted worktree simply drops out (a root
   that is no longer a directory is answered before discovery would spawn a
   fallback probe in it), newest first.
-- `status.rs` – the one place that answers "why is the plugin not doing
-  anything", across every silent-failure path: config disabled, harness
-  registration missing or disabled, state tree not gitignored, binary not
-  installed, manifest-versus-binary drift. Read-only – it never calls
-  `scratchpad::ensure`, creates a store, or adds a gitignore rule – and it exits
-  0 whenever a report was produced, so a script parsing `--json` never has to
-  special-case an exit code. Every null JSON value carries a non-null `note`;
-  `acting` is `None` rather than a guess when the harness layer is unknown.
+- `status.rs` – `status [--all] [--json]`, the one place that answers "why is
+  the plugin not doing anything", across every silent-failure path: config
+  disabled, harness registration missing or disabled, state tree not
+  gitignored, binary not installed, manifest-versus-binary drift. Read-only –
+  it never calls `scratchpad::ensure`, creates a store, or adds a gitignore
+  rule – and it exits 0 whenever a report was produced, so a script parsing
+  `--json` never has to special-case an exit code. Every null JSON value
+  carries a non-null `note`; `acting` is `None` rather than a guess when the
+  harness layer is unknown. The hooks section reads this worktree's heartbeat
+  rows by default and every row on the machine under `--all` or outside a
+  repository (`hooks.scope` is `this-worktree` or `machine`).
   `DECLARED_EVENTS` lists the five events the manifest actually registers and
   deliberately excludes `file-changed`. `PIN_FILE` is `ss-magic-plugin.version`
-  and `BINARY_REL` is `bin/ss-magic-plugin` – both renamed with the split; the
-  drift probe still runs `--version` and reads the LAST field of the FIRST line,
-  which is why that output shape is a contract. The harness and binary probes are
-  time-bounded and degrade to a note. The `compaction` section (R27) is
-  `compact_window::recommend_report` rendered as four `Field`s – the override
-  and where it was found, the two windows, the recommendation with its basis –
-  and adds ONE `problems` line, only when the override is set AND no window is
-  configured; `Inputs.compaction` carries the `Sources` so the tests point it
-  at a fake home. The `Versions` section gains `newest_release` (a `Field`:
-  the plugin release cache's tag with "checked <when>, fresh/stale" as the
-  source, or a note when the cache is absent, holds no plugin tag, or no cache
-  dir resolves) and `update_available: Option<bool>` against the pin – read
-  from `Inputs.release_cache` at `Inputs.now`, never refreshed by `status`, and
+  and `BINARY_REL` is `bin/ss-magic-plugin`; the drift probe runs `--version`
+  and reads the LAST field of the FIRST line, which is why that output shape is
+  a contract. The harness and binary probes are time-bounded and degrade to a
+  note. The `compaction` section (R27) is `compact_window::recommend_report`
+  rendered as four `Field`s – the override and where it was found, the two
+  windows, the recommendation with its basis – and adds ONE `problems` line,
+  only when the override is set AND no window is configured;
+  `Inputs.compaction` carries the `Sources` so the tests point it at a fake
+  home. The `versions` section carries `newest_release` (a `Field`: the plugin
+  release cache's tag with "checked <when>, fresh/stale" as the source, or a
+  note when the cache is absent, holds no plugin tag, or no cache dir
+  resolves) and `update_available: Option<bool>` against the pin – read from
+  `Inputs.release_cache` at `Inputs.now`, never refreshed by `status`, and
   never a `problems` line (an available update is information, not a fault);
   a pin that is not a plain triple makes it `None` (unknown), never `false`,
   the same answer `release-check` gives. The cache path comes from the
   NON-creating `release_check::existing_cache_file` (core's
   `release::existing_cache_dir`), because `status` promises to create nothing
   and the writers' `cache_dir()` scaffolds the OS cache directory as a side
-  effect. `SCHEMA_VERSION` is `2` since the split: `versions.cli` became
-  `versions.running` and `versions` gained `newest_release` /
-  `update_available` beside the top-level `compaction` section, so a reader
-  of shape `1` can tell it is looking at a different report.
+  effect. `SCHEMA_VERSION` is `2`, bumped whenever a key changes meaning or
+  goes away. Shape `2`'s top-level keys are `schema`, `tool_version`, `cwd`,
+  `repo`, `identity`, `enablement`, `state_tree`, `gate`, `compaction`,
+  `bootstrap`, `versions`, `hooks` and `problems`; `versions` reports the
+  running plugin's own version as `versions.running` (a reader of shape `1`
+  expects `versions.cli`, which shape `2` does not have) beside `manifest`,
+  `pin`, `binary`, `drift`, `detail` (the human-readable explanation of
+  `drift`), `newest_release` and `update_available`.
   The heartbeat store it reads is the non-creating
   `heartbeat::existing_store_dir` (shared with `--recommend`), so a diagnostic
   never scaffolds the store it reports on.
@@ -561,22 +620,23 @@ tree moved wholesale. Three facts shape every module in it:
   operator's remedy text shared by the notice and the report, and it ends in
   "start a new session" rather than `/reload-plugins` alone, because a reload
   re-registers the plugin but keeps the old binary until a fresh session's
-  bootstrap swaps it (R29's literal wording named the reload; see the plan's
-  amendment note). Nothing here installs anything.
-- `setup_ci.rs` – writes `.github/workflows/ss-magic-checklist.yml` from
-  the embedded `assets/workflow/checklist.yml`, pinning the running binary's
-  version. `classify` returns `State::{Absent, Identical, PinStale, Differs}`
-  and only `Differs` (a local edit) needs `--force`; `--check`/`-n` reports
-  without writing. `PinStale` is proved by re-rendering the template at the
-  version found in the file and requiring an exact byte match. Written 0644 –
-  committed content, unlike the 0600 state tree. The template is now on the
-  PLUGIN's line throughout: `VERSION_PLACEHOLDER` is `@SS_MAGIC_PLUGIN_VERSION@`
-  and `PIN_KEY` is `SS_MAGIC_PLUGIN_VERSION:`, the workflow downloads
-  `ss-magic-plugin-<target>.tar.gz` from an `ss-magic-plugin-v$VERSION` release
-  (verifying its published `.sha256` sibling), and it runs `ss-magic-plugin
-  checklist verify` / `render-md`. That is not cosmetic: the plugin's version is
-  never equal to the CLI's, so a `v$VERSION` tag would name a different release
-  entirely – or none at all.
+  bootstrap swaps it. Nothing here installs anything.
+- `setup_ci.rs` – `setup-github-ci [--check|-n] [--force|-f]` writes
+  `.github/workflows/ss-magic-checklist.yml` from the embedded
+  `assets/workflow/checklist.yml`, pinning the running binary's version.
+  `classify` returns `State::{Absent, Identical, PinStale, Differs}` and only
+  `Differs` (a local edit) needs `--force`; `--check`/`-n` reports without
+  writing. `PinStale` is proved by re-rendering the template at the version
+  found in the file and requiring an exact byte match. Written 0644 –
+  committed content, unlike the 0600 state tree. The template is on the
+  PLUGIN's release line throughout: `VERSION_PLACEHOLDER` is
+  `@SS_MAGIC_PLUGIN_VERSION@` and `PIN_KEY` is `SS_MAGIC_PLUGIN_VERSION:`, the
+  workflow downloads `ss-magic-plugin-<target>.tar.gz` from an
+  `ss-magic-plugin-v$VERSION` release (verifying its published `.sha256`
+  sibling), and it runs `ss-magic-plugin checklist verify` / `render-md`. It
+  must use the plugin tag because the plugin's version is never equal to the
+  CLI's, so a `v$VERSION` tag would name a different release entirely – or
+  none at all.
 - `compact_window.rs` – two halves, and the split IS the safety
   story (R28). `compact-window --set <TOKENS>` writes an absolute
   `autoCompactWindow` into the per-machine, gitignored
@@ -588,27 +648,27 @@ tree moved wholesale. Three facts shape every module in it:
   so unrelated harness keys survive, and refuses rather than rebuilding a
   malformed file – and it is the ONLY settings write in the module (it also
   appends the `.claude/settings.local.json` ignore rule to the repository's
-  `.gitignore`, the same rule every per-machine file gets). `compact-window --recommend [--json]` (R24) is
-  read-only: it reports whether `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is set and
-  WHERE (the process environment, then the `env` block of the user's
-  `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`, the project's two files, and
-  the platform's managed-settings file – `Sources` carries those paths so tests
-  run against tempdirs), the window each project file configures, and a
-  recommendation with the exact `--set` command; it writes nothing and exits 0,
-  which a test proves by snapshotting the repository tree, a fake home and the
-  store before and after. The recommendation (R25, KTD11) is
-  `recommend(peaks)`: over the newest `RECOMMEND_ROWS` (20) ledger rows
-  attributable to this repository that carry `peak_context_tokens`,
-  `clamp(ceil_to_10000(1.25 × max_peak), 100000, 1000000)` in INTEGER
-  arithmetic (`(max*5).div_ceil(4)`, so `1.25 × 80000` stays exactly 100,000
-  instead of a float rounding it up to 110,000); three or more rows are `high`
-  confidence, one or two `low`, none gives no number and the generic range
-  guidance instead – never a made-up figure. `recommend_report` is the shared
-  read-only report `status`'s compaction section is built from;
-  `window_configured` / `enable_tip` are the two small helpers the other
-  advisory surfaces key on. Every advisory surface says the override is the
-  person's to remove by hand; nothing in the crate ever edits the user's
-  settings, a managed settings file, or the tracked project file.
+  `.gitignore`, the same rule every per-machine file gets).
+  `compact-window --recommend [--json]` (R24) is read-only: it reports whether
+  `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is set and WHERE (the process environment,
+  then the `env` block of the user's `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`,
+  the project's two files, and the platform's managed-settings file – `Sources`
+  carries those paths so tests run against tempdirs), the window each project
+  file configures, and a recommendation with the exact `--set` command; it
+  writes nothing and exits 0, which a test proves by snapshotting the
+  repository tree, a fake home and the store before and after. The
+  recommendation (R25, KTD11) is `recommend(peaks)`: over the newest
+  `RECOMMEND_ROWS` (20) ledger rows attributable to this repository that carry
+  `peak_context_tokens`, `clamp(ceil_to_10000(1.25 × max_peak), 100000,
+  1000000)` in INTEGER arithmetic (`(max*5).div_ceil(4)`, so `1.25 × 80000`
+  stays exactly 100,000 instead of a float rounding it up to 110,000); three or
+  more rows are `high` confidence, one or two `low`, none gives no number and
+  the generic range guidance instead – never a made-up figure.
+  `recommend_report` is the shared read-only report `status`'s compaction
+  section is built from; `window_configured` / `enable_tip` are the two small
+  helpers the other advisory surfaces key on. Every advisory surface says the
+  override is the person's to remove by hand; nothing in the crate ever edits
+  the user's settings, a managed settings file, or the tracked project file.
 
 ### The operator checklist (`checklist/`)
 
@@ -635,26 +695,32 @@ the ONLY write path.
   making order a pure function of content rather than of prior position; an
   unreadable timestamp sorts to the end instead of aborting the sort. Section
   order is never touched – author-declared order is render order.
-- `checklist/validate.rs` – pure findings, no printing and no I/O. `Severity::Error`
-  blocks `verify` and the renderer; `Warning` describes shape defects the next
-  CLI write self-repairs and must NEVER fail CI.
-- `checklist/render.rs` – the single `render()` behind `list`, `verify`,
-  `render-md`, the commit nudge and the CI PR comment, so all five are
-  byte-identical. Every field of user-authored prose goes through
-  `prose_inline` / `md_link` escaping, and the whole output is wrapped in
-  `cache::envelope` – checklist prose is repository-authored text that reaches a
-  model's context. Timestamps render through the shared UTC formatter, never a
-  local clock, so output is identical across machines and timezones.
+- `checklist/validate.rs` – pure findings, no printing and no I/O.
+  `Severity::Error` makes `verify` exit 1 (the CI gate) and makes a mutating
+  verb print a "still to fill in" note after its write; it does not stop
+  rendering: `list` renders and adds a stderr note counting the errors, and
+  `render-md` does not validate at all. `Warning` describes shape defects the
+  next CLI write self-repairs and must NEVER fail CI.
+- `checklist/render.rs` – the single `render()` behind `list` (bounded to
+  `LIST_BYTE_BUDGET`, 24,000 bytes) and `render-md` (unbounded, the exact body
+  CI posts as the PR comment), so the two outputs differ only in the byte
+  budget; `verify` does not render, and the commit nudge is a fixed advisory
+  string with no checklist in it. Every field of user-authored prose goes
+  through `prose_inline` / `md_link` escaping, and the whole output is wrapped
+  in `cache::envelope` – checklist prose is repository-authored text that
+  reaches a model's context. Timestamps render through the shared UTC
+  formatter, never a local clock, so output is identical across machines and
+  timezones.
 - `checklist/verbs.rs` – `init`, `add-item`, `add-entry`, `set`, `done`, `list`,
   `verify`, `render-md`. Every mutating verb is read-modify-write over the WHOLE
   document (read, mutate one field, `canonicalize`, re-stamp `updated`, write
   back), so `extras` survive; writes are temp-file-then-rename preserving the
-  existing mode. An advisory `tmproot::with_lock` spans the whole
-  read-mutate-write, and spans exist-check plus write for `init`, so concurrent
-  verbs cannot lose an update or duplicate a slug. Exit codes are distinct on
-  purpose: 2 for "the command as typed cannot be carried out", but 1 from
-  `verify` for "the document is invalid", so CI can tell them apart. The
-  `.superset/.magic/checklist.json` pointer's contents are NOT trusted blindly –
-  the target is validated lexically against absolute paths and `..` segments –
-  and `resolve_active` falls back to the naming convention (unambiguous single
-  match only) when no pointer exists.
+  existing mode. An advisory `tmproot::with_lock` on `checklist.lock` in the
+  state tree spans the whole read-mutate-write, and spans exist-check plus write
+  for `init`, so concurrent verbs cannot lose an update or duplicate a slug.
+  Exit codes are distinct on purpose: 2 for "the command as typed cannot be
+  carried out", but 1 from `verify` for "the document is invalid", so CI can
+  tell them apart. The `.superset/.magic/checklist.json` pointer's contents are
+  NOT trusted blindly – the target is validated lexically against absolute
+  paths and `..` segments – and `resolve_active` falls back to the naming
+  convention (unambiguous single match only) when no pointer exists.

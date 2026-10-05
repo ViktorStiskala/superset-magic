@@ -17,7 +17,7 @@
 //! ledger in ss-magic's `ProjectDirs` app root rather than inside any
 //! worktree, and `status` filters by cwd when it is run inside one.
 //!
-//! It takes `data_dir()`, not the `cache_dir()` `src/update/check.rs` uses for
+//! It takes `data_dir()`, not the `cache_dir()` core's `release.rs` uses for
 //! its version-check cache. That module caches something it can always fetch
 //! again; this is a record of things that happened, which nothing can
 //! reconstruct. A history that vanishes on a disk-cleanup run is worse than no

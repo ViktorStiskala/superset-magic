@@ -1,9 +1,11 @@
 //! Markdown rendering for an operator checklist.
 //!
 //! [`render`] is the one entry point: it turns a parsed [`Document`] into the
-//! text every consumer — `checklist list`, `checklist verify`, the
-//! commit-time nudge and the CI pull-request comment — actually prints or
-//! posts, byte-for-byte the same regardless of which one calls it.
+//! text its consumers actually print or post: `checklist list` (the bounded
+//! view for whoever ran it) and `checklist render-md` (the unbounded body a CI
+//! job posts as the pull-request comment). Both go through the one function, so
+//! the two outputs differ only in the byte budget the caller passes. `checklist
+//! verify` does not render, and the commit-time nudge does not render either.
 //!
 //! ## Ported, not reused (R85)
 //!
@@ -33,10 +35,10 @@
 //! An item's title, its steps, its description, its `why`, and every
 //! reference label are free-form prose a repository controls, per
 //! `plugin/skills/operator-checklist/reference.md`. That prose ends up
-//! somewhere a model reads — the CLI's own terminal output, a commit-time
-//! nudge injected into a running session, a comment posted to a pull request
+//! somewhere a model reads — the CLI's own terminal output from `checklist
+//! list`, and the pull-request comment body from `checklist render-md`, which
 //! another session may later read as context. Rather than have each of those
-//! four surfaces remember to wrap what they show, `render` wraps it once,
+//! two surfaces remember to wrap what they show, `render` wraps it once,
 //! through [`crate::cache::envelope`] — the same call the conclusion
 //! cache and `hook::subagent_stop`'s salvaged transcripts already make (R64).
 //! One envelope format, applied in one place, is the whole point: two
