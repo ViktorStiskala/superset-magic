@@ -105,10 +105,12 @@ paths:
   every scenario against real `git` output and asserts `roots()` equals the
   subprocess probes' answer in ALL of them. Wired into the plugin crate only:
   the hook pipeline (`hook/mod.rs`, where spawning nothing is the point) and
-  the two read-only verbs that attribute ledger rows to a repository,
-  `compact-window --recommend` and the `cost` ledger's `rows_for_repository`.
-  Every CLI command keeps the subprocess probes (R22, the requirement that
-  the walk stays off the CLI's paths).
+  `compact-window --recommend` (its own root lookup, plus the ledger-row
+  attribution in `ledger::rows_for_repository`, which `status`'s compaction
+  section also reaches). The `cost` verb does not use it: `cost --here`
+  resolves its root with the `git::cwd_repo_root` subprocess probe. Every
+  CLI command keeps the subprocess probes (R22, the requirement that the walk
+  stays off the CLI's paths).
 - `git/gitignore.rs` – `.gitignore` helpers at a git root. `ensure_path_ignored`
   is the single entry point for adding an ignore rule, shared by reverse sync
   (the secret-safety boundary), the CLI's backups dir, the CLI's migrate/init

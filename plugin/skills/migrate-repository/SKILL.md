@@ -79,7 +79,8 @@ branch has already migrated the repository: stop with "merge the default branch 
 - **On the default branch:** print the inventory report and "create and switch to a branch, then
   re-run". Make no commit and switch nothing. End.
 - **Already migrated** (`enablement.ss_magic.enabled` is true, the legacy skill is gone, and the CI
-  state is not `absent`): **branch-only mode** – skip steps 3, 5 and 6.
+  state is not `absent`): **branch-only mode** – skip steps 3 and 6, and run step 5 only when the
+  CI state is `pin-stale` (an older or earlier-generation workflow; the upgrade is offered).
 - **Enabled, legacy skill gone, CI state `absent`:** branch-only mode, but run step 5.
 - **Otherwise:** full migration.
 
@@ -121,7 +122,8 @@ in every worktree of this repository on this machine.
 
 Run the `/ss-magic:setup-github-ci` state machine: `ss-magic-plugin setup-github-ci --check`
 first, branch on its `state:` token, and write only after the operator confirms. Note the final
-state – step 6 depends on it. In branch-only mode, ask to commit the workflow.
+state – step 6 depends on it: the workflow is installed only when it ends `identical` or a kept
+`differs`, never a declined `pin-stale`. In branch-only mode, ask to commit the workflow.
 
 ### 6. Retire the old rules (full migration only)
 
@@ -139,4 +141,6 @@ List every commit made (short hash and subject) and say none was pushed; the ite
 enablement state now; the instruction to run `git restore .superset/magic.json` in other worktrees
 before they merge the default branch; that other open branches merge the default branch first and
 then run this skill (which takes branch-only mode there); and a reminder to run the repository's
-own checks before pushing. The template is in [reference.md](./reference.md).
+own checks before pushing. A workflow left `pin-stale` must be upgraded with
+`/ss-magic:setup-github-ci` before a second checklist merges. The template is in
+[reference.md](./reference.md).

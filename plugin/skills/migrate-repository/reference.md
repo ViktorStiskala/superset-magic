@@ -83,8 +83,11 @@ flowchart TB
   r2 -- "full migration" --> r1 --> r3
 ```
 
-In branch-only mode the CI step runs only when `setup-github-ci --check` reports `absent`;
-otherwise the run passes from conversion straight to the final report. Choosing "keep Markdown"
+In branch-only mode the CI step runs only when `setup-github-ci --check` reports `absent` or
+`pin-stale` (a workflow this tool wrote at another pin; when `--check` names an earlier template
+generation, it is one that renders the wrong checklist and fails once `docs/actions/` holds two). On `identical` or `differs`
+(the operator's own edit, which the final report names) the run passes from conversion straight to
+the final report. Choosing "keep Markdown"
 at the size question converts nothing and passes straight to the CI step.
 
 ## Preflight
@@ -178,6 +181,16 @@ or none at all).
 
 Every commit names its paths twice, so nothing the operator had already staged rides along:
 `git add -- <paths>`, then `git commit -m '<fixed subject>' -- <paths>`.
+
+The fixed subjects are these four, used exactly as written. None contains a quote character, so
+each fits the single-quoted `-m` as is:
+
+| Commit | Paths | Subject |
+|---|---|---|
+| enable | `.superset/magic.json` and the `.gitignore` the enable changed | `Enable ss-magic-plugin` |
+| conversion | the checklist document and the legacy file | `Convert the operator checklist to the plugin JSON format` |
+| retirement | every path in the retire diff, plus the workflow from the CI step | `Retire the hand-written checklist rules` |
+| workflow alone | `.github/workflows/ss-magic-checklist.yml` (branch-only mode, or a no to the retire diff) | `Install the ss-magic checklist workflow` |
 
 ## Trust boundary and the write path
 
@@ -374,10 +387,15 @@ invalid document, a refused precondition, or an unexpected error.
 | `checklist init` | 2 | the stem is not well formed | re-derive it once per the rules; else stop |
 | `checklist init` | 1 | the state tree is not usable (not gitignored, or a tracked path) | stop; report `state_tree` from `status --json` |
 | `checklist add-item`, `add-entry`, `set`, `done` | 2 | malformed or taken id, unknown id, section or key, unreadable timestamp, `null` on a required field, no active checklist | show stderr; fix the argument once (next collision suffix, corrected timestamp); else stop and report |
+
 | `checklist verify` | 1, last line `<path> is not valid` | the document is invalid (its `error:` lines are findings) | the one fix above |
 | `checklist verify` | 2 | no such checklist, or the path was refused | stop and report |
 | `setup-github-ci` | 1 or 2 | refused without `--force`, or an unreadable workflow | follow the `setup-github-ci` skill |
 | any verb | 1 with `error:`, and no `is not valid` line | an unexpected I/O error | stop and report |
+
+When a refusal comes after that item's `add-item` succeeded, the item already exists: re-run only
+the refused call and the ones after it, with the same id. Take the next collision suffix only when
+`add-item` itself reports the id as taken.
 
 ## The legacy file after conversion
 
@@ -407,8 +425,12 @@ fails on dead backticked paths stays green.
 Defer to the `/ss-magic:setup-github-ci` state machine: `ss-magic-plugin setup-github-ci --check`
 first, branch on the `state:` token (`absent`, `identical`, `pin-stale`, `differs`), confirm before
 any write, `--force` only on an explicit yes for `differs`. The workflow counts as **installed**
-when the file exists after this step (written now, or `identical`, `pin-stale` or a kept `differs`
-before). It renders the checklists a pull request adds or modifies.
+only when the state after this step is `identical` (written now, or already current) or a kept
+`differs`. A `pin-stale` workflow the operator declined to upgrade is not installed, so the
+retirement keeps the PR-description link rule. The current workflow renders the checklists a pull
+request adds or modifies; an earlier template generation (named by `--check`) ran `verify` and
+`render-md` with no path, so it renders the checklist already merged instead of the pull request's
+own, and fails once `docs/actions/` holds two.
 
 ## Retirement
 
@@ -492,7 +514,10 @@ Next:
 ```
 
 Leave out the `git restore` line when no commit touched `.superset/magic.json`, and add a line for
-anything stopped or declined, naming the step.
+anything stopped or declined, naming the step. When the workflow ends `pin-stale`, add a line saying
+it must be upgraded with `/ss-magic:setup-github-ci` before a second checklist merges; when
+`--check` named an earlier template generation, give the reason: that template renders the wrong
+document and fails once `docs/actions/` holds two checklists.
 
 The open items come from the conversion's own record of what it added, not from `checklist list`,
 which prints the origin URL.

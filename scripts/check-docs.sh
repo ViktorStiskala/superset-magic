@@ -14,6 +14,16 @@
 # result. Directory scans use `find -L`, so a symlinked file or subdirectory is
 # checked (and counted) like any other: the reader of these files follows links.
 #
+# For the same reason a check FAILS when a path it requires is absent under
+# ROOT, naming the path on stderr: a check whose scope is gone has looked at
+# nothing, and a wrong ROOT, or a later move of the rules directory or the
+# skills, would otherwise print seven `ok` lines and turn every guard off. The
+# required paths are CLAUDE.md, README.md and .cursor/BUGBOT.md (regular files)
+# and .claude/rules/ and plugin/skills/ (directories); each check requires the
+# ones it reads, as its section below lists. The other scope paths
+# (CONTRIBUTING.md, CONCEPTS.md, docs/solutions/, docs/runbooks/) are checked
+# when present and skipped when absent.
+#
 #   retired subcommand spelling    no current-state document spells the old
 #                                  `ss-magic` + `plugin` + `<verb>` form
 #   skills name no CLAUDE_PLUGIN_DATA
@@ -66,6 +76,28 @@ BUDGET_BYTES=50000
 
 TAB=$(printf '\t')
 
+# Prints one finding per required path that is absent under root, so the check
+# calling it FAILS instead of reading clean over a scope it never saw. A path
+# ending in `/` must be a directory; any other must be a regular file. Both
+# tests follow symlinks, as the scans themselves do.
+require_scope() { # root path...
+    local root=$1 p
+    shift
+    for p in "$@"; do
+        case $p in
+            */)
+                [ -d "$root/$p" ] ||
+                    printf '%s: required directory is missing (the check cannot look at it)\n' "$p"
+                ;;
+            *)
+                [ -f "$root/$p" ] ||
+                    printf '%s: required file is missing (the check cannot look at it)\n' "$p"
+                ;;
+        esac
+    done
+    return 0
+}
+
 # --------------------------------------------------------------------------
 # Check 1: the retired subcommand spelling.
 #
@@ -85,11 +117,16 @@ TAB=$(printf '\t')
 # there is acted on, not merely misread. docs/plans/ is deliberately NOT in
 # scope - a plan is a historical record and quotes the spelling that was current
 # when it was written.
+#
+# Requires CLAUDE.md, README.md, .cursor/BUGBOT.md, .claude/rules/ and
+# plugin/skills/; docs/solutions/, CONTRIBUTING.md and CONCEPTS.md are scanned
+# when present.
 # --------------------------------------------------------------------------
 SPELLING_SCOPE="plugin/skills docs/solutions .claude/rules README.md CONTRIBUTING.md CONCEPTS.md CLAUDE.md .cursor/BUGBOT.md"
 
 check_spelling() { # root
     local root=$1 p existing=""
+    require_scope "$root" CLAUDE.md README.md .cursor/BUGBOT.md .claude/rules/ plugin/skills/
     for p in $SPELLING_SCOPE; do
         [ -e "$root/$p" ] && existing="$existing $p"
     done
@@ -109,9 +146,12 @@ check_spelling() { # root
 # would expand to nothing and produce a path at the filesystem root, with no
 # error. Skills reach the pinned binary through the bin/ wrapper instead, which
 # is on the Bash tool's PATH while the plugin is enabled.
+#
+# Requires plugin/skills/.
 # --------------------------------------------------------------------------
 check_plugin_data() { # root
     local root=$1
+    require_scope "$root" plugin/skills/
     [ -d "$root/plugin/skills" ] || return 0
     (cd "$root" && find -L plugin/skills -type f -exec grep -nHF -- 'CLAUDE_PLUGIN_DATA' {} +) |
         sed 's/$/ (expands to nothing in the Bash tool; use ss-magic-plugin)/'
@@ -128,9 +168,12 @@ check_plugin_data() { # root
 # release was published most recently, which since the split can be a
 # `ss-magic-plugin-vX.Y.Z` release that carries no installer script at all. The
 # documented one-liner would then 404 for everyone.
+#
+# Requires README.md.
 # --------------------------------------------------------------------------
 check_installer_pin() { # root
     local root=$1
+    require_scope "$root" README.md
     [ -f "$root/README.md" ] || return 0
     (cd "$root" && grep -nHF -- 'releases/latest/download/' README.md) |
         sed 's/$/ (latest can resolve to a plugin release with no installer; pin a vX.Y.Z release)/'
@@ -149,9 +192,12 @@ check_installer_pin() { # root
 # `.claude/rules/` directory itself is allowed, as the subject of a review rule
 # ("flag a change under `.claude/rules/` that ..."); so is a glob such as
 # `.claude/rules/*.md`, which names no individual file.
+#
+# Requires .cursor/BUGBOT.md.
 # --------------------------------------------------------------------------
 check_bugbot() { # root
     local root=$1 f=".cursor/BUGBOT.md"
+    require_scope "$root" "$f"
     [ -f "$root/$f" ] || return 0
     (cd "$root" && grep -nHF -- '](' "$f") |
         sed 's/$/ (Markdown link; BUGBOT cannot follow links, restate the rule inline)/'
@@ -194,6 +240,8 @@ check_bugbot() { # root
 # .claude/rules/ file, README.md, CONTRIBUTING.md, CONCEPTS.md, docs/runbooks/,
 # docs/solutions/ and plugin/skills/. docs/plans/ and docs/brainstorms/ are out
 # of scope (historical records; their links point at the tree as it was).
+# Requires CLAUDE.md, README.md, .claude/rules/ and plugin/skills/; the rest of
+# the scope is checked when present.
 # --------------------------------------------------------------------------
 link_scope_files() { # root -> repo-relative paths, one per line
     local root=$1 p d
@@ -315,6 +363,7 @@ extract_links() { # file
 
 check_links() { # root
     local root=$1 rel dir kind ln raw target path scheme_re='^[A-Za-z][A-Za-z0-9+.-]*:'
+    require_scope "$root" CLAUDE.md README.md .claude/rules/ plugin/skills/
     link_scope_files "$root" | while IFS= read -r rel || [ -n "$rel" ]; do
         dir=$(dirname "$rel")
         extract_links "$root/$rel" | while IFS="$TAB" read -r kind ln raw || [ -n "$kind" ]; do
@@ -371,6 +420,8 @@ check_links() { # root
 # a line-shape test would accept it. Indentation is spaces only: YAML forbids
 # tabs there. Accepting either would also drop the file from the always-loaded
 # budget below, although the loader cannot read its `paths:` at all.
+#
+# Requires .claude/rules/.
 # --------------------------------------------------------------------------
 
 # Prints `none`, `paths`, or `bad <reason>` for one file.
@@ -434,6 +485,7 @@ rule_files() { # root -> repo-relative paths of every .claude/rules/**/*.md
 
 check_frontmatter() { # root
     local root=$1 rel state
+    require_scope "$root" .claude/rules/
     rule_files "$root" | while IFS= read -r rel || [ -n "$rel" ]; do
         state=$(frontmatter_state "$root/$rel")
         [ "${state#bad }" = "$state" ] || printf '%s: %s\n' "$rel" "${state#bad }"
@@ -450,6 +502,9 @@ check_frontmatter() { # root
 # The set is DERIVED by scanning the directory, never named, so a new rule file
 # added without frontmatter, in a subdirectory or not, counts the moment it
 # exists.
+#
+# Requires CLAUDE.md and .claude/rules/: without either, the total would count
+# only what is left and pass however large the missing part has grown.
 # --------------------------------------------------------------------------
 always_loaded_files() { # root
     local root=$1 rel
@@ -475,6 +530,7 @@ EOF
 
 check_budget() { # root
     local root=$1 total rel size
+    require_scope "$root" CLAUDE.md .claude/rules/
     total=$(always_loaded_bytes "$root")
     [ "$total" -le "$BUDGET_BYTES" ] && return 0
     printf '%s bytes > %s budget; the always-loaded set is:\n' "$total" "$BUDGET_BYTES"
@@ -868,6 +924,103 @@ MD
     chmod 644 "$F/README.md"
 
     # ======================================================================
+    # A missing scope fails the checks that need it. Each case asserts the
+    # WHOLE ok/FAIL output, so a check that does not require the path is
+    # proved to stay ok, and asserts each failing check's own "required"
+    # detail line, so a check that would fail anyway (a link to the removed
+    # file) is proved to fail for the missing path too.
+    expect_scope_failures() { # missing-path check-names (newline-separated)
+        local missing=$1 failing=$2 name expected=""
+        while IFS= read -r name || [ -n "$name" ]; do
+            [ -n "$name" ] || continue
+            if printf '%s\n' "$failing" | grep -qxF -- "$name"; then
+                expected="${expected}FAIL $name
+"
+                assert_contains_fixed "$ERR" "error: $name: $missing: required" "$name names $missing"
+            else
+                expected="${expected}ok   $name
+"
+            fi
+        done <<'NAMES'
+retired subcommand spelling
+skills name no CLAUDE_PLUGIN_DATA
+README pins the installer
+BUGBOT is self-contained
+relative links resolve
+rule frontmatter
+always-loaded budget
+NAMES
+        assert_eq 1 "$CODE" "exits 1"
+        assert_eq "$expected" "$(cat "$OUT")
+" "exactly the checks that need $missing fail"
+    }
+
+    current_case="an empty ROOT"
+    mkdir -p "$SANDBOX/empty"
+    run_guard "$SANDBOX/empty"
+    assert_eq 1 "$CODE" "exits 1"
+    assert_eq 7 "$(grep -c '^FAIL ' "$OUT")" "every check fails"
+    assert_eq 7 "$(wc -l <"$OUT" | tr -d ' ')" "still one line per check"
+    for p in CLAUDE.md README.md .cursor/BUGBOT.md .claude/rules/ plugin/skills/; do
+        assert_contains_fixed "$ERR" ": $p: required" "the detail names $p"
+    done
+
+    current_case="CLAUDE.md missing"
+    fixture scope-claude
+    rm -f "$F/CLAUDE.md"
+    run_guard "$F"
+    expect_scope_failures CLAUDE.md "retired subcommand spelling
+relative links resolve
+always-loaded budget"
+
+    current_case=".claude/rules/ missing"
+    fixture scope-rules
+    rm -rf "$F/.claude/rules"
+    run_guard "$F"
+    expect_scope_failures .claude/rules/ "retired subcommand spelling
+relative links resolve
+rule frontmatter
+always-loaded budget"
+
+    current_case=".claude/rules is a file, not a directory"
+    fixture scope-rules-file
+    rm -rf "$F/.claude/rules"
+    printf 'not a directory\n' >"$F/.claude/rules"
+    run_guard "$F"
+    assert_contains_fixed "$OUT" "FAIL rule frontmatter" "a file in its place is not the directory"
+    assert_contains_fixed "$ERR" "error: rule frontmatter: .claude/rules/: required directory is missing" "and says why"
+
+    current_case="README.md missing"
+    fixture scope-readme
+    rm -f "$F/README.md"
+    run_guard "$F"
+    expect_scope_failures README.md "retired subcommand spelling
+README pins the installer
+relative links resolve"
+
+    current_case=".cursor/BUGBOT.md missing"
+    fixture scope-bugbot
+    rm -f "$F/.cursor/BUGBOT.md"
+    run_guard "$F"
+    expect_scope_failures .cursor/BUGBOT.md "retired subcommand spelling
+BUGBOT is self-contained"
+
+    current_case="plugin/skills/ missing"
+    fixture scope-skills
+    rm -rf "$F/plugin/skills"
+    run_guard "$F"
+    expect_scope_failures plugin/skills/ "retired subcommand spelling
+skills name no CLAUDE_PLUGIN_DATA
+relative links resolve"
+
+    current_case="an optional scope path missing"
+    fixture scope-optional
+    rm -rf "$F/CONCEPTS.md" "$F/docs/runbooks"
+    run_guard "$F"
+    assert_eq 0 "$CODE" "exits 0"
+    assert_eq 7 "$(grep -c '^ok   ' "$OUT")" "seven ok lines"
+
+    # ======================================================================
     current_case="several failures at once"
     fixture many
     printf 'ss-magic plugin status\n' >>"$F/CLAUDE.md"
@@ -887,7 +1040,9 @@ case "${1:-}" in
         selftest "${2:-}"
         ;;
     -h|--help)
-        sed -n '2,48p' "$SELF" | sed 's/^# \{0,1\}//'
+        # The header comment: every line after the shebang up to the first
+        # line that is not a comment.
+        awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$SELF" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     -*)

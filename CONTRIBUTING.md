@@ -157,8 +157,9 @@ predicates, and only the second one carries the safety property.
 
 Outside the crates, the plugin ships as a packaged tree: `plugin/` (its manifest,
 hooks, bootstrap script, hook shim, wrapper, shared shell libs, version pin and
-the three skills `scratchpad`, `operator-checklist` and `setup-github-ci`),
-`.claude-plugin/marketplace.json` (which pins that tree's zip by SHA-256), `scripts/build-plugin-zip.py` (the reproducible builder and the
+the four skills `scratchpad`, `operator-checklist`, `setup-github-ci` and
+`migrate-repository`), `.claude-plugin/marketplace.json` (which pins that
+tree's zip by SHA-256), `scripts/build-plugin-zip.py` (the reproducible builder and the
 release assertions), `scripts/test-bootstrap.sh`, `scripts/mark-latest.sh` (the
 post-announce step that keeps the repository's "latest" mark on the CLI line,
 with `scripts/test-mark-latest.sh` driving it against a fake `gh` – on Linux in
@@ -342,7 +343,10 @@ selection suite, a build of the exact asset cargo-dist will publish, and the
 documentation guards.
 The guards live in `scripts/check-docs.sh`, which you can run locally
 (`bash scripts/check-docs.sh`, plus `--selftest` for its own fixture tests); it
-prints one `ok`/`FAIL` line for each of seven checks:
+prints one `ok`/`FAIL` line for each of seven checks. A check also fails when a
+path it needs is missing under the root it is given (`CLAUDE.md`, `README.md`,
+`.cursor/BUGBOT.md`, `.claude/rules/` or `plugin/skills/`), so a wrong root or
+a moved directory cannot read as clean:
 
 - no current-state document (`plugin/skills/`, `docs/solutions/`,
   `.claude/rules/`, `README.md`, `CONTRIBUTING.md`, `CONCEPTS.md`, `CLAUDE.md`,

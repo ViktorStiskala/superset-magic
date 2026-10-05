@@ -143,6 +143,9 @@ every module in it:
   `file-changed.lock` (`hook/file_changed.rs`); `hooks.lock` and `cost.lock`
   sit in the machine-level store beside the heartbeat log and the ledger, and
   `current.lock` and `checklist.lock` in the `.superset/.magic/` state tree.
+  `checklist.lock` goes through `tmproot::with_lock` (`checklist/verbs.rs`
+  passes the state tree as the directory), but `current.lock` is the exception:
+  `scratchpad.rs` opens it and takes it directly with `fd_lock::RwLock`.
 - `identity.rs` – the deterministic `<repo>-<branch>` slug, derived from
   git alone and never from the Superset workspace name (which can be silently
   renamed). `resolve(cwd)` returns `None` outside a git repo – there is no

@@ -2,9 +2,10 @@
 //!
 //! [`render`] is the one entry point: it turns a parsed [`Document`] into the
 //! text its consumers actually print or post: `checklist list` (the bounded
-//! view for whoever ran it) and `checklist render-md` (the unbounded body a CI
-//! job posts as the pull-request comment). Both go through the one function, so
-//! the two outputs differ only in the byte budget the caller passes. `checklist
+//! view for whoever ran it) and `checklist render-md` (the body a CI job posts as
+//! the pull-request comment: unbounded unless `--max-bytes` is given, which the
+//! shipped workflow does). Both go through the one function, so the two outputs
+//! differ only in the byte budget the caller passes. `checklist
 //! verify` does not render, and the commit-time nudge does not render either.
 //!
 //! ## Ported, not reused (R85)
@@ -78,8 +79,9 @@ use crate::scratchpad::format_rfc3339;
 /// a repository line rather than this function guessing at one or resolving
 /// it itself. `budget` passes straight through to `cache::envelope`:
 /// `Budget::Unbounded` for a destination with no size limit of its own (a
-/// file, a pull-request comment body), `Budget::Bytes(n)` for one injected
-/// into a model's context that has to stay small.
+/// file, or each document `render-md` emits whole), `Budget::Bytes(n)` for
+/// one that has to stay small: the terminal output of `list`, or the first
+/// document `render-md --max-bytes` must cut inside its own envelope.
 pub fn render(doc: &Document, path: &Path, repo_url: Option<&str>, budget: Budget) -> String {
     let body = render_body(doc, repo_url);
     let head = render_head(path);

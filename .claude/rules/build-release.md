@@ -22,7 +22,7 @@ not tune it per crate) and `[profile.dist]` inheriting it. Members live under
   surface and never tagged.
 - `crates/ss-magic` – binary `ss-magic`, the sync CLI. Currently `0.11.2`.
 - `crates/ss-magic-plugin` – binary `ss-magic-plugin`, the plugin's hook runtime
-  and verb tree. Currently `1.0.1`.
+  and verb tree. Currently `1.1.0`.
 
 Every `cargo` command is run from the root with `--workspace`; `cargo install
 --path` needs a `[package]`, so it names `crates/ss-magic`. `make install`
@@ -78,9 +78,11 @@ docs (tests, PR expectations, the per-line release procedure) live in
 
 `plugin/` is the packaged marketplace tree (`.claude-plugin/plugin.json`,
 `hooks/hooks.json`, `hooks/bootstrap.sh`, `hooks/run-hook.sh`,
-`bin/ss-magic-plugin`, `lib/tmproot.sh`, `lib/execguard.sh`, `skills/` (three
-skills: `scratchpad`, `operator-checklist` with its `reference.md`, and
-`setup-github-ci`), `ss-magic-plugin.version`); `scripts/build-plugin-zip.py` packs it
+`bin/ss-magic-plugin`, `lib/tmproot.sh`, `lib/execguard.sh`, `skills/` (four
+skills: `scratchpad`, `operator-checklist`, `setup-github-ci` and
+`migrate-repository`, each with its `SKILL.md` and, for some, further files such
+as a `reference.md`), `ss-magic-plugin.version`);
+`scripts/build-plugin-zip.py` packs it
 byte-reproducibly (sorted entries, fixed 1980-01-01 timestamps, normalized
 modes, STORED not deflated, `create_system` forced to unix, `.DS_Store`
 excluded, symlinks and non-ASCII names refused loudly), and

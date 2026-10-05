@@ -63,7 +63,9 @@ Preflight (read only)
   legacy skill: .claude/skills/operator-checklist/ (here and on origin/main)
   project rules: several matches across a handful of files
   CI workflow: state: absent
-  problems: none
+  problems:
+    - git does not ignore .superset/.magic/ — every state-writing hook refuses to write anything while that is true. `ss-magic-plugin enable` adds the rule.
+    - `plugin.enabled` is not true in <main checkout path> — every hook no-ops, whatever the harness has loaded. Turn it on with `ss-magic-plugin enable`.
 ```
 
 Not the default branch, not yet migrated: full migration. The file is under 80 items and 60 KB, so
@@ -223,7 +225,7 @@ rendered into a comment on the pull request. Do not edit the JSON by hand.
 ```
 
 The folder and all the other legacy folders stay. Commit gate: the document and the stub, as
-"Convert the operator checklist to the plugin's JSON format". Yes.
+"Convert the operator checklist to the plugin JSON format". Yes.
 
 ### CI
 
@@ -266,7 +268,7 @@ CI workflow: state identical (written)
 
 Commits (none pushed):
 - <hash> Enable ss-magic-plugin
-- <hash> Convert the operator checklist to the plugin's JSON format
+- <hash> Convert the operator checklist to the plugin JSON format
 - <hash> Retire the hand-written checklist rules
 
 Items left open:

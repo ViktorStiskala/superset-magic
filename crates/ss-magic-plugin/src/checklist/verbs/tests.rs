@@ -1644,6 +1644,44 @@ fn a_symlinked_checklist_path_is_refused_and_never_read() {
     assert!(err.contains("is a symlink"), "{err}");
 }
 
+/// Every explicit `FILE` is validated and read before anything is printed, so
+/// one bad path AFTER a valid one fails the whole run closed: exit 2 with the
+/// reason on stderr, and NOTHING of the valid document on stdout. The CI
+/// workflow relies on this – a partial body would read as a complete one,
+/// posted as the PR comment or taken as a passing `verify`. Each kind of bad
+/// path takes its own branch of the loader: one that does not exist (refused
+/// by the `lstat` check), one that exists but is not a checklist's JSON (the
+/// read's parse error), and a symlink (refused before anything is read).
+#[test]
+fn a_bad_path_after_a_valid_one_fails_closed_with_nothing_printed() {
+    let (_dir, root) = ignored_repo();
+    let a = write_checklist(&root, "2026-08-a", 0);
+
+    let missing = format!("{ACTIONS_REL}/2026-08-missing{CHECKLIST_SUFFIX}");
+    let malformed = format!("{ACTIONS_REL}/2026-08-broken{CHECKLIST_SUFFIX}");
+    fs::write(root.join(&malformed), "{ not json").unwrap();
+    let link = format!("{ACTIONS_REL}/2026-08-link{CHECKLIST_SUFFIX}");
+    std::os::unix::fs::symlink(root.join(&a), root.join(&link)).unwrap();
+
+    for (bad, reason) in [
+        (missing.as_str(), "does not exist"),
+        (malformed.as_str(), "malformed JSON"),
+        (link.as_str(), "is a symlink"),
+    ] {
+        let budget = (MARKER_RESERVE + 60_000).to_string();
+        for argv in [
+            vec!["verify", &a, bad],
+            vec!["render-md", &a, bad],
+            vec!["render-md", "--max-bytes", &budget, &a, bad],
+        ] {
+            let (code, out, err) = run_ok(&root, &argv);
+            assert_eq!(code, ExitCode::from(2), "{argv:?}: {err}");
+            assert!(err.contains(reason), "{argv:?}: {err}");
+            assert!(out.is_empty(), "{argv:?} printed {out}");
+        }
+    }
+}
+
 /// The convention's case fold is shared with the checklist deny: an uppercase
 /// directory is never refused for its spelling. Whether it then reads depends
 /// only on whether the filesystem folds case too.
@@ -1806,4 +1844,34 @@ fn with_no_paths_the_pointer_still_picks_the_document() {
     let (code, out, _) = run_ok(&root, &["render-md"]);
     assert_eq!(code, ExitCode::SUCCESS);
     assert_eq!(out, single_render(&root, &b));
+}
+
+/// With no FILE, `--max-bytes` still bounds the body: it applies to the active
+/// checklist alone, truncating it inside its envelope exactly as it would the
+/// same document named explicitly.
+#[test]
+fn with_no_paths_the_budget_applies_to_the_active_checklist() {
+    let (_dir, root) = ignored_repo();
+    let big = write_checklist(&root, "2026-08-big", 40_000);
+    let max = 8_000;
+    assert!(
+        single_render(&root, &big).len() > max,
+        "the fixture must outgrow the budget"
+    );
+
+    let (code, out, err) = run_ok(&root, &["render-md", "--max-bytes", &max.to_string()]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(out.len() <= max, "{} > {max}", out.len());
+    assert!(out.contains("The whole text is at"), "{out}");
+    assert!(
+        out.contains("END-UNTRUSTED-DATA"),
+        "the envelope is closed:\n{out}"
+    );
+    assert!(out.contains("padding line"), "the document's head is shown");
+
+    // The same budget over the same document named explicitly: no-FILE is a
+    // route to the document, not a different render.
+    let (code, explicit, _) = run_ok(&root, &["render-md", "--max-bytes", &max.to_string(), &big]);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(out, explicit);
 }

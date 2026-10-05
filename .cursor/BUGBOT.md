@@ -1747,7 +1747,10 @@ out of step or a stale digest, or a bump applied to the wrong group's surfaces.
   failure-path suite, the latest-mark suite, a build of the
   exact asset cargo-dist will publish, and the documentation guards in
   `scripts/check-docs.sh` (runnable locally; `--selftest` drives it against
-  fixture trees), one `ok`/`FAIL` line per check: no document (`plugin/skills/`,
+  fixture trees), one `ok`/`FAIL` line per check, each also failing when a path
+  it needs (`CLAUDE.md`, `README.md`, this file, `.claude/rules/`,
+  `plugin/skills/`) is missing – flag a change that moves or renames one of
+  those without updating the script: no document (`plugin/skills/`,
   `docs/solutions/`, `.claude/rules/`, `README.md`, `CONTRIBUTING.md`,
   `CONCEPTS.md`, `CLAUDE.md`, this file) spells the retired `ss-magic` +
   `plugin` subcommand form; no skill body names `CLAUDE_PLUGIN_DATA`;
