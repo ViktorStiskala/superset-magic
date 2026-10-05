@@ -306,10 +306,38 @@ builder selftest, the release assertions, the `cargo tree` dependency-absence
 proof, a check that a content change under `plugin/` came with a version bump
 (its baseline considers both tag shapes), the bootstrap failure-path suite, the
 latest-mark selection suite, a
-build of the exact asset cargo-dist will publish, and three document greps: no
-skill body may name `CLAUDE_PLUGIN_DATA`, no document may spell the retired
-`ss-magic` `plugin` subcommand form, and `README.md` may name no
-`releases/latest/download/` URL. On a release, the same job also refuses a
+build of the exact asset cargo-dist will publish, and the documentation guards.
+The guards live in `scripts/check-docs.sh`, which you can run locally
+(`bash scripts/check-docs.sh`, plus `--selftest` for its own fixture tests); it
+prints one `ok`/`FAIL` line for each of seven checks:
+
+- no current-state document (`plugin/skills/`, `docs/solutions/`,
+  `.claude/rules/`, `README.md`, `CONTRIBUTING.md`, `CONCEPTS.md`, `CLAUDE.md`,
+  `.cursor/BUGBOT.md`) spells the retired `ss-magic` `plugin` subcommand form;
+- no skill body names `CLAUDE_PLUGIN_DATA`;
+- `README.md` names no `releases/latest/download/` URL;
+- `.cursor/BUGBOT.md` contains no Markdown link, inline or reference-style,
+  and names no individual rule file under `.claude/rules/`;
+- every relative Markdown link (inline or a reference definition) in
+  `CLAUDE.md`, `.claude/rules/`, `README.md`, `CONTRIBUTING.md`, `CONCEPTS.md`,
+  `docs/runbooks/`, `docs/solutions/` and `plugin/skills/` resolves to an
+  existing file; links inside code fences and code spans are skipped, and a
+  fence left open to the end of a file fails the check, since it would hide
+  every link after it;
+- every `.claude/rules/` file has either no frontmatter or a well-formed
+  `paths:` list, each item quoted or a plain path and indented with spaces
+  (an unquoted `**/*.rs` is a YAML alias, not a string);
+- the always-loaded set – `CLAUDE.md` plus every `.claude/rules/` file without
+  a `paths:` list, found by scanning rather than by name, symlinks followed –
+  totals at most 50,000 bytes.
+
+A check also fails when a tool it runs reports an error (an unreadable file,
+for one), so a guard that could not look never reads as a pass.
+
+`docs/plans/` and `docs/brainstorms/` are outside every guard's scope. The
+`plugin` job runs the guards and their selftest, which makes them part of the
+release gate, and the macOS leg of the `test` job runs both again under
+`/bin/bash` 3.2 with BSD tools. On a release, the `plugin` job also refuses a
 tag matching neither `^v[0-9]+\.[0-9]+\.[0-9]+$` nor
 `^ss-magic-plugin-v[0-9]+\.[0-9]+\.[0-9]+$` – a prefixed CLI tag such as
 `ss-magic-v0.11.1` would publish a release the updater's anchored filter and

@@ -1438,12 +1438,34 @@ out of step or a stale digest, or a bump applied to the wrong group's surfaces.
   selftest, the release assertions, the `cargo tree` absence proof, a check that
   a content change under `plugin/` came with a version bump (its baseline
   considers BOTH tag shapes), the bootstrap failure-path suite, a build of the
-  exact asset cargo-dist will publish, and three document greps: no skill body
-  names `CLAUDE_PLUGIN_DATA`; no document (`plugin/skills/`, `docs/solutions/`,
-  `README.md`, `CONTRIBUTING.md`, `CONCEPTS.md`, `CLAUDE.md`, this file) spells
-  the retired `ss-magic` + `plugin` subcommand form – `docs/plans/` is
-  deliberately out of scope, a plan being a historical record; and `README.md`
-  names no `releases/latest/download/` URL. On a release, the same job also refuses a tag matching neither
+  exact asset cargo-dist will publish, and the documentation guards in
+  `scripts/check-docs.sh` (runnable locally; `--selftest` drives it against
+  fixture trees), one `ok`/`FAIL` line per check: no document (`plugin/skills/`,
+  `docs/solutions/`, `.claude/rules/`, `README.md`, `CONTRIBUTING.md`,
+  `CONCEPTS.md`, `CLAUDE.md`, this file) spells the retired `ss-magic` +
+  `plugin` subcommand form; no skill body names `CLAUDE_PLUGIN_DATA`;
+  `README.md` names no `releases/latest/download/` URL; this file contains no
+  Markdown link (no `]` immediately followed by `(`, and no line opening with a
+  bracketed label followed by a colon, which is a reference definition) and
+  names no individual rule file (a path under `.claude/rules/` ending in
+  `.md`); every relative Markdown link (inline or reference definition, outside
+  code fences and code spans) in the contributor-instructions file, the rule
+  files it indexes, `README.md`, `CONTRIBUTING.md`, `CONCEPTS.md`,
+  `docs/runbooks/`, `docs/solutions/` and `plugin/skills/` resolves to an
+  existing file, and a code fence left open to the end of a file fails that
+  check; every file under `.claude/rules/` has no frontmatter or a well-formed
+  `paths:` list, each item quoted or a plain path and indented with spaces; and
+  the always-loaded set (the contributor-instructions file plus every
+  rule file without a `paths:` list, derived by scanning `.claude/rules/`, never
+  from a list of names, symlinked files and directories included) totals at
+  most 50,000 bytes. A check also fails when a tool it runs writes to stderr
+  (an unreadable file, for one), never passing on an empty result it could not
+  produce. `docs/plans/` and
+  `docs/brainstorms/` are deliberately out of every guard's scope, a plan being
+  a historical record. The guards and their selftest also run under `/bin/bash`
+  3.2 on the macOS leg; flag a guard moved back inline into `ci.yml`, a
+  hardcoded list of always-loaded file names, or a scope that drops
+  `.claude/rules/`. On a release, the `plugin` job also refuses a tag matching neither
   `^v[0-9]+\.[0-9]+\.[0-9]+$` nor `^ss-magic-plugin-v[0-9]+\.[0-9]+\.[0-9]+$` – a
   prefixed CLI tag such as `ss-magic-v0.11.1` would publish a release the
   updater's anchored filter and every installed binary ignore, stranding the line
@@ -1481,14 +1503,15 @@ out of step or a stale digest, or a bump applied to the wrong group's surfaces.
 `README.md` (user-facing), `CONTRIBUTING.md` (contributor-facing: from-source
 builds, tests, PR expectations, release/versioning), `CONCEPTS.md` (domain
 vocabulary), and the repo's contributor-instructions file at the repo root
+together with the rule files it indexes under `.claude/rules/`
 (architecture/conventions) must reflect the current state after every
 implementation change — a new command, flag, module, or changed behavior. Flag
 a behavior- or architecture-changing PR that leaves any of them describing the
 old state (e.g. a new subcommand or plugin verb not listed in the README command
 inventory or the
 `main.rs`/`cli.rs` descriptions, a changed build/test/release workflow not
-reflected in `CONTRIBUTING.md`, or a new module absent from that
-contributor-instructions file's per-module Architecture section). The README's
+reflected in `CONTRIBUTING.md`, or a new module absent from the per-module
+architecture map for its crate among those rule files). The README's
 command inventory must match `cli.rs`'s `parse` and the plugin crate's
 `HumanVerb`/`HookEvent`, and the documented hook events must match what
 `plugin/hooks/hooks.json` actually registers – flag a doc that claims an event
