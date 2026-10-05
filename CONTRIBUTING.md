@@ -9,7 +9,7 @@ archives, or self-update deserve particular care.
 ## Building from source
 
 You need a Rust toolchain, provided by [rustup](https://rustup.rs/) (CI builds
-on stable), and `git` on `PATH`. The GitHub CLI (`gh`) is optional — it's only
+on stable), and `git` on `PATH`. The GitHub CLI (`gh`) is optional – it's only
 needed for the interactive finishing action that opens a PR, and for verifying
 release attestations. Working on the Claude Code plugin additionally needs
 `python3` (the packaging and release-assertion script) and `bash` – the
@@ -37,7 +37,9 @@ Both install paths drop `ss-magic` into `$CARGO_HOME/bin` (usually
 
 `make install` deliberately installs the sync CLI only. `ss-magic-plugin` is
 delivered by the Claude Code marketplace and installed under Claude Code's own
-plugin data directory by the plugin's `SessionStart` bootstrap; putting a
+plugin data directory (`${CLAUDE_PLUGIN_DATA}`, falling back to
+`${CLAUDE_CONFIG_DIR:-~/.claude}/plugins/data/ss-magic-ss-magic` when it is
+unset) by the plugin's `SessionStart` bootstrap; putting a
 development copy on your `PATH` would not be picked up by anything, because the
 hooks and the skills' wrapper both resolve the binary through that data
 directory, never through `PATH`. To exercise it locally, build the workspace and
@@ -65,20 +67,24 @@ cargo-dist uses and which inherits it), and lists the members under `crates/`:
   tree, binary `ss-magic-plugin`, released on `ss-magic-plugin-vX.Y.Z` tags.
 
 The two binaries are genuinely independent programs that happen to share
-plumbing. `ss-magic` has no `plugin` subcommand: the token was removed, not
-aliased. And the plugin crate depends on none of `self_update`, `inquire` or
-`ratatui`, directly or transitively through core – so "the plugin never
+plumbing. `ss-magic` has no `plugin` subcommand and no alias for one, so
+`ss-magic plugin` is an unknown subcommand like any other. And the plugin crate
+depends on none of `self_update`, `inquire` or `ratatui`, directly or transitively through core – so "the plugin never
 self-updates and never opens a TUI" is a fact about what is linked rather than a
 convention reviewers uphold. `cargo build` can only show a dependency is
 *present*, so the absence is asserted by
 `scripts/build-plugin-zip.py --check` and by `cargo tree -i` in CI.
 
 Source is layered so the pure logic stays unit-testable in isolation from the
-interactive layer, and grouped by purpose under each crate's `src/`.
+interactive layer, and grouped by purpose under each crate's `src/`. The lists
+below are the contributor overview; the per-module maps live in
+[.claude/rules/architecture-core.md](./.claude/rules/architecture-core.md),
+[.claude/rules/architecture-cli.md](./.claude/rules/architecture-cli.md) and
+[.claude/rules/architecture-plugin.md](./.claude/rules/architecture-plugin.md).
 
 In `ss-magic-core`:
 
-- `git/` — git plumbing (read-only probes and mutating primitives; all git/gh
+- `git/` – git plumbing (read-only probes and mutating primitives; all git/gh
   interaction shells out via `std::process::Command` – **no `git2`**), the
   `.gitignore` helpers, and `discover`, the filesystem-only root discovery the
   plugin crate uses (its hook path, and the two read-only verbs that attribute
@@ -92,7 +98,7 @@ In `ss-magic-core`:
   session identity both derive from.
 - `state_tree.rs` – the `.superset/.magic` constant and the one writer of its
   gitignore rule (called eagerly by `init`/`migrate`, lazily by the plugin's
-  `enable` verb).
+  `enable` verb and by a `config set` that turns `plugin.enabled` on).
 - `release.rs` – the per-line, daily-cached GitHub release check.
 - `hashing.rs` – FNV-1a for cache keys and a hand-rolled SHA-256 the plugin's
   shell bootstrap has to reproduce with `shasum`.
@@ -100,15 +106,17 @@ In `ss-magic-core`:
 
 In `ss-magic`:
 
-- `sync/` – `merge.rs` owns the reverse-sync push/pull/merge decision model and
-  per-hunk merge assembly (`similar`-based diffing); `reverse_sync.rs` owns the
-  backup-first, TOCTOU-guarded apply seam that writes a cockpit decision to
-  disk; `mod.rs` re-exports core's pure half so `crate::sync::apply` still
-  resolves.
+- `sync/` – `merge.rs` owns the push/pull/merge/delete decision model of the
+  unified Sync cockpit and per-hunk merge assembly (`similar`-based diffing);
+  `reverse_sync.rs` owns the backup-first, TOCTOU-guarded apply seam that writes
+  a cockpit decision to disk, the cockpit's entry point `run` and the
+  non-interactive `ss-magic reverse-sync` (`run_bulk`, which never opens the
+  cockpit); `mod.rs` re-exports core's pure half, so `crate::sync::apply`
+  resolves to core's engine.
 - `tui/` – the interactive layer: `inquire` menus and pickers, `theme.rs`
   (installs the `inquire` render config from core's color decision), the
   pure diff/decision models (`diffmodel`, also built on `similar`), and the
-  full-screen `ratatui` reverse-sync merge cockpit (`cockpit`, on the
+  full-screen `ratatui` unified Sync (merge) cockpit (`cockpit`, on the
   `crossterm` backend). `tui/mod.rs` re-exports core's `style`.
 - `workspace/` – the init/migration lifecycle (`migrate.rs`); re-exports core's
   `superset_files`.
@@ -118,7 +126,7 @@ In `ss-magic`:
   `repo_name_stem`), the hand-rolled arg parser (**no `clap`** – this is also
   where the `-n`/`--no-backup` flag for `sync`/`reverse-sync` is parsed), and
   composition (update gate, dispatch, event rendering; `main.rs` re-exports
-  core's `git` and `hashing` under their old `crate::` names).
+  core's `git` and `hashing` as `crate::git` and `crate::hashing`).
 
 In `ss-magic-plugin`, whose `main.rs` owns only the argv parse and the dispatch
 table:
@@ -149,8 +157,8 @@ predicates, and only the second one carries the safety property.
 
 Outside the crates, the plugin ships as a packaged tree: `plugin/` (its manifest,
 hooks, bootstrap script, hook shim, wrapper, shared shell libs, version pin and
-skills), `.claude-plugin/marketplace.json` (which pins that tree's zip by
-SHA-256), `scripts/build-plugin-zip.py` (the reproducible builder and the
+the three skills `scratchpad`, `operator-checklist` and `setup-github-ci`),
+`.claude-plugin/marketplace.json` (which pins that tree's zip by SHA-256), `scripts/build-plugin-zip.py` (the reproducible builder and the
 release assertions), `scripts/test-bootstrap.sh`, `scripts/mark-latest.sh` (the
 post-announce step that keeps the repository's "latest" mark on the CLI line,
 with `scripts/test-mark-latest.sh` driving it against a fake `gh` – on Linux in
@@ -160,14 +168,14 @@ from), and `assets/workflow/checklist.yml` (embedded into the plugin binary by
 its `setup_ci.rs`).
 
 `assets/magic.sh` is the canonical wrapper script, embedded into the binary
-via `include_str!` — edit it there, never in a repo's generated `.superset/`
+via `include_str!` – edit it there, never in a repo's generated `.superset/`
 copy. Domain vocabulary (main checkout, forward/reverse sync, sync patterns,
 candidates) is defined in [CONCEPTS.md](./CONCEPTS.md).
 
 A few boundaries to preserve:
 
 - Pattern syntax checks live in `sync/pattern.rs` and expansion (with the
-  default `node_modules` / `.venv` excludes) in `sync/apply.rs` — don't add a
+  default `node_modules` / `.venv` excludes) in `sync/apply.rs` – don't add a
   second glob implementation with divergent semantics.
 - The sync and pack engines emit typed events through caller-supplied
   closures; rendering and terminal side effects belong in `main.rs` / `tui/`,
@@ -184,13 +192,13 @@ A few boundaries to preserve:
   `crates/ss-magic-plugin/Cargo.toml` – or to `crates/ss-magic-core/Cargo.toml`,
   which the plugin links, so a dependency added there reaches it transitively
   and the guarantee is gone without the plugin's own manifest changing a line.
-- Do not reintroduce a `plugin` subcommand on the `ss-magic` CLI, in any form.
-  It was removed outright; a compatibility alias would put the plugin's verbs
-  back inside the binary that self-updates and opens a menu.
+- Do not add a `plugin` subcommand to the `ss-magic` CLI, in any form. The CLI
+  has none and no alias; a compatibility alias would put the plugin's verbs
+  inside the binary that self-updates and opens a menu.
 
 ## Tests
 
-`cargo test` is no longer the whole suite. Run all five the way CI does, from
+`cargo test` is not the whole suite. Run all five the way CI does, from
 the repository root:
 
 ```sh
@@ -200,6 +208,26 @@ python3 scripts/build-plugin-zip.py --check      # the release assertions
 /bin/bash scripts/test-bootstrap.sh              # the bootstrap's failure paths
 /bin/bash scripts/test-mark-latest.sh            # the latest-mark selection
 ```
+
+Before opening a PR that touches `plugin/`, also run the version-bump check CI
+runs, with the newest release tag reachable from `HEAD` (either tag shape) as
+the baseline:
+
+```sh
+python3 scripts/build-plugin-zip.py --check-bump <newest release tag reachable from HEAD>
+```
+
+It fails when the packed `plugin/` content differs from that tag's under an
+unchanged version, or when the content changed and the version moved
+backwards, since the resolved version, not the digest, is what makes the Claude
+Code client update. It skips
+with a note when the baseline does not resolve or carries no `plugin/` tree.
+
+`cargo test --workspace --locked` leaves the `#[ignore]`d tests out. Most are
+child-process helpers that their parent test spawns, but the ledger benchmark
+(`scanning_a_real_tree_reports_its_time`) panics under `-- --ignored` unless
+`SS_MAGIC_LEDGER_BENCH_TREE` names a Claude Code transcript `.jsonl`. Set it
+only for that deliberate run.
 
 The last four cover code `cargo test` cannot reach:
 
@@ -217,6 +245,7 @@ The last four cover code `cargo test` cannot reach:
   ok   distinct release lines
   ok   hooks spawn through the shim
   ok   workspace shape
+  ok   release gate blocks publishing
   ok   R96 committed digest pin
   ```
 
@@ -227,8 +256,10 @@ The last four cover code `cargo test` cannot reach:
   two lines' versions differ; every `hooks.json` entry spawns `bash` on a script
   that ships inside `${CLAUDE_PLUGIN_ROOT}`; the plugin and core manifests
   declare none of `self_update` / `inquire` / `ratatui` and core carries
-  `publish = false`; and the committed digest matches the current `plugin/`
-  tree.
+  `publish = false`; the generated `release.yml`'s `host` job needs the
+  `custom-ci` test gate and checks its result, along with every job
+  `build-local-artifacts` waits on (see [A red release gate](#a-red-release-gate));
+  and the committed digest matches the current `plugin/` tree.
 - `test-bootstrap.sh` drives `plugin/hooks/bootstrap.sh` through the failure
   modes that matter (offline, corrupted download, hostile version pin,
   unwritable data directory, unsupported platform, concurrent sessions) using a
@@ -252,8 +283,9 @@ The last four cover code `cargo test` cannot reach:
 - The wrapper `plugin/bin/ss-magic-plugin` is covered the same way, against the
   contract it states for itself: exit 0 with one line of explanation rather than
   failing a skill mid-run. Its cases include a directory sitting where the binary
-  should be and a present-but-unloadable binary, both of which reached `exec` and
-  ended in bash's own diagnostic before the shared `lib/execguard.sh` landed.
+  should be and a present-but-unloadable binary. Both must be refused by the
+  shared `lib/execguard.sh` before `exec`, because without that refusal they
+  reach `exec` and end in bash's own diagnostic.
 
 One more check is not a suite but belongs in the same list, because a build can
 never make it: `cargo build` proves a dependency is *present* and says nothing
@@ -278,17 +310,17 @@ Conventions worth knowing:
   and a scratch cwd, the same way environment-variable tests use
   `run_ignored_test_in_child` – never `set_current_dir` in a parallel suite.
 - Tests use `tempfile` plus shell-invoked `git init` / `git worktree add` to
-  build real repos — no git mocking. They must not depend on or mutate your
+  build real repos – no git mocking. They must not depend on or mutate your
   real repositories, global git config, clipboard, or installed `ss-magic`.
 - The interactive menu/pickers and the final-action git operations
   (commit/push/PR) have no unit tests; they are validated by manual smoke
   testing. If your change touches one of those surfaces, describe the manual
   path you exercised in the PR.
-- The reverse-sync merge cockpit (`tui/cockpit.rs`) is a partial exception:
+- The unified Sync merge cockpit (`tui/cockpit.rs`) is a partial exception:
   its event loop and terminal lifecycle are manual-smoke like the rest of the
   interactive layer, but its render path (`draw`) and pure key dispatch
   (`handle_key`) ARE unit-tested by driving `ratatui::backend::TestBackend`
-  with synthetic key events — no real terminal required. Prefer extending
+  with synthetic key events – no real terminal required. Prefer extending
   those tests over adding new manual-smoke-only cockpit behavior.
 - Test an exclusivity property by actually racing it, never sequentially. A
   "consume exactly once" claim that is checked by calling it twice in a row
@@ -303,10 +335,11 @@ Conventions worth knowing:
 CI (`.github/workflows/ci.yml`) runs the Rust suite on Ubuntu and macOS for
 every PR commit and every push to `main`, plus a `plugin` job carrying the
 builder selftest, the release assertions, the `cargo tree` dependency-absence
-proof, a check that a content change under `plugin/` came with a version bump
-(its baseline considers both tag shapes), the bootstrap failure-path suite, the
-latest-mark selection suite, a
-build of the exact asset cargo-dist will publish, and the documentation guards.
+proof, `build-plugin-zip.py --check-bump <baseline>` (a content change under
+`plugin/` must come with a version bump; the baseline is the newest reachable
+tag of either shape), the bootstrap failure-path suite, the latest-mark
+selection suite, a build of the exact asset cargo-dist will publish, and the
+documentation guards.
 The guards live in `scripts/check-docs.sh`, which you can run locally
 (`bash scripts/check-docs.sh`, plus `--selftest` for its own fixture tests); it
 prints one `ok`/`FAIL` line for each of seven checks:
@@ -369,8 +402,7 @@ shape matters.
   and `dist = false`, never released or tagged, and its `0.1.0` moves only on an
   incompatible change to its own API. Let `python3
   scripts/build-plugin-zip.py --check` enumerate the surfaces rather than working
-  from a remembered count – this file once said "four" while the script checked
-  seven.
+  from a remembered count.
 - **The two versions must never be equal.** cargo-dist reads a release tag as
   `[PACKAGE_NAME-]VERSION`, so a bare `vX.Y.Z` tag announces *every* dist-able
   package sitting at that version. Keeping the numbers apart is the entire
@@ -418,7 +450,7 @@ the suite passed, and attests the
 per-target `.tar.gz` archives with signed build provenance (Sigstore/Rekor);
 users can verify them with `gh attestation verify` as described in the README.
 The self-updater itself trusts the TLS-authenticated download plus cargo-dist
-checksums — it does not consume the attestations.
+checksums – it does not consume the attestations.
 
 ### Two release lines out of one workspace
 
@@ -446,6 +478,15 @@ which is why `--check` refuses a tree where the versions match. The CLI's bare
 shape is not negotiable either: the updater's anchored filter and every
 already-installed binary look for `vX.Y.Z`, so a prefixed `ss-magic-vX.Y.Z` tag
 would publish a release the whole installed base ignores.
+
+`.github/workflows/release.yml` is generated by cargo-dist; never hand-edit it.
+After any `dist-workspace.toml` or `[package.metadata.dist]` change, run `dist
+generate` and keep `dist generate --check` green. Verify an extra-artifacts
+change with `dist build --artifacts=global`, not `dist plan`: a wrong
+`working-dir` fails only in `build-global-artifacts`, after the tag is pushed,
+and `dist plan` cannot see it. (A zip filename that does not match what the
+builder emits is caught earlier, on every PR, by CI's "Build the asset
+cargo-dist will publish" step.)
 
 The plugin zip is declared as an extra artifact on the **plugin crate**
 (`[[package.metadata.dist.extra-artifacts]]` in
@@ -517,6 +558,13 @@ back: for a plugin tag it lists the releases, drops drafts and prereleases,
 picks the numerically greatest bare `v*` tag, runs `gh release edit <tag>
 --latest`, and reads `releases/latest` back – failing the job loudly if the
 mark did not take. For a `v*` tag it exits 0 without touching anything.
+The script reads its inputs from the environment: `MARK_LATEST_TAG` is the
+announced tag (falling back to `GITHUB_REF_NAME`; the workflow passes it, which
+is how the manual-dispatch fallback below works), `MARK_LATEST_REPO` is
+`OWNER/REPO` (default `ViktorStiskala/superset-magic`), and
+`MARK_LATEST_DRY_RUN=1` prints the chosen tag instead of editing anything, which
+is how to try it locally. It exits 2 when no tag is given and 1 when the mark
+did not take.
 
 If the command above prints the plugin tag anyway – the job was red, or the
 token could not edit the release – put the mark back by hand, either from the
@@ -552,15 +600,15 @@ The gate itself must block the **publish**, not only the builds. cargo-dist's
 `host` job runs `gh release create` whenever `plan` succeeded and each build
 job succeeded *or was skipped*. A job upstream of the builds whose result
 `host` never checks can therefore fail, skip every build, and let `host`
-publish an empty release. A `plan-jobs` entry is exactly that. On 2026-09-30
-the gate was `plan-jobs = ["./ci"]`, a date-dependent test failed, and
+publish an empty release. A `plan-jobs` entry is exactly that. This is the failure of 2026-09-30: with the gate
+declared as `plan-jobs = ["./ci"]`, a date-dependent test failed and
 `v0.11.1` and `ss-magic-plugin-v1.0.0` were published holding only
-`dist-manifest.json`. Both versions are unrecoverable, and the fix shipped as
-`v0.11.2` and `ss-magic-plugin-v1.0.1`. The two empty releases remain, marked
-as pre-releases (which both updaters skip) and titled "broken – no assets, do
-not use".
+`dist-manifest.json`. Both versions are unrecoverable and can never be reused.
+The fix shipped in `v0.11.2` and `ss-magic-plugin-v1.0.1`, and the two empty
+ones remain, marked as pre-releases (which both updaters skip) and titled
+"broken – no assets, do not use".
 
-The gate is now `local-artifacts-jobs = ["./ci"]`, which cargo-dist adds to
+The gate is `local-artifacts-jobs = ["./ci"]`, which cargo-dist adds to
 `host`'s `needs` and whose result it checks in `host`'s `if`.
 `scripts/build-plugin-zip.py --check` asserts that shape on the generated
 `release.yml` (`release gate blocks publishing`). Every job

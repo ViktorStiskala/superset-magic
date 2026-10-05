@@ -1,6 +1,6 @@
 # Concepts
 
-Shared domain vocabulary for this project — entities, named processes, and
+Shared domain vocabulary for this project – entities, named processes, and
 status concepts with project-specific meaning. Seeded with core domain
 vocabulary, then accretes as ce-compound and ce-compound-refresh process
 learnings; direct edits are fine. Glossary only, not a spec or catch-all.
@@ -27,12 +27,14 @@ sync or pack – only the backup and plugin-state subtrees inside it are.
 ss-magic writes it in two ways. Initialization lays it out fresh; migration
 converts a repository that predates the current layout, carrying the
 previously configured file list forward. Both stage the whole tree and
-materialize it in one step behind a finishing prompt, so an aborted run
-leaves the previous contract intact.
+materialize it in one step. The interactive flows ask a finishing question
+first, so an aborted run leaves the previous contract intact; the scripted
+`ss-magic init [PATTERN...]` has no prompt, writes the layout straight away
+and leaves the files uncommitted.
 
 ### Main checkout
 The primary git checkout that linked worktrees branch from and share a common
-git directory with — the canonical tree reverse sync writes back into and the
+git directory with – the canonical tree reverse sync writes back into and the
 source forward sync copies from.
 
 ### Sync patterns
@@ -79,9 +81,10 @@ picks a decision per file before applying the batch.
 ### Pre-write backup
 A timestamped copy of a file's losing bytes, taken immediately before an
 apply overwrites or deletes it, so a mistaken decision is recoverable.
-Backups live under a gitignored `.superset/backups/` of the root being
-overwritten – the worktree for the merge cockpit and forward sync, main for
-the direct `ss-magic reverse-sync` subcommand – one directory per apply batch,
+Backups live under a gitignored `.superset/backups/` in the root each flow
+designates – the worktree for the merge cockpit (which keeps main's losing
+bytes there too, under the batch's `main/` side) and for forward sync, main for the direct
+`ss-magic reverse-sync` subcommand – one directory per apply batch,
 named by the batch's timestamp and keeping the copies from each side apart, and
 are never committed. Taking backups is
 opt-out (`--no-backup`/`-n` on the direct subcommands) and, when skipped,
@@ -120,7 +123,7 @@ file's repo-relative path. The `<repo>` stem is derived from the
 repository's origin remote, so the same repository yields the same archive name
 from any clone URL form, falling back to the primary worktree's basename when no
 origin exists. A third operation on the
-sync patterns alongside forward and reverse sync — a portable snapshot of the
+sync patterns alongside forward and reverse sync – a portable snapshot of the
 configured file set (for backup, machine transfer, or handoff) rather than a
 copy between trees.
 
@@ -220,9 +223,13 @@ so anything else makes the root unusable rather than trusted.
 
 The handoff file records where the bootstrap installed the binary. It exists
 because the harness tells hook processes where the plugin's data directory
-is but does not tell the Bash tool, so the wrapper a skill runs, and the
-shim a hook runs through, both find the binary by reading the handoff rather
-than by guessing.
+is but does not tell the Bash tool, so the wrapper a skill runs finds the
+binary by reading the handoff rather than by guessing. The shim a hook runs
+through uses the harness's variable directly and falls back to the handoff only
+when it is empty. When the variable is unset, the bootstrap falls back to the
+harness's documented default location,
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/data/ss-magic-ss-magic`; the status
+verb tries the handoff first and only then that location.
 
 ### State tree
 The gitignored directory inside the workspace contract where the plugin
@@ -252,9 +259,12 @@ one tool the harness never spills to disk, so an unguarded large read is
 re-read on every later request. The gate is advisory, not a security boundary:
 a timeout, a malformed hook envelope, or a missing binary all leave the read
 to proceed. It can only deny, never allow – every uncertain lookup falls through
-to letting the read happen – and it has deliberate escape hatches: a bounded
-window of the file, a subagent's own reads, non-text files, configured exemption
-patterns, and a one-shot bypass claim.
+to letting the read happen – and it has deliberate escape hatches: anything
+inside the plugin's own state tree (so scratchpad notes can always be re-read
+after a compaction), a bounded window of the file, a subagent's own reads,
+non-text files, configured exemption patterns, and a one-shot bypass claim.
+The gate is also called the page-fault gate in the plugin's manifest and
+configuration code.
 
 ### Conclusion cache
 The store of Explore-agent answers about oversized files, keyed by a file's
@@ -270,8 +280,10 @@ to ship – verification, rollout, decisions still open, and follow-ups that
 outlive the code change – as one typed JSON document per action under
 `docs/actions/`. The plugin's own verbs are its only write path; direct reads and
 edits of the file are denied, which is what keeps every write canonically
-ordered, validated, and renderable to byte-identical Markdown wherever it
-appears (the CLI, a commit-time nudge, or a pull-request comment).
+ordered, validated, and renderable to Markdown that is byte-identical across
+machines and timezones. One renderer serves both the CLI's `list` view and the
+`render-md` output a CI job posts as the pull-request comment; they differ only
+in `list`'s byte budget (`render-md` is unbounded).
 
 ### One-shot claim
 A record whose consumption is its own exactly-once flag, used for the bypass
@@ -290,7 +302,9 @@ the CLI polls the release list and replaces itself, while the plugin is
 replaced by the marketplace client. The two versions are deliberately never
 equal, because the release tooling reads a tag without a package prefix as
 "every releasable package sitting at that version", so equal numbers would let
-one line's tag publish the other line's release.
+one line's tag publish the other line's release. The plugin only advises about a
+newer release of its own line (see Operator notice); it never downloads or
+installs one.
 
 ### Version pin
 The plugin's declared version, which fixes both the binary its hooks run and the
@@ -299,9 +313,46 @@ pinned binary and does nothing when it already matches, so updating the plugin i
 what updates the binary; no plugin invocation ever self-updates, because a
 mid-session swap would leave the binary and the shipped assets describing
 different behavior. When the binary actually running a hook does not match the
-pin, the mismatch is reported to the operator at session start – never as
-model-facing context – and the status verb names it as one reason the plugin may
-be doing nothing.
+pin, the mismatch is reported to the operator at session start as one of the
+operator notices below – never as model-facing context – and the status verb
+names it as one reason the plugin may be doing nothing.
+
+### Operator notice
+A one-line message the session-start hook sends to the person rather than the
+model, on the harness's operator channel. There are three. The version-drift
+notice appears on every kind of session start when the running binary is not the
+version the loaded plugin pins. The compaction advice appears once per machine,
+on a fresh start only, when an auto-compaction override is set and no compaction
+window is configured. The release suggestion appears once per release, on a
+fresh start only, when the cached release list shows a newer plugin release than
+the pin; the cache is refreshed in the background by a detached process, so
+session start never waits on the network. The last two are suppressed in quiet
+mode. The release suggestion is recorded before it is shown and is withheld when
+it cannot be recorded; the compaction advice is recorded best-effort, so on a
+machine whose cache directory refuses writes it can repeat.
+
+### Quiet mode
+The verdict that nobody is watching the session, so an operator notice would go
+unread: the permission mode is one that never waits for a person (bypass or
+don't-ask), or the harness was launched by an embedding other than the terminal
+(an SDK or an IDE extension). Absent signals mean not quiet, deliberately, since
+a wrongly shown line costs far less than a wrongly hidden one.
+
+### Compaction window
+The absolute token count at which the harness compacts a conversation, set in the
+project's settings (the tracked file or the per-machine, gitignored local one;
+the plugin writes only the local one). The plugin recommends one from
+the peak context size of the repository's recent sessions in the cost ledger
+(1.25 times the largest peak, rounded up to a multiple of 10,000 and clamped
+between 100,000 and 1,000,000 tokens), reports it read-only, and writes it only
+when the person explicitly asks. It never edits the user's own settings.
+
+### Session identity
+The deterministic `<repo>-<branch>` slug that names a worktree's session
+scratchpad directory. It comes from git alone – the origin remote (or a
+directory-name fallback) and the current branch, or a detached-head marker – and
+never from the Superset workspace name, which can be renamed silently. Outside a
+git repository there is no identity and the plugin does nothing.
 
 ### Heartbeat log
 The append-only, machine-level record of every hook invocation – including
@@ -324,16 +375,20 @@ an explanation; with nothing declared, nothing is ever blocked.
 Blocking happens at most once per declaration because consuming the record
 is itself the one-shot flag. A declaration left waiting too long is dropped
 rather than enforced – blocking an unrelated agent hours later would be
-worse than not enforcing. Independently of the block decision, the stopping
-agent's own text is salvaged to disk, since a lost transcript is
-irreversible while a block is retriable.
+worse than not enforcing. Independently of the block decision, a stopping agent
+that ended without a final message (absent or blank) has the text it did produce
+recovered from its transcript to disk, since a lost transcript is irreversible
+while a block is retriable. An agent that reported a result needs no salvage, and
+the step is skipped on a re-entered stop, outside a repository, and when the
+state tree refuses.
 
 ### Commit nudge
 The advisory context a before-tool-call hook adds when the model is about to
-commit, push, or open a pull request while an operator checklist in the
-repository is untracked or has unstaged edits: a reminder to update the
-checklist first. It never blocks the command and says so; it fires only when
-git reports the checklist as stale, so a clean checklist produces nothing.
+commit, push, or open a pull request while an operator checklist is absent from
+the commit: named by the active-checklist pointer but never written, or reported
+by git as untracked or having unstaged edits. It is a fixed reminder to update
+the checklist first, with no checklist content in it. It never blocks the
+command and says so, and a clean checklist produces nothing.
 
 ### Cost ledger
 The append-only record of what each ended session cost, written once per

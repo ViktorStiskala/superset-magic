@@ -85,10 +85,10 @@ pub const GATE_THRESHOLD_LINES_MIN: u32 = 500;
 /// Upper bound a configured threshold clamps to.
 pub const GATE_THRESHOLD_LINES_MAX: u32 = 20_000;
 
-/// Default byte budget for an inline conclusion. Sized to the measured
-/// 10,000-character cliff the hook contract records for the
-/// `additionalContext` channel; the deny channel (`permissionDecisionReason`)
-/// is uncapped and not governed by this value.
+/// Default byte budget for the whole denial that serves a cached conclusion
+/// inline. The deny channel (`permissionDecisionReason`) is itself uncapped,
+/// so this value is what bounds it; the default matches the measured
+/// 10,000-character cliff the hook contract records for `additionalContext`.
 pub const GATE_INLINE_BYTE_BUDGET_DEFAULT: u32 = 10_000;
 /// Lower bound a configured byte budget clamps to.
 pub const GATE_INLINE_BYTE_BUDGET_MIN: u32 = 1_000;
@@ -126,7 +126,8 @@ pub struct GateConfig {
     /// Line count above which a `Read` is gated. Clamped to
     /// [`GATE_THRESHOLD_LINES_MIN`]..=[`GATE_THRESHOLD_LINES_MAX`].
     pub threshold_lines: u32,
-    /// Byte budget for an inline conclusion riding `additionalContext`.
+    /// Byte budget for the denial that serves a cached conclusion inline (the
+    /// conclusion plus ss-magic's framing, on `permissionDecisionReason`).
     /// Clamped to
     /// [`GATE_INLINE_BYTE_BUDGET_MIN`]..=[`GATE_INLINE_BYTE_BUDGET_MAX`].
     pub inline_byte_budget: u32,
