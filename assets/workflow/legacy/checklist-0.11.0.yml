@@ -1,7 +1,7 @@
-# Render the ss-magic operator checklists a pull request adds or changes into a
-# pull-request comment, and fail the pull request when one of them is not valid.
+# Render this repository's ss-magic operator checklist into a pull-request
+# comment, and fail the pull request when the checklist is not valid.
 #
-# Written by `ss-magic-plugin setup-github-ci`, which substitutes the pinned
+# Written by `ss-magic plugin setup-github-ci`, which substitutes the pinned
 # version below. Do not hand-edit: `setup-github-ci` compares this file against
 # the version it would write, and a local edit makes every later run report the
 # file as "differing" instead of quietly advancing the pin.
@@ -31,35 +31,13 @@
 # skipped for fork pull requests instead of failing the run on every one of
 # them; the render job still runs, so an invalid checklist is still caught.
 #
-# ── Which checklists are rendered ────────────────────────────────────────────
-#
-# Exactly the top-level docs/actions/*.checklist.json files this pull request
-# adds or modifies, compared with the tip of the branch it targets. A checklist
-# merged by an earlier pull request is not this one's business, and with no
-# pointer file in CI there is nothing else that could say which document is
-# meant once docs/actions/ holds more than one.
-#
-# The checkout is GitHub's merge commit for the pull request, so its first
-# parent is that branch tip: diffing the two leaves out whatever arrived by
-# merging the target branch in. A deleted checklist is not selected, a renamed
-# one is selected at its new path, one that changed between a file and a
-# symlink counts as modified, and a file in a subdirectory of
-# docs/actions/ never is. None means a green job and no comment; several mean
-# one comment holding each document in turn.
-#
-# The selection fails closed. A checkout that is not a merge commit, or a
-# `git diff` that fails, fails the job: read as "no checklists", either would
-# silently switch the verify gate off for every pull request.
-#
 # ── Why no checklist text reaches a shell ────────────────────────────────────
 #
 # A checklist is repository content: its prose is written by whoever opened the
 # pull request. Rendered Markdown therefore travels as a file from the moment it
 # is produced to the moment `gh` reads it with `--body-file`, and is never
 # interpolated into a command line, an `echo`, or a `${{ }}` expression inside a
-# `run:` block. The selected file names travel the same way: NUL-separated in a
-# file, read back into an array, and passed to the binary as separate
-# arguments.
+# `run:` block.
 
 name: Operator checklist
 
@@ -78,17 +56,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The pinned ss-magic-plugin. `ss-magic-plugin setup-github-ci` owns this
-  # value and is the only thing that should change it - the binary, the skills
-  # and the checklist format are released together, so a hand-bumped pin here
-  # can name a version whose output this workflow does not expect.
-  #
-  # This is the PLUGIN's version, on its own release line
-  # (`ss-magic-plugin-vX.Y.Z`), not the `ss-magic` sync CLI's. The two are
-  # separate binaries released independently and their versions are never
-  # equal, so a `v$SS_MAGIC_PLUGIN_VERSION` tag would name a different release
-  # entirely - or none at all.
-  SS_MAGIC_PLUGIN_VERSION: "@SS_MAGIC_PLUGIN_VERSION@"
+  # The pinned ss-magic. `ss-magic plugin setup-github-ci` owns this value and
+  # is the only thing that should change it - the binary, the skills and the
+  # checklist format are released together, so a hand-bumped pin here can name
+  # a version whose output this workflow does not expect.
+  SS_MAGIC_VERSION: "@SS_MAGIC_VERSION@"
   SS_MAGIC_REPO: ViktorStiskala/superset-magic
 
 jobs:
@@ -103,59 +75,39 @@ jobs:
     permissions:
       contents: read
     outputs:
-      # Whether this pull request adds or changes a checklist at all, so the
-      # comment job knows there is something to post.
+      # Whether this branch has a checklist at all, so the comment job knows
+      # there is something to post.
       present: ${{ steps.probe.outputs.present }}
     steps:
       - uses: actions/checkout@v6
         with:
-          # The merge commit and its parents, so the selection below can diff
-          # it against the target branch tip (its first parent). The default
-          # depth of 1 would leave that parent out of the clone.
-          fetch-depth: 2
           # Do not leave the job's token in .git/config, where a later step -
           # or a build script the checked-out code brings with it - could read
           # it back out.
           persist-credentials: false
 
-      - name: Select the changed checklists
+      - name: Look for a checklist
         id: probe
         shell: bash
         run: |
           set -euo pipefail
-          # The diff below is only right against a merge commit; anything else
-          # fails here rather than selecting against the wrong parent.
-          if ! git rev-parse --verify HEAD^2 >/dev/null; then
-            echo '::error::HEAD is not the pull request merge commit.' >&2
-            exit 1
-          fi
-
-          # Its own command writing to a file, never `< <(git diff ...)`: a
-          # process substitution's failure is invisible to `set -e`, and a
-          # failed diff would read as zero checklists. `--diff-filter=AMT` keeps
-          # added, modified and type-changed (symlink to file, or the reverse)
-          # documents and drops deleted ones; `--no-renames` lists a renamed
-          # file as added at its new path; `:(glob)` stops `*` matching `/`, so
-          # a nested file is never selected. Every name starts with
-          # docs/actions/, so none can be read as an option.
-          git diff --name-only -z --no-renames --diff-filter=AMT HEAD^1 HEAD \
-            -- ':(glob)docs/actions/*.checklist.json' >"$RUNNER_TEMP/checklist-names"
-
-          if [ -s "$RUNNER_TEMP/checklist-names" ]; then
-            echo 'present=true' >>"$GITHUB_OUTPUT"
-          else
+          shopt -s nullglob
+          found=(docs/actions/*.checklist.json)
+          if [ ${#found[@]} -eq 0 ]; then
             echo 'present=false' >>"$GITHUB_OUTPUT"
-            echo 'This pull request adds or changes no docs/actions/*.checklist.json; nothing to render.'
+            echo 'No docs/actions/*.checklist.json on this branch; nothing to render.'
+          else
+            echo 'present=true' >>"$GITHUB_OUTPUT"
           fi
 
-      - name: Install the pinned ss-magic-plugin
+      - name: Install the pinned ss-magic
         if: steps.probe.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
           target=x86_64-unknown-linux-gnu
-          archive="ss-magic-plugin-$target.tar.gz"
-          base="https://github.com/$SS_MAGIC_REPO/releases/download/ss-magic-plugin-v$SS_MAGIC_PLUGIN_VERSION"
+          archive="ss-magic-$target.tar.gz"
+          base="https://github.com/$SS_MAGIC_REPO/releases/download/v$SS_MAGIC_VERSION"
 
           # Everything lands outside the checkout, so a repository cannot ship a
           # file that the download or the extraction would overwrite.
@@ -178,48 +130,23 @@ jobs:
           tar -xzf "$archive"
           # cargo-dist nests the binary one directory deep, named after the
           # archive.
-          install -m 0755 "ss-magic-plugin-$target/ss-magic-plugin" \
-            "$RUNNER_TEMP/ss-magic-plugin"
+          install -m 0755 "ss-magic-$target/ss-magic" "$RUNNER_TEMP/ss-magic"
           cd - >/dev/null
           rm -rf "$work"
 
-      - name: Verify the checklists
+      - name: Verify the checklist
         if: steps.probe.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          # Every step is a fresh shell, so the names are read back from the
-          # file here; an array from an earlier step would expand to nothing.
-          names=()
-          while IFS= read -r -d '' name; do
-            names+=("$name")
-          done <"$RUNNER_TEMP/checklist-names"
-          # The selection found names, so none here means the file was lost.
-          # With no arguments the verb would fall back to guessing a document.
-          if [ ${#names[@]} -eq 0 ]; then
-            echo '::error::The selected checklist names could not be read back.' >&2
-            exit 1
-          fi
-          "$RUNNER_TEMP/ss-magic-plugin" checklist verify "${names[@]}"
+          "$RUNNER_TEMP/ss-magic" plugin checklist verify
 
       - name: Render the comment body
         if: steps.probe.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          names=()
-          while IFS= read -r -d '' name; do
-            names+=("$name")
-          done <"$RUNNER_TEMP/checklist-names"
-          if [ ${#names[@]} -eq 0 ]; then
-            echo '::error::The selected checklist names could not be read back.' >&2
-            exit 1
-          fi
-          # GitHub refuses a comment over 65,536 characters; 60000 bytes keeps
-          # the whole body, the note naming any omitted document included,
-          # under it.
-          "$RUNNER_TEMP/ss-magic-plugin" checklist render-md --max-bytes 60000 "${names[@]}" \
-            >"$RUNNER_TEMP/checklist.md"
+          "$RUNNER_TEMP/ss-magic" plugin checklist render-md >"$RUNNER_TEMP/checklist.md"
 
       - name: Upload the rendered body
         if: steps.probe.outputs.present == 'true'
