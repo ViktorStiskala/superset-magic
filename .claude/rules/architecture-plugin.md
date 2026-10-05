@@ -623,20 +623,78 @@ event token as its argument.
   bootstrap swaps it. Nothing here installs anything.
 - `setup_ci.rs` – `setup-github-ci [--check|-n] [--force|-f]` writes
   `.github/workflows/ss-magic-checklist.yml` from the embedded
-  `assets/workflow/checklist.yml`, pinning the running binary's version.
-  `classify` returns `State::{Absent, Identical, PinStale, Differs}` and only
-  `Differs` (a local edit) needs `--force`; `--check`/`-n` reports without
-  writing. `PinStale` is proved by re-rendering the template at the version
-  found in the file and requiring an exact byte match. Written 0644 –
-  committed content, unlike the 0600 state tree. The template is on the
-  PLUGIN's release line throughout: `VERSION_PLACEHOLDER` is
-  `@SS_MAGIC_PLUGIN_VERSION@` and `PIN_KEY` is `SS_MAGIC_PLUGIN_VERSION:`, the
-  workflow downloads `ss-magic-plugin-<target>.tar.gz` from an
-  `ss-magic-plugin-v$VERSION` release (verifying its published `.sha256`
-  sibling), and it runs `ss-magic-plugin checklist verify` / `render-md`. It
-  must use the plugin tag because the plugin's version is never equal to the
-  CLI's, so a `v$VERSION` tag would name a different release entirely – or
-  none at all.
+  `assets/workflow/checklist.yml` (`TEMPLATE`), pinning the running binary's
+  version. Its first output line is `state: <token>` (`absent`, `identical`,
+  `pin-stale`, `differs`), a stable token the `setup-github-ci` skill branches
+  on. `classify` returns `State::{Absent, Identical, PinStale { found,
+  generation }, Differs}`, and only `Differs` (a local edit, or not this
+  workflow at all) needs `--force`. `PinStale` is proved, never guessed: a
+  template re-rendered at the version the file itself names must reproduce the
+  file byte for byte. `classify` tries the current template first
+  (`Generation::Current`, only for a version other than the running one), then
+  every `LEGACY_TEMPLATES` entry (`Generation::Legacy(label)`), each read
+  through its own pin key and placeholder and with NO version comparison: a
+  legacy workflow is stale even at today's version, because the template
+  around the pin is what changed. An edited legacy file matches no render and
+  is `Differs`.
+  `LEGACY_TEMPLATES` holds one `LegacyTemplate { label, body, pin_key,
+  placeholder }` per template generation an earlier release shipped, oldest
+  first, each `body` an `include_str!` of a byte-exact fixture under
+  `assets/workflow/legacy/` (extracted with `git show
+  <tag>:assets/workflow/checklist.yml`; a fixture carries no comment, since one
+  would break the byte comparison, so provenance lives in the table's doc
+  comment). `0.11.0` (`checklist-0.11.0.yml`) is what `v0.10.0` and `v0.11.0`
+  shipped while the plugin was still the CLI's `plugin` subcommand, pinning
+  the CLI under `SS_MAGIC_VERSION:` / `@SS_MAGIC_VERSION@`; `1.0.1`
+  (`checklist-1.0.1.yml`) is what `v0.11.1` through `ss-magic-plugin-v1.0.1`
+  shipped, with today's key and placeholder. Both generations ran `verify` /
+  `render-md` with no arguments, through the active-checklist route – they
+  rendered whichever checklist was already merged and failed once
+  `docs/actions/` held two. Whenever a release changes
+  `assets/workflow/checklist.yml`, copy the released file into
+  `assets/workflow/legacy/` and append it to the table BEFORE editing the
+  template: a generation missing from the table makes every workflow that
+  release wrote read as `differs`, a "local edit" needing `--force`.
+  `pinned_version` reads today's `PIN_KEY` and then each legacy key.
+  The report line (`report_state`) names the generation found, and a bounded
+  unified diff (`print_diff`, `DIFF_LINE_BUDGET` 120 lines, then a count of the
+  rest) prints for `Differs` AND for every `PinStale` – the current
+  generation's is the one pin line, a legacy one's is the whole rewrite the
+  write makes. `--check`/`-n` writes nothing and ends with the `would` line
+  for its state; for a legacy `PinStale` that line says a run would replace
+  the file with the current workflow rather than advance the pin. A workflow
+  that exists but cannot be read is refused (exit 2) rather than treated as
+  absent, a refused `Differs` exits 1, and a repository with no
+  `docs/actions/*.checklist.json` yet gets an advisory warning, never a
+  refusal. `run_core` hands the process's streams to `run_core_with(cwd,
+  version, check, force, out, err)`, so the tests assert on the state line,
+  the report and the diff – what the skill reads before it asks anything.
+  Written 0644 through `atomic::write_atomically` – committed content, unlike
+  the 0600 state tree.
+  The template is on the PLUGIN's release line throughout:
+  `VERSION_PLACEHOLDER` is `@SS_MAGIC_PLUGIN_VERSION@` and `PIN_KEY` is
+  `SS_MAGIC_PLUGIN_VERSION:`, and the workflow downloads
+  `ss-magic-plugin-<target>.tar.gz` from an `ss-magic-plugin-v$VERSION`
+  release (verifying its published `.sha256` sibling). It must use the plugin
+  tag because the plugin's version is never equal to the CLI's, so a
+  `v$VERSION` tag would name a different release entirely – or none at all.
+  Its `render` job selects the documents itself and never relies on the
+  gitignored pointer, which CI never has: it checks out GitHub's merge commit
+  with `fetch-depth: 2`, fails unless `HEAD^2` exists (anything but a merge
+  commit would diff against the wrong parent), and writes `git diff
+  --name-only -z --no-renames --diff-filter=AMT HEAD^1 HEAD --
+  ':(glob)docs/actions/*.checklist.json'` to a file under `$RUNNER_TEMP` – the
+  top-level checklists the pull request adds, modifies or type-changes against
+  the target branch tip, so a deleted one is never selected, a renamed one is
+  selected at its new path, and a nested one never is; a failed diff fails the
+  job rather than reading as "none". `present` is true when at least one name
+  was written. The verify and render steps each read the NUL-separated names
+  back into a bash array, fail when it comes back empty (the no-argument
+  route would guess a document), and pass the names as separate arguments,
+  never interpolated, to `ss-magic-plugin checklist verify` and `checklist
+  render-md --max-bytes 60000` (under GitHub's 65,536-character comment
+  limit), so several changed checklists become one comment and none means a
+  green job with no comment.
 - `compact_window.rs` – two halves, and the split IS the safety
   story (R28). `compact-window --set <TOKENS>` writes an absolute
   `autoCompactWindow` into the per-machine, gitignored
@@ -702,25 +760,68 @@ the ONLY write path.
   `render-md` does not validate at all. `Warning` describes shape defects the
   next CLI write self-repairs and must NEVER fail CI.
 - `checklist/render.rs` – the single `render()` behind `list` (bounded to
-  `LIST_BYTE_BUDGET`, 24,000 bytes) and `render-md` (unbounded, the exact body
-  CI posts as the PR comment), so the two outputs differ only in the byte
-  budget; `verify` does not render, and the commit nudge is a fixed advisory
-  string with no checklist in it. Every field of user-authored prose goes
-  through `prose_inline` / `md_link` escaping, and the whole output is wrapped
-  in `cache::envelope` – checklist prose is repository-authored text that
+  `LIST_BYTE_BUDGET`, 24,000 bytes) and `render-md` (unbounded unless
+  `--max-bytes` says otherwise; the exact body CI posts as the PR comment), so
+  for one document the two outputs differ only in the byte budget; joining
+  several documents and enforcing `--max-bytes` happen in `verbs.rs`, one
+  `render()` per document. `verify` does not render, and the commit nudge is a
+  fixed advisory string with no checklist in it. Every field of user-authored
+  prose goes through `prose_inline` / `md_link` escaping (`prose_inline` is
+  `pub(super)` so `verbs.rs` escapes the omitted-document marker's paths the
+  same way), and each document's output is wrapped in its own
+  `cache::envelope` – checklist prose is repository-authored text that
   reaches a model's context. Timestamps render through the shared UTC
   formatter, never a local clock, so output is identical across machines and
   timezones.
 - `checklist/verbs.rs` – `init`, `add-item`, `add-entry`, `set`, `done`, `list`,
-  `verify`, `render-md`. Every mutating verb is read-modify-write over the WHOLE
-  document (read, mutate one field, `canonicalize`, re-stamp `updated`, write
-  back), so `extras` survive; writes are temp-file-then-rename preserving the
-  existing mode. An advisory `tmproot::with_lock` on `checklist.lock` in the
-  state tree spans the whole read-mutate-write, and spans exist-check plus write
-  for `init`, so concurrent verbs cannot lose an update or duplicate a slug.
+  `verify [FILE...]`, `render-md [--max-bytes N] [FILE...]`. Every mutating
+  verb is read-modify-write over the WHOLE document (read, mutate one field,
+  `canonicalize`, re-stamp `updated`, write back), so `extras` survive;
+  writes are temp-file-then-rename preserving the existing mode. An advisory
+  `tmproot::with_lock` on `checklist.lock` in the state tree spans the whole
+  read-mutate-write, and spans exist-check plus write for `init`, so
+  concurrent verbs cannot lose an update or duplicate a slug.
   Exit codes are distinct on purpose: 2 for "the command as typed cannot be
   carried out", but 1 from `verify` for "the document is invalid", so CI can
   tell them apart. The `.superset/.magic/checklist.json` pointer's contents are
   NOT trusted blindly – the target is validated lexically against absolute
   paths and `..` segments – and `resolve_active` falls back to the naming
   convention (unambiguous single match only) when no pointer exists.
+  With no FILE, `verify` and `render-md` take exactly that active-checklist
+  route, unchanged; `render-md --max-bytes N` with no FILE applies the budget
+  to the active checklist alone. Explicit FILEs are what a caller without a
+  pointer (the CI workflow) uses. `load_explicit` validates and reads EVERY
+  FILE before anything is printed, so one refused path stops the run (exit 2)
+  before any verdict, and it never reads or writes the pointer – one that
+  happens to exist cannot change which documents are read. `validate_explicit`
+  refuses a FILE, naming the rule it broke, when it is absolute or has a `..`
+  component; when it fails `matches_convention` (the case-folding predicate
+  the checklist deny uses, so a nested `docs/actions/sub/…` or a differently
+  named file is refused); when `lstat` shows a symlink (never followed,
+  wherever it points); or when its canonical path falls outside the
+  CANONICALIZED repository root (a symlinked directory higher up), while a
+  root that itself sits behind a link, such as macOS's `/tmp`, still accepts
+  its own files. The document is then read through that canonical path. Any
+  other `-`-prefixed token is an error (exit 2), never a path, and only
+  `render-md` accepts `--max-bytes`, once, anywhere in the tail.
+  `verify FILE...` reports each document in turn, prefixing every finding
+  with its path, and exits 1 when any is invalid. `render-md FILE...`
+  (`render_documents`) emits each document's own `render()` output, in its
+  own envelope, in the order given, joined by the fixed `DOCUMENT_SEPARATOR`
+  (a Markdown thematic break; the verb adds no repository text of its own).
+  `--max-bytes N` bounds the WHOLE body, the marker included. When everything
+  fits nothing is cut; otherwise the body is the longest run of leading
+  documents that fits beside a marker naming the rest (`omitted_marker`), so
+  a document is never split mid-text. A FIRST document too big on its own is
+  rendered with `Budget::Bytes` set to the room the marker leaves, and
+  `cache::envelope` truncates it inside its own envelope; only when even that
+  does not fit is it left out too. The marker is fixed text plus the omitted
+  paths, each through `prose_inline` with every CR made a line feed first (a
+  lone CR ends a CommonMark line and could open a code fence), listing names
+  while they fit and counting the rest as "… and N more"; it is capped at
+  `MARKER_RESERVE` (2,048 bytes, separator included), which is also the
+  smallest `--max-bytes` the parser accepts. `run_core` hands the process's
+  streams to `run_core_with(cwd, sub, now, out, err)`, which passes them to the
+  reading verbs (`list`, `verify`, `render-md`) so tests assert on what they
+  print; the writing verbs still print to the process's own streams, since
+  their result is the file they wrote.

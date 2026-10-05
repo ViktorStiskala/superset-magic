@@ -32,6 +32,11 @@ first, so an aborted run leaves the previous contract intact; the scripted
 `ss-magic init [PATTERN...]` has no prompt, writes the layout straight away
 and leaves the files uncommitted.
 
+Initialization and migration here concern the workspace contract only. They
+are not the plugin's Repository migration, which moves a branch's operator
+checklist from hand-written Markdown to the typed document (see that term
+under the Claude Code plugin).
+
 ### Main checkout
 The primary git checkout that linked worktrees branch from and share a common
 git directory with – the canonical tree reverse sync writes back into and the
@@ -281,9 +286,42 @@ outlive the code change – as one typed JSON document per action under
 `docs/actions/`. The plugin's own verbs are its only write path; direct reads and
 edits of the file are denied, which is what keeps every write canonically
 ordered, validated, and renderable to Markdown that is byte-identical across
-machines and timezones. One renderer serves both the CLI's `list` view and the
-`render-md` output a CI job posts as the pull-request comment; they differ only
-in `list`'s byte budget (`render-md` is unbounded).
+machines and timezones. One renderer serves both the plugin's `list` view and the
+`render-md` output a CI job posts as the pull-request comment. `list` carries a
+fixed byte budget; `render-md` is unbounded unless given `--max-bytes`, which
+bounds the whole body, and the CI workflow always passes one so the comment
+fits the forge's size limit.
+
+`verify` and `render-md` take the active checklist by default, or an
+explicit list of documents (`list` takes none). CI uses the explicit form: it renders and verifies
+only the checklists the pull request added, modified or changed the type of
+(a deletion selects nothing, a rename is selected at its new path), posting one
+comment that holds each in turn, and does nothing when the pull request
+touches none. An explicit path must be a checklist document directly under
+`docs/actions/`, inside the repository and not a symlink; anything else is
+refused rather than read.
+
+### Repository migration
+What the plugin's migrate-repository skill does for a repository that keeps a
+hand-written Markdown checklist per branch: it preflights, asks whether to
+enable the plugin, converts the *current branch's* checklist into the typed
+Operator checklist document by driving the ordinary checklist verbs, sets up
+the CI workflow, and retires the repository's old hand-written checklist skill
+and rules. It converts one branch and one branch only – every earlier branch's
+checklist, and any standing one, stays Markdown as history, and other open
+branches run the skill themselves after merging. The skill decides and
+confirms; the verbs write, so the format's rules are enforced by validation
+rather than restated. It asks before each commit, before enabling, before
+discarding an uncommitted document, before writing the workflow, and before
+retiring the old skill and rules – the last as one consolidated diff, so
+retirement is one decision rather than many.
+
+This is not the sync model's initialization or migration, which converts a
+repository's workspace contract from the old setup-script layout to the current
+one. The two are distinct, and the order is fixed: the skill stops unless a
+workspace contract (`.superset/magic.json`) already exists, so a repository
+still on the old setup-script layout goes through the sync model's init or
+migrate first.
 
 ### One-shot claim
 A record whose consumption is its own exactly-once flag, used for the bypass

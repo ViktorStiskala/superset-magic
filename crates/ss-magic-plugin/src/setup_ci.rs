@@ -124,10 +124,12 @@ impl LegacyTemplate {
 ///   workflow.
 /// - `1.0.1`: released in `v0.11.1`, `v0.11.2`, `ss-magic-plugin-v1.0.0` and
 ///   `ss-magic-plugin-v1.0.1` (byte-identical), pinning the plugin under
-///   today's key. It left the choice of document to `checklist verify` and
-///   `render-md` with no arguments, so later pull requests rendered the one
-///   checklist already merged, and the job failed outright once
-///   `docs/actions/` held two.
+///   today's key.
+///
+/// Both generations ran `checklist verify` and `render-md` with no arguments,
+/// leaving the choice of document to the active-checklist route: later pull
+/// requests rendered the one checklist already merged, and the job failed
+/// outright once `docs/actions/` held two.
 ///
 /// A new generation is added here whenever `assets/workflow/checklist.yml`
 /// changes in a release – copy the released file before editing the template –

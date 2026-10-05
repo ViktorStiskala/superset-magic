@@ -10,17 +10,38 @@ paths:
 
 ### Non-Rust assets
 
-`plugin/` (the packaged marketplace tree), `.claude-plugin/marketplace.json`
-(the digest pin), `scripts/build-plugin-zip.py` (the reproducible builder and
-the release assertions), `scripts/test-bootstrap.sh` (the bootstrap's
-failure-path suite), `assets/workflow/checklist.yml` (embedded by the plugin crate's `setup_ci.rs`;
-it installs `ss-magic-plugin` from an `ss-magic-plugin-v…` release and its env
-var is `SS_MAGIC_PLUGIN_VERSION`), `.gitattributes` (line-ending pinning for
-the digest), `scripts/mark-latest.sh` + `scripts/test-mark-latest.sh` +
+`plugin/` (the packaged marketplace tree; its `skills/` holds the four
+skills – `scratchpad`, `operator-checklist`, `setup-github-ci` and
+`migrate-repository`, the last of which moves a repository's hand-written
+Markdown operator checklist onto the plugin for the current branch only,
+through the checklist verbs and five confirmation gates, with a
+`reference.md` and a worked `example.md` beside its `SKILL.md`; every skill
+spells a command `ss-magic-plugin <verb>` and names no
+`${CLAUDE_PLUGIN_DATA}`), `.claude-plugin/marketplace.json` (the digest pin),
+`scripts/build-plugin-zip.py` (the reproducible builder and the release
+assertions), `scripts/test-bootstrap.sh` (the bootstrap's failure-path suite),
+`assets/workflow/checklist.yml` (embedded by the plugin crate's
+`setup_ci.rs`; it installs `ss-magic-plugin` from an `ss-magic-plugin-v…`
+release, its env var is `SS_MAGIC_PLUGIN_VERSION`, and it verifies and
+renders only the checklists the pull request adds or changes, passed to the
+verbs as explicit arguments – the plugin map's `setup_ci.rs` bullet has the
+selection step), `assets/workflow/legacy/` (byte-exact copies of every
+earlier released template generation, the fixtures behind `setup_ci.rs`'s
+`LEGACY_TEMPLATES`; never edited, only added to when a release changes the
+template), `.gitattributes` (line-ending pinning for the digest),
+`scripts/mark-latest.sh` + `scripts/test-mark-latest.sh` +
 `.github/workflows/mark-latest.yml` (the post-announce latest-mark step; the
 procedure is the `releases/latest` bullet in
-[conventions.md](./conventions.md)), `scripts/lib/test-harness.sh` (the
-assertion helpers both shell suites source), and
+[conventions.md](./conventions.md)), `scripts/check-docs.sh` (the seven
+documentation guards – retired subcommand spelling, no
+`CLAUDE_PLUGIN_DATA` in a skill, the README installer pin, a self-contained
+BUGBOT, resolving relative links, rule-file frontmatter and the 50,000-byte
+always-loaded budget – plus a `--selftest` over fixture trees; bash 3.2,
+run by CI's `plugin` job and again under `/bin/bash` on the macOS leg; the
+checks list in [conventions.md](./conventions.md) describes each),
+`scripts/lib/test-harness.sh` (the assertion helpers sourced by
+`test-bootstrap.sh`, `test-mark-latest.sh` and `check-docs.sh --selftest`),
+and
 `docs/runbooks/forge-tag-and-release-protection.md` (the tag ruleset and
 release immutability on the forge – applied 2026-08-31 and verified against the
 live repository 2026-09-08; the ruleset also carries `required_signatures`,

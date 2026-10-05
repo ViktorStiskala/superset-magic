@@ -492,7 +492,8 @@ on, and it does four things:
   `docs/actions/`, with the steps a change needs before it is safe to ship. The
   plugin's own verbs are the only write path (direct reads and edits of the file
   are denied), which is what keeps the document canonically ordered and valid,
-  and a GitHub Actions workflow can render it into a pull-request comment.
+  and a GitHub Actions workflow verifies the checklists a pull request changes
+  and renders them into a comment on it.
 - **A cost ledger.** One row per ended session, read from that session's own
   transcript, using the harness's priced records where they exist and a
   versioned price table otherwise. A relative signal for comparing branches,
@@ -602,14 +603,51 @@ binary, and what you get depends on which case you are in:
 `ss-magic-plugin status` tells the two apart: it reports whether the binary
 arrived at all, and whether its version matches the plugin's pin.
 
+### Skills
+
+The plugin ships four skills. Claude picks one up when a request matches its
+description, and you can invoke one by name. The skills decide what to do and
+the [verbs](#verbs) do the writing. `/ss-magic:setup-github-ci` and
+`/ss-magic:migrate-repository` ask before they write anything; the scratchpad
+and checklist skills act as the work happens.
+
+- **`/ss-magic:scratchpad`** – opens or resumes this worktree's session
+  scratchpad at the start of a substantial task and keeps it current, so the
+  work survives a compaction. Drives `scratchpad ensure`; a dispatched agent
+  that received no injected context uses `status --json` to find the session
+  directory, and `conclude <FILE>` to record what a gated `Read` of that file
+  should be answered with.
+- **`/ss-magic:operator-checklist`** – keeps the operator checklist for a change
+  whose consequences reach beyond the diff. Drives the `checklist` verbs:
+  `init`, `add-item`, `add-entry`, `set`, `done`, `list`, `verify` and
+  `render-md`.
+- **`/ss-magic:setup-github-ci`** – adds or updates the checklist pull-request
+  workflow. Runs `setup-github-ci --check`, branches on the `state:` token it
+  prints (`absent`, `identical`, `pin-stale` or `differs`), and on confirmation
+  runs `setup-github-ci` – or `setup-github-ci --force`, only for a workflow
+  edited locally and only on an explicit yes.
+- **`/ss-magic:migrate-repository`** – moves a repository that keeps a
+  hand-written Markdown checklist per branch
+  (`docs/actions/<YYYY-MM-branch>/CHECKLIST.md`) onto the JSON checklist. It
+  converts the current branch's checklist only, leaves older ones as Markdown
+  history, retires the hand-written rules that maintained them, and sets up CI.
+  It asks for an explicit yes at exactly five gates – enabling, each commit,
+  discarding an uncommitted checklist document, the workflow write and the
+  retirement diff – and never switches branches or pushes. Drives
+  `status --json`, `seed-config`, `enable` / `enable --local`, the `checklist`
+  verbs (`init`, `add-item`, `add-entry`, `set`, `done`, and `verify <FILE>`)
+  and the `setup-github-ci` sequence above. It is not the `ss-magic` CLI's
+  [workspace migration](#init-and-migration-main-checkout) from `setup.sh` to
+  `magic.sh`.
+
 ### Verbs
 
 **You are not expected to type any of these in a terminal.** The plugin's binary
 is installed under Claude Code's own plugin data directory and is deliberately
 kept off your `PATH`, so it cannot collide with an `ss-magic` you installed
 yourself. Every verb below is reached from *inside* a Claude Code session: the
-shipped skills invoke them, the hooks' own messages point the model at them, and
-you can ask Claude to run one directly. The session's Bash tool carries a
+[shipped skills](#skills) invoke them, the hooks' own messages point the model
+at them, and you can ask Claude to run one directly. The session's Bash tool carries a
 `ss-magic-plugin` wrapper on its `PATH`, so the spelling below is exactly what
 runs there.
 
@@ -656,6 +694,12 @@ ss-magic-plugin setup-github-ci [--check|-n] [--force|-f]
 ss-magic-plugin checklist <SUBVERB>
                                   # init, add-item, add-entry, set, done, list,
                                   # verify, render-md – the only write path
+ss-magic-plugin checklist verify [FILE...]
+                                  # the active checklist, or each FILE named;
+                                  # non-zero exit if any is invalid
+ss-magic-plugin checklist render-md [--max-bytes N] [FILE...]
+                                  # the Markdown CI posts; --max-bytes bounds
+                                  # the whole output, naming what it left out
 ss-magic-plugin --help
 ss-magic-plugin --version         # prints `ss-magic-plugin <version>`; the
                                   # bootstrap gates every install on it
@@ -671,17 +715,44 @@ with an error and write nothing, so a checkout cannot point them at a file of
 yours outside it. A link that stays inside the repository is followed.
 
 The operator checklist is one file per action,
-`docs/actions/<YYYY-MM-slug>.checklist.json`, created by `checklist init <slug>`.
+`docs/actions/<YYYY-MM-slug>.checklist.json`, created by `checklist init <slug>`,
+which also records it as this worktree's active checklist. With no `FILE`,
+`checklist verify` and `render-md` work on that active checklist (or, where no
+pointer was recorded, on the one document in `docs/actions/` when there is
+exactly one). Given `FILE` arguments, they work on exactly those, never
+consulting or writing the pointer: each must be a repository-relative
+`docs/actions/<stem>.checklist.json`, and an absolute path, a `..`, a nested or
+differently named file, a symlink, or a path resolving outside the repository
+is refused. `verify` reports each document in turn and exits non-zero if any is
+invalid; `render-md` renders them one after another, in the order given.
+`--max-bytes N` (at least 2048) bounds `render-md`'s whole output: it keeps as
+many leading documents as fit and closes with a line naming the ones left out,
+and when even the first does not fit, it truncates that one inside its own
+untrusted-data envelope.
+
 `setup-github-ci` writes `.github/workflows/ss-magic-checklist.yml`, which
 installs the `ss-magic-plugin` release it pins (an `ss-magic-plugin-vX.Y.Z`
 archive, verified against its published `.sha256`), verifies and renders the
-checklist in a `render` job that holds only `contents: read`, and posts the
-result from a separate `comment` job that holds `pull-requests: write` and
-checks out no code. The comment job is skipped for pull requests opened from a
-fork, whose token cannot post, while the render job still runs, so an invalid
-checklist still fails the run. `--check` (`-n`) reports what it would do and
-writes nothing; `--force` (`-f`) is needed only to overwrite a workflow you
-edited locally.
+pull request's checklists in a `render` job that holds only `contents: read`,
+and posts the result from a separate `comment` job that holds
+`pull-requests: write` and checks out no code. The checklists it selects are
+the top-level `docs/actions/*.checklist.json` files the pull request adds or
+modifies, compared with the tip of the branch it targets: a checklist merged by
+an earlier pull request is left alone, a deleted one is not selected, a renamed
+one is selected at its new path, and a file in a subdirectory of
+`docs/actions/` never is. The names travel NUL-separated in a file and reach
+the binary as separate arguments, never interpolated into a command line, just
+as the rendered Markdown reaches `gh` only as a file. A pull request that
+touches no checklist gets a green run and no comment; one that touches several
+gets one comment holding each in turn, bounded to 60,000 bytes. The selection fails closed: a checkout
+that is not the pull request's merge commit, or a failed `git diff`, fails the
+job rather than reading as "no checklists". The comment job is skipped for pull
+requests opened from a fork, whose token cannot post, while the render job
+still runs, so an invalid checklist still fails the run. `--check` (`-n`)
+reports what it would do and writes nothing; `--force` (`-f`) is needed only to
+overwrite a workflow you edited locally. A workflow an earlier release wrote and
+nobody edited is advanced without it – see
+[Upgrading to 1.1.0](#upgrading-to-110).
 
 ### Sizing the auto-compact window
 
@@ -751,6 +822,23 @@ whether an update is available, and whether the notice was already shown.
 `--refresh` exits 0 whether or not GitHub could be reached; a failed fetch
 keeps the previous answer. `ss-magic-plugin status` shows the same "newest
 release" row in its `Versions` section.
+
+#### Upgrading to 1.1.0
+
+If the repository has a checklist workflow, re-run `/ss-magic:setup-github-ci`
+in a fresh session after the update, so the 1.1.0 binary is the one answering.
+A workflow any earlier release wrote and nobody edited since – the shape
+`v0.10.0` and `v0.11.0` wrote, which pinned the `ss-magic` CLI, or the one that
+pins the plugin, as of `ss-magic-plugin-v1.0.1` – reports `pin-stale`, the
+report names the template generation it found, a diff of the change is shown
+(a long diff is cut off after 120 lines with a note saying how many remain),
+and on confirmation it is replaced without `--force`. One you edited by hand
+reports `differs` instead, and is replaced only with `--force` once you have
+decided the local change can go. The new workflow verifies and renders only the
+checklists the pull request adds or modifies: the old one rendered whichever
+single checklist it found with no arguments, so a later pull request commented
+with a checklist merged long ago, and every run failed once `docs/actions/`
+held two.
 
 ### Hooks
 
