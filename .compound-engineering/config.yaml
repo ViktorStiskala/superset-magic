@@ -156,7 +156,7 @@ cross_model_peer: codex          # codex | claude | grok | cursor | composer | o
 work_engine_mode: prefer        # off | prefer | require (default: off)
 work_engine_preferences:
   - harness: codex
-    model: "gpt-5.6-sol"
+    model: "gpt-6-astra"
   - harness: claude             # configured default model
 
 # --- ce-promote ---
