@@ -85,6 +85,15 @@ jobs:
         if: runner.os == 'macOS'
         run: /bin/bash scripts/test-mark-latest.sh
 
+      # The documentation guards are bash 3.2 and BSD grep/awk/find too; the
+      # plugin job runs them under Linux's bash 5 and GNU tools, which would let
+      # a bash-4 or GNU-only construct pass unnoticed.
+      - name: Documentation guards (bash 3.2)
+        if: runner.os == 'macOS'
+        run: |
+          /bin/bash scripts/check-docs.sh --selftest
+          /bin/bash scripts/check-docs.sh
+
   plugin:
     name: plugin package
     runs-on: ubuntu-latest
@@ -218,62 +227,21 @@ jobs:
           echo "baseline: $base"
           python3 scripts/build-plugin-zip.py --check-bump "$base"
 
-      # A skill body runs through the Bash tool, where ${CLAUDE_PLUGIN_DATA} is
-      # NOT exported - it reaches hook and MCP/LSP processes only. Naming it in a
-      # skill would expand to nothing and produce a path at the filesystem root,
-      # with no error. Skills reach the pinned binary through the bin/ wrapper
-      # instead, which is on the Bash tool's PATH while the plugin is enabled.
-      - name: No skill body names CLAUDE_PLUGIN_DATA
+      # The documentation guards, one ok/FAIL line each: the retired
+      # `ss-magic` + `plugin` subcommand spelling (over the current-state docs,
+      # .claude/rules/ included), no CLAUDE_PLUGIN_DATA in a skill body, no
+      # releases/latest/download/ URL in README, BUGBOT link-free and naming no
+      # individual rule file, every relative link resolving, rule-file
+      # frontmatter absent or a well-formed `paths:` list, and the always-loaded
+      # set (CLAUDE.md plus every rule file without `paths:`) within 50,000
+      # bytes. The reasoning for each lives in the script, which also runs
+      # locally; docs/plans/ is out of every guard's scope. Running here puts
+      # them in the release gate.
+      - name: Documentation guards (scripts/check-docs.sh)
         run: |
           set -euo pipefail
-          if grep -rn 'CLAUDE_PLUGIN_DATA' plugin/skills/; then
-            echo "the paths above expand to nothing in the Bash tool; use ss-magic-plugin" >&2
-            exit 1
-          fi
-          echo "ok: no skill body names CLAUDE_PLUGIN_DATA"
-
-      # `ss-magic plugin <verb>` was the spelling while the plugin lived inside
-      # the sync CLI as a subcommand. It is now its own binary, `ss-magic-plugin
-      # <verb>`, and the old spelling is worse than merely stale: a user who has
-      # the sync CLI installed gets "unknown subcommand" from a real binary, and
-      # a skill body running it through the Bash tool reaches whichever `ss-magic`
-      # happens to be on PATH -- the update gate and the TUI included -- instead
-      # of the pinned plugin binary the wrapper resolves.
-      #
-      # The trailing space is load-bearing: it matches the verb form only, so
-      # prose about "the ss-magic plugin" as a thing still reads naturally.
-      - name: No document spells the old `ss-magic plugin` subcommand
-        run: |
-          set -euo pipefail
-          # docs/solutions/ and CLAUDE.md are in scope too: both are read by
-          # agents working in this repo, so a retired command there is acted on,
-          # not merely misread. docs/plans/ is deliberately NOT in scope - a plan
-          # is a historical record and quotes the spelling that was current when
-          # it was written.
-          if grep -rn 'ss-magic plugin ' \
-              plugin/skills/ docs/solutions/ \
-              README.md CONTRIBUTING.md CONCEPTS.md CLAUDE.md .cursor/BUGBOT.md; then
-            echo "the plugin is its own binary now; spell it 'ss-magic-plugin <verb>'." >&2
-            exit 1
-          fi
-          echo 'ok: no document spells the retired subcommand form'
-
-      # README documents `releases/download/v<V>/ss-magic-installer.sh`, pinned to
-      # a published release, not `releases/latest/download/...`. Two reasons, and
-      # the second is the one that bites: the command a reader copies must be
-      # reproducible, and `latest` is repository-wide -- it resolves to whichever
-      # release was published most recently, which since the split can be a
-      # `ss-magic-plugin-vX.Y.Z` release that carries no installer script at all.
-      # The documented one-liner would then 404 for everyone.
-      - name: README pins the installer to a release, never `latest`
-        run: |
-          set -euo pipefail
-          if grep -n 'releases/latest/download/' README.md; then
-            echo "'latest' is repository-wide and can resolve to a plugin release" >&2
-            echo "that publishes no installer. Pin the URL to a vX.Y.Z release." >&2
-            exit 1
-          fi
-          echo "ok: README names no releases/latest/download/ URL"
+          bash scripts/check-docs.sh --selftest
+          bash scripts/check-docs.sh
 
       # After a plugin release, the post-announce job hands the repository-wide
       # "latest" mark back to the newest CLI release (R12) – every ss-magic

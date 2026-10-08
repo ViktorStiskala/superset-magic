@@ -23,8 +23,10 @@ use super::schema::{ChangelogEntry, Document, Item, Reference, Section, Timestam
 /// How much a finding matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
-    /// The document is wrong. `verify` exits non-zero and the renderer is
-    /// never handed the file.
+    /// The document is wrong. `verify` exits non-zero, and CI (which runs
+    /// `verify`) fails on it. `list` and `render-md` still render a document
+    /// with errors – `list` adds a stderr note pointing at `verify` – because
+    /// the render is not the gate; `verify` is.
     Error,
     /// The document is usable but its shape is off, and an ordinary CLI write
     /// will tidy it.

@@ -28,10 +28,14 @@
 //! - **identical** — the file already is what this build would write, byte for
 //!   byte. Nothing is written, and that is reported as success rather than as a
 //!   no-op error.
-//! - **pin-stale** — the file is this exact workflow with a different version
-//!   pinned. Recognised by re-rendering the template at the version the file
+//! - **pin-stale** — the file is exactly what some `setup-github-ci` wrote and
+//!   nobody edited since: this workflow with a different version pinned, or a
+//!   workflow from an earlier template generation ([`LEGACY_TEMPLATES`]) at any
+//!   version. Recognised by re-rendering each template at the version the file
 //!   itself names and finding that the result matches: that is what separates
-//!   "only the pin moved" from "somebody edited it", without diffing structure.
+//!   "only this tool wrote it" from "somebody edited it", without diffing
+//!   structure. A diff is printed here too, since a legacy file changes in more
+//!   than the pin, and the report names the generation found.
 //! - **differs** — anything else. It might be a deliberate local change (a
 //!   different runner, an extra step) so the verb refuses to overwrite it
 //!   without `--force`, and prints a diff so the decision can be made on the
@@ -45,14 +49,15 @@
 //! flag that a person or a skill had to type after seeing what `--check` said.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
-use crate::git;
 use crate::atomic;
 use crate::checklist::{ACTIONS_REL, CHECKLIST_SUFFIX};
+use crate::git;
 use ss_magic_core::style;
 
 /// The workflow template, embedded at compile time — the same `include_str!`
@@ -78,6 +83,72 @@ pub const WORKFLOW_REL: &str = ".github/workflows/ss-magic-checklist.yml";
 /// [`pinned_version`] reads it back out of a file on disk, which is what makes
 /// a stale pin distinguishable from a hand edit.
 const PIN_KEY: &str = "SS_MAGIC_PLUGIN_VERSION:";
+
+/// A workflow template an earlier release shipped.
+///
+/// Kept because a repository still holds whatever an earlier `setup-github-ci`
+/// wrote, and recognising that file is what lets this build replace it without
+/// `--force`. Without the old body, an untouched old workflow and a hand-edited
+/// one look the same – both differ from today's render – and every upgrader
+/// would be told their file "was changed locally" when it was not.
+#[derive(Debug)]
+pub struct LegacyTemplate {
+    /// The generation's name in reports: the last version that shipped it.
+    pub label: &'static str,
+    /// The template exactly as that release embedded it, placeholder included.
+    pub body: &'static str,
+    /// The `env:` key that generation stored its pin under.
+    pub pin_key: &'static str,
+    /// The token that generation's render replaced with the pinned version.
+    pub placeholder: &'static str,
+}
+
+impl LegacyTemplate {
+    /// What that release's `setup-github-ci` wrote for `version` – the same
+    /// single substitution [`render`] does, with that generation's placeholder.
+    pub fn render(&self, version: &str) -> String {
+        self.body.replace(self.placeholder, version)
+    }
+}
+
+/// Every template generation an earlier release shipped, oldest first.
+///
+/// The fixtures are byte-exact copies of what each release embedded, extracted
+/// with `git show <tag>:assets/workflow/checklist.yml`; they carry no comment
+/// of their own, because one would break the byte comparison that recognises
+/// them. Their provenance is recorded here instead:
+///
+/// - `0.11.0`: released in `v0.10.0` and `v0.11.0` (byte-identical), when the
+///   plugin was still the sync CLI's `plugin` subcommand – so it pins the
+///   `ss-magic` CLI under `SS_MAGIC_VERSION:`. `v0.9.0` and earlier shipped no
+///   workflow.
+/// - `1.0.1`: released in `v0.11.1`, `v0.11.2`, `ss-magic-plugin-v1.0.0` and
+///   `ss-magic-plugin-v1.0.1` (byte-identical), pinning the plugin under
+///   today's key.
+///
+/// Both generations ran `checklist verify` and `render-md` with no arguments,
+/// leaving the choice of document to the active-checklist route: later pull
+/// requests rendered the one checklist already merged, and the job failed
+/// outright once `docs/actions/` held two.
+///
+/// A new generation is added here whenever `assets/workflow/checklist.yml`
+/// changes in a release – copy the released file before editing the template –
+/// or every workflow that release wrote will read as a local edit after the
+/// next one.
+pub const LEGACY_TEMPLATES: &[LegacyTemplate] = &[
+    LegacyTemplate {
+        label: "0.11.0",
+        body: include_str!("../../../assets/workflow/legacy/checklist-0.11.0.yml"),
+        pin_key: "SS_MAGIC_VERSION:",
+        placeholder: "@SS_MAGIC_VERSION@",
+    },
+    LegacyTemplate {
+        label: "1.0.1",
+        body: include_str!("../../../assets/workflow/legacy/checklist-1.0.1.yml"),
+        pin_key: PIN_KEY,
+        placeholder: VERSION_PLACEHOLDER,
+    },
+];
 
 /// Mode for the written workflow: committed repository content, so
 /// world-readable, unlike anything under the plugin's state tree.
@@ -114,14 +185,25 @@ pub fn render(version: &str) -> String {
 
 /// The version a workflow file on disk pins, if it names one.
 ///
+/// Reads today's key first, then each key a [`LEGACY_TEMPLATES`] generation
+/// stored its pin under, so a workflow an earlier release wrote still reports
+/// the version it pins.
+///
 /// Scans for the `env:` entry rather than parsing YAML: the crate has no YAML
 /// reader and does not want one for a single key. A file that has been edited
 /// past recognition simply yields `None`, which lands it in
 /// [`State::Differs`] — the safe side, since that is the state that refuses to
 /// overwrite.
 pub fn pinned_version(text: &str) -> Option<String> {
+    std::iter::once(PIN_KEY)
+        .chain(LEGACY_TEMPLATES.iter().map(|generation| generation.pin_key))
+        .find_map(|key| pinned_under(text, key))
+}
+
+/// The value of the first `key` entry in `text`, if it has one.
+fn pinned_under(text: &str, key: &str) -> Option<String> {
     text.lines().find_map(|line| {
-        let rest = line.trim_start().strip_prefix(PIN_KEY)?;
+        let rest = line.trim_start().strip_prefix(key)?;
         let value = rest.trim();
         // The template quotes the value so YAML cannot read `1.10` as a
         // number. Accept it unquoted too, so a hand-written pin is still
@@ -144,8 +226,12 @@ pub enum State {
     Absent,
     /// Already byte-for-byte what would be written.
     Identical,
-    /// This workflow, at another version; the string is the version on disk.
-    PinStale { found: String },
+    /// A workflow this tool wrote and nobody edited, at another version or
+    /// from an earlier template generation; `found` is the version on disk.
+    PinStale {
+        found: String,
+        generation: Generation,
+    },
     /// Changed locally, or not this workflow at all.
     Differs,
 }
@@ -169,6 +255,17 @@ impl State {
     }
 }
 
+/// Which template a [`State::PinStale`] file was rendered from, because the two
+/// mean different writes: the current generation only moves the pin, while a
+/// legacy one replaces the whole workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Generation {
+    /// Today's template, at another version.
+    Current,
+    /// A [`LEGACY_TEMPLATES`] entry, by its label.
+    Legacy(&'static str),
+}
+
 /// Decide which state `existing` is in for the given target `version`.
 ///
 /// Pure, so the whole decision is testable without a repository.
@@ -185,7 +282,24 @@ pub fn classify(existing: Option<&str>, version: &str) -> State {
     // was deliberate.
     if let Some(found) = pinned_version(existing) {
         if found != version && existing == render(&found) {
-            return State::PinStale { found };
+            return State::PinStale {
+                found,
+                generation: Generation::Current,
+            };
+        }
+    }
+    // The same test against every template an earlier release wrote, each read
+    // through its own pin key and placeholder. No version comparison here: a
+    // legacy workflow is stale even when it pins exactly `version`, because the
+    // template around the pin is what changed.
+    for legacy in LEGACY_TEMPLATES {
+        if let Some(found) = pinned_under(existing, legacy.pin_key) {
+            if existing == legacy.render(&found) {
+                return State::PinStale {
+                    found,
+                    generation: Generation::Legacy(legacy.label),
+                };
+            }
         }
     }
     State::Differs
@@ -231,17 +345,39 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
 /// pin from being a value anybody has to maintain: there is no second copy of
 /// it in this repository to drift out of step with `Cargo.toml`.
 pub fn run_core(cwd: &Path, version: &str, check: bool, force: bool) -> Result<ExitCode> {
+    run_core_with(
+        cwd,
+        version,
+        check,
+        force,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// [`run_core`] with the two streams passed in, so a test can assert on what
+/// the verb says: the state line, the report and the diff are what the skill
+/// reads before it asks anything, so they are part of the result.
+fn run_core_with(
+    cwd: &Path,
+    version: &str,
+    check: bool,
+    force: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExitCode> {
     let root = match git::cwd_repo_root(cwd) {
         Ok(root) => root,
-        Err(err) => {
-            eprintln!("{}", style::err(format!("error: {err:#}")));
-            eprintln!(
+        Err(error) => {
+            writeln!(err, "{}", style::err(format!("error: {error:#}")))?;
+            writeln!(
+                err,
                 "{}",
                 style::info(
                     "`setup-github-ci` writes into a repository's .github/ directory, so it has \
                      to be run inside one."
                 )
-            );
+            )?;
             return Ok(ExitCode::from(2));
         }
     };
@@ -249,117 +385,127 @@ pub fn run_core(cwd: &Path, version: &str, check: bool, force: bool) -> Result<E
     let path = root.join(WORKFLOW_REL);
     let existing = match fs::read_to_string(&path) {
         Ok(text) => Some(text),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         // A file that exists but cannot be read is not the same as no file:
         // treating it as absent would overwrite it. Refuse instead.
-        Err(err) => {
-            eprintln!(
+        Err(error) => {
+            writeln!(
+                err,
                 "{}",
-                style::err(format!("error: cannot read {WORKFLOW_REL}: {err}"))
-            );
+                style::err(format!("error: cannot read {WORKFLOW_REL}: {error}"))
+            )?;
             return Ok(ExitCode::from(2));
         }
     };
 
     let state = classify(existing.as_deref(), version);
-    println!("state: {}", state.token());
-    report_state(&state, version);
+    writeln!(out, "state: {}", state.token())?;
+    report_state(out, &state, version)?;
 
     // Advisory, never a refusal: setting CI up before writing the first
     // checklist is a reasonable order to do things in, and the workflow is
     // written to sit quiet until a checklist appears.
     if !has_checklist(&root) {
-        println!(
+        writeln!(
+            out,
             "{}",
             style::warn(format!(
                 "This repository has no {ACTIONS_REL}/*{CHECKLIST_SUFFIX} yet, so the workflow \
                  will find nothing to render."
             ))
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "{}",
             style::info("  `ss-magic-plugin checklist init <slug>` creates one.")
-        );
+        )?;
     }
 
-    if state == State::Differs {
-        print_diff(existing.as_deref().unwrap_or(""), &render(version));
+    // A stale pin gets the diff too: for the current generation it is the one
+    // pin line, and for a legacy one it is the whole change the write makes,
+    // which is more than the pin and worth seeing before agreeing to it.
+    if matches!(state, State::Differs | State::PinStale { .. }) {
+        print_diff(out, existing.as_deref().unwrap_or(""), &render(version))?;
     }
 
     if check {
-        println!("{}", style::info(would(&state, force)));
+        writeln!(out, "{}", style::info(would(&state, force)))?;
         return Ok(ExitCode::SUCCESS);
     }
 
     if state == State::Identical {
-        println!(
+        writeln!(
+            out,
             "{}",
             style::ok(format!(
                 "{WORKFLOW_REL} is already current; nothing written."
             ))
-        );
+        )?;
         return Ok(ExitCode::SUCCESS);
     }
 
     if state.needs_force() && !force {
-        eprintln!(
+        writeln!(
+            err,
             "{}",
             style::err(format!(
                 "refused: {WORKFLOW_REL} was changed locally, and writing would discard that."
             ))
-        );
-        eprintln!(
+        )?;
+        writeln!(
+            err,
             "{}",
             style::info(
                 "  Re-run with `--force` to replace it, or keep the local version and leave the \
                  pin where it is."
             )
-        );
+        )?;
         return Ok(ExitCode::from(1));
     }
 
     write_workflow(&path, &render(version))?;
-    println!(
+    writeln!(
+        out,
         "{}",
         style::ok(format!(
             "Wrote {WORKFLOW_REL}, pinning ss-magic-plugin {version}."
         ))
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "{}",
         style::info("  Commit it; it runs on the next pull request.")
-    );
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 
 /// The human half of the state line: what was found, in the terms the skill
 /// needs in order to say something useful about it.
-fn report_state(state: &State, version: &str) {
-    match state {
-        State::Absent => println!(
-            "{}",
-            style::info(format!("No {WORKFLOW_REL} in this repository."))
+fn report_state(out: &mut dyn Write, state: &State, version: &str) -> Result<()> {
+    let line = match state {
+        State::Absent => format!("No {WORKFLOW_REL} in this repository."),
+        State::Identical => format!("{WORKFLOW_REL} matches ss-magic-plugin {version} exactly."),
+        State::PinStale {
+            found,
+            generation: Generation::Current,
+        } => format!(
+            "{WORKFLOW_REL} is this workflow, pinning ss-magic-plugin {found}; \
+             the current pin is {version}."
         ),
-        State::Identical => println!(
-            "{}",
-            style::info(format!(
-                "{WORKFLOW_REL} matches ss-magic-plugin {version} exactly."
-            ))
+        State::PinStale {
+            found,
+            generation: Generation::Legacy(label),
+        } => format!(
+            "{WORKFLOW_REL} is an untouched workflow from the {label} generation of the \
+             template, pinning {found}; the current workflow differs in more than the pin, and \
+             pins ss-magic-plugin {version}."
         ),
-        State::PinStale { found } => println!(
-            "{}",
-            style::info(format!(
-                "{WORKFLOW_REL} is this workflow, pinning ss-magic-plugin {found}; \
-                 the current pin is {version}."
-            ))
-        ),
-        State::Differs => println!(
-            "{}",
-            style::info(format!(
-                "{WORKFLOW_REL} exists and is not what ss-magic-plugin {version} would write."
-            ))
-        ),
-    }
+        State::Differs => {
+            format!("{WORKFLOW_REL} exists and is not what ss-magic-plugin {version} would write.")
+        }
+    };
+    writeln!(out, "{}", style::info(line))?;
+    Ok(())
 }
 
 /// What a `--check` run says it would do. Spelled out per state rather than
@@ -368,7 +514,14 @@ fn would(state: &State, force: bool) -> String {
     match state {
         State::Absent => "A run without --check would create it.".to_string(),
         State::Identical => "A run without --check would leave it alone.".to_string(),
-        State::PinStale { .. } => "A run without --check would advance the pin.".to_string(),
+        State::PinStale {
+            generation: Generation::Current,
+            ..
+        } => "A run without --check would advance the pin.".to_string(),
+        State::PinStale {
+            generation: Generation::Legacy(_),
+            ..
+        } => "A run without --check would replace it with the current workflow.".to_string(),
         State::Differs if force => {
             "A run without --check would replace it, discarding the local changes.".to_string()
         }
@@ -382,9 +535,10 @@ fn would(state: &State, force: bool) -> String {
 
 /// Whether any document matching the `docs/actions/` naming convention exists.
 ///
-/// The same convention the workflow's own glob uses, and the same one
-/// `checklist verify` falls back to when the gitignored pointer is absent — as
-/// it always is in CI.
+/// The same convention the workflow's `git diff` pathspec selects by: the
+/// workflow passes `checklist verify` and `render-md` the changed files that
+/// match it as explicit paths, so it never relies on the gitignored pointer,
+/// which is always absent in CI.
 fn has_checklist(root: &Path) -> bool {
     let Ok(entries) = fs::read_dir(root.join(ACTIONS_REL)) else {
         return false;
@@ -403,7 +557,7 @@ fn has_checklist(root: &Path) -> bool {
 /// The skill is told to show the difference before proposing an overwrite, and
 /// it has no way to compute one: it cannot see the bytes this build would
 /// write, since they only exist inside the binary. So the verb produces it.
-fn print_diff(current: &str, proposed: &str) {
+fn print_diff(out: &mut dyn Write, current: &str, proposed: &str) -> Result<()> {
     let diff = similar::TextDiff::from_lines(current, proposed);
     let text = diff
         .unified_diff()
@@ -413,18 +567,20 @@ fn print_diff(current: &str, proposed: &str) {
 
     let lines: Vec<&str> = text.lines().collect();
     for line in lines.iter().take(DIFF_LINE_BUDGET) {
-        println!("{}", style::info(*line));
+        writeln!(out, "{}", style::info(*line))?;
     }
     if lines.len() > DIFF_LINE_BUDGET {
-        println!(
+        writeln!(
+            out,
             "{}",
             style::info(format!(
                 "  … and {} more diff line(s); run `git diff` against a written copy to see \
                  all of it.",
                 lines.len() - DIFF_LINE_BUDGET
             ))
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// Replace the workflow atomically.

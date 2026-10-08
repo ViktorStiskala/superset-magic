@@ -242,10 +242,10 @@ fn the_installed_binary_is_pinned_and_checksum_verified() {
     assert!(render_job.contains("curl -fsSL"));
 }
 
-/// The workflow decides whether there is anything to do by globbing the same
-/// naming convention the binary falls back to when the (gitignored, so absent
-/// in CI) pointer does not answer. Tying the two together here means a rename
-/// of the convention cannot leave the workflow globbing a path nothing writes.
+/// The workflow selects the checklists a pull request changed with a `git diff`
+/// pathspec on the same naming convention the binary writes and validates
+/// explicit paths against. Tying the two together here means a rename of the
+/// convention cannot leave the workflow selecting a path nothing writes.
 #[test]
 fn the_workflow_globs_the_checklist_convention() {
     let glob = format!("{ACTIONS_REL}/*{CHECKLIST_SUFFIX}");
@@ -253,6 +253,100 @@ fn the_workflow_globs_the_checklist_convention() {
         TEMPLATE.contains(&glob),
         "the workflow should look for {glob}"
     );
+}
+
+// ── The asset: which checklists a pull request renders ────────────────────────
+
+/// One step of the `render` job, from its `- name: <name>` line up to the next
+/// step at the same indent (or the end of the job).
+fn render_step(name: &str) -> String {
+    let job = job_body("render");
+    let header = format!("      - name: {name}\n");
+    let start = job
+        .find(&header)
+        .unwrap_or_else(|| panic!("the render job has no `{name}` step"));
+    let rest = &job[start + header.len()..];
+    let end = rest.find("\n      - ").map_or(rest.len(), |i| i + 1);
+    format!("{header}{}", &rest[..end])
+}
+
+/// The merge ref the checkout lands on is a merge commit whose first parent is
+/// the base branch tip. Depth 2 is what brings that parent into the shallow
+/// clone, so the selection can diff against it; depth 1, the default, would
+/// leave `HEAD^1` unresolvable.
+#[test]
+fn the_render_job_checks_out_the_merge_commit_and_its_parents() {
+    let checkout = job_body("render");
+    let checkout = &checkout[checkout.find("actions/checkout").unwrap()..];
+    let checkout = &checkout[..checkout.find("\n      - ").unwrap()];
+    assert!(checkout.contains("fetch-depth: 2"), "{checkout}");
+    assert!(
+        checkout.contains("persist-credentials: false"),
+        "{checkout}"
+    );
+}
+
+/// The selection is what decides whether the verify gate runs at all, so a
+/// selection that fails must fail the job: a failure read as "zero checklists"
+/// would quietly turn the gate off for every pull request.
+#[test]
+fn the_selection_diffs_the_merge_commit_and_fails_closed() {
+    let probe = code(&render_step("Select the changed checklists"));
+    assert!(
+        probe.contains("git rev-parse --verify HEAD^2"),
+        "a non-merge HEAD must fail the job rather than diff against the wrong commit:\n{probe}"
+    );
+    assert!(
+        probe.contains(
+            "git diff --name-only -z --no-renames --diff-filter=AMT HEAD^1 HEAD \\\n            \
+             -- ':(glob)docs/actions/*.checklist.json' >\"$RUNNER_TEMP/checklist-names\""
+        ),
+        "the diff runs as its own command into a file, so `set -e` sees its status:\n{probe}"
+    );
+    // `T` is a modification too: a checklist that was a symlink on the base
+    // branch and is a regular file in the pull request (or the reverse) is a
+    // changed document, and leaving it out would let it skip verification.
+    // Only `D` (and `R`/`C`, which `--no-renames` never produces) stays out.
+    // A process substitution's exit status is invisible to `set -e`, so a
+    // failed `git diff` read that way would look exactly like an empty list.
+    for block in run_blocks() {
+        let block = code(&block);
+        assert!(
+            !block.contains("< <("),
+            "no step may read through `< <(`:\n{block}"
+        );
+    }
+}
+
+/// Each step is a fresh shell, so the names have to be read back from the file
+/// in every step that uses them; an array carried over from an earlier step
+/// would expand to nothing and silently fall back to the no-argument route,
+/// which refuses as soon as `docs/actions/` holds more than one document.
+#[test]
+fn verify_and_render_each_read_the_names_back_and_refuse_an_empty_list() {
+    for (step, call) in [
+        ("Verify the checklists", "checklist verify \"${names[@]}\""),
+        (
+            "Render the comment body",
+            "checklist render-md --max-bytes 60000 \"${names[@]}\"",
+        ),
+    ] {
+        let body = code(&render_step(step));
+        assert!(
+            body.contains("if: steps.probe.outputs.present == 'true'"),
+            "{step} must run only when the selection found something:\n{body}"
+        );
+        assert!(
+            body.contains("while IFS= read -r -d '' name; do")
+                && body.contains("done <\"$RUNNER_TEMP/checklist-names\""),
+            "{step} must re-read the NUL-separated names file:\n{body}"
+        );
+        assert!(
+            body.contains("if [ ${#names[@]} -eq 0 ]; then") && body.contains("exit 1"),
+            "{step} must fail on an empty list rather than call the verb with no paths:\n{body}"
+        );
+        assert!(body.contains(call), "{step} must pass every name:\n{body}");
+    }
 }
 
 // ── Rendering and reading the pin back ────────────────────────────────────────
@@ -354,7 +448,8 @@ fn the_same_workflow_at_another_version_is_a_stale_pin() {
     assert_eq!(
         classify(Some(&old), V),
         State::PinStale {
-            found: "0.1.0".to_string()
+            found: "0.1.0".to_string(),
+            generation: Generation::Current,
         }
     );
 }
@@ -383,6 +478,129 @@ fn a_whitespace_only_difference_still_differs() {
 fn an_edited_file_with_an_old_pin_differs() {
     let edited = render("0.1.0").replace("timeout-minutes: 10", "timeout-minutes: 30");
     assert_eq!(classify(Some(&edited), V), State::Differs);
+}
+
+// ── Workflows an earlier release wrote ────────────────────────────────────────
+
+/// The legacy generation recorded under `label`.
+fn legacy(label: &str) -> &'static LegacyTemplate {
+    LEGACY_TEMPLATES
+        .iter()
+        .find(|generation| generation.label == label)
+        .unwrap_or_else(|| panic!("no legacy generation labelled {label}"))
+}
+
+/// Every workflow an earlier release could have written, untouched, is one
+/// that can be advanced without `--force`. Looping over the table means a
+/// generation added to it later is covered without a new test.
+#[test]
+fn every_legacy_generation_is_a_stale_pin() {
+    assert!(!LEGACY_TEMPLATES.is_empty());
+    for generation in LEGACY_TEMPLATES {
+        let old = generation.render("0.1.0");
+        assert_ne!(
+            old, generation.body,
+            "{} has no placeholder",
+            generation.label
+        );
+        assert_eq!(
+            classify(Some(&old), V),
+            State::PinStale {
+                found: "0.1.0".to_string(),
+                generation: Generation::Legacy(generation.label),
+            },
+            "an untouched {} workflow must not read as a local edit",
+            generation.label
+        );
+    }
+}
+
+/// The 0.11.0 generation pinned the sync CLI under its own key, so reading the
+/// pin back has to know that key as well as today's.
+#[test]
+fn the_oldest_generation_pins_through_its_own_key() {
+    let generation = legacy("0.11.0");
+    assert_eq!(generation.pin_key, "SS_MAGIC_VERSION:");
+    let old = generation.render("0.11.0");
+    assert_eq!(pinned_version(&old).as_deref(), Some("0.11.0"));
+    assert_eq!(
+        classify(Some(&old), env!("CARGO_PKG_VERSION")).token(),
+        "pin-stale"
+    );
+}
+
+/// The version-equality rule belongs to the current template only: a legacy
+/// workflow pinning exactly this build's version still selects checklists the
+/// old way, so it is stale, not identical.
+#[test]
+fn a_legacy_generation_at_the_current_version_is_still_a_stale_pin() {
+    for generation in LEGACY_TEMPLATES {
+        assert_eq!(
+            classify(Some(&generation.render(V)), V),
+            State::PinStale {
+                found: V.to_string(),
+                generation: Generation::Legacy(generation.label),
+            }
+        );
+    }
+}
+
+/// AE5: a legacy workflow somebody changed is still a local change, whatever
+/// generation it started from.
+#[test]
+fn a_locally_edited_legacy_workflow_differs() {
+    for generation in LEGACY_TEMPLATES {
+        let edited = generation
+            .render(V)
+            .replace("runs-on: ubuntu-latest", "runs-on: self-hosted");
+        assert_ne!(edited, generation.render(V));
+        assert_eq!(
+            classify(Some(&edited), V),
+            State::Differs,
+            "{}",
+            generation.label
+        );
+    }
+}
+
+/// A fixture that drifted from what its release shipped would make every
+/// workflow of that generation read as a local edit, so each fixture is held to
+/// the shape its release wrote: the pin key and placeholder it names, and the
+/// placeholder exactly once.
+#[test]
+fn every_legacy_fixture_carries_its_own_pin() {
+    for generation in LEGACY_TEMPLATES {
+        assert_eq!(generation.body.matches(generation.placeholder).count(), 1);
+        assert!(
+            generation.body.contains(&format!(
+                "{} \"{}\"",
+                generation.pin_key, generation.placeholder
+            )),
+            "{}",
+            generation.label
+        );
+    }
+}
+
+/// The current generation keeps reporting a moved pin as nothing more than
+/// that, and a legacy one as a whole new workflow, because that is what each
+/// write does.
+#[test]
+fn the_check_line_says_what_the_write_would_change() {
+    let current = State::PinStale {
+        found: "0.1.0".to_string(),
+        generation: Generation::Current,
+    };
+    assert!(would(&current, false).contains("advance the pin"));
+    let old = State::PinStale {
+        found: "0.1.0".to_string(),
+        generation: Generation::Legacy(legacy("1.0.1").label),
+    };
+    assert!(
+        would(&old, false).contains("replace it with the current workflow"),
+        "{}",
+        would(&old, false)
+    );
 }
 
 // ── The verb, against a real repository ───────────────────────────────────────
@@ -482,6 +700,90 @@ fn a_stale_pin_is_advanced_on_a_write_run() {
     assert_eq!(written, render(V));
     assert_eq!(pinned_version(&written).as_deref(), Some(V));
     assert!(!code(&written).contains("pull_request_target"));
+}
+
+/// [`run_core_with`] against `root`, returning the exit code and what it
+/// printed to each stream.
+fn run_captured(root: &Path, check: bool, force: bool) -> (ExitCode, String, String) {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_core_with(root, V, check, force, &mut out, &mut err).unwrap();
+    (
+        code,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+/// AE4, the reporting half: a workflow the 1.0.1 generation wrote at its own
+/// version reads as a stale pin, names that generation, shows the whole
+/// difference (more than the pin moves), and stays exactly as it was.
+#[test]
+fn check_against_a_legacy_workflow_names_the_generation_and_shows_the_diff() {
+    let (_d, root) = repo();
+    add_checklist(&root);
+    let path = workflow_path(&root);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let generation = legacy("1.0.1");
+    let old = generation.render(generation.label);
+    fs::write(&path, &old).unwrap();
+
+    let (code, out, _) = run_captured(&root, true, false);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(out.lines().next(), Some("state: pin-stale"), "{out}");
+    assert!(
+        out.contains(&format!("the {} generation", generation.label)),
+        "the report must name the generation it found:\n{out}"
+    );
+    assert!(
+        out.contains("--- on disk") && out.contains("+++ would write"),
+        "a legacy upgrade changes more than the pin, so the diff is shown:\n{out}"
+    );
+    assert!(
+        out.contains("replace it with the current workflow"),
+        "{out}"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), old);
+}
+
+/// AE4, the writing half: no `--force` is needed to bring an untouched legacy
+/// workflow up to the current one.
+#[test]
+fn a_legacy_workflow_is_replaced_without_force() {
+    for generation in LEGACY_TEMPLATES {
+        let (_d, root) = repo();
+        add_checklist(&root);
+        let path = workflow_path(&root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, generation.render(generation.label)).unwrap();
+
+        let (code, _, err) = run_captured(&root, false, false);
+        assert_eq!(code, ExitCode::SUCCESS, "{}: {err}", generation.label);
+        assert_eq!(fs::read_to_string(&path).unwrap(), render(V));
+    }
+}
+
+/// AE5, end to end: an edited legacy workflow is refused without `--force`
+/// and left as it was.
+#[test]
+fn an_edited_legacy_workflow_is_not_overwritten_without_force() {
+    let (_d, root) = repo();
+    add_checklist(&root);
+    let path = workflow_path(&root);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let generation = legacy("1.0.1");
+    let mine = generation
+        .render(generation.label)
+        .replace("runs-on: ubuntu-latest", "runs-on: self-hosted");
+    fs::write(&path, &mine).unwrap();
+
+    let (code, out, _) = run_captured(&root, true, false);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(out.lines().next(), Some("state: differs"), "{out}");
+
+    let (code, _, err) = run_captured(&root, false, false);
+    assert_eq!(code, ExitCode::from(1));
+    assert!(err.contains("refused"), "{err}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), mine);
 }
 
 /// The one destructive case needs a flag. Without it the local file survives

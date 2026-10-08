@@ -30,8 +30,15 @@ Its first line is `state: <token>`. Branch on the token, not on the prose after 
    added step, a repository-specific runner – so ask whether to overwrite or keep the local version.
    Only on an explicit yes, run `ss-magic-plugin setup-github-ci --force`. A run without `--force`
    refuses this case on purpose, so never reach for the flag before asking.
-4. **`state: pin-stale`** – this exact workflow, naming an older ss-magic-plugin. `--check` reports
-   which version it pins and which it would move to. Ask, then run `ss-magic-plugin setup-github-ci`.
+4. **`state: pin-stale`** – a workflow this tool wrote and nobody edited since, but not the one this
+   build would write. It is either the current workflow at a different pin, or an untouched workflow
+   from an earlier template generation, at any version (the earliest generation pins the `ss-magic`
+   CLI under `SS_MAGIC_VERSION`, not ss-magic-plugin). `--check` reports which version
+   it pins and which it would move to, names the generation when it is an earlier one, and prints a
+   diff – for an earlier generation that diff is more than the pin line, so show it rather than
+   describing it. No local edit is at risk, so this advances without `--force`: ask, then run
+   `ss-magic-plugin setup-github-ci`. A hand-edited workflow, even one derived from an earlier
+   generation, is `state: differs` instead.
 
 Confirmation is required in every branch that writes. There are exactly two ways this ends: the
 workflow is written, or the user declined – and when they declined, say at which step.
@@ -45,14 +52,23 @@ workflow is written, or the user declined – and when they declined, say at whi
   Everything else is denied by a workflow-level `permissions: {}`.
 - Installs the pinned ss-magic-plugin from its GitHub release (the `ss-magic-plugin-vX.Y.Z` line, not
   the `ss-magic` sync CLI's) and verifies the published SHA-256 before running it.
-- Runs `checklist verify`, then posts `checklist render-md` as a pull-request comment, rewriting the
-  same comment on each push rather than adding a new one.
+- Verifies and renders only the checklists the pull request adds or changes: it lists the top-level
+  `docs/actions/*.checklist.json` files that differ from the branch the pull request targets (deleted
+  files left out, a renamed one counted at its new path) and passes those names to `checklist verify`
+  and `checklist render-md` as arguments. A pull request that touches no checklist renders and posts
+  nothing.
+- Posts the rendered Markdown as a pull-request comment, rewriting the same comment on each push
+  rather than adding a new one. The body is capped (`--max-bytes 60000`) below GitHub's comment limit;
+  a note names any checklist left out.
 - Passes every checklist-derived value to the forge CLI through a file (`--body-file`) – never
-  interpolated into a shell step, because checklist prose is repository-controlled text.
+  interpolated into a shell step, because checklist prose is repository-controlled text. The
+  selected file names reach the verbs as quoted arguments read back from a NUL-separated file, never
+  spliced into a command line.
 - Skips the comment on pull requests opened **from a fork**. GitHub issues fork pull requests a
   read-only token no matter what the workflow asks for, so the comment cannot be posted there. The
-  `render` job still runs, so an invalid checklist is still caught. Mention this if the repository
-  takes outside contributions.
+  `render` job still runs, so an invalid checklist the pull request changes is still caught. Mention
+  this if the repository takes outside contributions.
 
 If a repository has no checklist yet, the verb says so and writes the workflow anyway – it stays
-quiet until `docs/actions/` holds one. Run `ss-magic-plugin checklist init <slug>` to create it.
+quiet until a pull request adds or changes one under `docs/actions/`. Run
+`ss-magic-plugin checklist init <slug>` to create it.

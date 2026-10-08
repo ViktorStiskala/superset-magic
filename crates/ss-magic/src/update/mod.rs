@@ -1,7 +1,7 @@
 //! Self-update subsystem.
 //!
 //! Split into the cheap gate and the heavy apply:
-//! - [`check`] answers "is a newer release available?" cheaply and
+//! - [`ss_magic_core::release`] answers "is a newer release available?" cheaply and
 //!   offline-safely — a 24h-cached, per-release-line check that never errors,
 //!   never logs, and never blocks an offline or rate-limited run.
 //! - [`apply`] is the heavy half: lock → download/verify/swap → re-exec,

@@ -1,6 +1,6 @@
 [package]
 name = "ss-magic-plugin"
-version = "1.0.1"
+version = "1.1.0"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -61,6 +61,6 @@ ss-magic-core = { path = "../ss-magic-core", features = ["testutil"] }
 installers = []
 
 [[package.metadata.dist.extra-artifacts]]
-artifacts = ["ss-magic-plugin-v1.0.1.zip"]
+artifacts = ["ss-magic-plugin-v1.1.0.zip"]
 build = ["python3", "scripts/build-plugin-zip.py"]
 working-dir = "../.."

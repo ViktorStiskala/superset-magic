@@ -2,7 +2,7 @@
 //!
 //! A handful of entry points don't justify pulling in `clap`, so this is a tiny
 //! parser over `std::env::args`: the first non-flag token selects `sync`,
-//! `pack`, `update`, or `init`; its absence falls through to the
+//! `reverse-sync`, `pack`, `update`, or `init`; its absence falls through to the
 //! interactive (bare) mode. `--version`/`-V` and `--help`/`-h` short-circuit to
 //! terminal signals, and any unrecognized subcommand is an error carrying the
 //! same usage text the help path prints.

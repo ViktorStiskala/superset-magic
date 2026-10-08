@@ -85,10 +85,10 @@ pub const GATE_THRESHOLD_LINES_MIN: u32 = 500;
 /// Upper bound a configured threshold clamps to.
 pub const GATE_THRESHOLD_LINES_MAX: u32 = 20_000;
 
-/// Default byte budget for an inline conclusion. Sized to the measured
-/// 10,000-character cliff the hook contract records for the
-/// `additionalContext` channel; the deny channel (`permissionDecisionReason`)
-/// is uncapped and not governed by this value.
+/// Default byte budget for the whole denial that serves a cached conclusion
+/// inline. The deny channel (`permissionDecisionReason`) is itself uncapped,
+/// so this value is what bounds it; the default matches the measured
+/// 10,000-character cliff the hook contract records for `additionalContext`.
 pub const GATE_INLINE_BYTE_BUDGET_DEFAULT: u32 = 10_000;
 /// Lower bound a configured byte budget clamps to.
 pub const GATE_INLINE_BYTE_BUDGET_MIN: u32 = 1_000;
@@ -126,7 +126,8 @@ pub struct GateConfig {
     /// Line count above which a `Read` is gated. Clamped to
     /// [`GATE_THRESHOLD_LINES_MIN`]..=[`GATE_THRESHOLD_LINES_MAX`].
     pub threshold_lines: u32,
-    /// Byte budget for an inline conclusion riding `additionalContext`.
+    /// Byte budget for the denial that serves a cached conclusion inline (the
+    /// conclusion plus ss-magic's framing, on `permissionDecisionReason`).
     /// Clamped to
     /// [`GATE_INLINE_BYTE_BUDGET_MIN`]..=[`GATE_INLINE_BYTE_BUDGET_MAX`].
     pub inline_byte_budget: u32,
@@ -498,16 +499,21 @@ pub fn seed_config_at(root: &Path) -> Result<SeedOutcome> {
     Ok(SeedOutcome::Seeded)
 }
 
-/// `ss-magic-plugin seed-config` — invoked by `hooks/bootstrap.sh` once, right
-/// after it installs the binary.
+/// `ss-magic-plugin seed-config` – invoked by `hooks/bootstrap.sh` from every
+/// point where a usable pinned binary is known to exist: the already-installed
+/// fast path, the re-check under the install lock, and the end of a fresh
+/// install. It therefore runs on every session start, not once per machine,
+/// because the block must be seeded once per repository while the binary is
+/// installed once per machine; the once-ness lives here (it writes only when
+/// `magic.json` has no `plugin` key at all), so a repeat call costs a read and
+/// an exit.
 ///
-/// This verb exists because there is no longer any terminal path to the plugin
-/// configuration at all: the `ss-magic` CLI dropped its `plugin` subcommand
-/// when the plugin became its own binary, and the new binary lives under
-/// `${CLAUDE_PLUGIN_DATA}`, which is not on a person's `PATH`. Rather than
-/// document a command nobody can type, the bootstrap makes the configuration
-/// visible where a person is already looking — in the workspace contract file
-/// their repository already tracks.
+/// This verb exists because there is no terminal path to the plugin
+/// configuration at all: `ss-magic` has no `plugin` subcommand, and
+/// `ss-magic-plugin` lives under `${CLAUDE_PLUGIN_DATA}`, which is not on a
+/// person's `PATH`. Rather than document a command nobody can type, the
+/// bootstrap makes the configuration visible where a person is already
+/// looking – in the workspace contract file their repository already tracks.
 ///
 /// Outside a git repository it does nothing, like every other verb here.
 pub fn run_seed_config(args: &[String]) -> Result<ExitCode> {
