@@ -979,3 +979,267 @@ fn magic_sh_propagates_exit_code_from_ss_magic_via_exec() {
         "magic.sh must propagate ss-magic's exit code (3) via exec"
     );
 }
+
+// ── local install: config.local.json, load_sync_config, install_mode ─────
+
+use serde_json::{json, Value};
+
+/// Parse a JSON literal into the top-level map `merge_sync_entry_into_local_config`
+/// takes, so a fixture reads as the file's literal text.
+fn obj(v: Value) -> serde_json::Map<String, Value> {
+    match v {
+        Value::Object(m) => m,
+        other => panic!("fixture is not an object: {other}"),
+    }
+}
+
+fn merged(existing: Option<Value>) -> LocalConfigMerge {
+    let existing = existing.map(obj);
+    merge_sync_entry_into_local_config(existing.as_ref()).unwrap()
+}
+
+#[test]
+fn local_merge_absent_file_gets_setup_before_entry() {
+    let m = merged(None);
+    assert!(m.changed);
+    assert_eq!(Value::Object(m.config), json!({"setup": {"before": ["ss-magic sync"]}}));
+}
+
+#[test]
+fn local_merge_file_without_setup_key_keeps_other_keys() {
+    let m = merged(Some(json!({"note": 1})));
+    assert!(m.changed);
+    assert_eq!(
+        Value::Object(m.config),
+        json!({"note": 1, "setup": {"before": ["ss-magic sync"]}})
+    );
+}
+
+#[test]
+fn local_merge_object_setup_with_only_after_gains_before() {
+    let m = merged(Some(json!({"setup": {"after": ["./post.sh"]}})));
+    assert!(m.changed);
+    assert_eq!(
+        Value::Object(m.config),
+        json!({"setup": {"before": ["ss-magic sync"], "after": ["./post.sh"]}})
+    );
+}
+
+#[test]
+fn local_merge_object_setup_with_before_prepends_entry() {
+    let m = merged(Some(json!({"setup": {"before": ["./pre.sh"], "after": ["./post.sh"]}})));
+    assert!(m.changed);
+    assert_eq!(
+        Value::Object(m.config),
+        json!({"setup": {"before": ["ss-magic sync", "./pre.sh"], "after": ["./post.sh"]}})
+    );
+}
+
+/// AE3: the replace form (`setup` is a plain array) keeps that form and
+/// prepends, and every other key survives with its value.
+#[test]
+fn local_merge_array_setup_is_prepended_and_other_keys_survive() {
+    let m = merged(Some(
+        json!({"setup": ["./mine.sh"], "teardown": {"after": ["x"]}, "note": 1}),
+    ));
+    assert!(m.changed);
+    assert_eq!(
+        Value::Object(m.config),
+        json!({"setup": ["ss-magic sync", "./mine.sh"], "teardown": {"after": ["x"]}, "note": 1})
+    );
+}
+
+#[test]
+fn local_merge_reports_no_change_when_marker_already_present() {
+    for existing in [
+        json!({"setup": {"before": ["ss-magic sync", "./a.sh"]}}),
+        json!({"setup": {"after": ["ss-magic sync"]}}),
+        json!({"setup": ["./a.sh", "ss-magic sync"]}),
+        // A flagged invocation is still the marker, matching the committed
+        // install's `entry_is_magic_marker` test (a substring match).
+        json!({"setup": ["ss-magic sync --no-backup"]}),
+    ] {
+        let m = merged(Some(existing.clone()));
+        assert!(!m.changed, "{existing} must read as already registered");
+        assert_eq!(Value::Object(m.config), existing);
+    }
+}
+
+#[test]
+fn local_merge_refuses_setup_of_another_json_type() {
+    for bad in [json!("./one.sh"), json!(3), json!(null), json!(true)] {
+        let existing = obj(json!({"setup": bad}));
+        let err = merge_sync_entry_into_local_config(Some(&existing)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("setup"),
+            "error must name the setup key: {err:#}"
+        );
+    }
+}
+
+#[test]
+fn local_merge_refuses_a_non_array_before() {
+    let existing = obj(json!({"setup": {"before": "./one.sh"}}));
+    assert!(merge_sync_entry_into_local_config(Some(&existing)).is_err());
+}
+
+#[test]
+fn local_setup_marker_test_covers_every_shape() {
+    assert!(setup_has_sync_marker(&json!("ss-magic sync")));
+    assert!(setup_has_sync_marker(&json!(["a", "ss-magic sync"])));
+    assert!(setup_has_sync_marker(&json!({"before": ["ss-magic sync"]})));
+    assert!(setup_has_sync_marker(&json!({"after": ["ss-magic sync"]})));
+    assert!(!setup_has_sync_marker(&json!(["./magic.sh sync"])));
+    assert!(!setup_has_sync_marker(&json!({"before": ["ss-magic-plugin status"]})));
+    assert!(!setup_has_sync_marker(&json!(null)));
+    assert!(!setup_has_sync_marker(&json!(7)));
+}
+
+#[test]
+fn load_config_local_json_absent_is_none() {
+    let dir = fresh();
+    assert!(load_config_local_json(dir.path()).unwrap().is_none());
+}
+
+#[test]
+fn load_config_local_json_malformed_names_the_path() {
+    let dir = fresh();
+    fs::create_dir_all(dir.path().join(".superset")).unwrap();
+    fs::write(dir.path().join(".superset/config.local.json"), "{ not json").unwrap();
+    let err = load_config_local_json(dir.path()).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("config.local.json"),
+        "error must name the file: {err:#}"
+    );
+}
+
+#[test]
+fn load_config_local_json_rejects_a_non_object_document() {
+    let dir = fresh();
+    fs::create_dir_all(dir.path().join(".superset")).unwrap();
+    fs::write(dir.path().join(".superset/config.local.json"), "[1]").unwrap();
+    assert!(load_config_local_json(dir.path()).is_err());
+}
+
+#[test]
+fn write_config_local_json_round_trips_values_and_leaves_no_staging_file() {
+    let dir = fresh();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".superset")).unwrap();
+    fs::write(
+        root.join(".superset/config.local.json"),
+        r#"{"setup": ["./mine.sh"], "teardown": {"after": ["x"]}, "note": 1}"#,
+    )
+    .unwrap();
+    let before = load_config_local_json(root).unwrap();
+    let m = merge_sync_entry_into_local_config(before.as_ref()).unwrap();
+    write_config_local_json(root, &m.config).unwrap();
+
+    let after = load_config_local_json(root).unwrap().unwrap();
+    assert_eq!(
+        Value::Object(after),
+        json!({"setup": ["ss-magic sync", "./mine.sh"], "teardown": {"after": ["x"]}, "note": 1})
+    );
+    let raw = fs::read_to_string(root.join(".superset/config.local.json")).unwrap();
+    assert!(raw.ends_with('\n'), "pretty-printed with a trailing newline");
+    let names: Vec<String> = fs::read_dir(root.join(".superset"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["config.local.json".to_string()]);
+}
+
+#[test]
+fn write_config_local_json_creates_the_superset_dir() {
+    let dir = fresh();
+    write_config_local_json(dir.path(), &obj(json!({"setup": []}))).unwrap();
+    assert!(dir.path().join(".superset/config.local.json").is_file());
+}
+
+#[test]
+fn local_install_default_files_are_the_two_local_files() {
+    assert_eq!(
+        local_install_default_files(),
+        vec![
+            ".superset/magic.local.json".to_string(),
+            ".superset/config.local.json".to_string()
+        ]
+    );
+}
+
+fn write_superset_file(root: &Path, name: &str, body: &str) {
+    fs::create_dir_all(root.join(".superset")).unwrap();
+    fs::write(root.join(".superset").join(name), body).unwrap();
+}
+
+#[test]
+fn install_mode_is_derived_from_files() {
+    let dir = fresh();
+    let root = dir.path();
+    assert_eq!(install_mode(root), InstallMode::None);
+
+    // config.json alone (a team's own setup) is not an ss-magic install.
+    write_superset_file(root, "config.json", r#"{"setup": []}"#);
+    assert_eq!(install_mode(root), InstallMode::None);
+
+    // config.local.json alone does not decide the mode either, marker or not.
+    write_superset_file(root, "config.local.json", r#"{"setup": ["ss-magic sync"]}"#);
+    assert_eq!(install_mode(root), InstallMode::None);
+
+    write_superset_file(root, "magic.local.json", r#"{"files": [".env"]}"#);
+    assert_eq!(install_mode(root), InstallMode::Local);
+
+    // A committed magic.json wins over a coexisting magic.local.json.
+    write_superset_file(root, "magic.json", r#"{"files": []}"#);
+    assert_eq!(install_mode(root), InstallMode::Committed);
+}
+
+#[test]
+fn install_mode_committed_without_a_local_overlay() {
+    let dir = fresh();
+    write_superset_file(dir.path(), "magic.json", r#"{"files": []}"#);
+    assert_eq!(install_mode(dir.path()), InstallMode::Committed);
+}
+
+#[test]
+fn load_sync_config_returns_the_overlay_when_magic_json_exists() {
+    let dir = fresh();
+    let root = dir.path();
+    write_superset_file(root, "magic.json", r#"{"files": [".env"]}"#);
+    write_superset_file(root, "magic.local.json", r#"{"files": [".env", "x.key"]}"#);
+    let cfg = load_sync_config(root).unwrap().unwrap();
+    assert_eq!(cfg.files, vec![".env", "x.key"]);
+    // Identical to what load_overlaid answers: the plugin's loader is untouched.
+    assert_eq!(cfg.files, load_overlaid(root).unwrap().unwrap().files);
+}
+
+#[test]
+fn load_sync_config_uses_the_local_list_alone_without_magic_json() {
+    let dir = fresh();
+    let root = dir.path();
+    write_superset_file(
+        root,
+        "magic.local.json",
+        r#"{"_comment": "kept", "files": [".superset/magic.local.json", ".env"]}"#,
+    );
+    let cfg = load_sync_config(root).unwrap().unwrap();
+    assert_eq!(cfg.files, vec![".superset/magic.local.json", ".env"]);
+    assert_eq!(cfg.extras.get("_comment"), Some(&json!("kept")));
+    // load_overlaid still answers None here: its behavior must not change.
+    assert!(load_overlaid(root).unwrap().is_none());
+}
+
+#[test]
+fn load_sync_config_is_none_when_neither_file_exists() {
+    let dir = fresh();
+    write_superset_file(dir.path(), "config.json", r#"{"setup": []}"#);
+    assert!(load_sync_config(dir.path()).unwrap().is_none());
+}
+
+#[test]
+fn load_sync_config_malformed_local_list_is_an_error_naming_the_path() {
+    let dir = fresh();
+    write_superset_file(dir.path(), "magic.local.json", "{ nope");
+    let err = load_sync_config(dir.path()).unwrap_err();
+    assert!(format!("{err:#}").contains("magic.local.json"), "{err:#}");
+}
