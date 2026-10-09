@@ -373,12 +373,19 @@ where
     }
 
     // 5b. Pre-copy backup pass: back up every worktree file the copy will
-    // overwrite (under `<cwd>/.superset/backups/`, gitignored there) so a
-    // mistaken forward sync is recoverable. Skipped by `--no-backup`.
+    // overwrite (under `<cwd>/.superset/backups/`, ignored there) so a
+    // mistaken forward sync is recoverable. Skipped by `--no-backup`. The
+    // backups rule's sink follows MAIN's install mode (KTD4): `.gitignore` on a
+    // committed install, the shared `info/exclude` on a local one, so a local
+    // install never dirties the worktree's tracked `.gitignore`.
     if !no_backup {
-        if let Err(err) =
-            sync::reverse_sync::backup_forward_targets(&main_root, &cwd_root, &cfg.files)
-        {
+        let ignore_sink = sync::reverse_sync::ignore_sink_for(&main_root);
+        if let Err(err) = sync::reverse_sync::backup_forward_targets(
+            &main_root,
+            &cwd_root,
+            &cfg.files,
+            ignore_sink,
+        ) {
             eprintln!("{}", tui::style::err(format!("error: {err:#}")));
             return Ok(ExitCode::from(1));
         }
@@ -414,8 +421,10 @@ where
 /// run FROM the main checkout (`cwd_root == main_root` — there is nothing to
 /// push), then bulk-pushes every git-untracked candidate that differs from main
 /// via `sync::reverse_sync::run_bulk` (pre-overwrite backups under main's
-/// `.superset/backups/` unless `no_backup`, plus the gitignore-in-main secret
-/// gate on every write).
+/// `.superset/backups/` unless `no_backup`, plus the ignore-in-main secret
+/// gate on every write; both rules go to `.gitignore` on a committed install
+/// and to the shared `info/exclude` otherwise – KTD4, see
+/// `reverse_sync::ignore_sink_for`).
 pub fn run_reverse_sync_flow(cwd: &Path, no_backup: bool) -> Result<ExitCode> {
     let (cwd_root, main_root) = match resolve_sync_roots(cwd) {
         Ok(roots) => roots,

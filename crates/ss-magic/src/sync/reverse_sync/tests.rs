@@ -345,6 +345,7 @@ fn apply_push_overwrites_main_and_backs_up_old_bytes() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = applied(
         apply_decision(
@@ -394,6 +395,7 @@ fn apply_push_to_new_main_path_creates_and_gitignores_without_backup() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = applied(
         apply_decision(
@@ -435,6 +437,7 @@ fn apply_pull_overwrites_worktree_and_backs_up_its_old_bytes() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = applied(
         apply_decision(
@@ -483,6 +486,7 @@ fn apply_merge_writes_assembled_to_both_and_backs_up_both() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = applied(
         apply_decision(
@@ -563,6 +567,7 @@ fn apply_skips_when_target_changed_since_review() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let outcome = apply_decision(
         &ctx,
@@ -616,6 +621,7 @@ fn apply_applies_when_baseline_matches_current() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = applied(
         apply_decision(
@@ -660,6 +666,7 @@ fn apply_skips_when_target_appeared_after_review() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let outcome = apply_decision(
         &ctx,
@@ -706,6 +713,7 @@ fn apply_undecided_is_skipped() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let outcome = apply_decision(
         &ctx,
@@ -756,6 +764,7 @@ fn apply_push_skips_when_source_changed_since_review() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let outcome = apply_decision(
         &ctx,
@@ -813,6 +822,7 @@ fn apply_pull_skips_when_source_changed_since_review() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let outcome = apply_decision(
         &ctx,
@@ -861,6 +871,7 @@ fn apply_batch_continues_past_a_failing_file() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
 
     // The failing (unsafe) decision is FIRST, proving the batch keeps going and
@@ -921,6 +932,7 @@ fn apply_delete_removes_both_sides_and_backs_up_both() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = applied(
         apply_decision(
@@ -968,6 +980,7 @@ fn apply_delete_worktree_only_removes_and_backs_up_worktree() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = applied(
         apply_decision(
@@ -1019,6 +1032,7 @@ fn apply_delete_skips_when_side_changed_since_review() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let outcome = apply_decision(
         &ctx,
@@ -1073,6 +1087,7 @@ fn apply_delete_skips_when_main_side_changed_since_review() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let outcome = apply_decision(
         &ctx,
@@ -1118,6 +1133,7 @@ fn apply_delete_with_nothing_on_disk_is_skipped() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let outcome = apply_decision(
         &ctx,
@@ -1189,6 +1205,7 @@ fn review_baseline_pins_main_absent_for_worktree_only_status() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let outcome = apply_decision(
         &ctx,
@@ -1630,6 +1647,7 @@ fn apply_pull_creates_worktree_for_main_only() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = applied(
         apply_decision(
@@ -1670,6 +1688,7 @@ fn apply_delete_main_only_removes_main_and_backs_up() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = applied(
         apply_decision(
@@ -1717,6 +1736,7 @@ fn apply_push_tracked_source_skips_gitignore() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = applied(
         apply_decision(
@@ -1782,6 +1802,7 @@ fn apply_push_unreadable_source_leaves_main_untouched() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = apply_decision(&ctx, Path::new("secret.env"), &Decision::Push, base);
     let _ = fs::set_permissions(&wt.join("secret.env"), fs::Permissions::from_mode(0o644));
@@ -1816,6 +1837,7 @@ fn apply_push_with_backup_disabled_still_writes() {
         backups_root: backups.path(),
         ts: TS,
         backup: false,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = applied(
         apply_decision(
@@ -1865,6 +1887,7 @@ fn secret_fail_closed_push_untracked_always_gitignored() {
         backups_root: backups.path(),
         ts: TS,
         backup: true,
+        ignore_sink: IgnoreSink::Gitignore,
     };
     let res = applied(
         apply_decision(
@@ -2069,7 +2092,13 @@ fn forward_backup_pass_skips_excluded_trees_under_a_bare_superset_literal() {
         "RECOVERED=1\n",
     );
 
-    backup_forward_targets(main.path(), &wt, &[".superset".to_string()]).unwrap();
+    backup_forward_targets(
+        main.path(),
+        &wt,
+        &[".superset".to_string()],
+        IgnoreSink::Gitignore,
+    )
+    .unwrap();
 
     let captured = files_under(&wt.join(".superset/backups"));
     assert!(
@@ -2164,4 +2193,62 @@ fn config_local_json_exclusion_ignores_ascii_case() {
     assert!(!is_forward_only_rel(Path::new("config.local.json")));
     assert!(!is_forward_only_rel(Path::new(".superset/config.json")));
     assert!(!is_forward_only_rel(Path::new("apps/.superset/config.local.json")));
+}
+
+// ── Ignore-rule sink follows the install mode (KTD4) ────────────────────
+
+/// The lines of the repository's shared `<git-common-dir>/info/exclude`.
+fn info_exclude_lines(root: &Path) -> Vec<String> {
+    let path = git::git_common_dir(root).unwrap().join("info/exclude");
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A hand-written local install (a `magic.local.json`, no `magic.json`, and no
+/// `config.local.json`) still selects the `info/exclude` sink: the install mode
+/// is derived from `magic.json`'s absence alone, so both lazily added rules –
+/// the secret gate's and the backups tree's – land in `info/exclude` and no
+/// `.gitignore` is created in main.
+#[test]
+fn run_bulk_on_hand_written_local_install_writes_info_exclude_only() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let local = "{\n  \"files\": [\"secret.key\"]\n}\n";
+    write(main.path(), ".superset/magic.local.json", local);
+    write(&wt, ".superset/magic.local.json", local);
+    write(&wt, "secret.key", "KEY=wt\n");
+
+    let _ = run_bulk(&wt, main.path(), false).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(main.path().join("secret.key")).unwrap(),
+        "KEY=wt\n"
+    );
+    let lines = info_exclude_lines(main.path());
+    assert!(lines.contains(&"/secret.key".to_string()), "got {lines:?}");
+    assert!(
+        lines.contains(&"/.superset/backups/".to_string()),
+        "the backups rule follows the same sink, got {lines:?}"
+    );
+    assert!(
+        !main.path().join(".gitignore").exists(),
+        "no .gitignore may be created on a checkout without magic.json"
+    );
+    assert!(git::is_ignored(main.path(), Path::new("secret.key")).unwrap());
+}
+
+/// The sink mapping itself: only a committed install (a `magic.json` in main)
+/// writes `.gitignore`; a local install and NO install both fail safe to
+/// `info/exclude`, so an unknown state never dirties a tracked file.
+#[test]
+fn ignore_sink_for_maps_install_mode_fail_safe() {
+    let main = init_main_repo();
+    assert_eq!(ignore_sink_for(main.path()), IgnoreSink::LocalExclude);
+    write(main.path(), ".superset/magic.local.json", "{\"files\":[]}\n");
+    assert_eq!(ignore_sink_for(main.path()), IgnoreSink::LocalExclude);
+    write_magic(main.path(), &[]);
+    assert_eq!(ignore_sink_for(main.path()), IgnoreSink::Gitignore);
 }

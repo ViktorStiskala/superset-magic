@@ -3,9 +3,10 @@
 //!
 //! This is the ONE path that can write untracked (often secret) files into the
 //! shared main checkout, so it is deliberately conservative. The
-//! "Secret-safety boundary": a push into main only appends a `.gitignore` rule
-//! for a git-UNTRACKED source (see [`ensure_gitignored_in_main`], gated on
-//! `Baseline::source_untracked` in [`apply_decision`]), and that determination
+//! "Secret-safety boundary": a push into main only appends an ignore rule
+//! (`.gitignore` or `info/exclude`, see below) for a git-UNTRACKED source
+//! (see [`ensure_gitignored_in_main`], gated on `Baseline::source_untracked`
+//! in [`apply_decision`]), and that determination
 //! is POSITIVE and fail-closed (`!`[`git::tracked_files`]`.contains`) — an
 //! unenumerable / oddly-normalized name defaults to "secret". A regression there
 //! is a secret leak, not a cosmetic bug.
@@ -29,7 +30,18 @@
 //! the gitignore rule; a tracked file is already committed and must NOT gain one.
 //! The direct [`run_bulk`] restricts itself to untracked candidates entirely.
 //! Backups live under the `.superset/backups/` of the root being overwritten,
-//! gitignored there via the unified [`gitignore::ensure_path_ignored`].
+//! ignored there via [`gitignore::ensure_path_ignored_in`].
+//!
+//! ## Where the ignore rules go (KTD4 of the local-install plan)
+//!
+//! Every rule this module adds lazily – the backups tree and the secret gate's
+//! rule in main – goes to the sink [`ignore_sink_for`] picks from the MAIN
+//! checkout's install mode, resolved once per flow: a committed install (a
+//! `magic.json` in main) writes the team-visible `.gitignore` exactly as
+//! before; a local install, and a checkout with no install at all, write the
+//! shared, untracked `<git-common-dir>/info/exclude` instead, so a local install
+//! never dirties a tracked file. Either way the secret gate keeps its strict
+//! re-check: git must report the path ignored afterwards, or the push fails.
 //!
 //! ## Structure: testable logic vs interactive TUI
 //!
@@ -54,7 +66,7 @@ use crate::hashing;
 use crate::sync::apply;
 use crate::sync::merge::{backup_rel_path, BackupSide, Decision};
 use crate::git;
-use crate::git::gitignore::{self, Ignored, PathKind};
+use crate::git::gitignore::{self, IgnoreSink, Ignored, PathKind};
 use crate::tui::cockpit::{self, CockpitOutcome};
 use crate::tui::style;
 use crate::workspace::superset_files;
@@ -310,23 +322,33 @@ pub fn classify(main_root: &Path, worktree_root: &Path, rel: &Path) -> Result<Di
     }
 }
 
-/// Ensure `rel` is gitignored in main, the secret-leak boundary. Returns `true`
+/// Ensure `rel` is ignored in main, the secret-leak boundary. Returns `true`
 /// when a new rule was appended, `false` when it was already ignored (no-op).
 ///
-/// A thin wrapper over the unified [`gitignore::ensure_path_ignored`] (closest
-/// `.gitignore`, covering-glob-then-anchored-literal) that adds the STRICT
-/// re-verify the secret boundary requires: `ensure_path_ignored` is
-/// git-TOLERANT (a git failure reads as "not ignored" and writes a literal),
+/// A thin wrapper over [`gitignore::ensure_path_ignored_in`], writing to the
+/// `sink` the flow resolved from main's install mode ([`ignore_sink_for`]):
+/// main's closest `.gitignore` (covering-glob-then-anchored-literal) on a
+/// committed install, the shared `info/exclude` otherwise. It adds the STRICT
+/// re-verify the secret boundary requires for BOTH sinks: the `.gitignore` sink
+/// is git-TOLERANT (a git failure reads as "not ignored" and writes a literal),
 /// but here a git error must FAIL the push rather than trust a tolerant append.
-/// `git::is_ignored` propagates the error, and a still-unignored path bails, so
-/// no un-ignored secret ever lands committable in main.
-fn ensure_gitignored_in_main(worktree_root: &Path, main_root: &Path, rel: &Path) -> Result<bool> {
-    match gitignore::ensure_path_ignored(main_root, worktree_root, rel, PathKind::File)? {
+/// (The `info/exclude` sink already re-checks and errors when a tracked
+/// `.gitignore` negation outranks its rule; the second check is deliberately
+/// kept so the boundary never depends on which sink ran.) `git::is_ignored`
+/// propagates the error, and a still-unignored path bails, so no un-ignored
+/// secret ever lands committable in main.
+fn ensure_gitignored_in_main(
+    sink: IgnoreSink,
+    worktree_root: &Path,
+    main_root: &Path,
+    rel: &Path,
+) -> Result<bool> {
+    match gitignore::ensure_path_ignored_in(sink, main_root, worktree_root, rel, PathKind::File)? {
         Ignored::Already => Ok(false),
         Ignored::Appended => {
             if !git::is_ignored(main_root, rel)? {
                 anyhow::bail!(
-                    "refusing to reverse-sync {}: it is still not gitignored in main after \
+                    "refusing to reverse-sync {}: git still does not ignore it in main after \
                      appending an ignore rule — writing it would leave a secret committable in main",
                     rel.display()
                 );
@@ -422,10 +444,12 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Backups live under a gitignored `.superset/backups/` in the worktree so
-    // recovered secret bytes are never committed.
+    // Backups live under an ignored `.superset/backups/` in the worktree so
+    // recovered secret bytes are never committed. The ignore sink is resolved
+    // once, from main's install mode, and reused for the secret gate (KTD4).
     let ts = apply_timestamp();
-    let backups_root = backups_root_for(worktree_root, true)?;
+    let ignore_sink = ignore_sink_for(main_root);
+    let backups_root = backups_root_for(worktree_root, true, ignore_sink)?;
 
     let ctx = ApplyContext {
         worktree_root,
@@ -433,6 +457,7 @@ pub fn run(worktree_root: &Path, main_root: &Path) -> Result<ExitCode> {
         backups_root: &backups_root,
         ts: &ts,
         backup: true,
+        ignore_sink,
     };
     let summary = apply_batch(&ctx, &decisions, &baseline);
     Ok(finish_batch(summary, &backups_root, &ts, true, "Sync"))
@@ -546,10 +571,12 @@ fn apply_batch(
                     WriteDirection::MergeBoth => "merged → both",
                     WriteDirection::DeleteBoth => "deleted from both sides",
                 };
-                let ign = if result.gitignore_appended {
-                    " (gitignore rule added)"
-                } else {
-                    ""
+                // Name the file the rule went to, so a local install's user is
+                // not sent looking for a `.gitignore` change that never happened.
+                let ign = match (result.gitignore_appended, ctx.ignore_sink) {
+                    (false, _) => "",
+                    (true, IgnoreSink::Gitignore) => " (gitignore rule added)",
+                    (true, IgnoreSink::LocalExclude) => " (info/exclude rule added)",
                 };
                 println!(
                     "{}",
@@ -601,10 +628,13 @@ pub fn run_bulk(worktree_root: &Path, main_root: &Path, no_backup: bool) -> Resu
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Backups of main's overwritten bytes live under MAIN's gitignored
-    // `.superset/backups/` — the side this direction overwrites.
+    // Backups of main's overwritten bytes live under MAIN's ignored
+    // `.superset/backups/` — the side this direction overwrites. The ignore
+    // sink is resolved once, from main's install mode, and reused for the
+    // secret gate (KTD4).
     let ts = apply_timestamp();
-    let backups_root = backups_root_for(main_root, !no_backup)?;
+    let ignore_sink = ignore_sink_for(main_root);
+    let backups_root = backups_root_for(main_root, !no_backup, ignore_sink)?;
 
     let ctx = ApplyContext {
         worktree_root,
@@ -612,6 +642,7 @@ pub fn run_bulk(worktree_root: &Path, main_root: &Path, no_backup: bool) -> Resu
         backups_root: &backups_root,
         ts: &ts,
         backup: !no_backup,
+        ignore_sink,
     };
 
     // No interactive review window, so the baseline is the current on-disk
@@ -658,19 +689,28 @@ fn backup_if_exists(root: &Path, target: &Path, dest: &Path) -> Result<Option<Pa
 
 /// Back up every existing worktree file/dir that a forward `ss-magic sync`
 /// (main → worktree) is about to overwrite, under `cwd_root/.superset/backups/
-/// <ts>/…` (the worktree side forward sync overwrites), gitignored there. A
-/// no-op when the configured patterns match nothing. The copy engine itself
-/// stays untouched — this is a deliberate pre-pass with a narrow, documented
-/// same-process TOCTOU window (nothing else writes the worktree between this
-/// pass and the copy). Best-effort pruning keeps the backups dir bounded.
-pub fn backup_forward_targets(main_root: &Path, cwd_root: &Path, patterns: &[String]) -> Result<()> {
+/// <ts>/…` (the worktree side forward sync overwrites), ignored there through
+/// `ignore_sink` – which the caller resolves from the MAIN checkout's install
+/// mode with [`ignore_sink_for`] (KTD4), so a local install re-adds a missing
+/// backups rule to `info/exclude` rather than to the worktree's tracked
+/// `.gitignore`. A no-op when the configured patterns match nothing. The copy
+/// engine itself stays untouched — this is a deliberate pre-pass with a
+/// narrow, documented same-process TOCTOU window (nothing else writes the
+/// worktree between this pass and the copy). Best-effort pruning keeps the
+/// backups dir bounded.
+pub fn backup_forward_targets(
+    main_root: &Path,
+    cwd_root: &Path,
+    patterns: &[String],
+    ignore_sink: IgnoreSink,
+) -> Result<()> {
     let matches = apply::match_paths(main_root, patterns)
         .context("expanding sync patterns for the pre-copy backup pass")?;
     if matches.is_empty() {
         return Ok(());
     }
     let ts = apply_timestamp();
-    let backups_root = backups_root_for(cwd_root, true)?;
+    let backups_root = backups_root_for(cwd_root, true, ignore_sink)?;
     let mut backed_up = Vec::new();
     for rel in &matches {
         // Skip every excluded tree. Backing one up is the same leak as syncing
@@ -713,29 +753,58 @@ pub fn backup_forward_targets(main_root: &Path, cwd_root: &Path, patterns: &[Str
 /// through `info/exclude` instead of a tracked `.gitignore`.
 pub(crate) const BACKUPS_REL: &str = ".superset/backups";
 
-/// Ensure the tool's `.superset/backups/` tree is gitignored under `root` at the
-/// closest existing `.gitignore` (or the git-root file) — a no-op when git
-/// already ignores it. The ONE place the `.superset/backups` ignore rule is
-/// wired, shared by [`backups_root_for`] (lazy, at the first sync's backup) and
-/// the init/migrate bootstrap (eager, via `migrate`'s bootstrap step, so a fresh
-/// `ss-magic init` gitignores the backups tree up front — exactly like
-/// `magic.local.json`, and before any secret bytes are ever backed up).
-pub(crate) fn ensure_backups_ignored(root: &Path) -> Result<()> {
-    gitignore::ensure_path_ignored(root, root, Path::new(BACKUPS_REL), PathKind::Dir)?;
+/// Ensure the tool's `.superset/backups/` tree is ignored under `root` — a
+/// no-op when git already ignores it. `sink` says where a new rule goes: the
+/// closest existing `.gitignore` (or the git-root file) for
+/// [`IgnoreSink::Gitignore`], the shared `info/exclude` as the root-anchored
+/// `/.superset/backups/` for [`IgnoreSink::LocalExclude`]. The ONE place the
+/// lazily added `.superset/backups` ignore rule is wired, shared by
+/// [`backups_root_for`] (lazy, at the first sync's backup, with the sink the
+/// flow resolved via [`ignore_sink_for`]) and the committed init/migrate
+/// bootstrap (eager, always [`IgnoreSink::Gitignore`] since it writes a
+/// committed install, so a fresh `ss-magic init` ignores the backups tree up
+/// front — exactly like `magic.local.json`, and before any secret bytes are
+/// ever backed up).
+pub(crate) fn ensure_backups_ignored(root: &Path, sink: IgnoreSink) -> Result<()> {
+    gitignore::ensure_path_ignored_in(sink, root, root, Path::new(BACKUPS_REL), PathKind::Dir)?;
     Ok(())
 }
 
-/// The backups root under `root`, first ensuring it is gitignored (via
-/// [`ensure_backups_ignored`]) when `ensure_ignore` is set — skipped when
-/// `--no-backup` disables backups (there is nothing to hide). Shared by the
-/// cockpit [`run`], the direct [`run_bulk`], and the forward
+/// The backups root under `root`, first ensuring it is ignored (via
+/// [`ensure_backups_ignored`], through `sink`) when `ensure_ignore` is set —
+/// skipped when `--no-backup` disables backups (there is nothing to hide).
+/// Shared by the cockpit [`run`], the direct [`run_bulk`], and the forward
 /// [`backup_forward_targets`]; the `.superset/backups` path is joined here, the
 /// ignore rule is wired once in [`ensure_backups_ignored`].
-fn backups_root_for(root: &Path, ensure_ignore: bool) -> Result<PathBuf> {
+fn backups_root_for(root: &Path, ensure_ignore: bool, sink: IgnoreSink) -> Result<PathBuf> {
     if ensure_ignore {
-        ensure_backups_ignored(root)?;
+        ensure_backups_ignored(root, sink)?;
     }
     Ok(root.join(BACKUPS_REL))
+}
+
+/// Where the sync flows write a lazily added ignore rule, decided from the MAIN
+/// checkout's install mode (KTD4 of the local-install plan: the sink fails
+/// safe, so only a committed install writes `.gitignore`).
+///
+/// - [`superset_files::InstallMode::Committed`] (a `magic.json` in main):
+///   [`IgnoreSink::Gitignore`], the team-visible rule, exactly as before local
+///   installs existed.
+/// - [`superset_files::InstallMode::Local`] and
+///   [`superset_files::InstallMode::None`]: [`IgnoreSink::LocalExclude`], the
+///   shared, untracked `info/exclude`. Mapping the no-install case here too
+///   means an unknown state never dirties a tracked file.
+///
+/// Main, not the worktree, decides: main is where the install lives and where
+/// the secret gate writes, and a worktree's untracked `magic.json` copy must
+/// not be able to flip the sink.
+pub fn ignore_sink_for(main_root: &Path) -> IgnoreSink {
+    match superset_files::install_mode(main_root) {
+        superset_files::InstallMode::Committed => IgnoreSink::Gitignore,
+        superset_files::InstallMode::Local | superset_files::InstallMode::None => {
+            IgnoreSink::LocalExclude
+        }
+    }
 }
 
 /// Timestamp string for a batch of backups: the current UTC time as a
@@ -1045,7 +1114,9 @@ pub struct ApplyResult {
     /// Backup paths written before each destructive overwrite (empty when the
     /// target was newly created and had no prior bytes).
     pub backups: Vec<PathBuf>,
-    /// True when a rule was appended to main's `.gitignore` for this path.
+    /// True when the secret gate appended an ignore rule for this path in main:
+    /// to main's `.gitignore` on a committed install, to the shared
+    /// `info/exclude` otherwise (see [`ApplyContext::ignore_sink`]).
     pub gitignore_appended: bool,
 }
 
@@ -1183,8 +1254,8 @@ pub struct ApplyContext<'a> {
     /// The main checkout root (reverse-sync destination for `Push`, source for
     /// `Pull`, and the secret-safety boundary).
     pub main_root: &'a Path,
-    /// Root directory backups are written under (gitignored via
-    /// [`gitignore::ensure_path_ignored`] at the closest `.gitignore`).
+    /// Root directory backups are written under (ignored via
+    /// [`ensure_backups_ignored`] through [`Self::ignore_sink`]).
     pub backups_root: &'a Path,
     /// The batch's single timestamp, shared by every backup path in the run.
     pub ts: &'a str,
@@ -1193,6 +1264,11 @@ pub struct ApplyContext<'a> {
     /// [`Guard::Changed`] skip and the secret-safety gitignore step are
     /// unaffected.
     pub backup: bool,
+    /// Where the secret gate ([`ensure_gitignored_in_main`]) writes its rule:
+    /// resolved once per flow from main's install mode by [`ignore_sink_for`]
+    /// (KTD4), so a local install's rules land in `info/exclude` and a
+    /// committed install's in `.gitignore`.
+    pub ignore_sink: IgnoreSink,
 }
 
 /// One file's review-time metadata baseline for [`apply_decision`]'s TOCTOU
@@ -1298,7 +1374,7 @@ pub fn apply_decision(
             // main and must NOT gain a `.gitignore` rule; `source_untracked` is
             // derived fail-closed, so an undeterminable source still gates on.
             let gitignore_appended = if baseline.source_untracked {
-                ensure_gitignored_in_main(ctx.worktree_root, ctx.main_root, rel)?
+                ensure_gitignored_in_main(ctx.ignore_sink, ctx.worktree_root, ctx.main_root, rel)?
             } else {
                 false
             };
@@ -1389,7 +1465,7 @@ pub fn apply_decision(
             // untracked source (see the Push arm) so a tracked merge target never
             // gains a `.gitignore` rule.
             let gitignore_appended = if baseline.source_untracked {
-                ensure_gitignored_in_main(ctx.worktree_root, ctx.main_root, rel)?
+                ensure_gitignored_in_main(ctx.ignore_sink, ctx.worktree_root, ctx.main_root, rel)?
             } else {
                 false
             };

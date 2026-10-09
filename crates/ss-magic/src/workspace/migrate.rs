@@ -95,7 +95,10 @@ fn ensure_bootstrap_gitignores(repo_root: &Path) -> Result<()> {
         Path::new(MAGIC_LOCAL_REL),
         gitignore::PathKind::File,
     )?;
-    reverse_sync::ensure_backups_ignored(repo_root)?;
+    // init/migrate always produce a COMMITTED install, so the backups rule goes
+    // to the team-visible `.gitignore` (KTD4: only a committed install writes
+    // `.gitignore`; the lazy sync-time rule picks its sink from the install mode).
+    reverse_sync::ensure_backups_ignored(repo_root, gitignore::IgnoreSink::Gitignore)?;
     state_tree::ensure_state_ignored(repo_root)?;
     Ok(())
 }

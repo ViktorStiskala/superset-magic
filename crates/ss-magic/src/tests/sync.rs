@@ -2,7 +2,7 @@ use crate::*;
 use std::fs;
 
 use ss_magic_core::testutil::{
-    exit_code_to_u8, init_main_repo, make_worktree, write_file, write_magic,
+    exit_code_to_u8, git_run, init_main_repo, make_worktree, write_file, write_magic,
 };
 
 // ── Test: patterns from overlaid config copy into the worktree ─────────
@@ -319,4 +319,56 @@ fn no_sync_config_message_names_both_pattern_files() {
     assert!(msg.contains(".superset/magic.local.json"), "msg: {msg}");
     assert!(msg.contains("ss-magic init --local"), "msg: {msg}");
     assert!(msg.contains("/repo"), "msg: {msg}");
+}
+
+/// KTD4 on the forward path: on a local install whose `info/exclude` lost the
+/// backups rule, a backing-up `ss-magic sync` re-adds `/.superset/backups/` to
+/// `info/exclude` and leaves the worktree's tracked `.gitignore` alone.
+#[test]
+fn forward_sync_on_local_install_readds_backups_rule_to_info_exclude() {
+    let main = init_main_repo("main");
+    let main_root = main.path().canonicalize().unwrap();
+    write_file(&main_root, ".gitignore", "target/\n");
+    git_run(&["add", ".gitignore"], &main_root);
+    git_run(&["commit", "-q", "-m", "gitignore"], &main_root);
+    write_file(&main_root, ".env", "NEW=1\n");
+    let code = workspace::local_install::run_local_init_noninteractive(
+        &main_root,
+        &[".env".to_string()],
+    )
+    .unwrap();
+    assert_eq!(exit_code_to_u8(code), 0, "local install must succeed");
+
+    // Drop the backups rule the install wrote.
+    let exclude = git::git_common_dir(&main_root).unwrap().join("info/exclude");
+    let kept: String = fs::read_to_string(&exclude)
+        .unwrap()
+        .lines()
+        .filter(|l| *l != "/.superset/backups/")
+        .map(|l| format!("{l}\n"))
+        .collect();
+    fs::write(&exclude, kept).unwrap();
+
+    let (_wt, wt_root) = make_worktree(&main_root);
+    write_file(&wt_root, ".env", "OLD=0\n");
+    assert!(!git::is_ignored(&wt_root, Path::new(".superset/backups")).unwrap());
+
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    assert_eq!(exit_code_to_u8(code), 0, "sync_core must succeed");
+
+    let lines: Vec<String> = fs::read_to_string(&exclude)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        lines.contains(&"/.superset/backups/".to_string()),
+        "the backups rule must be re-added to info/exclude, got {lines:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(wt_root.join(".gitignore")).unwrap(),
+        "target/\n",
+        "the worktree's tracked .gitignore must be untouched"
+    );
+    assert!(git::is_ignored(&wt_root, Path::new(".superset/backups")).unwrap());
 }
