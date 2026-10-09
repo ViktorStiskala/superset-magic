@@ -25,7 +25,7 @@ tune it per crate) and `[profile.dist]` inheriting it. Members live under
 - `crates/ss-magic-core` – the shared library. `publish = false` plus
   `[package.metadata.dist] dist = false`, version `0.1.0`, never a release
   surface and never tagged.
-- `crates/ss-magic` – binary `ss-magic`, the sync CLI. Currently `0.11.2`.
+- `crates/ss-magic` – binary `ss-magic`, the sync CLI. Currently `0.12.0`.
 - `crates/ss-magic-plugin` – binary `ss-magic-plugin`, the plugin's hook runtime
   and verb tree. Currently `1.0.1`.
 
@@ -122,15 +122,15 @@ plumbing without ever linking the updater or a prompt library.
 ```mermaid
 flowchart TB
   subgraph core["ss-magic-core (library, publish = false, dist = false)"]
-    g["git: probes, gitignore, discover"]
+    g["git: probes, gitignore (+ IgnoreSink), discover"]
     r["release: per-line GitHub check, cache, ETag"]
     s["sync: EXCLUDED_TREES, pattern, repo_scan, apply"]
-    m["superset_files, reponame, state_tree, hashing, style"]
+    m["superset_files (+ local install), reponame, state_tree, hashing, style"]
   end
   subgraph cli["ss-magic (binary, tag vX.Y.Z)"]
     cm["main.rs, cli.rs (no plugin token)"]
     ct["tui: theme, menu, cockpit, ui"]
-    ce["sync: reverse_sync, merge; pack; workspace/migrate"]
+    ce["sync: reverse_sync, merge; pack; workspace/migrate, local_install"]
     cu["update: apply via self_update, always a pinned tag"]
   end
   subgraph plug["ss-magic-plugin (binary, tag ss-magic-plugin-vX.Y.Z)"]
@@ -163,8 +163,8 @@ reverse_sync, merge}.rs` (the interactive half – they drive the cockpit – wi
 `sync/mod.rs` re-exporting core's `apply`/`pattern`/`repo_scan`/
 `under_excluded_tree`), `tui/` (plus `tui/theme.rs`, which installs the
 `inquire` render config from `style::enabled()`; `tui/mod.rs` re-exports
-core's `style`), `workspace/{mod, migrate}.rs` (`workspace/mod.rs` re-exports
-core's `superset_files`), `update/{mod, apply}.rs`, and the crate-root tests
+core's `style`), `workspace/{mod, migrate, local_install}.rs` (`workspace/mod.rs`
+re-exports core's `superset_files`), `update/{mod, apply}.rs`, and the crate-root tests
 under `tests/`. `main.rs` re-exports core's `git` and `hashing` under their old
 `crate::` names, so a path inside the CLI reads exactly as it did before the
 split.
@@ -198,7 +198,10 @@ The modules, by purpose:
   nudge – built on `git_raw`, NEVER the trimming `git` helper, because porcelain's
   leading column is a literal space for a worktree-only modification and a blanket
   `.trim()` shifts every field), `symbolic_ref_head` / `short_head_sha` (the branch
-  name and abbreviated SHA behind the plugin's `<repo>-<branch>` identity slug);
+  name and abbreviated SHA behind the plugin's `<repo>-<branch>` identity slug),
+  `git_common_dir` (the absolute `--git-common-dir`, a relative answer resolved
+  against the probed root as `main_checkout_root` does – where the local-install
+  ignore sink finds the shared `info/exclude`);
   `parse_ls_files_z` is the shared NUL-split behind BOTH `untracked_files` and
   `tracked_files`, defensively dropping any absolute / `..`-bearing entry in one
   place) and mutating primitives (`stage_paths`, `nothing_to_commit`, `commit`,
@@ -251,8 +254,8 @@ The modules, by purpose:
   command keeps the subprocess probes (R22).
 - `superset_files.rs` (core; the CLI reaches it as
   `crate::workspace::superset_files`) – `.superset/{config.json, magic.sh,
-  magic.json, magic.local.json}` I/O (plus the legacy `setup_config.json`
-  reader).
+  magic.json, magic.local.json, config.local.json}` I/O (plus the legacy
+  `setup_config.json` reader).
   `load_config` reads Superset-owned `config.json`;
   `merge_setup_into_config` builds a new `Config` from a new `setup`
   array while preserving `teardown` and `run` from disk;
@@ -279,6 +282,33 @@ The modules, by purpose:
   materializes the staged `.superset/` tree atomically (files always
   overwritten — preservation happens upstream of the write; `*.sh` are
   chmod 0755'd; a `delete` set strips the retired `setup.sh`).
+  The **local-install** half sits beside the committed one, additively (the
+  plugin calls `load_overlaid`, so nothing existing changed):
+  `install_mode(root)` derives `InstallMode::{Committed, Local, None}` from
+  which files exist and never stores it – `Committed` when `.superset/magic.json`
+  exists (it wins over a `magic.local.json` beside it), `Local` when only
+  `magic.local.json` exists, `None` otherwise; it tests `exists()`, so a
+  directory named `magic.json` still reads as `Committed` and the loader then
+  errors instead of the tree silently becoming a local install.
+  `load_sync_config(root)` uses the same predicate and is what sync, reverse
+  sync, the cockpit and pack call: the overlay on a committed install, the
+  `magic.local.json` config alone on a local one, `None` when neither file
+  exists. `load_config_local_json` reads Superset's per-machine
+  `config.local.json` as a raw `serde_json::Map` (absent is `None`, malformed is
+  a hard error naming the path); `merge_sync_entry_into_local_config` returns a
+  `LocalConfigMerge { config, changed }` that inserts `LOCAL_SYNC_ENTRY`
+  (`ss-magic sync`) into `setup.before`, or at the front of `setup` when that
+  is a plain array, leaving every other key and every existing setup entry
+  alone; it changes nothing (so the file is not rewritten) when
+  `setup_has_sync_marker` finds `ss-magic sync` anywhere in `setup`, and refuses
+  a `setup` of any other JSON type (a string, a number, `null`, or an object
+  whose `before` is not an array) rather than overwriting it.
+  `write_config_local_json` commits through the same staged-sibling-plus-rename
+  helper as `write_magic_json`. Because serde_json's `preserve_order` stays off,
+  rewriting the map sorts its keys alphabetically – values survive, and an
+  unchanged file is never rewritten. `local_install_default_files()` is the two
+  patterns a local install always lists first (`.superset/magic.local.json`,
+  `.superset/config.local.json`).
 - `sync/mod.rs` (core) – the sync engine's pure root, and the home of the ONE
   excluded-trees rule every enumeration layer applies. (The CLI's own
   `sync/mod.rs` declares `reverse_sync` and `merge` and re-exports the rest
@@ -420,7 +450,12 @@ The modules, by purpose:
   the subcommand token, deliberately asymmetric with the terminal `-h`/`--help`
   short-circuit). `Command` stays `Copy`/`Eq` (`bool` is both). `init
   [PATTERN...]` parses to `Parsed::Init(patterns)` (carried apart from the
-  `Command` enum). There is NO `plugin` token and no `Parsed::Plugin` variant –
+  `Command` enum), and `init --local [PATTERN...]` to `Parsed::InitLocal(patterns)`
+  – a separate variant, not a flag on `Init`, so the committed `init` keeps its
+  exact shape. `has_local` scans the WHOLE argv for `--local`, before or after
+  `init`, for a safety reason: a scan that only looked after `init` would read
+  `ss-magic --local init` as a committed init, which writes tracked files, the one
+  outcome a user asking for a local install must never get. There is NO `plugin` token and no `Parsed::Plugin` variant –
   the token was deleted outright when the plugin became its own binary, with no
   alias and no redirect, so `ss-magic plugin` now takes the ordinary
   `Parsed::Error` path. `--version`/`-V` short-circuits to `Parsed::Version` and
@@ -433,34 +468,98 @@ The modules, by purpose:
   protect, and reintroducing either the token or the stop is a regression. Pure
   and unit-testable without spawning the process.
 - `tui/menu.rs` — bare-invocation operation menu. Location-gated: main
-  checkout offers init / migrate / edit config; a worktree offers a SINGLE
+  checkout offers init (plus "Initialize ss-magic locally", `MenuOp::InitLocal`) /
+  migrate / edit config, and on a local install (`Branch::Local`) offers
+  `EditConfigLocal` (the selection replaces the list) and `Pack`; a worktree
+  offers a SINGLE
   "Sync" entry (`MenuOp::Sync`) that opens the unified `reverse_sync::run`
   cockpit (push / pull / merge / delete per file, both directions) – the
   separate forward/reverse menu entries and the old `forward_sync_in_worktree`
-  handler are gone. `Pack` is offered wherever an initialized `magic.json`
-  exists (any worktree, or main on a `Normal` branch), so it appears in both
-  location lists. Routes selections to their handlers via the `Select` driver;
-  Esc/Ctrl-C is inert.
+  handler are gone. `Pack` is offered wherever a pattern list exists (any
+  worktree, or main on a `Normal` or `Local` branch), so it appears in both
+  location lists. Dispatch goes through the pure `handler_for(Location, MenuOp)
+  -> Option<Handler>` (`Handler::{Migrate, CommittedInit, EditCommitted,
+  LocalInstall, Sync, Pack}`; both local ops map to `LocalInstall`), so a test
+  proves every op `operations_for` offers has an arm and none can reach the
+  dispatcher's `unreachable!`. The main-checkout menu also prints the R13
+  duplicate-entry warning (see `workspace/migrate.rs`) before showing the menu.
+  Routes selections to their handlers via the `Select` driver; Esc/Ctrl-C is
+  inert.
 - `workspace/migrate.rs` — detect + migrate/init branching off `config.json`'s
   `setup` (old `setup.sh` reference → migrate; `magic.sh` marker →
-  normal; neither → init). Stages renames/writes/deletes into a tempdir
+  normal; neither → init). `detect_branch(config, mode)` also takes the main
+  root's `InstallMode`: it returns `Branch::Local` only when `config.json`
+  yields neither `Migrate` nor `Normal` AND the mode is `Local`, so a
+  `setup.sh` or marker entry still wins over a leftover local install.
+  `duplicate_sync_entry_warning(root)` / `print_duplicate_sync_entry_warning`
+  implement R13: when the mode is `Committed` and `config.local.json`'s `setup`
+  still carries `ss-magic sync` (typically a local install later turned into a
+  committed one), Superset would run the sync twice per workspace, so the
+  main-checkout menu and committed `run_init` / `run_init_noninteractive` warn.
+  Committed init checks AFTER it writes `magic.json`, which is the moment the
+  duplicate comes into being. The warning is advisory: an unreadable or
+  malformed `config.local.json` yields no warning rather than an error, because
+  the committed flows do not own that file. Stages renames/writes/deletes into a tempdir
   and materializes via `copy_into_repo` only after the finishing-action
   prompt. `run_init_noninteractive` is the TUI-free init behind
   `ss-magic init` (writes the layout from CLI patterns, no prompt, not
   gated by auto-update). All three write paths (`run_migrate`, `run_init`,
   `run_init_noninteractive`) call `ensure_bootstrap_gitignores`, which gitignores
   BOTH `magic.local.json` (a `gitignore::ensure_path_ignored` `File` rule) AND
-  the tool's `.superset/backups/` tree (via `reverse_sync::ensure_backups_ignored`,
-  the same `Dir` rule the first sync would otherwise add lazily) at the closest
+  the tool's `.superset/backups/` tree (via `reverse_sync::ensure_backups_ignored`
+  with `IgnoreSink::Gitignore` passed explicitly – a committed install is the
+  one mode that owns a tracked `.gitignore`; the same `Dir` rule the first sync
+  would otherwise add lazily) at the closest
   existing `.gitignore` (or the git-root file) – git-tolerant, so each degrades to
   a literal append in the non-git test tempdirs. Ignoring backups up front means
   a fresh `ss-magic init` protects the backup tree before any secret bytes are
   ever backed up.
+- `workspace/local_install.rs` — the **local (uncommitted) install** behind
+  `ss-magic init --local [PATTERN...]` (`run_local_init_noninteractive`) and the
+  main-checkout menu's "Initialize ss-magic locally" / local edit entries
+  (`run_local_init`, interactive). A local install writes only gitignored files
+  into the MAIN checkout, so a developer can use ss-magic on a repository without
+  proposing anything to the team (R5: `git status --porcelain` stays empty):
+  `.superset/magic.local.json` (the pattern list – there is no `magic.json`, and
+  `load_sync_config` reads this file alone) and `.superset/config.local.json`
+  (Superset's per-machine override of `config.json`, where `ss-magic sync` is
+  registered in `setup` so Superset runs the binary directly). It NEVER writes or
+  invokes `magic.sh` (a committed wrapper), `magic.json`, or `config.json`. Rules:
+  (1) it always resolves `git::main_checkout_root` from the cwd root, even when
+  run in a linked worktree, because Superset reads the main checkout's
+  `config.local.json` and sync loads patterns from the main root (KTD6 of the
+  plan: an install written into a worktree would never be read); (2) `refusal`
+  returns exit 1 with nothing written (R9) when `install_mode` is `Committed`,
+  when `detect_branch` says `Migrate` or `Normal`, or when either local file is
+  TRACKED by git (checked with `git::tracked_files`, so an unenumerable name
+  fails closed as tracked) – a malformed `config.json` is an error naming the
+  path; (3) validate everything, then ignore, then write (KTD7): `prepare` parses
+  `magic.local.json` and merges `config.local.json` in memory first (a malformed
+  file fails before any byte is written), `commit` then writes the four
+  `LocalExclude` rules – `.superset/magic.local.json`, `.superset/config.local.json`,
+  `.superset/backups/`, `.superset/.magic/` – each verified by git, and only then
+  `magic.local.json` and, when the merge changed it, `config.local.json`, so a
+  failure part-way leaves at most untracked exclude lines, never an unignored local
+  file. There is no finishing-action prompt (nothing to commit); the interactive
+  picker is the confirmation and Esc there returns before any write. (4) KTD8:
+  the interactive entry REPLACES the list (`selection_files`: the local defaults,
+  then the picker selection, so deselecting removes a pattern; the defaults are
+  not offered as picker rows, `without_local_defaults`), carrying `_comment` and
+  other extras through `merge_files_into_magic_config`; the non-interactive entry
+  APPENDS (`appended_files`: the existing list in its order, then any missing
+  default, then the new patterns, all deduped, so a re-run never reorders or
+  drops). It does not run the legacy `~/.claude/skills` cleanup, which stays with
+  committed init/migrate. Both entries end with `finish`, which prints the
+  advisory `PATH` warning (KTD10) when `ss-magic` does not resolve on the
+  current `PATH` – advisory only, since it can only catch an invocation by
+  absolute path and cannot prove the shell Superset runs resolves the binary.
+  The plugin is not part of a local install and should not be enabled on one.
 - `sync/reverse_sync.rs` — the sync engine: reconcile the configured files
   between a worktree and main, safely, in BOTH directions. Three entry points.
   `run` is the interactive unified Sync cockpit (the worktree menu's single
-  "Sync" entry): it computes `compute_reconcile_set` – every overlaid-pattern
-  match on EITHER root (patterns expanded against both, so a main-only file is
+  "Sync" entry): it computes `compute_reconcile_set` – every pattern
+  (`load_sync_config`, so a local install's `magic.local.json` alone works) match
+  on EITHER root (patterns expanded against both, so a main-only file is
   seen) whose worktree and main copies are not byte-identical, with directory
   matches and the tool's own `.superset/backups/` tree dropped – classifies each
   via the 4-way `classify` (`WorktreeOnly` / `MainOnly` / `Differs` /
@@ -470,7 +569,15 @@ The modules, by purpose:
   merge / delete decisions via `apply_decision(&ApplyContext, rel, &Decision,
   Baseline)`. `run_bulk` is the non-interactive `ss-magic reverse-sync`
   (worktree → main): bulk-push every git-untracked `compute_candidates` match
-  that differs from main, no TUI, `source_untracked` hard-coded `true`.
+  that differs from main, no TUI, `source_untracked` hard-coded `true`. Both
+  candidate computations drop `.superset/config.local.json` beside their
+  `under_excluded_tree` filter (`is_forward_only_rel`, KTD9 of the local-install
+  plan; R12): it holds commands Superset runs for every new workspace, so a
+  worktree edit must never reach main through reverse sync, bulk or cockpit. The
+  comparison is component-wise and ASCII-case-insensitive (a case-insensitive
+  filesystem names the same file with another spelling), applies in every
+  install mode, and is NOT an `EXCLUDED_TREES` entry because that list also
+  removes paths from forward sync and pack – forward sync still copies the file.
   `backup_forward_targets` is the pre-copy backup pass for the forward
   `ss-magic sync` (main → worktree), backing up under `cwd`'s
   `.superset/backups/` every worktree file the copy will overwrite. Each
@@ -481,14 +588,25 @@ The modules, by purpose:
   best-effort `prune_old_backups`, print the applied/skipped/failed summary
   prefixed with the direction `label` – bidirectional "Sync" for `run`, one-way
   "Reverse sync" for `run_bulk` – and pick the exit code, non-zero iff a file
-  failed); `backups_root_for(root, ensure_ignore)` joins the `.superset/backups`
+  failed); `backups_root_for(root, ensure_ignore, sink)` joins the `.superset/backups`
   path under the root being OVERWRITTEN (cockpit `run` → worktree, `run_bulk` →
   main, forward `backup_forward_targets` → cwd) and, when `ensure_ignore`,
-  gitignores it via `ensure_backups_ignored` – the ONE place the
-  `.superset/backups` ignore rule (a `gitignore::ensure_path_ignored` `Dir` rule)
-  is wired, shared with the eager init/migrate bootstrap
-  (`ensure_bootstrap_gitignores`) so a fresh `ss-magic init` adds the same rule up
-  front rather than waiting for the first sync. `apply_decision` is the backup-first apply
+  ignores it via `ensure_backups_ignored(root, sink)` – the ONE place the
+  `.superset/backups` ignore rule (a `Dir` rule through
+  `gitignore::ensure_path_ignored_in`) is wired, shared with the eager
+  init/migrate bootstrap (`ensure_bootstrap_gitignores`) so a fresh `ss-magic
+  init` adds the same rule up front rather than waiting for the first sync.
+  **Which file a lazy rule lands in is the KTD4 sink rule, fail-safe: only a
+  committed install writes `.gitignore`.** `ignore_sink_for(main_root)` is its
+  single mapping – `InstallMode::Committed` → `IgnoreSink::Gitignore`, `Local`
+  AND `None` → `IgnoreSink::LocalExclude` – so an unknown state never dirties a
+  tracked file. `run`, `run_bulk` and `sync_core` (for the forward backup pass,
+  which takes the sink as a `backup_forward_targets` parameter) resolve it once
+  per flow from the MAIN root, and `ApplyContext.ignore_sink` carries it to
+  `apply_decision`. The applied line reads "(info/exclude rule added)" instead of
+  "(gitignore rule added)" when the `LocalExclude` sink wrote the rule
+  (`ApplyResult.gitignore_appended` keeps its name; its doc says the rule may have
+  gone to `info/exclude`). `apply_decision` is the backup-first apply
   seam: a path-safety guard; a review-time baseline re-check via `check_target`
   – per-file `(worktree, main)` `FileMeta` is captured via `review_baseline`
   BEFORE the cockpit opens (the `Baseline` passed into `apply_decision`) and
@@ -518,7 +636,10 @@ The modules, by purpose:
   TOCTOU `Guard::Changed` skip is unaffected; and `ensure_gitignored_in_main`
   runs before any secret bytes land in main, but ONLY for an untracked source
   (`Baseline.source_untracked`) – a tracked file is already committed and must
-  NOT gain a `.gitignore` rule. `Push` and `Merge` each carry a one-sided guard
+  NOT gain a `.gitignore` rule. On a local install or an unset one the rule goes
+  to `info/exclude` through the context's sink instead, and the strict post-append
+  re-check (git must report the path ignored in main, or the push fails) is the
+  same for both sinks. `Push` and `Merge` each carry a one-sided guard
   (a `Push` with no worktree baseline, or a `Merge` missing either side, skips
   rather than reading an absent side – defense-in-depth against an
   out-of-contract MainOnly). `Decision::Delete` unlinks BOTH sides (whichever
@@ -553,7 +674,9 @@ The modules, by purpose:
   carries a cross-reference to `tui::cockpit`'s coloring (local-only renders
   green, main-only red), and `SPLIT_MIN_PANE_WIDTH` reserves one extra column
   (`+ 1`) for the split view's vertical divider.
-- `pack.rs` — `ss-magic pack`: expand the overlaid `magic.json` patterns
+- `pack.rs` — `ss-magic pack`: expand the configured patterns (the
+  `load_sync_config` result: `magic.json` + `magic.local.json`, or a local
+  install's `magic.local.json` alone)
   against the current git repo root (via `sync/apply.rs`'s `match_paths`) and
   write the matches — repo-relative — into `ss-magic-<repo>.tar.bz2` at that
   root. `archive_file_name` derives `<repo>` from the normalized `origin`
@@ -573,7 +696,7 @@ The modules, by purpose:
   outside `pack_core` so tests never touch the user's clipboard.
   Everything (config source, match target, archive destination) is the
   one `cwd_repo_root`. `pack_core(cwd, on_event)` mirrors `main::sync_core`'s
-  control flow (resolve root → probe magic.json → load overlaid → empty
+  control flow (resolve root → load the sync config → empty
   guard → work) and emits a `PackEvent` stream. `write_archive` tars into a
   bzip2 stream (`bzip2` crate, pure-Rust `libbz2-rs-sys` backend — no C
   toolchain) via a `NamedTempFile` in the root, then persists atomically.
@@ -594,7 +717,8 @@ The modules, by purpose:
   (`Path::is_dir()` would follow it and archive the target tree); and it
   discards the temp file without touching an existing archive when nothing was
   actually added, so a prior good backup is never replaced by an empty tarball.
-- `git/gitignore.rs` — `.gitignore` helpers at a git root. `ensure_path_ignored`
+- `git/gitignore.rs` — `.gitignore` helpers at a git root (plus the
+  `info/exclude` sink described below). `ensure_path_ignored`
   is the single entry point shared by reverse sync (the secret-safety boundary),
   the backups dir, and the migrate/init bootstrap: it ensures a `rel` of
   `PathKind::{File, Dir}` is ignored under a target root, adding a rule only when
@@ -615,6 +739,25 @@ The modules, by purpose:
   target root; `parse_covering_line` is its parser. The private `is_ignored_opt`
   (trailing-slash query for `Dir`), `closest_gitignore_dir`, and
   `anchored_literal` back `ensure_path_ignored`.
+  `IgnoreSink::{Gitignore, LocalExclude}` and `ensure_path_ignored_in(sink,
+  target_root, rule_source_root, rel, kind)` choose WHERE a rule lands:
+  `Gitignore` delegates to `ensure_path_ignored` unchanged; `LocalExclude` writes
+  to `<git-common-dir>/info/exclude`, which git reads for the main checkout and
+  every linked worktree but never tracks, so a local install changes no tracked
+  file. The `LocalExclude` writer is git-STRICT (a failed git probe or a missing
+  common dir is an error, unlike the tolerant `Gitignore` path): it probes git
+  first and skips a path git already ignores, appends a root-anchored literal
+  (`/.superset/backups/`, `/secret.key`) through the same `append_line` rules as
+  `ensure_entry` (creating `info/` and the file when absent, never reordering,
+  no duplicate line), then RE-CHECKS with git and errors naming the path and
+  `info/exclude` if the path is still not ignored – `info/exclude` has lower
+  precedence than any tracked `.gitignore`, so a tracked negation such as
+  `!/.superset/backups/` could otherwise leave a silent leak. The literal's
+  glob metacharacters (`\`, `*`, `?`, `[`, a trailing space) are backslash-escaped
+  so a secret's file name cannot widen into a pattern, and a path containing CR
+  or LF is refused. `rule_source_root` is ignored for `LocalExclude` (a rule in
+  a shared file is always the anchored literal, never a glob copied from the
+  source tree).
 - `update/` – every-invocation self-update. Core's `release.rs` (the former
   `update/check.rs`, moved verbatim; `update/mod.rs` and `update/apply.rs`
   import it as `ss_magic_core::release`) does the daily-cached,
@@ -684,7 +827,10 @@ The modules, by purpose:
   plugin invocation could self-update or open the TUI, and being a separate
   binary that links neither `self_update` nor `inquire` is strictly stronger
   than that arrangement. `should_run_update_gate` remains an INCLUSION list over
-  `Command`. `Bare` routes to `tui::menu::run`;
+  `Command`. `Bare` routes to `tui::menu::run`; `Parsed::Init` runs the
+  committed `run_init_noninteractive` and `Parsed::InitLocal` the local
+  `local_install::run_local_init_noninteractive` (both through
+  `init_noninteractive`, `InitKind::{Committed, Local}`);
   `Sync { no_backup }` runs the non-interactive forward copy (`sync_core`),
   which now runs a pre-copy backup pass (`reverse_sync::backup_forward_targets`)
   before `sync::apply::run` unless `--no-backup`; `ReverseSync { no_backup }`
@@ -692,8 +838,11 @@ The modules, by purpose:
   (nothing to push) and otherwise bulk-pushes via `reverse_sync::run_bulk`;
   `Pack` runs `pack::pack_core` (`run_pack_flow` + `print_pack_event`); `Update`
   forces a self-update. `resolve_sync_roots` resolves the cwd + main-checkout
-  roots shared by the forward and reverse flows. `print_event` renders the
-  `sync::apply::Event` stream.
+  roots shared by the forward and reverse flows. `load_magic_or_exit` (sync and
+  pack) goes through `load_sync_config`, so a local install's `magic.local.json`
+  alone satisfies it; with neither file, `no_sync_config_message` names both
+  pattern files and both init commands (`init`, `init --local`). `print_event`
+  renders the `sync::apply::Event` stream.
 
 ## The Claude Code plugin (`crates/ss-magic-plugin/src/`)
 
@@ -1663,7 +1812,12 @@ the real incident this run fixed.
   unenumerable name) defaults to secret and runs the gate. NEVER derive
   untracked-ness by ABSENCE from an untracked set (`untracked.contains(rel)`) — a
   lookup miss then lands on the permissive side and leaks. Rule for any security
-  gate: phrase the question so the UNKNOWN answer is the SAFE one. See
+  gate: phrase the question so the UNKNOWN answer is the SAFE one. The same
+  fail-safe shape picks the ignore sink: only a positively `Committed` install
+  writes a tracked `.gitignore`; `Local` and unknown (`None`) write `info/exclude`
+  (`reverse_sync::ignore_sink_for`), and after the append git itself must report the
+  path ignored in main or the push fails. A local install must never write a
+  tracked file. See
   [docs/solutions/logic-errors/secret-gate-positive-tracked-determination-fail-closed.md](./docs/solutions/logic-errors/secret-gate-positive-tracked-determination-fail-closed.md).
 - **Enforce a secret-excluding path filter at the point of final enumeration, not
   on an upstream list.** The excluded-trees filter (`sync::under_excluded_tree`
