@@ -657,8 +657,10 @@ pub fn backup_forward_targets(main_root: &Path, cwd_root: &Path, patterns: &[Str
     Ok(())
 }
 
-/// Repo-relative path of the tool's per-batch backups tree.
-const BACKUPS_REL: &str = ".superset/backups";
+/// Repo-relative path of the tool's per-batch backups tree. Crate-visible so
+/// the local install (`workspace/local_install.rs`) can ignore the same tree
+/// through `info/exclude` instead of a tracked `.gitignore`.
+pub(crate) const BACKUPS_REL: &str = ".superset/backups";
 
 /// Ensure the tool's `.superset/backups/` tree is gitignored under `root` at the
 /// closest existing `.gitignore` (or the git-root file) — a no-op when git

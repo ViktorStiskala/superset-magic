@@ -1,0 +1,377 @@
+//! Local (uncommitted) install: `ss-magic init --local [PATTERN...]` and the
+//! main-checkout menu's "Initialize ss-magic locally" / edit entry.
+//!
+//! A local install lets one developer use ss-magic on a repository without
+//! proposing anything to the team. It writes only gitignored files into the
+//! MAIN checkout:
+//!
+//! - `.superset/magic.local.json` – the pattern list. A local install has no
+//!   `magic.json`, so this file alone is what sync, reverse sync and pack read
+//!   (core's `superset_files::load_sync_config`).
+//! - `.superset/config.local.json` – Superset's per-machine override of the
+//!   committed `config.json`. The install registers `ss-magic sync` in its
+//!   `setup` key so Superset runs the binary directly for every new workspace.
+//!   No `magic.sh` wrapper is written: it would be a committed file.
+//!
+//! Every ignore rule goes to the repository's shared `<git-common-dir>/info/exclude`
+//! (core's `IgnoreSink::LocalExclude`), which git reads for the main checkout
+//! and every linked worktree but never tracks, so `git status` stays empty.
+//!
+//! Three rules shape the flow:
+//!
+//! - **Always the main checkout** (KTD6 in the plan: the install targets the
+//!   main checkout even when run from a linked worktree, because Superset reads
+//!   the main checkout's `config.local.json` for a new workspace and sync loads
+//!   its patterns from the main root – an install written into a worktree would
+//!   never be read).
+//! - **Refuse beside a committed install** (R9): a `magic.json`, a
+//!   `config.json` `setup` that `migrate::detect_branch` recognizes, or either
+//!   local file being TRACKED (writing it would dirty the working tree) refuses
+//!   with exit 1 before anything is written.
+//! - **Validate everything, then ignore, then write** (KTD7 in the plan: there
+//!   is no commit prompt because there is nothing to commit; every input is
+//!   parsed and merged in memory first, the `info/exclude` rules are written and
+//!   verified next, and only then do the two JSON files land – so a failure
+//!   part-way leaves at most untracked exclude lines, never an unignored local
+//!   file that `git status` would show).
+//!
+//! The interactive entry REPLACES the pattern list with the picker selection
+//! (it doubles as the edit entry, so deselecting removes a pattern); the
+//! non-interactive entry APPENDS its patterns to the existing list (KTD8 in the
+//! plan). Unlike committed init, neither runs the legacy `~/.claude/skills`
+//! cleanup: that belongs to the committed install's lifecycle.
+
+use std::ffi::OsStr;
+use std::path::Path;
+use std::process::ExitCode;
+
+use anyhow::Result;
+
+use crate::git;
+use crate::git::gitignore::{self, IgnoreSink, PathKind};
+use crate::sync::reverse_sync::BACKUPS_REL;
+use crate::tui::style;
+use crate::tui::ui;
+use crate::workspace::migrate::{self, Branch};
+use crate::workspace::superset_files::{self, InstallMode, LocalConfigMerge, MagicConfig};
+use ss_magic_core::state_tree::STATE_REL;
+
+/// Repo-relative path of the local pattern list.
+const MAGIC_LOCAL_REL: &str = ".superset/magic.local.json";
+
+/// Repo-relative path of Superset's per-machine config override.
+const CONFIG_LOCAL_REL: &str = ".superset/config.local.json";
+
+/// The binary Superset must be able to resolve when it runs the registered
+/// `ss-magic sync` setup step.
+const BIN_NAME: &str = "ss-magic";
+
+/// Everything a local install will write, computed in memory before any write
+/// so a malformed input aborts with nothing on disk.
+struct Prepared {
+    /// The existing `magic.local.json`, if any: its `files` seed the new list
+    /// and its unknown keys (including `_comment`) are carried forward.
+    existing_local: Option<MagicConfig>,
+    /// The merged `config.local.json` and whether it differs from the file on
+    /// disk (an unchanged file is never rewritten).
+    config_local: LocalConfigMerge,
+}
+
+/// Interactive local install, behind the main-checkout menu's "Initialize
+/// ss-magic locally" and "Edit synced files" entries on a local install.
+///
+/// Resolves the main checkout from `cwd_root`, refuses beside a committed
+/// install, validates `config.local.json`, then opens the pattern picker seeded
+/// from the existing `magic.local.json`. The picker is the confirmation: Esc
+/// there returns before anything is written. The selection REPLACES the list
+/// (the local defaults are always kept first).
+// Allowed dead until `ss-magic init --local` (argv) and the main-checkout menu
+// entries are wired to these two entry points; until then only this module's
+// tests reach them. Remove the attribute when wiring them.
+#[allow(dead_code)]
+pub fn run_local_init(cwd_root: &Path) -> Result<ExitCode> {
+    style::print_section("Initialize ss-magic locally (uncommitted)");
+    let main_root = git::main_checkout_root(cwd_root)?;
+    print_main_root(&main_root);
+
+    if let Some(reason) = refusal(&main_root)? {
+        eprintln!("{}", style::err(format!("error: {reason}")));
+        return Ok(ExitCode::from(1));
+    }
+    let prepared = prepare(&main_root)?;
+
+    // The local defaults are always written, so they are not offered as
+    // picker rows; every other existing pattern is (custom ones preselected).
+    let existing_files: Vec<String> = prepared
+        .existing_local
+        .as_ref()
+        .map(|cfg| without_local_defaults(&cfg.files))
+        .unwrap_or_default();
+    let options_strs: Vec<&str> = crate::sync::repo_scan::OPTIONS.to_vec();
+    let fs_match = crate::sync::repo_scan::matches_for_patterns(&main_root, &options_strs)?;
+    let (options, preselected) = migrate::build_pattern_options(&existing_files, &fs_match);
+    let chosen = ui::pick_patterns(&options, &preselected, &main_root)?;
+
+    let files = selection_files(&chosen);
+    println!();
+    println!("This will:");
+    ui::print_pattern_list(&summary_lines(&prepared));
+    println!();
+
+    commit(&main_root, prepared, files)?;
+    finish();
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Non-interactive `ss-magic init --local [PATTERN...]`: the same install
+/// without the picker. `patterns` are APPENDED to the existing
+/// `magic.local.json` list (a re-run never drops a pattern), after the local
+/// defaults.
+// Allowed dead until `ss-magic init --local` (argv) and the main-checkout menu
+// entries are wired to these two entry points; until then only this module's
+// tests reach them. Remove the attribute when wiring them.
+#[allow(dead_code)]
+pub fn run_local_init_noninteractive(cwd_root: &Path, patterns: &[String]) -> Result<ExitCode> {
+    let main_root = git::main_checkout_root(cwd_root)?;
+    print_main_root(&main_root);
+
+    if let Some(reason) = refusal(&main_root)? {
+        eprintln!("{}", style::err(format!("error: {reason}")));
+        return Ok(ExitCode::from(1));
+    }
+    let prepared = prepare(&main_root)?;
+    let existing_files: &[String] = prepared
+        .existing_local
+        .as_ref()
+        .map(|cfg| cfg.files.as_slice())
+        .unwrap_or_default();
+    let files = appended_files(existing_files, patterns);
+
+    commit(&main_root, prepared, files)?;
+    finish();
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_main_root(main_root: &Path) {
+    println!(
+        "{}",
+        style::info(format!("Main checkout: {}", main_root.display()))
+    );
+}
+
+/// Why a local install must not run in `main_root`, or `None` when it may.
+///
+/// Refuses (R9) when the main checkout already carries a committed install –
+/// a `magic.json`, or a `config.json` `setup` that the committed flow's
+/// [`migrate::detect_branch`] classifies as `Migrate` (the retired `setup.sh`)
+/// or `Normal` (the `magic.sh` / `ss-magic sync` marker) – or when either local
+/// file is tracked by git, since rewriting a tracked file would show up in
+/// `git status` and a local install must change no tracked file. A malformed
+/// `config.json` is an error naming the path, never a guess.
+fn refusal(main_root: &Path) -> Result<Option<String>> {
+    if superset_files::install_mode(main_root) == InstallMode::Committed {
+        return Ok(Some(
+            "this repository already has a committed ss-magic install (.superset/magic.json). \
+             Run `ss-magic` in the main checkout to edit it instead of adding a local install."
+                .to_string(),
+        ));
+    }
+    let config = superset_files::load_config(main_root)?;
+    match migrate::detect_branch(config.as_ref()) {
+        Branch::Migrate => {
+            return Ok(Some(
+                ".superset/config.json still runs the retired setup.sh: this repository has an \
+                 old committed install. Run `ss-magic` in the main checkout to migrate it \
+                 instead of adding a local install."
+                    .to_string(),
+            ))
+        }
+        Branch::Normal => {
+            return Ok(Some(
+                ".superset/config.json's setup already runs ss-magic (a committed install). \
+                 Run `ss-magic` in the main checkout to edit it instead of adding a local install."
+                    .to_string(),
+            ))
+        }
+        Branch::Init => {}
+    }
+    let tracked = git::tracked_files(main_root, &[MAGIC_LOCAL_REL, CONFIG_LOCAL_REL])?;
+    if let Some(path) = tracked.first() {
+        return Ok(Some(format!(
+            "{} is tracked by git, and a local install must not change a tracked file. \
+             Untrack it first (`git rm --cached {}`), then re-run.",
+            path.display(),
+            path.display()
+        )));
+    }
+    Ok(None)
+}
+
+/// Load and validate both inputs in memory: the existing `magic.local.json`
+/// (for its patterns and unknown keys) and the `config.local.json` merge. Any
+/// parse or merge failure returns here, before a single byte is written.
+fn prepare(main_root: &Path) -> Result<Prepared> {
+    let existing_local = superset_files::load_magic_local_json(main_root)?;
+    let existing_config = superset_files::load_config_local_json(main_root)?;
+    let config_local = superset_files::merge_sync_entry_into_local_config(existing_config.as_ref())?;
+    Ok(Prepared {
+        existing_local,
+        config_local,
+    })
+}
+
+/// Write the install in KTD7 order: first the four `info/exclude` rules
+/// (each verified by git, so a tracked `.gitignore` negation that would expose
+/// a local file fails loudly here), then `magic.local.json`, then
+/// `config.local.json` only when its merge changed something.
+fn commit(main_root: &Path, prepared: Prepared, files: Vec<String>) -> Result<()> {
+    let rules: [(&str, PathKind); 4] = [
+        (MAGIC_LOCAL_REL, PathKind::File),
+        (CONFIG_LOCAL_REL, PathKind::File),
+        (BACKUPS_REL, PathKind::Dir),
+        (STATE_REL, PathKind::Dir),
+    ];
+    for (rel, kind) in rules {
+        gitignore::ensure_path_ignored_in(
+            IgnoreSink::LocalExclude,
+            main_root,
+            main_root,
+            Path::new(rel),
+            kind,
+        )?;
+    }
+
+    let magic_local =
+        superset_files::merge_files_into_magic_config(prepared.existing_local.as_ref(), files);
+    superset_files::write_magic_local_json(main_root, &magic_local)?;
+    let config_changed = prepared.config_local.changed;
+    if config_changed {
+        superset_files::write_config_local_json(main_root, &prepared.config_local.config)?;
+    }
+
+    println!("{}", style::ok("Excluded the local files via .git/info/exclude"));
+    println!("{}", style::ok(format!("Wrote {MAGIC_LOCAL_REL}")));
+    if config_changed {
+        println!(
+            "{}",
+            style::ok(format!(
+                "Registered `{}` in {CONFIG_LOCAL_REL}",
+                superset_files::LOCAL_SYNC_ENTRY
+            ))
+        );
+    } else {
+        println!(
+            "{}",
+            style::info(format!(
+                "{CONFIG_LOCAL_REL} already runs `{}`",
+                superset_files::LOCAL_SYNC_ENTRY
+            ))
+        );
+    }
+    Ok(())
+}
+
+/// The closing lines shared by both entries: the KTD10 `PATH` advisory, then
+/// the "nothing to commit" note.
+fn finish() {
+    if !resolves_on_path(std::env::var_os("PATH").as_deref(), BIN_NAME) {
+        println!("{}", style::warn(path_warning()));
+    }
+    println!(
+        "{}",
+        style::info("Done. Nothing to commit: every file written is ignored by git.")
+    );
+}
+
+/// The on-screen summary of what the interactive install will write.
+fn summary_lines(prepared: &Prepared) -> Vec<String> {
+    let mut lines = vec![
+        "Exclude the local files via .git/info/exclude (never a tracked .gitignore)".to_string(),
+        format!("Write {MAGIC_LOCAL_REL} (the synced patterns)"),
+    ];
+    if prepared.config_local.changed {
+        lines.push(format!(
+            "Register `{}` in {CONFIG_LOCAL_REL} setup",
+            superset_files::LOCAL_SYNC_ENTRY
+        ));
+    }
+    lines
+}
+
+/// The interactive entry's new list: the local defaults, then the picker
+/// selection, deduped. Pure so the replace semantic is testable without the
+/// prompt.
+fn selection_files(chosen: &[String]) -> Vec<String> {
+    let mut files = superset_files::local_install_default_files();
+    push_missing(&mut files, chosen);
+    files
+}
+
+/// The non-interactive entry's new list: the existing list in its existing
+/// order, then any local default it lacks, then the new `patterns`, deduped.
+/// A fresh install therefore lists the defaults first; a re-run only appends.
+fn appended_files(existing: &[String], patterns: &[String]) -> Vec<String> {
+    let mut files = Vec::with_capacity(existing.len() + patterns.len() + 2);
+    push_missing(&mut files, existing);
+    push_missing(&mut files, &superset_files::local_install_default_files());
+    push_missing(&mut files, patterns);
+    files
+}
+
+fn push_missing(files: &mut Vec<String>, more: &[String]) {
+    for p in more {
+        if !files.iter().any(|f| f == p) {
+            files.push(p.clone());
+        }
+    }
+}
+
+/// `files` without the local defaults, which the picker does not offer since
+/// [`selection_files`] always writes them.
+fn without_local_defaults(files: &[String]) -> Vec<String> {
+    let defaults = superset_files::local_install_default_files();
+    files
+        .iter()
+        .filter(|f| !defaults.contains(f))
+        .cloned()
+        .collect()
+}
+
+/// Whether `name` resolves to an executable file through the `PATH` value
+/// `path_var` (`None` = `PATH` unset). Takes the value rather than reading the
+/// environment so it is testable without mutating the test process's `PATH`.
+///
+/// KTD10 in the plan: this is advisory only. It catches an invocation by
+/// absolute path (`./target/release/ss-magic init --local`), but it cannot prove
+/// that the shell Superset runs `ss-magic sync` in resolves the binary.
+fn resolves_on_path(path_var: Option<&OsStr>, name: &str) -> bool {
+    let Some(path_var) = path_var else {
+        return false;
+    };
+    std::env::split_paths(path_var).any(|dir| is_executable_file(&dir.join(name)))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn path_warning() -> String {
+    format!(
+        "`{BIN_NAME}` is not on this shell's PATH. Superset runs `{}` from \
+         {CONFIG_LOCAL_REL} for every new workspace, so make sure the environment it \
+         uses resolves `{BIN_NAME}`, or workspace setup will fail.",
+        superset_files::LOCAL_SYNC_ENTRY
+    )
+}
+
+#[cfg(test)]
+mod tests;
