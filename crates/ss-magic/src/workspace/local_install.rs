@@ -325,11 +325,19 @@ fn without_local_defaults(files: &[String]) -> Vec<String> {
 /// KTD10 in the plan: this is advisory only. It catches an invocation by
 /// absolute path (`./target/release/ss-magic init --local`), but it cannot prove
 /// that the shell Superset runs `ss-magic sync` in resolves the binary.
+///
+/// Each directory is probed for the bare name and for the name plus the
+/// platform's executable suffix (`std::env::consts::EXE_SUFFIX`): on Windows the
+/// installed binary is `ss-magic.exe`, which a shell runs as `ss-magic`. On unix
+/// the suffix is empty, so the second probe repeats the first.
 fn resolves_on_path(path_var: Option<&OsStr>, name: &str) -> bool {
     let Some(path_var) = path_var else {
         return false;
     };
-    std::env::split_paths(path_var).any(|dir| is_executable_file(&dir.join(name)))
+    let with_suffix = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(path_var).any(|dir| {
+        is_executable_file(&dir.join(name)) || is_executable_file(&dir.join(&with_suffix))
+    })
 }
 
 #[cfg(unix)]
