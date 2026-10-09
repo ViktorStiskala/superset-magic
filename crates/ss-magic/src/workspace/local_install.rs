@@ -85,10 +85,6 @@ struct Prepared {
 /// from the existing `magic.local.json`. The picker is the confirmation: Esc
 /// there returns before anything is written. The selection REPLACES the list
 /// (the local defaults are always kept first).
-// Allowed dead until `ss-magic init --local` (argv) and the main-checkout menu
-// entries are wired to these two entry points; until then only this module's
-// tests reach them. Remove the attribute when wiring them.
-#[allow(dead_code)]
 pub fn run_local_init(cwd_root: &Path) -> Result<ExitCode> {
     style::print_section("Initialize ss-magic locally (uncommitted)");
     let main_root = git::main_checkout_root(cwd_root)?;
@@ -127,10 +123,6 @@ pub fn run_local_init(cwd_root: &Path) -> Result<ExitCode> {
 /// without the picker. `patterns` are APPENDED to the existing
 /// `magic.local.json` list (a re-run never drops a pattern), after the local
 /// defaults.
-// Allowed dead until `ss-magic init --local` (argv) and the main-checkout menu
-// entries are wired to these two entry points; until then only this module's
-// tests reach them. Remove the attribute when wiring them.
-#[allow(dead_code)]
 pub fn run_local_init_noninteractive(cwd_root: &Path, patterns: &[String]) -> Result<ExitCode> {
     let main_root = git::main_checkout_root(cwd_root)?;
     print_main_root(&main_root);
@@ -169,7 +161,8 @@ fn print_main_root(main_root: &Path) {
 /// `git status` and a local install must change no tracked file. A malformed
 /// `config.json` is an error naming the path, never a guess.
 fn refusal(main_root: &Path) -> Result<Option<String>> {
-    if superset_files::install_mode(main_root) == InstallMode::Committed {
+    let mode = superset_files::install_mode(main_root);
+    if mode == InstallMode::Committed {
         return Ok(Some(
             "this repository already has a committed ss-magic install (.superset/magic.json). \
              Run `ss-magic` in the main checkout to edit it instead of adding a local install."
@@ -177,7 +170,7 @@ fn refusal(main_root: &Path) -> Result<Option<String>> {
         ));
     }
     let config = superset_files::load_config(main_root)?;
-    match migrate::detect_branch(config.as_ref()) {
+    match migrate::detect_branch(config.as_ref(), mode) {
         Branch::Migrate => {
             return Ok(Some(
                 ".superset/config.json still runs the retired setup.sh: this repository has an \
@@ -193,7 +186,8 @@ fn refusal(main_root: &Path) -> Result<Option<String>> {
                     .to_string(),
             ))
         }
-        Branch::Init => {}
+        // `Local` is this module's own install being re-run or edited.
+        Branch::Init | Branch::Local => {}
     }
     let tracked = git::tracked_files(main_root, &[MAGIC_LOCAL_REL, CONFIG_LOCAL_REL])?;
     if let Some(path) = tracked.first() {

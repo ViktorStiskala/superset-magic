@@ -95,16 +95,59 @@ fn is_safe_rel(rel: &Path) -> bool {
     })
 }
 
-/// Compute reverse-sync candidates for `worktree_root` (R23, KTD10):
-/// files matching the worktree's overlaid patterns that are git-UNTRACKED.
+/// Repo-relative path of Superset's per-machine `config.local.json`, which a
+/// local install registers `ss-magic sync` in and syncs into every worktree.
+const CONFIG_LOCAL_REL: &str = ".superset/config.local.json";
+
+/// True for a path that travels main → worktree ONLY and must never be
+/// offered for reverse sync: Superset's `.superset/config.local.json`.
 ///
-/// Returns repo-relative paths, de-duped and sorted for stable ordering.
-/// An absent `magic.json` in the worktree yields an empty candidate set
-/// (nothing configured to sync). Defensively drops any path that fails the
-/// in-tree safety check.
+/// That file holds the commands Superset runs for every new workspace, so a
+/// worktree edit pushed into main would run in every workspace created after
+/// it (R12). KTD9 in the local-install plan puts the drop at the enumeration
+/// layer – [`compute_candidates`] and [`compute_reconcile_set`], beside their
+/// `under_excluded_tree` filter – rather than in `EXCLUDED_TREES`, because that
+/// list also removes paths from FORWARD sync and pack, and forward sync is how
+/// the file reaches a worktree at all.
+///
+/// The comparison is component-wise (so `apps/.superset/config.local.json` is
+/// an ordinary path) and ignores ASCII case, because on a case-insensitive
+/// filesystem (macOS by default) a pattern spelled
+/// `.Superset/CONFIG.local.json` names the very same file; matching only the
+/// canonical spelling would let a pattern's capitalization bypass the rule.
+pub(crate) fn is_forward_only_rel(rel: &Path) -> bool {
+    let mut got = rel.components();
+    let mut want = Path::new(CONFIG_LOCAL_REL).components();
+    loop {
+        match (got.next(), want.next()) {
+            (None, None) => return true,
+            (Some(a), Some(b)) => {
+                if !a
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Compute reverse-sync candidates for `worktree_root` (R23, KTD10):
+/// files matching the worktree's sync patterns that are git-UNTRACKED.
+///
+/// The patterns come from `superset_files::load_sync_config`: the overlay of
+/// `magic.json` and `magic.local.json` on a committed install, or
+/// `magic.local.json` alone on a local install. Returns repo-relative paths,
+/// de-duped and sorted for stable ordering. A worktree with neither file
+/// yields an empty candidate set (nothing configured to sync). Defensively
+/// drops any path that fails the in-tree safety check, and the forward-only
+/// `config.local.json` ([`is_forward_only_rel`]).
 // consumed by U11 run(); wired into the menu by U10
 pub fn compute_candidates(worktree_root: &Path) -> Result<Vec<PathBuf>> {
-    let cfg = match superset_files::load_overlaid(worktree_root)? {
+    let cfg = match superset_files::load_sync_config(worktree_root)? {
         Some(c) => c,
         None => return Ok(Vec::new()),
     };
@@ -139,6 +182,8 @@ pub fn compute_candidates(worktree_root: &Path) -> Result<Vec<PathBuf>> {
         // Never offer anything living in an excluded tree: a backed-up
         // secret copy, the plugin's `.magic` state, `.scratchpad`, or `.git`.
         .filter(|rel| !crate::sync::under_excluded_tree(rel))
+        // Nor Superset's `config.local.json`: it travels main → worktree only.
+        .filter(|rel| !is_forward_only_rel(rel))
         .collect();
 
     out.sort();
@@ -165,18 +210,20 @@ pub struct Candidate {
 }
 
 /// Compute the unified reconcile set for the interactive Sync cockpit: every
-/// overlaid-pattern match on EITHER root whose worktree and main copies are not
+/// sync-pattern match (`superset_files::load_sync_config`, so a local install's
+/// `magic.local.json` counts) on EITHER root whose worktree and main copies are not
 /// byte-identical, classified, with `Identical` dropped.
 ///
 /// Patterns are expanded against BOTH roots (a main-only file is invisible to
 /// the worktree walk, and vice-versa). Directory matches are dropped (reverse
 /// sync copies single files; a directory would `EISDIR` in [`classify`] / the
 /// cockpit), as is the tool's own `.superset/backups/` tree (so a backed-up
-/// secret is never re-offered). `wt_untracked` is derived by POSITIVE tracked
+/// secret is never re-offered), and so is the forward-only `config.local.json`
+/// ([`is_forward_only_rel`]). `wt_untracked` is derived by POSITIVE tracked
 /// determination ([`git::tracked_files`]) so a path that cannot be enumerated as
 /// tracked biases to "secret".
 pub fn compute_reconcile_set(worktree_root: &Path, main_root: &Path) -> Result<Vec<Candidate>> {
-    let cfg = match superset_files::load_overlaid(worktree_root)? {
+    let cfg = match superset_files::load_sync_config(worktree_root)? {
         Some(c) => c,
         None => return Ok(Vec::new()),
     };
@@ -200,7 +247,11 @@ pub fn compute_reconcile_set(worktree_root: &Path, main_root: &Path) -> Result<V
     let mut rels: Vec<PathBuf> = wt_matched
         .into_iter()
         .chain(main_matched)
-        .filter(|rel| is_safe_rel(rel) && !crate::sync::under_excluded_tree(rel))
+        .filter(|rel| {
+            is_safe_rel(rel)
+                && !crate::sync::under_excluded_tree(rel)
+                && !is_forward_only_rel(rel)
+        })
         .collect();
     rels.sort();
     rels.dedup();

@@ -3,7 +3,9 @@
 //! Bare invocation routes here instead of the old `bootstrap_flow`/`apply_flow`.
 //! The menu is location-aware: main checkout vs worktree determines which
 //! operations are offered. Within the main checkout, [`migrate::detect_branch`]
-//! picks the migration/init/edit-config variant.
+//! picks the migration/init/edit-config variant, and a local (uncommitted)
+//! install – a `magic.local.json` with no `magic.json` – gets its own
+//! [`Branch::Local`] row set.
 //!
 //! ## Structure: testable routing vs interactive TUI
 //!
@@ -27,6 +29,7 @@ use anyhow::Result;
 use inquire::Select;
 
 use crate::git;
+use crate::workspace::local_install;
 use crate::workspace::migrate::{self, Branch};
 use crate::sync::reverse_sync;
 use crate::tui::style;
@@ -41,8 +44,15 @@ pub enum MenuOp {
     Migrate,
     /// Main-checkout, Branch::Init: first-time initialization of the magic layout.
     Init,
+    /// Main-checkout, Branch::Init: first-time LOCAL install – patterns in the
+    /// gitignored `magic.local.json`, `ss-magic sync` registered in Superset's
+    /// gitignored `config.local.json`, no tracked file changed.
+    InitLocal,
     /// Main-checkout, Branch::Normal: edit the committed `magic.json` patterns.
     EditConfig,
+    /// Main-checkout, Branch::Local: edit a local install's `magic.local.json`
+    /// patterns (the selection replaces the list).
+    EditConfigLocal,
     /// Worktree: the unified interactive sync cockpit — reconcile every
     /// configured file against main in either direction (push / pull / merge /
     /// delete per file).
@@ -50,8 +60,8 @@ pub enum MenuOp {
     /// Archive the configured files into `ss-magic-<repo>.tar.bz2` at the git
     /// root (name derived from the normalized `origin` remote, falling back to
     /// the primary worktree basename — see `pack::archive_file_name`). Offered
-    /// wherever an initialized `magic.json` exists (any worktree, or the main
-    /// checkout on a Normal branch).
+    /// wherever a pattern list exists (any worktree, or the main checkout on a
+    /// Normal or Local branch).
     Pack,
 }
 
@@ -60,7 +70,9 @@ impl fmt::Display for MenuOp {
         let label = match self {
             MenuOp::Migrate => "Migrate to the magic.json layout",
             MenuOp::Init => "Initialize ss-magic",
+            MenuOp::InitLocal => "Initialize ss-magic locally",
             MenuOp::EditConfig => "Edit synced files (magic.json)",
+            MenuOp::EditConfigLocal => "Edit synced files (magic.local.json, local install)",
             MenuOp::Sync => "Sync with main (interactive — push, pull, merge, or delete per file)",
             MenuOp::Pack => "Pack configured files into a tar.bz2 archive",
         };
@@ -82,9 +94,10 @@ pub enum Location {
 /// Pure helper: given a location and a branch decision (irrelevant for a
 /// worktree), return the ordered list of [`MenuOp`]s to offer.
 ///
-/// `Pack` is offered wherever an initialized `magic.json` exists — any worktree,
-/// and the main checkout on a `Normal` branch. `Init`/`Migrate` branches have no
-/// `magic.json` yet, so `Pack` would have nothing to archive there.
+/// `Pack` is offered wherever a pattern list exists — any worktree, and the
+/// main checkout on a `Normal` (committed `magic.json`) or `Local`
+/// (`magic.local.json` only) branch. `Init`/`Migrate` branches have no pattern
+/// list yet, so `Pack` would have nothing to archive there.
 ///
 /// Truth table:
 ///
@@ -92,16 +105,54 @@ pub enum Location {
 /// |-----------|-------------------|----------------------------------------|
 /// | Worktree  | (any)             | `[Sync, Pack]`                         |
 /// | Main      | `Branch::Migrate` | `[Migrate]`                            |
-/// | Main      | `Branch::Init`    | `[Init]`                               |
+/// | Main      | `Branch::Init`    | `[Init, InitLocal]`                    |
 /// | Main      | `Branch::Normal`  | `[EditConfig, Pack]`                   |
+/// | Main      | `Branch::Local`   | `[EditConfigLocal, Pack]`              |
 pub fn operations_for(location: Location, branch: Branch) -> Vec<MenuOp> {
     match location {
         Location::Worktree => vec![MenuOp::Sync, MenuOp::Pack],
         Location::Main => match branch {
             Branch::Migrate => vec![MenuOp::Migrate],
-            Branch::Init => vec![MenuOp::Init],
+            Branch::Init => vec![MenuOp::Init, MenuOp::InitLocal],
             Branch::Normal => vec![MenuOp::EditConfig, MenuOp::Pack],
+            Branch::Local => vec![MenuOp::EditConfigLocal, MenuOp::Pack],
         },
+    }
+}
+
+/// The handler a selected [`MenuOp`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handler {
+    /// `migrate::run_migrate`.
+    Migrate,
+    /// `migrate::run_init`, first committed install.
+    CommittedInit,
+    /// [`edit_config`], editing a committed install's `magic.json`.
+    EditCommitted,
+    /// `local_install::run_local_init` – first local install and its edit
+    /// entry alike, since the interactive local flow replaces the list.
+    LocalInstall,
+    /// `reverse_sync::run`, the unified worktree cockpit.
+    Sync,
+    /// `run_pack_flow`.
+    Pack,
+}
+
+/// Pure helper: the handler for `op` at `location`, or `None` when that op is
+/// never offered there. Split from the dispatch closures so a test can prove
+/// every op [`operations_for`] offers has a handler, i.e. no selection can
+/// reach the dispatcher's `unreachable!` arm.
+pub fn handler_for(location: Location, op: MenuOp) -> Option<Handler> {
+    match (location, op) {
+        (Location::Worktree, MenuOp::Sync) => Some(Handler::Sync),
+        (_, MenuOp::Pack) => Some(Handler::Pack),
+        (Location::Main, MenuOp::Migrate) => Some(Handler::Migrate),
+        (Location::Main, MenuOp::Init) => Some(Handler::CommittedInit),
+        (Location::Main, MenuOp::EditConfig) => Some(Handler::EditCommitted),
+        (Location::Main, MenuOp::InitLocal | MenuOp::EditConfigLocal) => {
+            Some(Handler::LocalInstall)
+        }
+        _ => None,
     }
 }
 
@@ -144,9 +195,9 @@ pub fn run(cwd: &Path) -> Result<ExitCode> {
         };
 
         let ops = operations_for(Location::Worktree, Branch::Init); // branch unused for worktree
-        dispatch_menu(ops, |op| match op {
-            MenuOp::Sync => reverse_sync::run(&cwd_root, &main_root),
-            MenuOp::Pack => crate::run_pack_flow(cwd),
+        dispatch_menu(ops, |op| match handler_for(Location::Worktree, op) {
+            Some(Handler::Sync) => reverse_sync::run(&cwd_root, &main_root),
+            Some(Handler::Pack) => crate::run_pack_flow(cwd),
             _ => unreachable!("worktree only offers Sync/Pack"),
         })
     } else {
@@ -163,16 +214,21 @@ pub fn run(cwd: &Path) -> Result<ExitCode> {
             }
         };
 
-        let branch = migrate::detect_branch(config.as_ref());
+        let mode = superset_files::install_mode(&cwd_root);
+        let branch = migrate::detect_branch(config.as_ref(), mode);
         let ops = operations_for(Location::Main, branch);
+        // R13: a committed install beside a `config.local.json` that still
+        // registers `ss-magic sync` runs the sync twice; say so up front.
+        migrate::print_duplicate_sync_entry_warning(&cwd_root);
 
         let repo_root = cwd_root.clone();
-        dispatch_menu(ops, move |op| match op {
-            MenuOp::Migrate => migrate::run_migrate(&repo_root, config.as_ref().unwrap()),
-            MenuOp::Init => migrate::run_init(&repo_root, config.as_ref()),
-            MenuOp::EditConfig => edit_config(&repo_root, config.as_ref()),
-            MenuOp::Pack => crate::run_pack_flow(&repo_root),
-            _ => unreachable!("main checkout only offers Migrate/Init/EditConfig/Pack"),
+        dispatch_menu(ops, move |op| match handler_for(Location::Main, op) {
+            Some(Handler::Migrate) => migrate::run_migrate(&repo_root, config.as_ref().unwrap()),
+            Some(Handler::CommittedInit) => migrate::run_init(&repo_root, config.as_ref()),
+            Some(Handler::EditCommitted) => edit_config(&repo_root, config.as_ref()),
+            Some(Handler::LocalInstall) => local_install::run_local_init(&repo_root),
+            Some(Handler::Pack) => crate::run_pack_flow(&repo_root),
+            _ => unreachable!("main checkout only offers Migrate/Init/EditConfig/local/Pack"),
         })
     }
 }

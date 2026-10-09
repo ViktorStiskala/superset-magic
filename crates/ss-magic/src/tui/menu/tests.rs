@@ -37,13 +37,6 @@ fn migrate_branch_offers_migrate_op() {
     assert_eq!(ops, vec![MenuOp::Migrate]);
 }
 
-/// Branch::Init → exactly [Init].
-#[test]
-fn init_branch_offers_init_op() {
-    let ops = operations_for(Location::Main, Branch::Init);
-    assert_eq!(ops, vec![MenuOp::Init]);
-}
-
 /// Branch::Normal → [EditConfig, Pack].
 #[test]
 fn normal_branch_offers_edit_config_and_pack() {
@@ -85,4 +78,71 @@ fn main_checkout_ops_are_main_only() {
         overlap.is_empty(),
         "location-specific ops must not overlap; overlap={overlap:?}"
     );
+}
+
+// ── Local install rows ───────────────────────────────────────────────────
+
+/// Every branch, the local one included, for the exhaustive checks below.
+const ALL_BRANCHES: [Branch; 4] = [Branch::Migrate, Branch::Init, Branch::Normal, Branch::Local];
+
+/// Branch::Init → committed init first, then the local install.
+#[test]
+fn init_branch_offers_committed_and_local_init() {
+    let ops = operations_for(Location::Main, Branch::Init);
+    assert_eq!(ops, vec![MenuOp::Init, MenuOp::InitLocal]);
+}
+
+/// Branch::Local → edit the local patterns, and pack.
+#[test]
+fn local_branch_offers_edit_local_config_and_pack() {
+    let ops = operations_for(Location::Main, Branch::Local);
+    assert_eq!(ops, vec![MenuOp::EditConfigLocal, MenuOp::Pack]);
+}
+
+/// The local entries carry the labels the requirements name.
+#[test]
+fn local_entries_have_their_labels() {
+    assert_eq!(MenuOp::InitLocal.to_string(), "Initialize ss-magic locally");
+    assert!(
+        MenuOp::EditConfigLocal.to_string().contains("magic.local.json"),
+        "the local edit entry must name the file it edits"
+    );
+}
+
+/// The local entries are main-checkout only: a worktree never offers them.
+#[test]
+fn worktree_never_offers_local_install_ops() {
+    for branch in ALL_BRANCHES {
+        let ops = operations_for(Location::Worktree, branch);
+        assert!(!ops.contains(&MenuOp::InitLocal), "branch={branch:?}");
+        assert!(!ops.contains(&MenuOp::EditConfigLocal), "branch={branch:?}");
+    }
+}
+
+/// Every op the menu can offer has a handler, so no selection can reach the
+/// dispatcher's `unreachable!` arm.
+#[test]
+fn every_offered_op_has_a_handler() {
+    for location in [Location::Main, Location::Worktree] {
+        for branch in ALL_BRANCHES {
+            for op in operations_for(location, branch) {
+                assert!(
+                    handler_for(location, op).is_some(),
+                    "location={location:?} branch={branch:?} op={op:?} has no handler"
+                );
+            }
+        }
+    }
+}
+
+/// Both local entries open the local install (the interactive entry doubles
+/// as the edit entry), never the committed init.
+#[test]
+fn local_entries_route_to_the_local_install() {
+    assert_eq!(handler_for(Location::Main, MenuOp::InitLocal), Some(Handler::LocalInstall));
+    assert_eq!(
+        handler_for(Location::Main, MenuOp::EditConfigLocal),
+        Some(Handler::LocalInstall)
+    );
+    assert_eq!(handler_for(Location::Main, MenuOp::Init), Some(Handler::CommittedInit));
 }

@@ -269,3 +269,54 @@ fn sync_backup_dir_is_gitignored_in_worktree() {
         ".superset/backups must be gitignored in the worktree after a backing-up sync"
     );
 }
+
+// ── Local install (no magic.json) ──────────────────────────────────────
+
+/// AE4: a local install in main (only `magic.local.json`, no `magic.json`) is
+/// a valid sync source. `sync_core` in a fresh worktree copies the configured
+/// `.env` AND both local files, so the worktree carries the install too.
+#[test]
+fn ae4_sync_from_a_local_install_copies_patterns_and_local_files() {
+    let main = init_main_repo("main");
+    let main_root = main.path().canonicalize().unwrap();
+    write_file(&main_root, ".env", "FOO=1\n");
+    let code = workspace::local_install::run_local_init_noninteractive(
+        &main_root,
+        &[".env".to_string()],
+    )
+    .unwrap();
+    assert_eq!(exit_code_to_u8(code), 0, "local install must succeed");
+    assert!(!main_root.join(".superset/magic.json").exists());
+
+    let (_wt, wt_root) = make_worktree(&main_root);
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    assert_eq!(exit_code_to_u8(code), 0, "sync_core must accept a local install");
+    assert_eq!(fs::read_to_string(wt_root.join(".env")).unwrap(), "FOO=1\n");
+    for rel in [".superset/magic.local.json", ".superset/config.local.json"] {
+        assert_eq!(
+            fs::read(wt_root.join(rel)).unwrap(),
+            fs::read(main_root.join(rel)).unwrap(),
+            "{rel} must be copied into the worktree"
+        );
+    }
+}
+
+/// Neither `magic.json` nor `magic.local.json` in main: still exit 1.
+#[test]
+fn sync_without_any_pattern_file_exits_1() {
+    let main = init_main_repo("main");
+    let (_wt, wt_root) = make_worktree(main.path());
+    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    assert_eq!(exit_code_to_u8(code), 1);
+}
+
+/// The no-config error names both files a checkout can be configured by, and
+/// both ways to create one.
+#[test]
+fn no_sync_config_message_names_both_pattern_files() {
+    let msg = no_sync_config_message(std::path::Path::new("/repo"));
+    assert!(msg.contains(".superset/magic.json"), "msg: {msg}");
+    assert!(msg.contains(".superset/magic.local.json"), "msg: {msg}");
+    assert!(msg.contains("ss-magic init --local"), "msg: {msg}");
+    assert!(msg.contains("/repo"), "msg: {msg}");
+}

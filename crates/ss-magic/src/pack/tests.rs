@@ -704,3 +704,18 @@ fn exclusion_matches_exact_components_not_prefixes() {
         assert!(entries.contains(want), "{want} must pack: {entries:?}");
     }
 }
+
+// ── Local install (no magic.json) ──────────────────────────────────────
+
+/// A checkout whose only pattern list is `magic.local.json` packs that list's
+/// matches (R7): the local install is a valid pack source.
+#[test]
+fn packs_the_patterns_of_a_local_install() {
+    let repo = init_repo();
+    write_file(repo.path(), ".superset/magic.local.json", r#"{"files":[".env"]}"#);
+    write_file(repo.path(), ".env", "FOO=1\n");
+
+    let code = pack_core(repo.path(), |_| {}).unwrap();
+    assert!(exit_ok(code), "pack_core must accept a local install");
+    assert_eq!(archive_read(repo.path(), ".env").as_deref(), Some("FOO=1\n"));
+}

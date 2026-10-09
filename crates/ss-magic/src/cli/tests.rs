@@ -239,3 +239,53 @@ fn help_mentions_version() {
         "usage should mention --version"
     );
 }
+
+// ── init --local ─────────────────────────────────────────────────────────
+
+#[test]
+fn init_local_flag_selects_the_local_install() {
+    assert_eq!(
+        parse(&argv(&["init", "--local", ".env"])),
+        Parsed::InitLocal(vec![".env".to_string()])
+    );
+}
+
+#[test]
+fn init_local_flag_after_the_patterns_parses_the_same() {
+    assert_eq!(
+        parse(&argv(&["init", ".env", "--local"])),
+        Parsed::InitLocal(vec![".env".to_string()])
+    );
+}
+
+/// `--local` before the subcommand still selects the local install: a stray
+/// position must never turn the request into a committed init, which writes
+/// tracked files.
+#[test]
+fn init_local_flag_before_init_still_selects_the_local_install() {
+    assert_eq!(
+        parse(&argv(&["--local", "init", ".env"])),
+        Parsed::InitLocal(vec![".env".to_string()])
+    );
+}
+
+#[test]
+fn init_local_without_patterns_is_an_empty_local_init() {
+    assert_eq!(parse(&argv(&["init", "--local"])), Parsed::InitLocal(vec![]));
+}
+
+#[test]
+fn init_without_local_flag_stays_committed() {
+    assert_eq!(
+        parse(&argv(&["init", ".env"])),
+        Parsed::Init(vec![".env".to_string()])
+    );
+}
+
+#[test]
+fn help_documents_init_local() {
+    assert!(
+        usage().contains("init --local"),
+        "usage should document `init --local [PATTERN...]`"
+    );
+}
