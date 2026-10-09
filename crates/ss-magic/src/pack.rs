@@ -105,10 +105,11 @@ pub enum PackEvent {
 /// Core pack flow, shared by `ss-magic pack` and the interactive menu.
 ///
 /// Resolves the current repo root, loads its sync pattern list (committed
-/// overlay, or a local install's `magic.local.json`), expands the patterns against that root, and writes
-/// the matched files into `<root>/ss-magic-<repo>.tar.bz2` (see [`archive_file_name`]) with repo-relative
-/// paths. Extracted as `pack_core` (taking an `on_event` closure) so tests can
-/// collect events without side effects on stdout.
+/// overlay, or a local install's `magic.local.json`), expands the patterns
+/// against that root, and writes the matched files into
+/// `<root>/ss-magic-<repo>.tar.bz2` (see [`archive_file_name`]) with
+/// repo-relative paths. Extracted as `pack_core` (taking an `on_event` closure)
+/// so tests can collect events without side effects on stdout.
 ///
 /// Hard errors (non-zero exit), paralleling `sync_core`:
 /// - Cannot resolve the git repo root (not in a repo, or git fails).

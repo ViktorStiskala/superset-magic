@@ -34,19 +34,26 @@ const MAGIC_JSON: &str = "magic.json";
 const MAGIC_LOCAL_JSON: &str = "magic.local.json";
 const CONFIG_LOCAL_JSON: &str = "config.local.json";
 
-/// Relative path of `magic.local.json` as it appears inside the repo.
-/// Referenced by [`default_magic_files`] and the bootstrap helper.
-const MAGIC_LOCAL_PATTERN: &str = ".superset/magic.local.json";
+/// Relative path of `magic.local.json` as it appears inside the repo – the ONE
+/// spelling of it. Seeded as a sync pattern by [`default_magic_files`] and
+/// [`local_install_default_files`], and imported by the CLI wherever it names
+/// the file: the init/migrate bootstrap gitignore rule and the local install's
+/// tracked-file refusal, ignore rule and progress lines.
+pub const MAGIC_LOCAL_PATTERN: &str = ".superset/magic.local.json";
 
-/// Relative path of `config.local.json` as it appears inside the repo. A local
-/// install lists it as a sync pattern so forward sync carries Superset's
-/// per-machine setup override into every worktree.
-const CONFIG_LOCAL_PATTERN: &str = ".superset/config.local.json";
+/// Relative path of `config.local.json` as it appears inside the repo – the ONE
+/// spelling of it. A local install lists it as a sync pattern so forward sync
+/// carries Superset's per-machine setup override into every worktree, and the
+/// CLI's reverse-sync forward-only guard (`is_forward_only_rel`) compares
+/// against this same constant, so the pattern that is seeded and the path that
+/// is never pushed back into main cannot drift apart.
+pub const CONFIG_LOCAL_PATTERN: &str = ".superset/config.local.json";
 
 /// The literal setup command a local install registers in `config.local.json`.
 /// Superset runs it directly (a local install writes no `magic.sh` wrapper, as
-/// the wrapper would be a committed file). It matches the substring the
-/// committed install's `entry_is_magic_marker` already recognizes.
+/// the wrapper would be a committed file). The CLI's committed-install detector
+/// (`entry_is_magic_marker`) and [`setup_has_sync_marker`] both match on this
+/// constant, so the entry written and the entry recognized cannot drift apart.
 pub const LOCAL_SYNC_ENTRY: &str = "ss-magic sync";
 
 /// Shape of `.superset/config.json`.

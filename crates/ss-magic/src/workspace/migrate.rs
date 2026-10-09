@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 use crate::git;
 use crate::git::gitignore;
 use crate::sync::reverse_sync;
-use crate::workspace::superset_files::{self, Config, InstallMode};
+use crate::workspace::superset_files::{self, Config, InstallMode, MAGIC_LOCAL_PATTERN};
 use crate::tui::style;
 use crate::tui::ui::{self, FinalAction};
 use ss_magic_core::state_tree;
@@ -60,11 +60,6 @@ pub const MAGIC_WRAPPER_ENTRY: &str = "./.superset/magic.sh sync";
 
 /// Relative path of the retired `setup.sh`, deleted on migration.
 const SETUP_SH_REL: &str = ".superset/setup.sh";
-
-/// Relative path of `magic.local.json` as it appears inside the repo. Gitignored
-/// via `gitignore::ensure_path_ignored` during migration and init (the closest
-/// existing `.gitignore`, or the git-root file; a no-op if git already ignores it).
-const MAGIC_LOCAL_REL: &str = ".superset/magic.local.json";
 
 /// Ensure the workspace's bootstrap gitignore rules exist under `repo_root` —
 /// the step shared verbatim by `run_migrate`, `run_init`, and
@@ -92,7 +87,7 @@ fn ensure_bootstrap_gitignores(repo_root: &Path) -> Result<()> {
     gitignore::ensure_path_ignored(
         repo_root,
         repo_root,
-        Path::new(MAGIC_LOCAL_REL),
+        Path::new(MAGIC_LOCAL_PATTERN),
         gitignore::PathKind::File,
     )?;
     // init/migrate always produce a COMMITTED install, so the backups rule goes
@@ -185,9 +180,12 @@ fn entry_is_setup_sh(entry: &str) -> bool {
     entry.contains(SETUP_SH_MARKER)
 }
 
-/// True when a `setup` entry references the new wrapper / sync marker.
+/// True when a `setup` entry references the new wrapper (`magic.sh`) or the
+/// bare sync command a local install registers ([`superset_files::LOCAL_SYNC_ENTRY`],
+/// shared with core's `setup_has_sync_marker` so the committed-install detector
+/// and the local install's merge/duplicate check recognize one marker).
 fn entry_is_magic_marker(entry: &str) -> bool {
-    entry.contains("magic.sh") || entry.contains("ss-magic sync")
+    entry.contains("magic.sh") || entry.contains(superset_files::LOCAL_SYNC_ENTRY)
 }
 
 /// Pure branch decision (KTD8, R10), given the parsed `config.json` and the
@@ -442,12 +440,20 @@ fn rename_setup_config(repo_root: &Path) -> Result<()> {
 /// Pure so the seeding rule is unit-testable without the UI.
 fn init_magic_files(chosen: &[String]) -> Vec<String> {
     let mut files = superset_files::default_magic_files();
-    for p in chosen {
+    push_missing(&mut files, chosen);
+    files
+}
+
+/// Append each entry of `more` that `files` does not already hold, in `more`'s
+/// order, so the result keeps `files`' entries first and holds no duplicate.
+/// The one dedupe rule behind every `files` seeder: this module's
+/// [`init_magic_files`] and the local install's selection and append lists.
+pub(crate) fn push_missing(files: &mut Vec<String>, more: &[String]) {
+    for p in more {
         if !files.iter().any(|f| f == p) {
             files.push(p.clone());
         }
     }
-    files
 }
 
 /// Build the picker `(options, preselected_indices)` for `run_init`, factored

@@ -258,11 +258,19 @@ pub fn ensure_path_ignored(
 /// to a literal append. A `Dir` is queried with a trailing slash so a `foo/bar/`
 /// rule matches before the directory exists on disk.
 fn is_ignored_opt(root: &Path, rel: &Path, kind: PathKind) -> Option<bool> {
-    let mut s = rel.to_str()?.to_string();
-    if kind == PathKind::Dir && !s.ends_with('/') {
-        s.push('/');
+    git::is_ignored_str(root, &with_dir_slash(rel.to_str()?, kind)).ok()
+}
+
+/// `path` with a trailing `/` added when `kind` is [`PathKind::Dir`] and it
+/// does not already end in one, else `path` unchanged. The one spelling rule
+/// for a directory, shared by the probes (git matches a directory-only `foo/`
+/// rule against a slash-terminated query even before the directory exists) and
+/// by the `.gitignore` rule written for it.
+fn with_dir_slash(path: &str, kind: PathKind) -> String {
+    match kind {
+        PathKind::Dir if !path.ends_with('/') => format!("{path}/"),
+        _ => path.to_string(),
     }
-    git::is_ignored_str(root, &s).ok()
 }
 
 /// The deepest ancestor directory of `rel` (under `target_root`) that already
@@ -310,10 +318,7 @@ fn anchored_literal(
             .with_context(|| format!("non-UTF-8 path: {}", sub.display()))?;
         format!("/{sub_str}")
     };
-    Ok(match kind {
-        PathKind::Dir if !base.ends_with('/') => format!("{base}/"),
-        _ => base,
-    })
+    Ok(with_dir_slash(&base, kind))
 }
 
 /// Ensure `rel` (of `kind`) is ignored under `target_root`, writing any new rule
@@ -359,10 +364,7 @@ fn ensure_in_local_exclude(target_root: &Path, rel: &Path, kind: PathKind) -> Re
         .to_str()
         .with_context(|| format!("non-UTF-8 path: {}", rel.display()))?;
     // Probe with the same trailing-slash convention the rule is written with.
-    let probe = match kind {
-        PathKind::Dir if !rel_str.ends_with('/') => format!("{rel_str}/"),
-        _ => rel_str.to_string(),
-    };
+    let probe = with_dir_slash(rel_str, kind);
     if git::is_ignored_str(target_root, &probe)? {
         return Ok(Ignored::Already);
     }

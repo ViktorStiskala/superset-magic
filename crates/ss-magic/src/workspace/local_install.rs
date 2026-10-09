@@ -42,7 +42,7 @@
 //! cleanup: that belongs to the committed install's lifecycle.
 
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -52,15 +52,11 @@ use crate::git::gitignore::{self, IgnoreSink, PathKind};
 use crate::sync::reverse_sync::BACKUPS_REL;
 use crate::tui::style;
 use crate::tui::ui;
-use crate::workspace::migrate::{self, Branch};
-use crate::workspace::superset_files::{self, InstallMode, LocalConfigMerge, MagicConfig};
+use crate::workspace::migrate::{self, push_missing, Branch};
+use crate::workspace::superset_files::{
+    self, InstallMode, LocalConfigMerge, MagicConfig, CONFIG_LOCAL_PATTERN, MAGIC_LOCAL_PATTERN,
+};
 use ss_magic_core::state_tree::STATE_REL;
-
-/// Repo-relative path of the local pattern list.
-const MAGIC_LOCAL_REL: &str = ".superset/magic.local.json";
-
-/// Repo-relative path of Superset's per-machine config override.
-const CONFIG_LOCAL_REL: &str = ".superset/config.local.json";
 
 /// The binary Superset must be able to resolve when it runs the registered
 /// `ss-magic sync` setup step.
@@ -87,14 +83,9 @@ struct Prepared {
 /// (the local defaults are always kept first).
 pub fn run_local_init(cwd_root: &Path) -> Result<ExitCode> {
     style::print_section("Initialize ss-magic locally (uncommitted)");
-    let main_root = git::main_checkout_root(cwd_root)?;
-    print_main_root(&main_root);
-
-    if let Some(reason) = refusal(&main_root)? {
-        eprintln!("{}", style::err(format!("error: {reason}")));
+    let Some((main_root, prepared)) = begin(cwd_root)? else {
         return Ok(ExitCode::from(1));
-    }
-    let prepared = prepare(&main_root)?;
+    };
 
     // The local defaults are always written, so they are not offered as
     // picker rows; every other existing pattern is (custom ones preselected).
@@ -124,14 +115,9 @@ pub fn run_local_init(cwd_root: &Path) -> Result<ExitCode> {
 /// `magic.local.json` list (a re-run never drops a pattern), after the local
 /// defaults.
 pub fn run_local_init_noninteractive(cwd_root: &Path, patterns: &[String]) -> Result<ExitCode> {
-    let main_root = git::main_checkout_root(cwd_root)?;
-    print_main_root(&main_root);
-
-    if let Some(reason) = refusal(&main_root)? {
-        eprintln!("{}", style::err(format!("error: {reason}")));
+    let Some((main_root, prepared)) = begin(cwd_root)? else {
         return Ok(ExitCode::from(1));
-    }
-    let prepared = prepare(&main_root)?;
+    };
     let existing_files: &[String] = prepared
         .existing_local
         .as_ref()
@@ -144,11 +130,23 @@ pub fn run_local_init_noninteractive(cwd_root: &Path, patterns: &[String]) -> Re
     Ok(ExitCode::SUCCESS)
 }
 
-fn print_main_root(main_root: &Path) {
+/// The preamble both entries share, in order: resolve the main checkout, name
+/// it on screen, refuse (printing why) when a local install must not run there,
+/// then [`prepare`] both inputs in memory. `None` means a refusal was already
+/// printed and the caller exits 1; nothing has been written by then.
+fn begin(cwd_root: &Path) -> Result<Option<(PathBuf, Prepared)>> {
+    let main_root = git::main_checkout_root(cwd_root)?;
     println!(
         "{}",
         style::info(format!("Main checkout: {}", main_root.display()))
     );
+
+    if let Some(reason) = refusal(&main_root)? {
+        eprintln!("{}", style::err(format!("error: {reason}")));
+        return Ok(None);
+    }
+    let prepared = prepare(&main_root)?;
+    Ok(Some((main_root, prepared)))
 }
 
 /// Why a local install must not run in `main_root`, or `None` when it may.
@@ -189,7 +187,7 @@ fn refusal(main_root: &Path) -> Result<Option<String>> {
         // `Local` is this module's own install being re-run or edited.
         Branch::Init | Branch::Local => {}
     }
-    let tracked = git::tracked_files(main_root, &[MAGIC_LOCAL_REL, CONFIG_LOCAL_REL])?;
+    let tracked = git::tracked_files(main_root, &[MAGIC_LOCAL_PATTERN, CONFIG_LOCAL_PATTERN])?;
     if let Some(path) = tracked.first() {
         return Ok(Some(format!(
             "{} is tracked by git, and a local install must not change a tracked file. \
@@ -220,8 +218,8 @@ fn prepare(main_root: &Path) -> Result<Prepared> {
 /// `config.local.json` only when its merge changed something.
 fn commit(main_root: &Path, prepared: Prepared, files: Vec<String>) -> Result<()> {
     let rules: [(&str, PathKind); 4] = [
-        (MAGIC_LOCAL_REL, PathKind::File),
-        (CONFIG_LOCAL_REL, PathKind::File),
+        (MAGIC_LOCAL_PATTERN, PathKind::File),
+        (CONFIG_LOCAL_PATTERN, PathKind::File),
         (BACKUPS_REL, PathKind::Dir),
         (STATE_REL, PathKind::Dir),
     ];
@@ -244,12 +242,12 @@ fn commit(main_root: &Path, prepared: Prepared, files: Vec<String>) -> Result<()
     }
 
     println!("{}", style::ok("Excluded the local files via .git/info/exclude"));
-    println!("{}", style::ok(format!("Wrote {MAGIC_LOCAL_REL}")));
+    println!("{}", style::ok(format!("Wrote {MAGIC_LOCAL_PATTERN}")));
     if config_changed {
         println!(
             "{}",
             style::ok(format!(
-                "Registered `{}` in {CONFIG_LOCAL_REL}",
+                "Registered `{}` in {CONFIG_LOCAL_PATTERN}",
                 superset_files::LOCAL_SYNC_ENTRY
             ))
         );
@@ -257,7 +255,7 @@ fn commit(main_root: &Path, prepared: Prepared, files: Vec<String>) -> Result<()
         println!(
             "{}",
             style::info(format!(
-                "{CONFIG_LOCAL_REL} already runs `{}`",
+                "{CONFIG_LOCAL_PATTERN} already runs `{}`",
                 superset_files::LOCAL_SYNC_ENTRY
             ))
         );
@@ -281,11 +279,11 @@ fn finish() {
 fn summary_lines(prepared: &Prepared) -> Vec<String> {
     let mut lines = vec![
         "Exclude the local files via .git/info/exclude (never a tracked .gitignore)".to_string(),
-        format!("Write {MAGIC_LOCAL_REL} (the synced patterns)"),
+        format!("Write {MAGIC_LOCAL_PATTERN} (the synced patterns)"),
     ];
     if prepared.config_local.changed {
         lines.push(format!(
-            "Register `{}` in {CONFIG_LOCAL_REL} setup",
+            "Register `{}` in {CONFIG_LOCAL_PATTERN} setup",
             superset_files::LOCAL_SYNC_ENTRY
         ));
     }
@@ -312,23 +310,12 @@ fn appended_files(existing: &[String], patterns: &[String]) -> Vec<String> {
     files
 }
 
-fn push_missing(files: &mut Vec<String>, more: &[String]) {
-    for p in more {
-        if !files.iter().any(|f| f == p) {
-            files.push(p.clone());
-        }
-    }
-}
-
 /// `files` without the local defaults, which the picker does not offer since
-/// [`selection_files`] always writes them.
+/// [`selection_files`] always writes them. Original order is kept.
 fn without_local_defaults(files: &[String]) -> Vec<String> {
     let defaults = superset_files::local_install_default_files();
-    files
-        .iter()
-        .filter(|f| !defaults.contains(f))
-        .cloned()
-        .collect()
+    let defaults: Vec<&str> = defaults.iter().map(String::as_str).collect();
+    superset_files::existing_unknown_entries(files, &defaults)
 }
 
 /// Whether `name` resolves to an executable file through the `PATH` value
@@ -361,7 +348,7 @@ fn is_executable_file(path: &Path) -> bool {
 fn path_warning() -> String {
     format!(
         "`{BIN_NAME}` is not on this shell's PATH. Superset runs `{}` from \
-         {CONFIG_LOCAL_REL} for every new workspace, so make sure the environment it \
+         {CONFIG_LOCAL_PATTERN} for every new workspace, so make sure the environment it \
          uses resolves `{BIN_NAME}`, or workspace setup will fail.",
         superset_files::LOCAL_SYNC_ENTRY
     )

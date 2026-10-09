@@ -261,7 +261,7 @@ fn migration_transforms_old_layout_into_new() {
     // legacy files are gone and the new ones are present.
     superset_files::copy_into_repo(stage.path(), repo.path(), &[SETUP_SH_REL]).unwrap();
     rename_setup_config(repo.path()).unwrap();
-    gitignore::ensure_entry(repo.path(), MAGIC_LOCAL_REL).unwrap();
+    gitignore::ensure_entry(repo.path(), MAGIC_LOCAL_PATTERN).unwrap();
 
     let dot = repo.path().join(".superset");
     assert!(!dot.join("setup.sh").exists(), "setup.sh must be deleted");
@@ -286,7 +286,7 @@ fn migration_transforms_old_layout_into_new() {
 
     // .gitignore now ignores magic.local.json.
     let gi = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-    assert!(gi.lines().any(|l| l == MAGIC_LOCAL_REL));
+    assert!(gi.lines().any(|l| l == MAGIC_LOCAL_PATTERN));
 }
 
 /// KTD2: the same pre-existing `.superset/.magic/` plugin state survives
@@ -556,7 +556,7 @@ fn run_init_noninteractive_writes_layout_from_patterns() {
     assert_eq!(cfg.setup, vec![MAGIC_WRAPPER_ENTRY.to_string()]);
 
     let gi = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-    assert!(gi.lines().any(|l| l == MAGIC_LOCAL_REL));
+    assert!(gi.lines().any(|l| l == MAGIC_LOCAL_PATTERN));
     // The backups tree is gitignored up front by the same bootstrap step, so a
     // recovered secret is never committed even before the first sync runs.
     assert!(
@@ -920,7 +920,7 @@ fn bootstrap_gitignores_cover_local_config_backups_and_state_tree() {
     ensure_bootstrap_gitignores(repo.path()).unwrap();
 
     let gi = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-    for rule in [MAGIC_LOCAL_REL, ".superset/backups/", ".superset/.magic/"] {
+    for rule in [MAGIC_LOCAL_PATTERN, ".superset/backups/", ".superset/.magic/"] {
         assert!(
             gi.lines().any(|l| l == rule),
             "ensure_bootstrap_gitignores must write {rule:?}, got: {gi:?}"

@@ -107,10 +107,6 @@ fn is_safe_rel(rel: &Path) -> bool {
     })
 }
 
-/// Repo-relative path of Superset's per-machine `config.local.json`, which a
-/// local install registers `ss-magic sync` in and syncs into every worktree.
-const CONFIG_LOCAL_REL: &str = ".superset/config.local.json";
-
 /// True for a path that travels main → worktree ONLY and must never be
 /// offered for reverse sync: Superset's `.superset/config.local.json`.
 ///
@@ -128,23 +124,17 @@ const CONFIG_LOCAL_REL: &str = ".superset/config.local.json";
 /// `.Superset/CONFIG.local.json` names the very same file; matching only the
 /// canonical spelling would let a pattern's capitalization bypass the rule.
 pub(crate) fn is_forward_only_rel(rel: &Path) -> bool {
-    let mut got = rel.components();
-    let mut want = Path::new(CONFIG_LOCAL_REL).components();
-    loop {
-        match (got.next(), want.next()) {
-            (None, None) => return true,
-            (Some(a), Some(b)) => {
-                if !a
-                    .as_os_str()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
-                {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
+    // Core's `CONFIG_LOCAL_PATTERN` is the same constant a local install seeds
+    // into `magic.local.json`, so the forward-synced pattern and this guard
+    // always name one path. Equal component count plus pairwise
+    // case-insensitive equality is "the same component sequence".
+    let want = Path::new(superset_files::CONFIG_LOCAL_PATTERN);
+    rel.components().count() == want.components().count()
+        && rel.components().zip(want.components()).all(|(a, b)| {
+            a.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+        })
 }
 
 /// Compute reverse-sync candidates for `worktree_root` (R23, KTD10):
