@@ -120,13 +120,19 @@ no associative arrays, no `mapfile`, no `${var^^}`).
   The CLI's is `cli.rs`: `parse(&[String]) -> Parsed` selects the command from
   the first non-flag token; `Command` is `{ Bare, Sync { no_backup },
   ReverseSync { no_backup }, Pack, Update }`, and `Parsed` additionally carries
-  `Init(Vec<String>)`, `Version`, `Help` and `Error(token)` – there is no
-  `Plugin` variant any more. `sync`/`reverse-sync` read the `-n`/`--no-backup`
-  flag via a full-argv scan (`has_no_backup`, position-independent – before OR
-  after the subcommand), an intentional asymmetry with `-h`/`--help` (a terminal
-  short-circuit recognized only BEFORE the subcommand). Flag any addition of
-  `clap`/`structopt`/`argh`, command dispatch logic added outside `cli.rs`, or a
-  "fix" that makes `has_no_backup` and the `--help` scan match each other.
+  `Init(Vec<String>)`, `InitLocal(Vec<String>)`, `Version`, `Help` and
+  `Error(token)` – there is no `Plugin` variant any more. `sync`/`reverse-sync`
+  read the `-n`/`--no-backup` flag via a full-argv scan (`has_no_backup`,
+  position-independent – before OR after the subcommand), an intentional
+  asymmetry with `-h`/`--help` (a terminal short-circuit recognized only BEFORE
+  the subcommand). `init` reads `--local` the same way (`has_local`, a full-argv
+  scan): `--local` ANYWHERE in argv – `ss-magic --local init` as well as
+  `ss-magic init --local` – must select `InitLocal`, NEVER the committed
+  `Init`, because a committed init writes tracked files, the one outcome a user
+  asking for a local install must never get. Flag any addition of
+  `clap`/`structopt`/`argh`, command dispatch logic added outside `cli.rs`, a
+  "fix" that makes `has_no_backup` and the `--help` scan match each other, or a
+  `--local` check narrowed to the tokens after `init`.
 - **The CLI's `--version` scan runs PAST a subcommand token, and must keep
   doing so.** `ss-magic sync --version` prints the version; without that, an
   unrecognized `--version` is skipped as an unknown flag and falls through to
@@ -261,8 +267,10 @@ committable and must never leak.
   `-n`/`--no-backup`.
 - **The gitignore-in-main step fires ONLY for a git-UNTRACKED worktree source,
   determined POSITIVELY.** Only a PUSH or MERGE writes worktree bytes into main,
-  and only an untracked (secret) source may add a `.gitignore` rule there – a
-  TRACKED, already-committed file must NEVER gain one. The gate is
+  and only an untracked (secret) source may add an ignore rule there (a
+  `.gitignore` rule on a committed install, an `info/exclude` rule otherwise –
+  only a committed install writes `.gitignore`) – a TRACKED, already-committed
+  file must NEVER gain either. The gate is
   `Baseline::source_untracked`, derived FAIL-CLOSED as `!tracked.contains(rel)`
   where `tracked` comes from `git::tracked_files` (`git ls-files --cached`): a
   path NOT positively known-tracked (a non-UTF-8 or oddly-normalized name, an
@@ -271,15 +279,17 @@ committable and must never leak.
   committed install it copies the covering `.gitignore` rule (verified via `git
   check-ignore -v`, negations excluded) or an anchored literal into main, and on
   a local install (see the local-install bullet below) it appends an anchored
-  literal to `info/exclude` instead. Either way it then STRICTLY re-verifies
-  with `git::is_ignored` and bails (writing NOTHING) if the path is still not
-  ignored. Flag: a Push/Merge that appends a `.gitignore` rule for a tracked
-  file; a Push/Merge that writes an untracked secret into main WITHOUT ensuring it
-  is ignored there (dropping `ensure_gitignored_in_main` or its strict re-verify
-  bail); OR deriving untracked-ness by ABSENCE from an untracked list (fail-OPEN –
-  a name missing from a `git ls-files --others` set is not proof it is tracked)
-  instead of positive tracked determination. Pull and Delete never touch main's
-  `.gitignore`.
+  literal to `info/exclude` instead. When it appended a rule, it then strictly
+  re-verifies with `git::is_ignored` and refuses the write into main if the
+  path is still not ignored (the appended rule itself stays; the secret bytes
+  never land). Flag: a Push/Merge that appends an ignore rule (`.gitignore` or
+  `info/exclude`) for a tracked file; a Push/Merge that writes an untracked
+  secret into main WITHOUT ensuring it is ignored there (dropping
+  `ensure_gitignored_in_main` or its strict re-verify refusal); OR deriving
+  untracked-ness by ABSENCE from an untracked list (fail-OPEN – a name missing
+  from a `git ls-files --others` set is not proof it is tracked) instead of
+  positive tracked determination. Pull and Delete never touch main's ignore
+  rules.
 - **The reconcile set unions patterns across BOTH roots and classifies 4-way.**
   `compute_reconcile_set` expands the overlaid patterns against the worktree AND
   the main root (a main-only file is invisible to the worktree walk, and

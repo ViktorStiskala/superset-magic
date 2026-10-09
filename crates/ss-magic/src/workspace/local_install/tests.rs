@@ -297,6 +297,42 @@ fn malformed_config_local_json_errors_before_any_write() {
     assert!(!root.join(".superset/magic.local.json").exists());
 }
 
+/// KTD7 write order: the `info/exclude` rules are written AND verified by git
+/// before either JSON file. A committed `.gitignore` negation outranks
+/// `info/exclude`, so the verification fails – and because it runs first, the
+/// install errors with neither local file on disk and `git status` unchanged,
+/// rather than leaving an unignored `magic.local.json` showing up as untracked.
+fn assert_negation_refuses_before_json_writes(gitignore: &str) {
+    let (_dir, root) = repo();
+    write_file(&root, ".gitignore", gitignore);
+    commit_all(&root);
+    let before = porcelain(&root);
+
+    let result = run_local_init_noninteractive(&root, &strings(&[".env"]));
+    assert!(
+        result.is_err(),
+        "a tracked negation of `{gitignore}` must fail the install, got {result:?}"
+    );
+    assert!(!root.join(".superset/magic.local.json").exists());
+    assert!(!root.join(".superset/config.local.json").exists());
+    assert_eq!(porcelain(&root), before, "git status must not change");
+}
+
+/// A tracked `.gitignore` re-including `magic.local.json` fails at its own
+/// (first) rule, before any JSON file is written.
+#[test]
+fn ktd7_tracked_negation_of_magic_local_json_errors_before_json_writes() {
+    assert_negation_refuses_before_json_writes("!/.superset/magic.local.json\n");
+}
+
+/// A tracked `.gitignore` re-including the backups tree fails at the THIRD
+/// rule, after the two file rules succeeded – still before any JSON file is
+/// written, which is what pins the rules loop ahead of the writes.
+#[test]
+fn ktd7_tracked_negation_of_backups_dir_errors_before_json_writes() {
+    assert_negation_refuses_before_json_writes("!/.superset/backups/\n");
+}
+
 // ── Pattern-list semantics ────────────────────────────────────────────────────
 
 /// Non-interactive re-runs APPEND: a new pattern lands once, after the

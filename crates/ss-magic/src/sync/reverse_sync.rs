@@ -123,14 +123,25 @@ fn is_safe_rel(rel: &Path) -> bool {
 /// filesystem (macOS by default) a pattern spelled
 /// `.Superset/CONFIG.local.json` names the very same file; matching only the
 /// canonical spelling would let a pattern's capitalization bypass the rule.
+///
+/// Current-directory (`.`) components are skipped on both sides before the
+/// comparison, mirroring core's `under_excluded_tree`. A literal pattern
+/// reaches here unnormalized, and `Path::components` keeps a LEADING `.`, so
+/// without the skip `./.superset/config.local.json` would count three
+/// components against two and read as an ordinary path – letting the cockpit
+/// offer the file and a push write the worktree's setup commands into main.
 pub(crate) fn is_forward_only_rel(rel: &Path) -> bool {
+    use std::path::Component;
     // Core's `CONFIG_LOCAL_PATTERN` is the same constant a local install seeds
     // into `magic.local.json`, so the forward-synced pattern and this guard
     // always name one path. Equal component count plus pairwise
     // case-insensitive equality is "the same component sequence".
+    fn named(p: &Path) -> impl Iterator<Item = Component<'_>> {
+        p.components().filter(|c| !matches!(c, Component::CurDir))
+    }
     let want = Path::new(superset_files::CONFIG_LOCAL_PATTERN);
-    rel.components().count() == want.components().count()
-        && rel.components().zip(want.components()).all(|(a, b)| {
+    named(rel).count() == named(want).count()
+        && named(rel).zip(named(want)).all(|(a, b)| {
             a.as_os_str()
                 .to_string_lossy()
                 .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
