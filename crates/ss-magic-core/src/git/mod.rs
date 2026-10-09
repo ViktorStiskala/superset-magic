@@ -91,6 +91,18 @@ pub fn main_checkout_root(cwd_root: &Path) -> Result<PathBuf> {
         .with_context(|| format!("could not canonicalize {}", parent.display()))
 }
 
+/// Absolute, canonical path of the repository's shared git directory
+/// (`git rev-parse --git-common-dir`): the main checkout's `.git`, the same
+/// answer from the main checkout and from every linked worktree. This is where
+/// `info/exclude` lives – the one untracked ignore file git reads for the main
+/// checkout AND every linked worktree. A relative answer (git prints `.git`
+/// when run from the main checkout root) is resolved against `root`, as
+/// [`main_checkout_root`] does.
+pub fn git_common_dir(root: &Path) -> Result<PathBuf> {
+    let common = git(&["rev-parse", "--git-common-dir"], Some(root))?;
+    resolve(&common, root)
+}
+
 /// URL of the `origin` remote, or `None` when no origin is configured
 /// (remote config is shared, so this works from linked worktrees too).
 pub fn origin_url(cwd_root: &Path) -> Result<Option<String>> {
