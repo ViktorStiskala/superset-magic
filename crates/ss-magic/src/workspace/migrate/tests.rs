@@ -988,11 +988,14 @@ fn duplicate_sync_entry_warning_fires_for_committed_install_with_marker() {
         .expect("a committed install with the marker must warn");
     assert!(warning.contains("ss-magic sync"), "warning: {warning}");
     assert!(warning.contains(".superset/config.local.json"), "warning: {warning}");
+    assert!(warning.contains("twice"), "warning: {warning}");
 }
 
-/// The marker in a plain-array `setup` is the same duplicate.
+/// A plain-array `setup` REPLACES the committed one, so `magic.sh` never runs
+/// and the local entry is the only sync: the note must not call it a duplicate
+/// or tell the user to remove it (that would leave no sync at all).
 #[test]
-fn duplicate_sync_entry_warning_covers_the_array_form() {
+fn duplicate_sync_entry_warning_array_form_keeps_the_only_sync() {
     let repo = fresh();
     write_rel(repo.path(), ".superset/magic.json", r#"{"files":[]}"#);
     write_rel(
@@ -1000,7 +1003,43 @@ fn duplicate_sync_entry_warning_covers_the_array_form() {
         ".superset/config.local.json",
         r#"{"setup":["ss-magic sync","./mine.sh"]}"#,
     );
-    assert!(duplicate_sync_entry_warning(repo.path()).is_some());
+    let warning = duplicate_sync_entry_warning(repo.path())
+        .expect("the array form still gets a note");
+    assert!(warning.contains("plain array"), "warning: {warning}");
+    assert!(warning.contains("only sync"), "warning: {warning}");
+    assert!(!warning.contains("twice"), "warning: {warning}");
+    assert!(!warning.contains("Remove the"), "warning: {warning}");
+}
+
+/// A `setup` shape Superset does not support yields no warning (the committed
+/// flows never fail or advise on a file they do not own), even when it
+/// contains the command text.
+#[test]
+fn duplicate_sync_entry_warning_is_silent_on_an_unsupported_shape() {
+    let repo = fresh();
+    write_rel(repo.path(), ".superset/magic.json", r#"{"files":[]}"#);
+    for body in [
+        r#"{"setup":"ss-magic sync"}"#,
+        r#"{"setup":{"before":"x","after":["ss-magic sync"]}}"#,
+    ] {
+        write_rel(repo.path(), ".superset/config.local.json", body);
+        assert_eq!(duplicate_sync_entry_warning(repo.path()), None, "{body}");
+    }
+}
+
+/// An `after`-only marker in the wrap form still runs alongside the committed
+/// setup, so it is the duplicate case.
+#[test]
+fn duplicate_sync_entry_warning_counts_an_after_entry() {
+    let repo = fresh();
+    write_rel(repo.path(), ".superset/magic.json", r#"{"files":[]}"#);
+    write_rel(
+        repo.path(),
+        ".superset/config.local.json",
+        r#"{"setup":{"after":["ss-magic sync"]}}"#,
+    );
+    let warning = duplicate_sync_entry_warning(repo.path()).expect("must warn");
+    assert!(warning.contains("twice"), "warning: {warning}");
 }
 
 /// A local install's own entry is not a duplicate: it is the only one.

@@ -374,8 +374,16 @@ committable and must never leak.
   `info/exclude` has lower precedence than a tracked `.gitignore`: a tracked
   negation must become an error naming the path, never a silent leak. The local
   install refuses (exit 1, nothing written) beside a committed install (a
-  `magic.json`, or a `config.json` `setup` classified as migrate/normal) or when
-  either local file is tracked; it always targets the MAIN checkout, also when
+  `magic.json`, or a `config.json` `setup` classified as migrate/normal), when
+  either local file is tracked under ANY capitalization (the whole index is
+  listed and compared ASCII-case-insensitively, because a literal pathspec
+  misses `.superset/CONFIG.LOCAL.JSON` while a case-insensitive filesystem
+  writes straight into it; `:(icase)` magic is not used because
+  `GIT_LITERAL_PATHSPECS=1` silently disables it), or when `.superset` or either
+  local file is a symlink (the JSON writers rename onto a link's resolved
+  target, so an untracked `config.local.json -> config.json` link would rewrite
+  the tracked `config.json`; an `lstat` error other than not-found refuses
+  too); it always targets the MAIN checkout, also when
   run from a worktree; and it validates every input in memory, then writes the
   `info/exclude` rules, and only then the two JSON files, so a failure leaves at
   most untracked exclude lines, never an unignored local file. Flag: any path of
@@ -384,7 +392,13 @@ committable and must never leak.
   to `.gitignore`; an `info/exclude` append without the git re-check; a
   `config.local.json` rewrite when the merge changed nothing; or a `setup` merge
   that drops an existing entry or key, or overwrites a `setup` of an unexpected
-  JSON type instead of refusing it.
+  JSON type instead of refusing it. `superset_files::classify_local_setup`
+  checks the SHAPE before the marker (`setup` must be an array or an object
+  whose `before`/`after` are absent or arrays, and the marker counts only in
+  their string items), so `{"setup": "ss-magic sync"}` is refused rather than
+  read as already registered. Also flag a tracked-file check that relies on a
+  literal pathspec, or a symlink check that resolves the link instead of
+  refusing it.
 - **`.superset/config.local.json` NEVER reverse-syncs into main.** It holds
   commands Superset runs for every new workspace, so a worktree edit must not
   reach main through reverse sync. `is_forward_only_rel` (component-wise,
@@ -394,11 +408,18 @@ committable and must never leak.
   it is deliberately NOT an `EXCLUDED_TREES` entry. Flag a reverse-sync path
   that can push, merge or delete it, a filter applied to a downstream list
   instead of both candidate computations, or its addition to `EXCLUDED_TREES`.
+  The comparison is core's `superset_files::rel_eq_ignore_ascii_case`, shared
+  with the local install's tracked-file refusal. The guard is path-based by
+  design: whatever the file runs or links to is ordinary sync content.
 - When a committed install coexists with a `config.local.json` whose `setup`
-  still carries `ss-magic sync`, Superset would run the sync twice per
-  workspace; the main-checkout menu and committed `init` print a warning
-  (`migrate::duplicate_sync_entry_warning`). It is advisory: a malformed or
-  unreadable `config.local.json` yields no warning, never an error. Flag making
+  still carries `ss-magic sync`, the main-checkout menu and committed `init`
+  print a warning (`migrate::duplicate_sync_entry_warning`), and its advice
+  depends on the form. A `{before, after}` object WRAPS the committed setup,
+  so the sync runs twice and the advice is to remove the local entry. A plain
+  array REPLACES the committed setup (`magic.sh` never runs), so that entry is
+  the only sync and the warning must NOT tell the user to remove it. It is
+  advisory: a malformed or unreadable `config.local.json`, or an unsupported
+  `setup` shape, yields no warning, never an error. Flag making
   that warning fatal or letting a committed flow rewrite `config.local.json`.
 - `git/gitignore.rs::ensure_entry` appends a line only if no exact match exists,
   creates the file if absent, and never reorders. Flag changes that reorder or

@@ -25,9 +25,10 @@
 //!   its patterns from the main root – an install written into a worktree would
 //!   never be read).
 //! - **Refuse beside a committed install** (R9): a `magic.json`, a
-//!   `config.json` `setup` that `migrate::detect_branch` recognizes, or either
-//!   local file being TRACKED (writing it would dirty the working tree) refuses
-//!   with exit 1 before anything is written.
+//!   `config.json` `setup` that `migrate::detect_branch` recognizes, either
+//!   local file being TRACKED under any capitalization, or `.superset` or
+//!   either local file being a symlink (both would let the install dirty the
+//!   working tree) refuses with exit 1 before anything is written.
 //! - **Validate everything, then ignore, then write** (KTD7 in the plan: there
 //!   is no commit prompt because there is nothing to commit; every input is
 //!   parsed and merged in memory first, the `info/exclude` rules are written and
@@ -57,6 +58,9 @@ use crate::workspace::superset_files::{
     self, InstallMode, LocalConfigMerge, MagicConfig, CONFIG_LOCAL_PATTERN, MAGIC_LOCAL_PATTERN,
 };
 use ss_magic_core::state_tree::STATE_REL;
+
+/// The `.superset` directory both local files live in, relative to the root.
+const SUPERSET_DIR_REL: &str = ".superset";
 
 /// The binary Superset must be able to resolve when it runs the registered
 /// `ss-magic sync` setup step.
@@ -154,10 +158,19 @@ fn begin(cwd_root: &Path) -> Result<Option<(PathBuf, Prepared)>> {
 /// Refuses (R9) when the main checkout already carries a committed install –
 /// a `magic.json`, or a `config.json` `setup` that the committed flow's
 /// [`migrate::detect_branch`] classifies as `Migrate` (the retired `setup.sh`)
-/// or `Normal` (the `magic.sh` / `ss-magic sync` marker) – or when either local
-/// file is tracked by git, since rewriting a tracked file would show up in
-/// `git status` and a local install must change no tracked file. A malformed
-/// `config.json` is an error naming the path, never a guess.
+/// or `Normal` (the `magic.sh` / `ss-magic sync` marker) – or when the install
+/// could end up writing a tracked file, which would show up in `git status`
+/// when a local install must change no tracked file:
+///
+/// - `.superset` or either local file is a symlink ([`symlink_refusal`]): the
+///   JSON writers rename onto a link's resolved target, so an untracked link to
+///   `config.json` would rewrite that tracked file. An `lstat` failure refuses
+///   too.
+/// - either local file is tracked under any capitalization
+///   ([`tracked_refusal`]): on a case-insensitive filesystem the canonical
+///   path would rewrite a differently-cased tracked entry.
+///
+/// A malformed `config.json` is an error naming the path, never a guess.
 fn refusal(main_root: &Path) -> Result<Option<String>> {
     let mode = superset_files::install_mode(main_root);
     if mode == InstallMode::Committed {
@@ -187,16 +200,75 @@ fn refusal(main_root: &Path) -> Result<Option<String>> {
         // `Local` is this module's own install being re-run or edited.
         Branch::Init | Branch::Local => {}
     }
-    let tracked = git::tracked_files(main_root, &[MAGIC_LOCAL_PATTERN, CONFIG_LOCAL_PATTERN])?;
-    if let Some(path) = tracked.first() {
-        return Ok(Some(format!(
-            "{} is tracked by git, and a local install must not change a tracked file. \
-             Untrack it first (`git rm --cached {}`), then re-run.",
-            path.display(),
-            path.display()
-        )));
+    if let Some(reason) = symlink_refusal(main_root)? {
+        return Ok(Some(reason));
+    }
+    tracked_refusal(main_root)
+}
+
+/// Refuse when `.superset`, `.superset/magic.local.json` or
+/// `.superset/config.local.json` in `main_root` is a symlink.
+///
+/// The JSON writers commit through a staged sibling plus `rename` onto the
+/// path's RESOLVED target (core's `write_atomically`, which follows links on
+/// purpose for the plugin's config writer). The tracked-file check only sees
+/// the link's own name, so an untracked `config.local.json -> config.json`
+/// link would pass it and the install would rewrite the tracked
+/// `config.json`. Refusing every link is stricter than resolving and
+/// re-checking the target, and also covers a link that leaves the repository.
+/// An `lstat` failure other than "not found" refuses too: an unknown answer
+/// must never let the write through.
+fn symlink_refusal(main_root: &Path) -> Result<Option<String>> {
+    for rel in [SUPERSET_DIR_REL, MAGIC_LOCAL_PATTERN, CONFIG_LOCAL_PATTERN] {
+        match std::fs::symlink_metadata(main_root.join(rel)) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Ok(Some(format!(
+                    "{rel} is a symlink. A local install writes its files in place and never \
+                     through a link, which could rewrite a tracked file. Replace it with a \
+                     regular file or directory, then re-run."
+                )))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Ok(Some(format!(
+                    "could not check whether {rel} is a symlink ({e}), so a local install \
+                     will not write it"
+                )))
+            }
+        }
     }
     Ok(None)
+}
+
+/// Refuse when the index tracks either local file under ANY capitalization.
+///
+/// A literal `git ls-files -- .superset/config.local.json` misses an index
+/// entry spelled `.superset/CONFIG.LOCAL.JSON`, yet on a case-insensitive
+/// filesystem (macOS by default) writing the lowercase path rewrites that
+/// tracked file. So the whole index is listed and each entry compared with
+/// core's case-insensitive [`superset_files::rel_eq_ignore_ascii_case`] (the
+/// same rule reverse sync's forward-only filter uses). `:(icase)` pathspec
+/// magic is deliberately not used: `GIT_LITERAL_PATHSPECS=1` in the
+/// environment turns magic off, the pathspec then matches nothing, and the
+/// check would pass when it must refuse. Listing the index once is cheap for
+/// a one-shot command.
+fn tracked_refusal(main_root: &Path) -> Result<Option<String>> {
+    let tracked = git::tracked_files(main_root, &[])?;
+    let hit = tracked.iter().find(|path| {
+        [MAGIC_LOCAL_PATTERN, CONFIG_LOCAL_PATTERN]
+            .iter()
+            .any(|rel| superset_files::rel_eq_ignore_ascii_case(path, Path::new(rel)))
+    });
+    Ok(hit.map(|path| {
+        format!(
+            "{} is tracked by git, and a local install must not change a tracked file. \
+             Untrack it first (`git rm --cached {}`), then re-run. If it is a symlink, \
+             also replace it with a regular file.",
+            path.display(),
+            path.display()
+        )
+    }))
 }
 
 /// Load and validate both inputs in memory: the existing `magic.local.json`

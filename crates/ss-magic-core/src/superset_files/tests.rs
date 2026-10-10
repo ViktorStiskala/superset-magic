@@ -1084,15 +1084,70 @@ fn local_merge_refuses_a_non_array_before() {
 }
 
 #[test]
-fn local_setup_marker_test_covers_every_shape() {
-    assert!(setup_has_sync_marker(&json!("ss-magic sync")));
-    assert!(setup_has_sync_marker(&json!(["a", "ss-magic sync"])));
-    assert!(setup_has_sync_marker(&json!({"before": ["ss-magic sync"]})));
-    assert!(setup_has_sync_marker(&json!({"after": ["ss-magic sync"]})));
-    assert!(!setup_has_sync_marker(&json!(["./magic.sh sync"])));
-    assert!(!setup_has_sync_marker(&json!({"before": ["ss-magic-plugin status"]})));
-    assert!(!setup_has_sync_marker(&json!(null)));
-    assert!(!setup_has_sync_marker(&json!(7)));
+fn local_merge_refuses_a_non_array_after() {
+    let existing = obj(json!({"setup": {"after": "./one.sh"}}));
+    let err = merge_sync_entry_into_local_config(Some(&existing)).unwrap_err();
+    assert!(format!("{err:#}").contains("setup.after"), "{err:#}");
+}
+
+/// The shape is validated BEFORE the marker shortcut: a value that contains the
+/// command in a place Superset would not run it as a setup step must be
+/// refused, not reported as already registered.
+#[test]
+fn local_merge_refuses_an_unsupported_shape_even_when_it_carries_the_marker() {
+    for bad in [
+        json!("ss-magic sync"),
+        json!({"before": "./one.sh", "after": ["ss-magic sync"]}),
+        json!({"before": ["ss-magic sync"], "after": 3}),
+    ] {
+        let existing = obj(json!({"setup": bad}));
+        assert!(
+            merge_sync_entry_into_local_config(Some(&existing)).is_err(),
+            "{bad} must be refused"
+        );
+    }
+}
+
+#[test]
+fn classify_local_setup_covers_every_shape() {
+    use LocalSetup::*;
+    let c = |v: Value| classify_local_setup(&v);
+    assert_eq!(c(json!(["a", "ss-magic sync"])), Replace { has_marker: true });
+    assert_eq!(c(json!(["./magic.sh sync"])), Replace { has_marker: false });
+    assert_eq!(c(json!([])), Replace { has_marker: false });
+    assert_eq!(c(json!({"before": ["ss-magic sync"]})), Wrap { has_marker: true });
+    assert_eq!(c(json!({"after": ["ss-magic sync"]})), Wrap { has_marker: true });
+    assert_eq!(c(json!({})), Wrap { has_marker: false });
+    assert_eq!(
+        c(json!({"before": ["ss-magic-plugin status"]})),
+        Wrap { has_marker: false }
+    );
+    // Only `before` / `after` are commands: a marker under another key or
+    // nested deeper than a string item does not count.
+    assert_eq!(c(json!({"note": "ss-magic sync"})), Wrap { has_marker: false });
+    assert_eq!(c(json!([["ss-magic sync"]])), Replace { has_marker: false });
+    for bad in [
+        json!("ss-magic sync"),
+        json!(null),
+        json!(7),
+        json!(true),
+        json!({"before": "x"}),
+        json!({"after": {"a": 1}}),
+    ] {
+        assert!(matches!(c(bad.clone()), Unsupported(_)), "{bad}");
+    }
+}
+
+#[test]
+fn rel_eq_ignore_ascii_case_compares_components() {
+    let eq = |a: &str, b: &str| rel_eq_ignore_ascii_case(Path::new(a), Path::new(b));
+    assert!(eq(".superset/config.local.json", ".superset/config.local.json"));
+    assert!(eq(".Superset/CONFIG.LOCAL.JSON", ".superset/config.local.json"));
+    assert!(eq("./.superset/config.local.json", ".superset/config.local.json"));
+    assert!(eq(".superset/./config.local.json", ".superset/config.local.json"));
+    assert!(!eq("apps/.superset/config.local.json", ".superset/config.local.json"));
+    assert!(!eq(".superset/config.local.json.bak", ".superset/config.local.json"));
+    assert!(!eq(".superset", ".superset/config.local.json"));
 }
 
 #[test]

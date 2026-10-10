@@ -125,27 +125,19 @@ fn is_safe_rel(rel: &Path) -> bool {
 /// canonical spelling would let a pattern's capitalization bypass the rule.
 ///
 /// Current-directory (`.`) components are skipped on both sides before the
-/// comparison, mirroring core's `under_excluded_tree`. A literal pattern
-/// reaches here unnormalized, and `Path::components` keeps a LEADING `.`, so
-/// without the skip `./.superset/config.local.json` would count three
-/// components against two and read as an ordinary path – letting the cockpit
-/// offer the file and a push write the worktree's setup commands into main.
+/// comparison. A literal pattern reaches here unnormalized, and
+/// `Path::components` keeps a LEADING `.`, so without the skip
+/// `./.superset/config.local.json` would read as an ordinary path – letting the
+/// cockpit offer the file and a push write the worktree's setup commands into
+/// main. Core's [`superset_files::rel_eq_ignore_ascii_case`] owns both rules;
+/// the local install's tracked-file refusal uses the same helper.
+///
+/// The guard is path-based: it protects the file by its own name. Whatever
+/// `config.local.json` runs or links to (a script, a symlink target) is
+/// ordinary sync content when a pattern matches it, as for any setup command
+/// that executes a synced, untracked file.
 pub(crate) fn is_forward_only_rel(rel: &Path) -> bool {
-    use std::path::Component;
-    // Core's `CONFIG_LOCAL_PATTERN` is the same constant a local install seeds
-    // into `magic.local.json`, so the forward-synced pattern and this guard
-    // always name one path. Equal component count plus pairwise
-    // case-insensitive equality is "the same component sequence".
-    fn named(p: &Path) -> impl Iterator<Item = Component<'_>> {
-        p.components().filter(|c| !matches!(c, Component::CurDir))
-    }
-    let want = Path::new(superset_files::CONFIG_LOCAL_PATTERN);
-    named(rel).count() == named(want).count()
-        && named(rel).zip(named(want)).all(|(a, b)| {
-            a.as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
-        })
+    superset_files::rel_eq_ignore_ascii_case(rel, Path::new(superset_files::CONFIG_LOCAL_PATTERN))
 }
 
 /// Compute reverse-sync candidates for `worktree_root` (R23, KTD10):

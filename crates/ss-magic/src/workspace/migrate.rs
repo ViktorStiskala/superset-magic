@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 use crate::git;
 use crate::git::gitignore;
 use crate::sync::reverse_sync;
-use crate::workspace::superset_files::{self, Config, InstallMode, MAGIC_LOCAL_PATTERN};
+use crate::workspace::superset_files::{self, Config, InstallMode, LocalSetup, MAGIC_LOCAL_PATTERN};
 use crate::tui::style;
 use crate::tui::ui::{self, FinalAction};
 use ss_magic_core::state_tree;
@@ -182,7 +182,7 @@ fn entry_is_setup_sh(entry: &str) -> bool {
 
 /// True when a `setup` entry references the new wrapper (`magic.sh`) or the
 /// bare sync command a local install registers ([`superset_files::LOCAL_SYNC_ENTRY`],
-/// shared with core's `setup_has_sync_marker` so the committed-install detector
+/// shared with core's `classify_local_setup` so the committed-install detector
 /// and the local install's merge/duplicate check recognize one marker).
 fn entry_is_magic_marker(entry: &str) -> bool {
     entry.contains("magic.sh") || entry.contains(superset_files::LOCAL_SYNC_ENTRY)
@@ -228,29 +228,48 @@ pub fn detect_branch(config: Option<&Config>, mode: InstallMode) -> Branch {
 /// exists in `root` (a `magic.json`) AND Superset's per-machine
 /// `.superset/config.local.json` still registers `ss-magic sync` in its
 /// `setup` – typically left behind by a local install that was later turned
-/// into a committed one. Superset then runs the sync twice for every new
-/// workspace: once from the committed `config.json` and once from the local
-/// override.
+/// into a committed one.
 ///
-/// Advisory only: an unreadable or malformed `config.local.json` yields `None`
-/// rather than an error, because the committed flows do not own that file and
-/// must not fail on it.
+/// What that means depends on the `setup` form (Superset's local-config merge
+/// rule, see [`superset_files::LocalSetup`]):
+///
+/// - a `{before, after}` object WRAPS the committed setup, so Superset runs the
+///   sync twice for every new workspace – once from the committed
+///   `config.json` (via `magic.sh`) and once from the override. The advice is
+///   to remove the local entry.
+/// - a plain array REPLACES the committed setup, so `magic.sh` never runs on
+///   this machine and the local entry is the ONLY sync. Advising its removal
+///   would leave workspaces with no synced files, so this form gets a
+///   different note: keep the entry while the array stays, or drop the local
+///   `setup` key to run the committed setup instead.
+///
+/// Advisory only: an unreadable or malformed `config.local.json`, or a `setup`
+/// of a shape Superset does not support, yields `None` rather than an error,
+/// because the committed flows do not own that file and must not fail on it.
 pub fn duplicate_sync_entry_warning(root: &Path) -> Option<String> {
     if superset_files::install_mode(root) != InstallMode::Committed {
         return None;
     }
     let local = superset_files::load_config_local_json(root).ok()??;
     let setup = local.get("setup")?;
-    if !superset_files::setup_has_sync_marker(setup) {
-        return None;
+    let entry = superset_files::LOCAL_SYNC_ENTRY;
+    match superset_files::classify_local_setup(setup) {
+        LocalSetup::Wrap { has_marker: true } => Some(format!(
+            "warning: .superset/config.local.json still registers `{entry}` in its setup, and \
+             this repository has a committed ss-magic install (.superset/magic.json), so Superset \
+             runs the sync twice for every new workspace. Remove the `{entry}` entry from \
+             .superset/config.local.json."
+        )),
+        LocalSetup::Replace { has_marker: true } => Some(format!(
+            "warning: .superset/config.local.json's setup is a plain array, which replaces the \
+             committed setup in .superset/config.json on this machine: .superset/magic.sh never \
+             runs here, and the `{entry}` entry in the array is this checkout's only sync. Keep \
+             it while the array form stays. To run the committed setup instead, delete the \
+             `setup` key from .superset/config.local.json (or turn it into a \
+             {{\"before\": [...]}} object without the `{entry}` entry)."
+        )),
+        _ => None,
     }
-    Some(format!(
-        "warning: .superset/config.local.json still registers `{entry}` in its setup, and \
-         this repository has a committed ss-magic install (.superset/magic.json), so Superset \
-         runs the sync twice for every new workspace. Remove the `{entry}` entry from \
-         .superset/config.local.json.",
-        entry = superset_files::LOCAL_SYNC_ENTRY
-    ))
 }
 
 /// Print the R13 warning for `root` when it applies (see

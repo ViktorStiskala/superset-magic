@@ -299,10 +299,19 @@ The modules, by purpose:
   `LocalConfigMerge { config, changed }` that inserts `LOCAL_SYNC_ENTRY`
   (`ss-magic sync`) into `setup.before`, or at the front of `setup` when that
   is a plain array, leaving every other key and every existing setup entry
-  alone; it changes nothing (so the file is not rewritten) when
-  `setup_has_sync_marker` finds `ss-magic sync` anywhere in `setup`, and refuses
-  a `setup` of any other JSON type (a string, a number, `null`, or an object
-  whose `before` is not an array) rather than overwriting it.
+  alone. It first classifies the value with `classify_local_setup`, which
+  returns `LocalSetup::{Replace { has_marker }, Wrap { has_marker },
+  Unsupported(reason)}` (a plain array replaces the committed setup; a
+  `{before, after}` object whose `before` and `after` are each absent or an
+  array wraps it; the marker counts only in those arrays' string items). An
+  `Unsupported` shape (a string, a number, `null`, or an object whose `before`
+  or `after` is not an array) is refused rather than overwritten, a supported
+  shape that already carries the marker changes nothing (so the file is not
+  rewritten), and the SHAPE is checked before the marker, so
+  `{"setup": "ss-magic sync"}` is refused rather than read as registered.
+  `rel_eq_ignore_ascii_case(a, b)` is the component-wise, ASCII-case-insensitive
+  path comparison (skipping `.` components) shared by reverse sync's
+  forward-only filter and the local install's tracked-file refusal.
   `write_config_local_json` commits through the same staged-sibling-plus-rename
   helper as `write_magic_json`. Because serde_json's `preserve_order` stays off,
   rewriting the map sorts its keys alphabetically – values survive, and an
@@ -494,12 +503,17 @@ The modules, by purpose:
   `duplicate_sync_entry_warning(root)` / `print_duplicate_sync_entry_warning`
   implement R13: when the mode is `Committed` and `config.local.json`'s `setup`
   still carries `ss-magic sync` (typically a local install later turned into a
-  committed one), Superset would run the sync twice per workspace, so the
-  main-checkout menu and committed `run_init` / `run_init_noninteractive` warn.
+  committed one), the main-checkout menu and committed `run_init` /
+  `run_init_noninteractive` warn. The advice follows the `setup` form
+  (`classify_local_setup`): a `{before, after}` object wraps the committed
+  setup, so Superset runs the sync twice and the warning says to remove the
+  local entry; a plain array REPLACES the committed setup, so `magic.sh` never
+  runs, the local entry is the only sync, and the warning says to keep it (or
+  delete the local `setup` key to run the committed setup).
   Committed init checks AFTER it writes `magic.json`, which is the moment the
   duplicate comes into being. The warning is advisory: an unreadable or
-  malformed `config.local.json` yields no warning rather than an error, because
-  the committed flows do not own that file. Stages renames/writes/deletes into a tempdir
+  malformed `config.local.json`, or an unsupported `setup` shape, yields no
+  warning rather than an error, because the committed flows do not own that file. Stages renames/writes/deletes into a tempdir
   and materializes via `copy_into_repo` only after the finishing-action
   prompt. `run_init_noninteractive` is the TUI-free init behind
   `ss-magic init` (writes the layout from CLI patterns, no prompt, not
@@ -530,17 +544,26 @@ The modules, by purpose:
   `config.local.json` and sync loads patterns from the main root (KTD6 of the
   plan: an install written into a worktree would never be read); (2) `refusal`
   returns exit 1 with nothing written (R9) when `install_mode` is `Committed`,
-  when `detect_branch` says `Migrate` or `Normal`, or when either local file is
-  TRACKED by git (checked with `git::tracked_files`, so an unenumerable name
-  fails closed as tracked) – a malformed `config.json` is an error naming the
-  path; (3) validate everything, then ignore, then write (KTD7): `prepare` parses
+  when `detect_branch` says `Migrate` or `Normal`, when `.superset` or either
+  local file is a symlink (`symlink_refusal`: the JSON writers rename onto a
+  link's resolved target, so an untracked `config.local.json -> config.json`
+  link would rewrite the tracked `config.json`; an `lstat` error other than
+  not-found refuses too), or when either local file is TRACKED by git under
+  any capitalization (`tracked_refusal` lists the whole index with
+  `git::tracked_files` and compares each entry with
+  `superset_files::rel_eq_ignore_ascii_case`, because a literal pathspec
+  misses `.superset/CONFIG.LOCAL.JSON` while a case-insensitive filesystem
+  writes into it; `:(icase)` magic is avoided since `GIT_LITERAL_PATHSPECS=1`
+  disables it) – a malformed `config.json` is an error naming the path; (3) validate everything, then ignore, then write (KTD7): `prepare` parses
   `magic.local.json` and merges `config.local.json` in memory first (a malformed
   file fails before any byte is written), `commit` then writes the four
   `LocalExclude` rules – `.superset/magic.local.json`, `.superset/config.local.json`,
   `.superset/backups/`, `.superset/.magic/` – each verified by git, and only then
   `magic.local.json` and, when the merge changed it, `config.local.json`, so a
   failure part-way leaves at most untracked exclude lines, never an unignored local
-  file. There is no finishing-action prompt (nothing to commit); the interactive
+  file (one known limit: a hard kill between a writer's staging write and its
+  `rename` can leave an unignored `.superset/.<name>.<pid>.<seq>.tmp`, which
+  `git status` shows as untracked). There is no finishing-action prompt (nothing to commit); the interactive
   picker is the confirmation and Esc there returns before any write. (4) KTD8:
   the interactive entry REPLACES the list (`selection_files`: the local defaults,
   then the picker selection, so deselecting removes a pattern; the defaults are
@@ -574,9 +597,10 @@ The modules, by purpose:
   `under_excluded_tree` filter (`is_forward_only_rel`, KTD9 of the local-install
   plan; R12): it holds commands Superset runs for every new workspace, so a
   worktree edit must never reach main through reverse sync, bulk or cockpit. The
-  comparison is component-wise and ASCII-case-insensitive (a case-insensitive
-  filesystem names the same file with another spelling), applies in every
-  install mode, and is NOT an `EXCLUDED_TREES` entry because that list also
+  comparison is core's component-wise, ASCII-case-insensitive
+  `rel_eq_ignore_ascii_case` (a case-insensitive filesystem names the same file
+  with another spelling), is path-based by design (whatever the file runs or
+  links to is ordinary sync content), applies in every install mode, and is NOT an `EXCLUDED_TREES` entry because that list also
   removes paths from forward sync and pack – forward sync still copies the file.
   `backup_forward_targets` is the pre-copy backup pass for the forward
   `ss-magic sync` (main → worktree), backing up under `cwd`'s

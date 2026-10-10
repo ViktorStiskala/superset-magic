@@ -52,7 +52,7 @@ pub const CONFIG_LOCAL_PATTERN: &str = ".superset/config.local.json";
 /// The literal setup command a local install registers in `config.local.json`.
 /// Superset runs it directly (a local install writes no `magic.sh` wrapper, as
 /// the wrapper would be a committed file). The CLI's committed-install detector
-/// (`entry_is_magic_marker`) and [`setup_has_sync_marker`] both match on this
+/// (`entry_is_magic_marker`) and [`classify_local_setup`] both match on this
 /// constant, so the entry written and the entry recognized cannot drift apart.
 pub const LOCAL_SYNC_ENTRY: &str = "ss-magic sync";
 
@@ -354,19 +354,91 @@ pub fn local_install_default_files() -> Vec<String> {
     vec![MAGIC_LOCAL_PATTERN.to_string(), CONFIG_LOCAL_PATTERN.to_string()]
 }
 
-/// Whether a `setup` value (any JSON shape) already registers `ss-magic sync`.
+/// The shape of a `config.local.json` `setup` value, as Superset reads it.
 ///
-/// Walks strings, arrays and objects (so both Superset forms are covered: the
-/// plain array that replaces the committed key and the `{before, after}`
-/// object that wraps it) and reports true when any string contains
-/// [`LOCAL_SYNC_ENTRY`]. Numbers, booleans and null never match.
-pub fn setup_has_sync_marker(setup: &serde_json::Value) -> bool {
-    match setup {
-        serde_json::Value::String(s) => s.contains(LOCAL_SYNC_ENTRY),
-        serde_json::Value::Array(items) => items.iter().any(setup_has_sync_marker),
-        serde_json::Value::Object(map) => map.values().any(setup_has_sync_marker),
-        _ => false,
+/// Superset merges `config.local.json` over the committed `config.json` per
+/// key: a plain array REPLACES the committed `setup`, and a `{before, after}`
+/// object WRAPS it (`before` runs first, then the committed steps, then
+/// `after`). Anything else is a shape this tool will not guess at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalSetup {
+    /// A plain array: the committed `setup` never runs on this machine.
+    /// `has_marker` is true when one of its strings contains
+    /// [`LOCAL_SYNC_ENTRY`].
+    Replace { has_marker: bool },
+    /// A `{before, after}` object whose `before` and `after` are each absent or
+    /// an array. `has_marker` is true when a string in either contains
+    /// [`LOCAL_SYNC_ENTRY`]; other keys are not commands and never count.
+    Wrap { has_marker: bool },
+    /// Any other value: a string, number, boolean or null `setup`, or an
+    /// object whose `before` or `after` is not an array. The payload says
+    /// which, ready for an error message.
+    Unsupported(String),
+}
+
+/// Classify a `setup` value (see [`LocalSetup`]).
+///
+/// The marker is only looked for in the places Superset actually runs as
+/// commands, and only once the shape is known to be supported, so a value such
+/// as `{"setup": "ss-magic sync"}` is `Unsupported`, never "already wired up".
+pub fn classify_local_setup(setup: &serde_json::Value) -> LocalSetup {
+    use serde_json::Value;
+
+    fn has_marker(items: &[Value]) -> bool {
+        items
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.contains(LOCAL_SYNC_ENTRY)))
     }
+
+    match setup {
+        Value::Array(items) => LocalSetup::Replace {
+            has_marker: has_marker(items),
+        },
+        Value::Object(map) => {
+            let mut marker = false;
+            for key in ["before", "after"] {
+                match map.get(key) {
+                    None => {}
+                    Some(Value::Array(items)) => marker |= has_marker(items),
+                    Some(other) => {
+                        return LocalSetup::Unsupported(format!(
+                            "`setup.{key}` in {CONFIG_LOCAL_JSON} is {}, not an array",
+                            json_type_name(other)
+                        ))
+                    }
+                }
+            }
+            LocalSetup::Wrap { has_marker: marker }
+        }
+        other => LocalSetup::Unsupported(format!(
+            "`setup` in {CONFIG_LOCAL_JSON} is {}, not an array or a {{before, after}} object",
+            json_type_name(other)
+        )),
+    }
+}
+
+/// Whether two repo-relative paths name the same file on a case-insensitive
+/// filesystem: the same component sequence, compared with ASCII case ignored.
+///
+/// Current-directory (`.`) components are skipped on both sides first, because
+/// `Path::components` keeps a LEADING `.`, so `./.superset/config.local.json`
+/// would otherwise count one component more than `.superset/config.local.json`.
+/// The comparison is component-wise, so `apps/.superset/config.local.json` is a
+/// different path. Used wherever a guard protects one of the local-install
+/// files by name: a different capitalization reaches the very same file on
+/// macOS's default filesystem, and a guard matching only the canonical
+/// spelling would let it through.
+pub fn rel_eq_ignore_ascii_case(a: &Path, b: &Path) -> bool {
+    use std::path::Component;
+    fn named(p: &Path) -> impl Iterator<Item = Component<'_>> {
+        p.components().filter(|c| !matches!(c, Component::CurDir))
+    }
+    named(a).count() == named(b).count()
+        && named(a).zip(named(b)).all(|(x, y)| {
+            x.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&y.as_os_str().to_string_lossy())
+        })
 }
 
 /// Result of [`merge_sync_entry_into_local_config`]: the document to write and
@@ -404,12 +476,14 @@ pub fn load_config_local_json(
 ///   created when missing; `after` and any other key are untouched.
 /// - `setup` a plain array (the replace form): the entry is prepended to that
 ///   array, keeping the form the user chose.
-/// - the marker already appears anywhere in `setup` ([`setup_has_sync_marker`]):
+/// - a supported shape that already runs the marker ([`classify_local_setup`]):
 ///   nothing changes and `changed` is false.
 /// - `setup` of any other JSON type (string, number, bool, null), or an object
-///   whose `before` is not an array: refused with an error rather than
-///   overwritten, because guessing at a shape Superset may interpret
-///   differently could discard the user's own setup.
+///   whose `before` or `after` is not an array: refused with an error rather
+///   than overwritten, because guessing at a shape Superset may interpret
+///   differently could discard the user's own setup. The shape is checked
+///   BEFORE the marker, so `{"setup": "ss-magic sync"}` is refused too: it
+///   contains the command but Superset would not run it as a setup step.
 ///
 /// Every other top-level key (`teardown`, `run`, unknown ones) keeps its value.
 /// The map is serde_json's default sorted map, so a rewritten file orders its
@@ -431,27 +505,25 @@ pub fn merge_sync_entry_into_local_config(
         return Ok(LocalConfigMerge { config, changed: true });
     };
 
-    if setup_has_sync_marker(setup) {
-        return Ok(LocalConfigMerge { config, changed: false });
+    match classify_local_setup(setup) {
+        LocalSetup::Unsupported(reason) => bail!("{reason}; fix it by hand, then re-run"),
+        LocalSetup::Replace { has_marker: true } | LocalSetup::Wrap { has_marker: true } => {
+            return Ok(LocalConfigMerge { config, changed: false });
+        }
+        LocalSetup::Replace { has_marker: false } | LocalSetup::Wrap { has_marker: false } => {}
     }
 
+    // The classification above established the shape: an array, or an object
+    // whose `before` is absent or an array.
     match setup {
         Value::Array(items) => items.insert(0, entry()),
         Value::Object(map) => match map.get_mut("before") {
-            None => {
+            Some(Value::Array(items)) => items.insert(0, entry()),
+            _ => {
                 map.insert("before".to_string(), Value::Array(vec![entry()]));
             }
-            Some(Value::Array(items)) => items.insert(0, entry()),
-            Some(other) => bail!(
-                "`setup.before` in {CONFIG_LOCAL_JSON} is {}, not an array; fix it by hand, then re-run",
-                json_type_name(other)
-            ),
         },
-        other => bail!(
-            "`setup` in {CONFIG_LOCAL_JSON} is {}, not an array or a {{before, after}} object; \
-             fix it by hand, then re-run",
-            json_type_name(other)
-        ),
+        _ => unreachable!("classify_local_setup accepts only arrays and objects"),
     }
     Ok(LocalConfigMerge { config, changed: true })
 }

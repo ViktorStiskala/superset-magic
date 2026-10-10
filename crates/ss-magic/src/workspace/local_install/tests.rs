@@ -279,6 +279,70 @@ fn tracked_magic_local_json_refuses() {
     assert_eq!(snapshot(&root), before);
 }
 
+/// A tracked local file under a different capitalization refuses: on a
+/// case-insensitive filesystem writing the canonical path would rewrite it,
+/// and a literal pathspec does not find it. The check is name-based, so this
+/// runs the same on case-sensitive CI.
+#[test]
+fn tracked_local_file_in_another_case_refuses() {
+    for rel in [".superset/CONFIG.LOCAL.JSON", ".Superset/magic.local.json"] {
+        let (_dir, root) = repo();
+        write_file(&root, rel, "{}\n");
+        commit_all(&root);
+        let before = snapshot(&root);
+        let porcelain_before = porcelain(&root);
+
+        let code = run_local_init_noninteractive(&root, &[]).unwrap();
+        assert_eq!(exit_code_to_u8(code), 1, "{rel}");
+        assert_eq!(snapshot(&root), before, "{rel}");
+        assert_eq!(porcelain(&root), porcelain_before, "{rel}");
+
+        let reason = refusal(&root).unwrap().expect("must refuse");
+        assert!(reason.contains(rel), "names the index spelling: {reason}");
+    }
+}
+
+/// An UNTRACKED symlink at either local file refuses: the JSON writers follow
+/// a link onto its target, so `config.local.json -> config.json` would
+/// otherwise rewrite the tracked `config.json` while reporting nothing to
+/// commit.
+#[cfg(unix)]
+#[test]
+fn symlinked_local_file_refuses_and_leaves_the_target_alone() {
+    for rel in [".superset/config.local.json", ".superset/magic.local.json"] {
+        let (_dir, root) = repo();
+        write_file(&root, ".superset/config.json", r#"{"setup": ["bun install"]}"#);
+        commit_all(&root);
+        std::os::unix::fs::symlink("config.json", root.join(rel)).unwrap();
+        let before = snapshot(&root);
+        let porcelain_before = porcelain(&root);
+
+        let code = run_local_init_noninteractive(&root, &strings(&[".env"])).unwrap();
+        assert_eq!(exit_code_to_u8(code), 1, "{rel}");
+        assert_eq!(snapshot(&root), before, "{rel}");
+        assert_eq!(porcelain(&root), porcelain_before, "{rel}");
+
+        let reason = refusal(&root).unwrap().expect("must refuse");
+        assert!(reason.contains("symlink"), "{reason}");
+    }
+}
+
+/// A symlinked `.superset` directory redirects both local files, so it
+/// refuses as well.
+#[cfg(unix)]
+#[test]
+fn symlinked_superset_dir_refuses() {
+    let (_dir, root) = repo();
+    let elsewhere = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), root.join(".superset")).unwrap();
+    let before = snapshot(&root);
+
+    let code = run_local_init_noninteractive(&root, &[]).unwrap();
+    assert_eq!(exit_code_to_u8(code), 1);
+    assert_eq!(snapshot(&root), before);
+    assert!(fs::read_dir(elsewhere.path()).unwrap().next().is_none());
+}
+
 /// A malformed `config.local.json` is an error naming the file, and nothing –
 /// neither JSON file nor `info/exclude` – changes, because every input is
 /// validated before the first write.

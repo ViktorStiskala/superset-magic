@@ -466,7 +466,7 @@ It writes only gitignored files:
 | File | What it holds |
 |---|---|
 | `.superset/magic.local.json` | the pattern list – seeded with `.superset/magic.local.json`, `.superset/config.local.json` and your patterns. A local install has **no** `magic.json`. |
-| `.superset/config.local.json` | Superset's per-machine override of `config.json`. `ss-magic sync` is added to `setup.before` (to the front of `setup` when that is a plain list), so it runs ahead of the team's own setup steps and your files exist before `bun install` or migrations. Every other key and existing step is kept, and a re-run does not rewrite the file. |
+| `.superset/config.local.json` | Superset's per-machine override of `config.json`. `ss-magic sync` is added to `setup.before`, so it runs ahead of the team's committed setup steps and your files exist before `bun install` or migrations. When `setup` is already a plain list (which replaces the committed setup on this machine), the sync goes to the front of that list instead. Every other key and existing step is kept, and a re-run does not rewrite the file. |
 
 No `magic.sh`, no `magic.json` and no change to `.superset/config.json` is
 written. Superset runs the `ss-magic` binary directly from
@@ -503,10 +503,15 @@ Behaviour to know:
   removes a pattern.
 - It refuses, writing nothing, when the main checkout already has a committed
   install (a `magic.json`, or a `config.json` setup that ss-magic's init/migrate
-  recognises), or when either local file is tracked by git.
-- If you later turn it into a committed install, remove the `ss-magic sync` entry
-  from `config.local.json`: the main-checkout menu and committed `init` warn
-  when it is still there, since Superset would then run the sync twice.
+  recognises), when either local file is tracked by git (under any
+  capitalization), or when `.superset` or either local file is a symlink (the
+  write would land on the link's target, which may be a tracked file).
+- If you later turn it into a committed install, the main-checkout menu and
+  committed `init` warn about a leftover `ss-magic sync` entry in
+  `config.local.json`. With the `{"before": [...]}` form Superset would run the
+  sync twice, so remove the entry. With a plain-array `setup`, the array
+  replaces the committed setup and that entry is the only sync, so keep it, or
+  delete the local `setup` key to run the committed setup instead.
 - **Update to 0.12.0 or newer first**; older binaries do not know `--local`.
   Likewise, Superset's setup runs whatever `ss-magic` it resolves, so keep that
   binary current.
