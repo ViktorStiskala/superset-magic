@@ -433,3 +433,235 @@ fn ensure_path_ignored_reuses_covering_rule_when_target_has_matching_nested_giti
     );
     assert!(git::is_ignored_str(target.path(), "apps/api/debug.log").unwrap());
 }
+
+// ── ensure_path_ignored_in: the LocalExclude sink ────────────────────────
+
+fn info_exclude(root: &Path) -> String {
+    fs::read_to_string(root.join(".git/info/exclude")).unwrap_or_default()
+}
+
+/// `git_common_dir` answers the same absolute `.git` from the main checkout
+/// (where git prints a relative `.git`) and from a linked worktree.
+#[test]
+fn git_common_dir_is_absolute_and_shared_by_worktrees() {
+    let main = crate::testutil::init_main_repo("main");
+    let (_wt_guard, wt) = crate::testutil::make_worktree(main.path());
+    let expected = main.path().join(".git").canonicalize().unwrap();
+
+    assert_eq!(git::git_common_dir(main.path()).unwrap(), expected);
+    assert_eq!(git::git_common_dir(&wt).unwrap(), expected);
+}
+
+/// A file rule is appended to `.git/info/exclude` as a root-anchored literal,
+/// git then ignores it, and no `.gitignore` is created.
+#[test]
+fn local_exclude_file_rule_appends_to_info_exclude() {
+    let main = crate::testutil::init_main_repo("main");
+    let root = main.path();
+
+    let got = ensure_path_ignored_in(
+        IgnoreSink::LocalExclude,
+        root,
+        root,
+        Path::new("x.key"),
+        PathKind::File,
+    )
+    .unwrap();
+
+    assert_eq!(got, Ignored::Appended);
+    assert!(info_exclude(root).lines().any(|l| l == "/x.key"), "got {:?}", info_exclude(root));
+    assert!(git::is_ignored_str(root, "x.key").unwrap());
+    assert!(!root.join(".gitignore").exists(), ".gitignore must not be created");
+}
+
+/// A rule written from the main root is honored inside a linked worktree,
+/// because `info/exclude` is shared.
+#[test]
+fn local_exclude_rule_is_honored_in_linked_worktree() {
+    let main = crate::testutil::init_main_repo("main");
+    let (_wt_guard, wt) = crate::testutil::make_worktree(main.path());
+
+    ensure_path_ignored_in(
+        IgnoreSink::LocalExclude,
+        main.path(),
+        main.path(),
+        Path::new("x.key"),
+        PathKind::File,
+    )
+    .unwrap();
+
+    assert!(git::is_ignored_str(&wt, "x.key").unwrap());
+}
+
+/// A `Dir` rule is written with a trailing slash and matches before the
+/// directory exists.
+#[test]
+fn local_exclude_dir_rule_has_trailing_slash_and_matches_before_creation() {
+    let main = crate::testutil::init_main_repo("main");
+    let root = main.path();
+    assert!(!root.join(".superset/backups").exists());
+
+    ensure_path_ignored_in(
+        IgnoreSink::LocalExclude,
+        root,
+        root,
+        Path::new(".superset/backups"),
+        PathKind::Dir,
+    )
+    .unwrap();
+
+    assert!(info_exclude(root).lines().any(|l| l == "/.superset/backups/"));
+    assert!(git::is_ignored_str(root, ".superset/backups/").unwrap());
+}
+
+/// A path a committed `.gitignore` already covers is `Already`, and
+/// `info/exclude` is not touched.
+#[test]
+fn local_exclude_skips_path_already_ignored_by_gitignore() {
+    let main = crate::testutil::init_main_repo("main");
+    let root = main.path();
+    fs::write(root.join(".gitignore"), "x.key\n").unwrap();
+    let before = info_exclude(root);
+
+    let got = ensure_path_ignored_in(
+        IgnoreSink::LocalExclude,
+        root,
+        root,
+        Path::new("x.key"),
+        PathKind::File,
+    )
+    .unwrap();
+
+    assert_eq!(got, Ignored::Already);
+    assert_eq!(info_exclude(root), before);
+}
+
+/// A missing `info/` directory is created.
+#[test]
+fn local_exclude_creates_missing_info_dir() {
+    let main = crate::testutil::init_main_repo("main");
+    let root = main.path();
+    let info = root.join(".git/info");
+    fs::remove_dir_all(&info).ok();
+    assert!(!info.exists());
+
+    ensure_path_ignored_in(
+        IgnoreSink::LocalExclude,
+        root,
+        root,
+        Path::new("x.key"),
+        PathKind::File,
+    )
+    .unwrap();
+
+    assert!(git::is_ignored_str(root, "x.key").unwrap());
+    assert!(info.join("exclude").is_file());
+}
+
+/// Re-running never duplicates a line, and an `info/exclude` that lacks a
+/// trailing newline keeps its last line intact.
+#[test]
+fn local_exclude_is_idempotent_and_preserves_existing_lines() {
+    let main = crate::testutil::init_main_repo("main");
+    let root = main.path();
+    fs::create_dir_all(root.join(".git/info")).unwrap();
+    fs::write(root.join(".git/info/exclude"), "# mine\nfoo").unwrap();
+
+    for _ in 0..2 {
+        ensure_path_ignored_in(
+            IgnoreSink::LocalExclude,
+            root,
+            root,
+            Path::new("x.key"),
+            PathKind::File,
+        )
+        .unwrap();
+    }
+
+    assert_eq!(info_exclude(root), "# mine\nfoo\n/x.key\n");
+}
+
+/// A tracked `.gitignore` negation outranks `info/exclude`, so the re-check
+/// must turn the silent leak into an error naming the path.
+#[test]
+fn local_exclude_errors_when_a_negation_overrides_the_rule() {
+    let main = crate::testutil::init_main_repo("main");
+    let root = main.path();
+    fs::write(root.join(".gitignore"), "!/.superset/backups/\n").unwrap();
+
+    let err = ensure_path_ignored_in(
+        IgnoreSink::LocalExclude,
+        root,
+        root,
+        Path::new(".superset/backups"),
+        PathKind::Dir,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains(".superset/backups"), "got: {err:#}");
+}
+
+/// Glob metacharacters in a file name are escaped so the rule matches only
+/// that exact file, never a wider set.
+#[test]
+fn local_exclude_escapes_glob_metacharacters() {
+    let main = crate::testutil::init_main_repo("main");
+    let root = main.path();
+
+    ensure_path_ignored_in(
+        IgnoreSink::LocalExclude,
+        root,
+        root,
+        Path::new("a[1]*.key"),
+        PathKind::File,
+    )
+    .unwrap();
+
+    assert!(git::is_ignored_str(root, "a[1]*.key").unwrap());
+    assert!(!git::is_ignored_str(root, "a1x.key").unwrap(), "rule must not widen");
+}
+
+/// A name containing a newline cannot be written as one rule line, so it is
+/// refused rather than split into two rules.
+#[test]
+fn local_exclude_refuses_a_newline_in_the_path() {
+    let main = crate::testutil::init_main_repo("main");
+    let root = main.path();
+
+    let err = ensure_path_ignored_in(
+        IgnoreSink::LocalExclude,
+        root,
+        root,
+        Path::new("a\nb"),
+        PathKind::File,
+    );
+
+    assert!(err.is_err());
+    assert!(!info_exclude(root).contains("a\n"));
+}
+
+/// The `Gitignore` sink is exactly `ensure_path_ignored`: same result, same
+/// `.gitignore` bytes, nothing in `info/exclude`.
+#[test]
+fn gitignore_sink_behaves_like_ensure_path_ignored() {
+    let via_sink = crate::testutil::init_main_repo("main");
+    let direct = crate::testutil::init_main_repo("main");
+
+    let a = ensure_path_ignored_in(
+        IgnoreSink::Gitignore,
+        via_sink.path(),
+        via_sink.path(),
+        Path::new("secret.txt"),
+        PathKind::File,
+    )
+    .unwrap();
+    let b = ensure_path_ignored(direct.path(), direct.path(), Path::new("secret.txt"), PathKind::File)
+        .unwrap();
+
+    assert_eq!(a, b);
+    assert_eq!(
+        fs::read_to_string(via_sink.path().join(".gitignore")).unwrap(),
+        fs::read_to_string(direct.path().join(".gitignore")).unwrap()
+    );
+    assert!(!info_exclude(via_sink.path()).contains("secret.txt"));
+}

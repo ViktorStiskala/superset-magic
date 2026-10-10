@@ -1,6 +1,7 @@
 //! The `.superset` workspace contract: config/magic file I/O and the
 //! init/migration lifecycle that materializes the layout.
 
+pub(crate) mod local_install;
 pub(crate) mod migrate;
 
 // The contract I/O is core's (the plugin reads the same files); re-exported

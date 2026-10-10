@@ -7,7 +7,9 @@
 //! - An entry referencing the `magic.sh` / `ss-magic sync` marker *only* →
 //!   [`Branch::Normal`]: already migrated, nothing to do.
 //! - Neither marker present, or `config.json` absent → [`Branch::Init`]:
-//!   first-time bootstrap of the NEW layout.
+//!   first-time bootstrap of the NEW layout – unless the main checkout holds a
+//!   local (uncommitted) install, a `magic.local.json` without a `magic.json`,
+//!   which is [`Branch::Local`] (edited by `workspace::local_install`).
 //!
 //! A *malformed* `config.json` is NEVER classified here — it is a hard error
 //! surfaced by the caller (`superset_files::load_config` returns the parse
@@ -37,7 +39,7 @@ use anyhow::{Context, Result};
 use crate::git;
 use crate::git::gitignore;
 use crate::sync::reverse_sync;
-use crate::workspace::superset_files::{self, Config};
+use crate::workspace::superset_files::{self, Config, InstallMode, LocalSetup, MAGIC_LOCAL_PATTERN};
 use crate::tui::style;
 use crate::tui::ui::{self, FinalAction};
 use ss_magic_core::state_tree;
@@ -58,11 +60,6 @@ pub const MAGIC_WRAPPER_ENTRY: &str = "./.superset/magic.sh sync";
 
 /// Relative path of the retired `setup.sh`, deleted on migration.
 const SETUP_SH_REL: &str = ".superset/setup.sh";
-
-/// Relative path of `magic.local.json` as it appears inside the repo. Gitignored
-/// via `gitignore::ensure_path_ignored` during migration and init (the closest
-/// existing `.gitignore`, or the git-root file; a no-op if git already ignores it).
-const MAGIC_LOCAL_REL: &str = ".superset/magic.local.json";
 
 /// Ensure the workspace's bootstrap gitignore rules exist under `repo_root` —
 /// the step shared verbatim by `run_migrate`, `run_init`, and
@@ -90,10 +87,13 @@ fn ensure_bootstrap_gitignores(repo_root: &Path) -> Result<()> {
     gitignore::ensure_path_ignored(
         repo_root,
         repo_root,
-        Path::new(MAGIC_LOCAL_REL),
+        Path::new(MAGIC_LOCAL_PATTERN),
         gitignore::PathKind::File,
     )?;
-    reverse_sync::ensure_backups_ignored(repo_root)?;
+    // init/migrate always produce a COMMITTED install, so the backups rule goes
+    // to the team-visible `.gitignore` (KTD4: only a committed install writes
+    // `.gitignore`; the lazy sync-time rule picks its sink from the install mode).
+    reverse_sync::ensure_backups_ignored(repo_root, gitignore::IgnoreSink::Gitignore)?;
     state_tree::ensure_state_ignored(repo_root)?;
     Ok(())
 }
@@ -170,6 +170,9 @@ pub enum Branch {
     Normal,
     /// Neither marker present, or `config.json` absent — first-time init.
     Init,
+    /// Neither marker present and the main checkout holds a local install (a
+    /// `magic.local.json` with no `magic.json`): edit the local patterns.
+    Local,
 }
 
 /// True when a `setup` entry references the retired `setup.sh`.
@@ -177,40 +180,104 @@ fn entry_is_setup_sh(entry: &str) -> bool {
     entry.contains(SETUP_SH_MARKER)
 }
 
-/// True when a `setup` entry references the new wrapper / sync marker.
+/// True when a `setup` entry references the new wrapper (`magic.sh`) or the
+/// bare sync command a local install registers ([`superset_files::LOCAL_SYNC_ENTRY`],
+/// shared with core's `classify_local_setup` so the committed-install detector
+/// and the local install's merge/duplicate check recognize one marker).
 fn entry_is_magic_marker(entry: &str) -> bool {
-    entry.contains("magic.sh") || entry.contains("ss-magic sync")
+    entry.contains("magic.sh") || entry.contains(superset_files::LOCAL_SYNC_ENTRY)
 }
 
-/// Pure branch decision (KTD8, R10).
+/// Pure branch decision (KTD8, R10), given the parsed `config.json` and the
+/// main checkout's [`superset_files::install_mode`].
 ///
-/// Truth table over the parsed `config.json`:
+/// Truth table:
 ///
-/// | config.json        | setup contents                  | Branch  |
-/// |--------------------|---------------------------------|---------|
-/// | `None` (absent)    | —                               | Init    |
-/// | `Some`             | references `setup.sh`           | Migrate |
-/// | `Some`             | `setup.sh` AND magic marker     | Migrate |
-/// | `Some`             | magic marker only               | Normal  |
-/// | `Some`             | neither marker                  | Init    |
+/// | config.json        | setup contents                  | mode          | Branch  |
+/// |--------------------|---------------------------------|---------------|---------|
+/// | `Some`             | references `setup.sh`           | any           | Migrate |
+/// | `Some`             | `setup.sh` AND magic marker     | any           | Migrate |
+/// | `Some`             | magic marker only               | any           | Normal  |
+/// | `None` or `Some`   | neither marker                  | `Local`       | Local   |
+/// | `None` or `Some`   | neither marker                  | not `Local`   | Init    |
 ///
 /// Migrate wins over Normal whenever a `setup.sh` reference is present, so a
 /// half-migrated `setup` array (both markers) is repaired by migration rather
-/// than treated as already-done. A malformed `config.json` is handled by the
-/// caller as a hard error and never reaches this function.
-pub fn detect_branch(config: Option<&Config>) -> Branch {
-    let Some(cfg) = config else {
-        return Branch::Init;
-    };
-    let has_setup_sh = cfg.setup.iter().any(|e| entry_is_setup_sh(e));
-    if has_setup_sh {
+/// than treated as already-done. `config.json` is consulted first and the mode
+/// last, so a local install never masks a committed one: [`Branch::Local`] is
+/// the answer only when `config.json` says neither Migrate nor Normal (KTD1 in
+/// the local-install plan: the mode is derived from which pattern files exist,
+/// never stored). A malformed `config.json` is handled by the caller as a hard
+/// error and never reaches this function.
+pub fn detect_branch(config: Option<&Config>, mode: InstallMode) -> Branch {
+    let setup: &[String] = config.map(|c| c.setup.as_slice()).unwrap_or_default();
+    if setup.iter().any(|e| entry_is_setup_sh(e)) {
         return Branch::Migrate;
     }
-    let has_magic = cfg.setup.iter().any(|e| entry_is_magic_marker(e));
-    if has_magic {
-        Branch::Normal
+    if setup.iter().any(|e| entry_is_magic_marker(e)) {
+        return Branch::Normal;
+    }
+    if mode == InstallMode::Local {
+        Branch::Local
     } else {
         Branch::Init
+    }
+}
+
+/// The R13 warning, or `None` when it does not apply: a committed install
+/// exists in `root` (a `magic.json`) AND Superset's per-machine
+/// `.superset/config.local.json` still registers `ss-magic sync` in its
+/// `setup` – typically left behind by a local install that was later turned
+/// into a committed one.
+///
+/// What that means depends on the `setup` form (Superset's local-config merge
+/// rule, see [`superset_files::LocalSetup`]):
+///
+/// - a `{before, after}` object WRAPS the committed setup, so Superset runs the
+///   sync twice for every new workspace – once from the committed
+///   `config.json` (via `magic.sh`) and once from the override. The advice is
+///   to remove the local entry.
+/// - a plain array REPLACES the committed setup, so `magic.sh` never runs on
+///   this machine and the local entry is the ONLY sync. Advising its removal
+///   would leave workspaces with no synced files, so this form gets a
+///   different note: keep the entry while the array stays, or drop the local
+///   `setup` key to run the committed setup instead.
+///
+/// Advisory only: an unreadable or malformed `config.local.json`, or a `setup`
+/// of a shape Superset does not support, yields `None` rather than an error,
+/// because the committed flows do not own that file and must not fail on it.
+pub fn duplicate_sync_entry_warning(root: &Path) -> Option<String> {
+    if superset_files::install_mode(root) != InstallMode::Committed {
+        return None;
+    }
+    let local = superset_files::load_config_local_json(root).ok()??;
+    let setup = local.get("setup")?;
+    let entry = superset_files::LOCAL_SYNC_ENTRY;
+    match superset_files::classify_local_setup(setup) {
+        LocalSetup::Wrap { has_marker: true } => Some(format!(
+            "warning: .superset/config.local.json still registers `{entry}` in its setup, and \
+             this repository has a committed ss-magic install (.superset/magic.json), so Superset \
+             runs the sync twice for every new workspace. Remove the `{entry}` entry from \
+             .superset/config.local.json."
+        )),
+        LocalSetup::Replace { has_marker: true } => Some(format!(
+            "warning: .superset/config.local.json's setup is a plain array, which replaces the \
+             committed setup in .superset/config.json on this machine: .superset/magic.sh never \
+             runs here, and the `{entry}` entry in the array is this checkout's only sync. Keep \
+             it while the array form stays. To run the committed setup instead, delete the \
+             `setup` key from .superset/config.local.json (or turn it into a \
+             {{\"before\": [...]}} object without the `{entry}` entry)."
+        )),
+        _ => None,
+    }
+}
+
+/// Print the R13 warning for `root` when it applies (see
+/// [`duplicate_sync_entry_warning`]). Shared by the committed init flows and
+/// the main-checkout menu.
+pub fn print_duplicate_sync_entry_warning(root: &Path) {
+    if let Some(warning) = duplicate_sync_entry_warning(root) {
+        println!("{}", style::warn(warning));
     }
 }
 
@@ -392,12 +459,20 @@ fn rename_setup_config(repo_root: &Path) -> Result<()> {
 /// Pure so the seeding rule is unit-testable without the UI.
 fn init_magic_files(chosen: &[String]) -> Vec<String> {
     let mut files = superset_files::default_magic_files();
-    for p in chosen {
+    push_missing(&mut files, chosen);
+    files
+}
+
+/// Append each entry of `more` that `files` does not already hold, in `more`'s
+/// order, so the result keeps `files`' entries first and holds no duplicate.
+/// The one dedupe rule behind every `files` seeder: this module's
+/// [`init_magic_files`] and the local install's selection and append lists.
+pub(crate) fn push_missing(files: &mut Vec<String>, more: &[String]) {
+    for p in more {
         if !files.iter().any(|f| f == p) {
             files.push(p.clone());
         }
     }
-    files
 }
 
 /// Build the picker `(options, preselected_indices)` for `run_init`, factored
@@ -538,6 +613,9 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
     }
     println!("{}", style::ok("Gitignored .superset/backups/"));
     println!("{}", style::ok("Gitignored .superset/.magic/"));
+    // Checked after the write: `magic.json` now exists, so a `config.local.json`
+    // left over from a local install is a duplicate sync entry (R13).
+    print_duplicate_sync_entry_warning(repo_root);
 
     execute_final_action(repo_root, action, INIT_COMMIT_MESSAGE, "chore/ss-magic-init-")
 }
@@ -584,6 +662,8 @@ pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<
     }
     println!("{}", style::ok("Gitignored .superset/backups/"));
     println!("{}", style::ok("Gitignored .superset/.magic/"));
+    // After the write, as in `run_init`: the R13 duplicate-entry warning.
+    print_duplicate_sync_entry_warning(repo_root);
     println!(
         "{}",
         style::info("Done. Changes are on disk; run `git status` to review.")

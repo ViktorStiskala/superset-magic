@@ -5,6 +5,9 @@
 //!   .superset/setup_config.json   { files: [pattern, ...] }  (legacy; read-only)
 //!   .superset/magic.json          { files: [pattern, ...] }  (committed)
 //!   .superset/magic.local.json    { files: [pattern, ...] }  (gitignored overlay)
+//!   .superset/config.local.json   Superset's per-machine override of config.json
+//!                                 (gitignored; a local install registers
+//!                                 `ss-magic sync` in its `setup` key)
 //!
 //! The embedded `magic.sh` (under `assets/`) is the single source of truth
 //! for the wrapper body; migration and init write the on-disk copy. The
@@ -29,10 +32,29 @@ const MAGIC_SH_NAME: &str = "magic.sh";
 const SETUP_CONFIG_JSON: &str = "setup_config.json";
 const MAGIC_JSON: &str = "magic.json";
 const MAGIC_LOCAL_JSON: &str = "magic.local.json";
+const CONFIG_LOCAL_JSON: &str = "config.local.json";
 
-/// Relative path of `magic.local.json` as it appears inside the repo.
-/// Referenced by [`default_magic_files`] and the bootstrap helper.
-const MAGIC_LOCAL_PATTERN: &str = ".superset/magic.local.json";
+/// Relative path of `magic.local.json` as it appears inside the repo – the ONE
+/// spelling of it. Seeded as a sync pattern by [`default_magic_files`] and
+/// [`local_install_default_files`], and imported by the CLI wherever it names
+/// the file: the init/migrate bootstrap gitignore rule and the local install's
+/// tracked-file refusal, ignore rule and progress lines.
+pub const MAGIC_LOCAL_PATTERN: &str = ".superset/magic.local.json";
+
+/// Relative path of `config.local.json` as it appears inside the repo – the ONE
+/// spelling of it. A local install lists it as a sync pattern so forward sync
+/// carries Superset's per-machine setup override into every worktree, and the
+/// CLI's reverse-sync forward-only guard (`is_forward_only_rel`) compares
+/// against this same constant, so the pattern that is seeded and the path that
+/// is never pushed back into main cannot drift apart.
+pub const CONFIG_LOCAL_PATTERN: &str = ".superset/config.local.json";
+
+/// The literal setup command a local install registers in `config.local.json`.
+/// Superset runs it directly (a local install writes no `magic.sh` wrapper, as
+/// the wrapper would be a committed file). The CLI's committed-install detector
+/// (`entry_is_magic_marker`) and [`classify_local_setup`] both match on this
+/// constant, so the entry written and the entry recognized cannot drift apart.
+pub const LOCAL_SYNC_ENTRY: &str = "ss-magic sync";
 
 /// Shape of `.superset/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,6 +287,274 @@ pub fn bootstrap_magic_local_json(root: &Path) -> Result<()> {
     let body = "{\n  \"_comment\": \"Local overlay for magic.json — gitignored, never committed. Add patterns here that are specific to this machine or checkout.\",\n  \"files\": []\n}\n";
     fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// Which kind of ss-magic install a checkout carries. Derived from the files
+/// on disk by [`install_mode`], never stored: a stored flag could disagree with
+/// the files, and the files are what sync actually reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMode {
+    /// `.superset/magic.json` exists: the team-visible (committed) install.
+    /// Its pattern list is the overlay of `magic.json` and `magic.local.json`.
+    Committed,
+    /// No `magic.json`, but `.superset/magic.local.json` exists: a local
+    /// (uncommitted) install whose only pattern list is the local file.
+    Local,
+    /// Neither file exists: no ss-magic install in this checkout.
+    None,
+}
+
+/// Classify the install in `root` from its `.superset/` files alone.
+///
+/// - `magic.json` exists: [`InstallMode::Committed`], even when
+///   `magic.local.json` also exists (a local overlay on a committed install is
+///   the ordinary committed shape, and committed must win so the overlay keeps
+///   its union semantics).
+/// - `magic.json` absent, `magic.local.json` present: [`InstallMode::Local`].
+/// - Otherwise [`InstallMode::None`].
+///
+/// The `ss-magic sync` marker in `config.local.json` deliberately does NOT
+/// decide the mode: it only makes the setup merge idempotent and drives the
+/// duplicate-entry warning. Existence is tested with `exists()`, not
+/// `is_file()`, so a `magic.json` that is a directory still selects
+/// `Committed` and the loader then fails loudly instead of the checkout being
+/// silently reclassified as a local install.
+pub fn install_mode(root: &Path) -> InstallMode {
+    if superset_dir(root).join(MAGIC_JSON).exists() {
+        InstallMode::Committed
+    } else if superset_dir(root).join(MAGIC_LOCAL_JSON).exists() {
+        InstallMode::Local
+    } else {
+        InstallMode::None
+    }
+}
+
+/// Load the pattern list sync, reverse sync and pack should use for `root`.
+///
+/// Follows [`install_mode`]: the overlay of `magic.json` and `magic.local.json`
+/// for a committed install ([`load_overlaid`], unchanged), `magic.local.json`
+/// alone for a local install, and `Ok(None)` when there is no install. A
+/// malformed file is a hard error naming the path, as in [`load_overlaid`].
+///
+/// [`load_overlaid`] keeps its exact behavior (it answers `None` without a
+/// `magic.json`) because the plugin crate calls it; the CLI uses this loader
+/// instead wherever a local install must be accepted.
+pub fn load_sync_config(root: &Path) -> Result<Option<MagicConfig>> {
+    match install_mode(root) {
+        InstallMode::Committed => load_overlaid(root),
+        InstallMode::Local => load_magic_local_json(root),
+        InstallMode::None => Ok(None),
+    }
+}
+
+/// The patterns a fresh local install seeds into `magic.local.json`: the local
+/// pattern file itself and Superset's `config.local.json`, so forward sync
+/// copies both into every worktree. The user's chosen patterns follow them.
+pub fn local_install_default_files() -> Vec<String> {
+    vec![MAGIC_LOCAL_PATTERN.to_string(), CONFIG_LOCAL_PATTERN.to_string()]
+}
+
+/// The shape of a `config.local.json` `setup` value, as Superset reads it.
+///
+/// Superset merges `config.local.json` over the committed `config.json` per
+/// key: a plain array REPLACES the committed `setup`, and a `{before, after}`
+/// object WRAPS it (`before` runs first, then the committed steps, then
+/// `after`). Anything else is a shape this tool will not guess at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalSetup {
+    /// A plain array: the committed `setup` never runs on this machine.
+    /// `has_marker` is true when one of its strings contains
+    /// [`LOCAL_SYNC_ENTRY`].
+    Replace { has_marker: bool },
+    /// A `{before, after}` object whose `before` and `after` are each absent or
+    /// an array. `has_marker` is true when a string in either contains
+    /// [`LOCAL_SYNC_ENTRY`]; other keys are not commands and never count.
+    Wrap { has_marker: bool },
+    /// Any other value: a string, number, boolean or null `setup`, or an
+    /// object whose `before` or `after` is not an array. The payload says
+    /// which, ready for an error message.
+    Unsupported(String),
+}
+
+/// Classify a `setup` value (see [`LocalSetup`]).
+///
+/// The marker is only looked for in the places Superset actually runs as
+/// commands, and only once the shape is known to be supported, so a value such
+/// as `{"setup": "ss-magic sync"}` is `Unsupported`, never "already wired up".
+pub fn classify_local_setup(setup: &serde_json::Value) -> LocalSetup {
+    use serde_json::Value;
+
+    fn has_marker(items: &[Value]) -> bool {
+        items
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.contains(LOCAL_SYNC_ENTRY)))
+    }
+
+    match setup {
+        Value::Array(items) => LocalSetup::Replace {
+            has_marker: has_marker(items),
+        },
+        Value::Object(map) => {
+            let mut marker = false;
+            for key in ["before", "after"] {
+                match map.get(key) {
+                    None => {}
+                    Some(Value::Array(items)) => marker |= has_marker(items),
+                    Some(other) => {
+                        return LocalSetup::Unsupported(format!(
+                            "`setup.{key}` in {CONFIG_LOCAL_JSON} is {}, not an array",
+                            json_type_name(other)
+                        ))
+                    }
+                }
+            }
+            LocalSetup::Wrap { has_marker: marker }
+        }
+        other => LocalSetup::Unsupported(format!(
+            "`setup` in {CONFIG_LOCAL_JSON} is {}, not an array or a {{before, after}} object",
+            json_type_name(other)
+        )),
+    }
+}
+
+/// Whether two repo-relative paths name the same file on a case-insensitive
+/// filesystem: the same component sequence, compared with ASCII case ignored.
+///
+/// Current-directory (`.`) components are skipped on both sides first, because
+/// `Path::components` keeps a LEADING `.`, so `./.superset/config.local.json`
+/// would otherwise count one component more than `.superset/config.local.json`.
+/// The comparison is component-wise, so `apps/.superset/config.local.json` is a
+/// different path. Used wherever a guard protects one of the local-install
+/// files by name: a different capitalization reaches the very same file on
+/// macOS's default filesystem, and a guard matching only the canonical
+/// spelling would let it through.
+pub fn rel_eq_ignore_ascii_case(a: &Path, b: &Path) -> bool {
+    use std::path::Component;
+    fn named(p: &Path) -> impl Iterator<Item = Component<'_>> {
+        p.components().filter(|c| !matches!(c, Component::CurDir))
+    }
+    named(a).count() == named(b).count()
+        && named(a).zip(named(b)).all(|(x, y)| {
+            x.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&y.as_os_str().to_string_lossy())
+        })
+}
+
+/// Result of [`merge_sync_entry_into_local_config`]: the document to write and
+/// whether it differs from the input. A caller skips the write when `changed`
+/// is false, so a re-run never rewrites the file.
+#[derive(Debug, Clone)]
+pub struct LocalConfigMerge {
+    pub config: serde_json::Map<String, serde_json::Value>,
+    pub changed: bool,
+}
+
+/// Load `.superset/config.local.json` as a raw JSON object. `Ok(None)` when
+/// absent; an error naming the path when it is malformed or is not a JSON
+/// object. It is Superset's file, not ours, so it is kept as an untyped map:
+/// every key (including ones Superset adds later) survives a rewrite.
+pub fn load_config_local_json(
+    root: &Path,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    let path = superset_dir(root).join(CONFIG_LOCAL_JSON);
+    read_json::<serde_json::Map<String, serde_json::Value>>(&path)
+        .with_context(|| format!("reading {}", path.display()))
+}
+
+/// Add the `ss-magic sync` setup entry to a `config.local.json` document,
+/// without touching anything else in it.
+///
+/// Superset merges this file over the committed `config.json`: a key that is a
+/// plain array REPLACES the committed one, and a key that is a `{before,
+/// after}` object WRAPS it. The entry goes where it runs first without
+/// dropping the team's steps (so files such as `.env` exist before
+/// `bun install` or a migration runs):
+///
+/// - `setup` absent: `{"before": ["ss-magic sync"]}`.
+/// - `setup` an object: the entry is prepended to its `before` array, which is
+///   created when missing; `after` and any other key are untouched.
+/// - `setup` a plain array (the replace form): the entry is prepended to that
+///   array, keeping the form the user chose.
+/// - a supported shape that already runs the marker ([`classify_local_setup`]):
+///   nothing changes and `changed` is false.
+/// - `setup` of any other JSON type (string, number, bool, null), or an object
+///   whose `before` or `after` is not an array: refused with an error rather
+///   than overwritten, because guessing at a shape Superset may interpret
+///   differently could discard the user's own setup. The shape is checked
+///   BEFORE the marker, so `{"setup": "ss-magic sync"}` is refused too: it
+///   contains the command but Superset would not run it as a setup step.
+///
+/// Every other top-level key (`teardown`, `run`, unknown ones) keeps its value.
+/// The map is serde_json's default sorted map, so a rewritten file orders its
+/// keys alphabetically; values survive, and an unchanged document is never
+/// rewritten.
+pub fn merge_sync_entry_into_local_config(
+    existing: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<LocalConfigMerge> {
+    use serde_json::Value;
+
+    let mut config = existing.cloned().unwrap_or_default();
+    let entry = || Value::String(LOCAL_SYNC_ENTRY.to_string());
+
+    let Some(setup) = config.get_mut("setup") else {
+        config.insert(
+            "setup".to_string(),
+            serde_json::json!({ "before": [LOCAL_SYNC_ENTRY] }),
+        );
+        return Ok(LocalConfigMerge { config, changed: true });
+    };
+
+    match classify_local_setup(setup) {
+        LocalSetup::Unsupported(reason) => bail!("{reason}; fix it by hand, then re-run"),
+        LocalSetup::Replace { has_marker: true } | LocalSetup::Wrap { has_marker: true } => {
+            return Ok(LocalConfigMerge { config, changed: false });
+        }
+        LocalSetup::Replace { has_marker: false } | LocalSetup::Wrap { has_marker: false } => {}
+    }
+
+    // The classification above established the shape: an array, or an object
+    // whose `before` is absent or an array.
+    match setup {
+        Value::Array(items) => items.insert(0, entry()),
+        Value::Object(map) => match map.get_mut("before") {
+            Some(Value::Array(items)) => items.insert(0, entry()),
+            _ => {
+                map.insert("before".to_string(), Value::Array(vec![entry()]));
+            }
+        },
+        _ => unreachable!("classify_local_setup accepts only arrays and objects"),
+    }
+    Ok(LocalConfigMerge { config, changed: true })
+}
+
+/// A short article-plus-noun name for a JSON value's type, for error messages.
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Rewrite `.superset/config.local.json` from `cfg`, pretty-printed with a
+/// trailing newline, through the same staged-sibling-plus-rename commit as the
+/// `magic*.json` writers (a write that dies half-way leaves the previous file).
+///
+/// A plain writer: it serializes exactly what `cfg` holds. A caller changing
+/// one key must load the file with [`load_config_local_json`] first and carry
+/// the rest forward, as [`merge_sync_entry_into_local_config`] does.
+pub fn write_config_local_json(
+    root: &Path,
+    cfg: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    ensure_superset_dir(root)?;
+    let path = superset_dir(root).join(CONFIG_LOCAL_JSON);
+    let body = format!("{}\n", serde_json::to_string_pretty(cfg)?);
+    write_atomically(&path, &body)
 }
 
 fn superset_dir(root: &Path) -> PathBuf {

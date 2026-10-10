@@ -79,16 +79,27 @@ pub fn is_worktree(cwd_root: &Path) -> Result<bool> {
 }
 
 /// Filesystem root of the main checkout (the directory containing the
-/// shared `.git`), derived from `git rev-parse --git-common-dir`.
+/// shared `.git`): the parent of [`git_common_dir`], canonicalized.
 pub fn main_checkout_root(cwd_root: &Path) -> Result<PathBuf> {
-    let common = git(&["rev-parse", "--git-common-dir"], Some(cwd_root))?;
-    let common = resolve(&common, cwd_root)?;
+    let common = git_common_dir(cwd_root)?;
     let parent = common
         .parent()
         .with_context(|| format!("git-common-dir has no parent: {}", common.display()))?;
     parent
         .canonicalize()
         .with_context(|| format!("could not canonicalize {}", parent.display()))
+}
+
+/// Absolute, canonical path of the repository's shared git directory
+/// (`git rev-parse --git-common-dir`): the main checkout's `.git`, the same
+/// answer from the main checkout and from every linked worktree. This is where
+/// `info/exclude` lives – the one untracked ignore file git reads for the main
+/// checkout AND every linked worktree. A relative answer (git prints `.git`
+/// when run from the main checkout root) is resolved against `root`.
+/// [`main_checkout_root`] is built on it.
+pub fn git_common_dir(root: &Path) -> Result<PathBuf> {
+    let common = git(&["rev-parse", "--git-common-dir"], Some(root))?;
+    resolve(&common, root)
 }
 
 /// URL of the `origin` remote, or `None` when no origin is configured

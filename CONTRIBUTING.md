@@ -110,8 +110,9 @@ In `ss-magic`:
   pure diff/decision models (`diffmodel`, also built on `similar`), and the
   full-screen `ratatui` reverse-sync merge cockpit (`cockpit`, on the
   `crossterm` backend). `tui/mod.rs` re-exports core's `style`.
-- `workspace/` – the init/migration lifecycle (`migrate.rs`); re-exports core's
-  `superset_files`.
+- `workspace/` – the init/migration lifecycle (`migrate.rs`) and the local
+  (uncommitted) install (`local_install.rs`, behind `init --local`); re-exports
+  core's `superset_files`.
 - `update/` – the self-update apply path and the `update` verb, on top of
   core's `release`.
 - `pack.rs`, `cli.rs`, `main.rs` – the pack engine (re-exporting core's

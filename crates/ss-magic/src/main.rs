@@ -102,7 +102,10 @@ fn run() -> Result<ExitCode> {
         }
         // Non-interactive init (AN1): seed the layout from CLI patterns. Not
         // gated — one-time setup shouldn't depend on a network round-trip.
-        Parsed::Init(patterns) => init_noninteractive(&patterns),
+        Parsed::Init(patterns) => init_noninteractive(&patterns, InitKind::Committed),
+        // Non-interactive local install (`init --local`): same ungated
+        // reasoning; it always lands in the MAIN checkout, also from a worktree.
+        Parsed::InitLocal(patterns) => init_noninteractive(&patterns, InitKind::Local),
         Parsed::Command(cmd) => {
             // U8: run the daily-cache auto-update gate before any work for
             // `Bare` and `Sync`. On a "newer" verdict, `auto_update` swaps the
@@ -140,14 +143,32 @@ pub fn menu_blocked_reason(stdin_tty: bool, stdout_tty: bool) -> Option<&'static
     }
 }
 
-/// Non-interactive `ss-magic init [PATTERN...]` (AN1): seed the magic.json
+/// Which non-interactive init `ss-magic init` was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitKind {
+    /// `init [PATTERN...]`: the committed `magic.json` layout.
+    Committed,
+    /// `init --local [PATTERN...]`: the local (uncommitted) install.
+    Local,
+}
+
+/// Non-interactive `ss-magic init [--local] [PATTERN...]` (AN1): seed the
 /// layout from CLI-supplied patterns without the TUI, so automation (CI,
-/// Superset provisioning) can bootstrap a repo. Operates on the current
-/// checkout root.
-fn init_noninteractive(patterns: &[String]) -> Result<ExitCode> {
+/// Superset provisioning) can bootstrap a repo. A committed init operates on
+/// the current checkout root; a local install resolves the main checkout from
+/// it (`workspace::local_install`), because that is where Superset and sync
+/// read a local install from.
+fn init_noninteractive(patterns: &[String], kind: InitKind) -> Result<ExitCode> {
     let cwd = env::current_dir().context("getting current directory")?;
     match git::cwd_repo_root(&cwd) {
-        Ok(repo_root) => workspace::migrate::run_init_noninteractive(&repo_root, patterns),
+        Ok(repo_root) => match kind {
+            InitKind::Committed => {
+                workspace::migrate::run_init_noninteractive(&repo_root, patterns)
+            }
+            InitKind::Local => {
+                workspace::local_install::run_local_init_noninteractive(&repo_root, patterns)
+            }
+        },
         Err(err) => {
             eprintln!(
                 "{}",
@@ -194,33 +215,36 @@ fn dispatch(cmd: Command) -> Result<ExitCode> {
     }
 }
 
-/// Probe `<root>/.superset/magic.json` and load the overlaid config, printing a
-/// styled error and returning the exit code on absence or malformation. Shared
-/// by the forward-sync (`sync_core`) and pack (`pack::pack_core`) flows so the
-/// "magic.json absent/malformed" error path lives in exactly one place.
-///
-/// `Ok(None)` from `load_overlaid` means the file vanished between the probe and
-/// the load (a race) — reported the same as absent.
-pub fn load_magic_or_exit(root: &Path) -> std::result::Result<workspace::superset_files::MagicConfig, ExitCode> {
-    let magic_json_path = root.join(".superset/magic.json");
-    let absent = || {
-        eprintln!(
-            "{}",
-            tui::style::err(format!(
-                "error: no `.superset/magic.json` in {}; expected {}",
-                root.display(),
-                magic_json_path.display()
-            ))
-        );
-        ExitCode::from(1)
-    };
+/// The error printed when `root` has neither pattern file: names both
+/// `magic.json` (a committed install) and `magic.local.json` (a local install)
+/// and both ways to create one. Pure so the wording is testable without
+/// capturing stderr.
+pub fn no_sync_config_message(root: &Path) -> String {
+    format!(
+        "error: no `.superset/magic.json` or `.superset/magic.local.json` in {}; \
+         run `ss-magic init` (committed) or `ss-magic init --local` (local install) \
+         in the main checkout first",
+        root.display()
+    )
+}
 
-    if !magic_json_path.is_file() {
-        return Err(absent());
-    }
-    match workspace::superset_files::load_overlaid(root) {
+/// Load the sync pattern list for `root`, printing a styled error and
+/// returning the exit code on absence or malformation. Shared by the
+/// forward-sync (`sync_core`) and pack (`pack::pack_core`) flows so the
+/// "no pattern list / malformed" error path lives in exactly one place.
+///
+/// Goes through `superset_files::load_sync_config` (KTD1 in the local-install
+/// plan: the install mode is derived from which files exist): the overlay of
+/// `magic.json` and `magic.local.json` on a committed install, and
+/// `magic.local.json` alone on a local install, which has no `magic.json` at
+/// all. `Ok(None)` – neither file – is the [`no_sync_config_message`] error.
+pub fn load_magic_or_exit(root: &Path) -> std::result::Result<workspace::superset_files::MagicConfig, ExitCode> {
+    match workspace::superset_files::load_sync_config(root) {
         Ok(Some(cfg)) => Ok(cfg),
-        Ok(None) => Err(absent()),
+        Ok(None) => {
+            eprintln!("{}", tui::style::err(no_sync_config_message(root)));
+            Err(ExitCode::from(1))
+        }
         Err(err) => {
             eprintln!("{}", tui::style::err(format!("error: {err:#}")));
             Err(ExitCode::from(1))
@@ -228,11 +252,12 @@ pub fn load_magic_or_exit(root: &Path) -> std::result::Result<workspace::superse
     }
 }
 
-/// Non-interactive pack: archive the files defined by the overlaid `magic.json`
-/// into `ss-magic-<repo>.tar.bz2` at the git root (name derived from the
-/// normalized origin remote). Handler for `ss-magic pack`
-/// and the interactive menu's "Pack" operation. Delegates to `pack::pack_core`
-/// with the stdout event printer.
+/// Non-interactive pack: archive the files defined by the sync pattern list
+/// (`load_magic_or_exit`: committed overlay, or a local install's
+/// `magic.local.json`) into `ss-magic-<repo>.tar.bz2` at the git root (name
+/// derived from the normalized origin remote). Handler for `ss-magic pack` and
+/// the interactive menu's "Pack" operation. Delegates to `pack::pack_core` with
+/// the stdout event printer.
 pub fn run_pack_flow(cwd: &Path) -> Result<ExitCode> {
     pack::pack_core(cwd, print_pack_event)
 }
@@ -274,15 +299,17 @@ fn print_pack_event(ev: &pack::PackEvent) {
 /// Handler for `ss-magic sync` (the worktree menu now routes to the interactive
 /// unified cockpit instead).
 ///
-/// Resolves the main checkout root, verifies `.superset/magic.json` exists
-/// there, loads the overlaid config (magic.json + magic.local.json), backs up
+/// Resolves the main checkout root, loads its sync pattern list
+/// (`load_magic_or_exit`: magic.json + magic.local.json on a committed install,
+/// magic.local.json alone on a local one), backs up
 /// every worktree file about to be overwritten (under `<cwd>/.superset/backups/`,
 /// unless `no_backup`), then runs the existing `sync::apply::run` engine into
 /// `cwd`. No git/gh operations, no setup commands.
 ///
 /// Hard errors (non-zero exit):
 /// - Cannot resolve the main checkout root (not in a git repo, or git fails).
-/// - `.superset/magic.json` absent in the resolved main root.
+/// - Neither `.superset/magic.json` nor `.superset/magic.local.json` in the
+///   resolved main root.
 /// - Malformed `magic.json` or `magic.local.json` in the main root.
 pub fn run_sync_flow(cwd: &Path, no_backup: bool) -> Result<ExitCode> {
     sync_core(cwd, no_backup, print_event)
@@ -330,7 +357,7 @@ where
         Err(code) => return Ok(code),
     };
 
-    // 3-4. Probe + load the overlaid magic.json (hard error on absent/malformed).
+    // 3-4. Load the sync pattern list (hard error on absent/malformed).
     let cfg = match load_magic_or_exit(&main_root) {
         Ok(c) => c,
         Err(code) => return Ok(code),
@@ -340,18 +367,25 @@ where
     if cfg.files.is_empty() {
         println!(
             "{}",
-            tui::style::info("magic.json `files` is empty — nothing to sync.")
+            tui::style::info("the configured `files` list is empty — nothing to sync.")
         );
         return Ok(ExitCode::SUCCESS);
     }
 
     // 5b. Pre-copy backup pass: back up every worktree file the copy will
-    // overwrite (under `<cwd>/.superset/backups/`, gitignored there) so a
-    // mistaken forward sync is recoverable. Skipped by `--no-backup`.
+    // overwrite (under `<cwd>/.superset/backups/`, ignored there) so a
+    // mistaken forward sync is recoverable. Skipped by `--no-backup`. The
+    // backups rule's sink follows MAIN's install mode (KTD4): `.gitignore` on a
+    // committed install, the shared `info/exclude` on a local one, so a local
+    // install never dirties the worktree's tracked `.gitignore`.
     if !no_backup {
-        if let Err(err) =
-            sync::reverse_sync::backup_forward_targets(&main_root, &cwd_root, &cfg.files)
-        {
+        let ignore_sink = sync::reverse_sync::ignore_sink_for(&main_root);
+        if let Err(err) = sync::reverse_sync::backup_forward_targets(
+            &main_root,
+            &cwd_root,
+            &cfg.files,
+            ignore_sink,
+        ) {
             eprintln!("{}", tui::style::err(format!("error: {err:#}")));
             return Ok(ExitCode::from(1));
         }
@@ -387,8 +421,10 @@ where
 /// run FROM the main checkout (`cwd_root == main_root` — there is nothing to
 /// push), then bulk-pushes every git-untracked candidate that differs from main
 /// via `sync::reverse_sync::run_bulk` (pre-overwrite backups under main's
-/// `.superset/backups/` unless `no_backup`, plus the gitignore-in-main secret
-/// gate on every write).
+/// `.superset/backups/` unless `no_backup`, plus the ignore-in-main secret
+/// gate on every write; both rules go to `.gitignore` on a committed install
+/// and to the shared `info/exclude` otherwise – KTD4, see
+/// `reverse_sync::ignore_sink_for`).
 pub fn run_reverse_sync_flow(cwd: &Path, no_backup: bool) -> Result<ExitCode> {
     let (cwd_root, main_root) = match resolve_sync_roots(cwd) {
         Ok(roots) => roots,

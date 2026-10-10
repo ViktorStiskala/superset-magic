@@ -2,7 +2,8 @@
 //!
 //! A handful of entry points don't justify pulling in `clap`, so this is a tiny
 //! parser over `std::env::args`: the first non-flag token selects `sync`,
-//! `pack`, `update`, or `init`; its absence falls through to the
+//! `pack`, `update`, or `init` (with `--local` anywhere selecting the local
+//! install); its absence falls through to the
 //! interactive (bare) mode. `--version`/`-V` and `--help`/`-h` short-circuit to
 //! terminal signals, and any unrecognized subcommand is an error carrying the
 //! same usage text the help path prints.
@@ -46,6 +47,14 @@ pub enum Parsed {
     /// given file patterns without the TUI. Carried separately from `Command`
     /// (which stays `Copy`) and handled before the update gate.
     Init(Vec<String>),
+    /// Non-interactive `init --local [PATTERN...]`: a local (uncommitted)
+    /// install in the main checkout – the patterns go into the gitignored
+    /// `magic.local.json` and `ss-magic sync` is registered in Superset's
+    /// gitignored `config.local.json`, so no tracked file changes. A separate
+    /// variant rather than a flag on [`Parsed::Init`] so the committed `init`
+    /// keeps its exact shape; `--local` anywhere in argv selects it (see
+    /// [`has_local`]).
+    InitLocal(Vec<String>),
     /// `--version`/`-V` was requested; print the version and exit 0. Terminal:
     /// it is decided before any subcommand is selected, so a `--version` from a
     /// script can never fall through to the bare menu.
@@ -71,6 +80,11 @@ Commands:
   update         Force a self-update to the latest release
   init           Initialize .superset (magic.json layout) non-interactively;
                  optional file-pattern args become magic.json `files`
+  init --local [PATTERN...]
+                 Local (uncommitted) install in the main checkout: patterns go
+                 to the gitignored magic.local.json, `ss-magic sync` is
+                 registered in .superset/config.local.json, ignore rules go to
+                 .git/info/exclude; no tracked file changes
 
 Options:
   -n, --no-backup   Skip the pre-overwrite backup on `sync`/`reverse-sync`.
@@ -115,14 +129,20 @@ pub fn parse(args: &[String]) -> Parsed {
             }),
             "pack" => Parsed::Command(Command::Pack),
             "update" => Parsed::Command(Command::Update),
-            // Positional args after `init` become magic.json file patterns.
-            "init" => Parsed::Init(
-                args[i + 1..]
+            // Positional args after `init` become file patterns: magic.json's
+            // for a committed init, magic.local.json's for `--local`.
+            "init" => {
+                let patterns: Vec<String> = args[i + 1..]
                     .iter()
                     .filter(|a| !a.starts_with('-'))
                     .cloned()
-                    .collect(),
-            ),
+                    .collect();
+                if has_local(args) {
+                    Parsed::InitLocal(patterns)
+                } else {
+                    Parsed::Init(patterns)
+                }
+            }
             other => Parsed::Error(other.to_string()),
         };
     }
@@ -137,6 +157,16 @@ pub fn parse(args: &[String]) -> Parsed {
 /// maintainer should NOT "fix" one to match the other.
 fn has_no_backup(args: &[String]) -> bool {
     args.iter().any(|a| a == "--no-backup" || a == "-n")
+}
+
+/// True when `--local` appears ANYWHERE in argv, before or after `init`.
+///
+/// A whole-slice scan, like [`has_no_backup`], and for a safety reason beyond
+/// convenience: a positional scan that only looked after `init` would read
+/// `ss-magic --local init` as a COMMITTED init, which writes tracked files –
+/// the one outcome a user asking for a local install must never get.
+fn has_local(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--local")
 }
 
 /// True when `--version`/`-V` appears anywhere in argv.

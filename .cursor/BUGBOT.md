@@ -120,13 +120,19 @@ no associative arrays, no `mapfile`, no `${var^^}`).
   The CLI's is `cli.rs`: `parse(&[String]) -> Parsed` selects the command from
   the first non-flag token; `Command` is `{ Bare, Sync { no_backup },
   ReverseSync { no_backup }, Pack, Update }`, and `Parsed` additionally carries
-  `Init(Vec<String>)`, `Version`, `Help` and `Error(token)` – there is no
-  `Plugin` variant any more. `sync`/`reverse-sync` read the `-n`/`--no-backup`
-  flag via a full-argv scan (`has_no_backup`, position-independent – before OR
-  after the subcommand), an intentional asymmetry with `-h`/`--help` (a terminal
-  short-circuit recognized only BEFORE the subcommand). Flag any addition of
-  `clap`/`structopt`/`argh`, command dispatch logic added outside `cli.rs`, or a
-  "fix" that makes `has_no_backup` and the `--help` scan match each other.
+  `Init(Vec<String>)`, `InitLocal(Vec<String>)`, `Version`, `Help` and
+  `Error(token)` – there is no `Plugin` variant any more. `sync`/`reverse-sync`
+  read the `-n`/`--no-backup` flag via a full-argv scan (`has_no_backup`,
+  position-independent – before OR after the subcommand), an intentional
+  asymmetry with `-h`/`--help` (a terminal short-circuit recognized only BEFORE
+  the subcommand). `init` reads `--local` the same way (`has_local`, a full-argv
+  scan): `--local` ANYWHERE in argv – `ss-magic --local init` as well as
+  `ss-magic init --local` – must select `InitLocal`, NEVER the committed
+  `Init`, because a committed init writes tracked files, the one outcome a user
+  asking for a local install must never get. Flag any addition of
+  `clap`/`structopt`/`argh`, command dispatch logic added outside `cli.rs`, a
+  "fix" that makes `has_no_backup` and the `--help` scan match each other, or a
+  `--local` check narrowed to the tokens after `init`.
 - **The CLI's `--version` scan runs PAST a subcommand token, and must keep
   doing so.** `ss-magic sync --version` prints the version; without that, an
   unrecognized `--version` is skipped as an unknown flag and falls through to
@@ -261,23 +267,29 @@ committable and must never leak.
   `-n`/`--no-backup`.
 - **The gitignore-in-main step fires ONLY for a git-UNTRACKED worktree source,
   determined POSITIVELY.** Only a PUSH or MERGE writes worktree bytes into main,
-  and only an untracked (secret) source may add a `.gitignore` rule there – a
-  TRACKED, already-committed file must NEVER gain one. The gate is
+  and only an untracked (secret) source may add an ignore rule there (a
+  `.gitignore` rule on a committed install, an `info/exclude` rule otherwise –
+  only a committed install writes `.gitignore`) – a TRACKED, already-committed
+  file must NEVER gain either. The gate is
   `Baseline::source_untracked`, derived FAIL-CLOSED as `!tracked.contains(rel)`
   where `tracked` comes from `git::tracked_files` (`git ls-files --cached`): a
   path NOT positively known-tracked (a non-UTF-8 or oddly-normalized name, an
   unenumerable path) defaults to untracked = secret. `apply_decision`'s
-  Push/Merge arms call `ensure_gitignored_in_main` iff `source_untracked`; it
-  copies the covering `.gitignore` rule (verified via `git check-ignore -v`,
-  negations excluded) or an anchored literal into main, then STRICTLY re-verifies
-  with `git::is_ignored` and bails (writing NOTHING) if the path is still not
-  ignored. Flag: a Push/Merge that appends a `.gitignore` rule for a tracked
-  file; a Push/Merge that writes an untracked secret into main WITHOUT ensuring it
-  is ignored there (dropping `ensure_gitignored_in_main` or its strict re-verify
-  bail); OR deriving untracked-ness by ABSENCE from an untracked list (fail-OPEN –
-  a name missing from a `git ls-files --others` set is not proof it is tracked)
-  instead of positive tracked determination. Pull and Delete never touch main's
-  `.gitignore`.
+  Push/Merge arms call `ensure_gitignored_in_main` iff `source_untracked`; on a
+  committed install it copies the covering `.gitignore` rule (verified via `git
+  check-ignore -v`, negations excluded) or an anchored literal into main, and on
+  a local install (see the local-install bullet below) it appends an anchored
+  literal to `info/exclude` instead. When it appended a rule, it then strictly
+  re-verifies with `git::is_ignored` and refuses the write into main if the
+  path is still not ignored (the appended rule itself stays; the secret bytes
+  never land). Flag: a Push/Merge that appends an ignore rule (`.gitignore` or
+  `info/exclude`) for a tracked file; a Push/Merge that writes an untracked
+  secret into main WITHOUT ensuring it is ignored there (dropping
+  `ensure_gitignored_in_main` or its strict re-verify refusal); OR deriving
+  untracked-ness by ABSENCE from an untracked list (fail-OPEN – a name missing
+  from a `git ls-files --others` set is not proof it is tracked) instead of
+  positive tracked determination. Pull and Delete never touch main's ignore
+  rules.
 - **The reconcile set unions patterns across BOTH roots and classifies 4-way.**
   `compute_reconcile_set` expands the overlaid patterns against the worktree AND
   the main root (a main-only file is invisible to the worktree walk, and
@@ -324,11 +336,12 @@ committable and must never leak.
   Each direction writes its pre-overwrite backups under the `.superset/backups/`
   of the root it overwrites: the interactive cockpit → the worktree root, the
   direct `reverse-sync` → the main root, the forward `sync` → the worktree (cwd)
-  root (`backups_root_for`). That dir is gitignored at the closest `.gitignore`
-  via the single `ensure_backups_ignored` helper, which wraps
-  `gitignore::ensure_path_ignored(root, root, ".superset/backups", PathKind::Dir)`
-  (a `Dir` is queried/written with a trailing slash so a `.superset/backups/`
-  rule matches before the dir exists on disk). The SAME helper is called eagerly
+  root (`backups_root_for`). That dir is ignored via the single
+  `ensure_backups_ignored(root, sink)` helper, which wraps
+  `gitignore::ensure_path_ignored_in(sink, root, root, ".superset/backups", PathKind::Dir)`
+  – at the closest `.gitignore` for the `Gitignore` sink, in `info/exclude` for
+  the `LocalExclude` sink (a `Dir` is queried/written with a trailing slash so a
+  `.superset/backups/` rule matches before the dir exists on disk). The SAME helper is called eagerly
   by init/migrate (`ensure_bootstrap_gitignores`) so a fresh `ss-magic init`
   gitignores the backups tree up front, exactly like `magic.local.json`. Flag a
   backup written under the wrong root, a backups dir gitignored by a hand-rolled
@@ -341,6 +354,73 @@ committable and must never leak.
   `ensure_gitignored_in_main` before any secret bytes land in main. Flag a
   `--no-backup` path that also skips the gitignore-in-main gate or the
   concurrent-edit guard.
+- **A local (uncommitted) install must never write a tracked file, and its
+  ignore rules go to `info/exclude`.** `ss-magic init --local` (and the
+  main-checkout menu's local entries, `workspace/local_install.rs`) installs for
+  one developer without touching anything the team tracks: the patterns go into
+  the gitignored `.superset/magic.local.json` (there is NO `magic.json`), and
+  `ss-magic sync` is added to the `setup` of Superset's gitignored
+  `.superset/config.local.json`. No `magic.sh`, `magic.json` or `config.json` is
+  written, and `git status --porcelain` must stay empty afterwards. The install
+  mode is DERIVED from which files exist (`superset_files::install_mode`:
+  `magic.json` present → `Committed`; only `magic.local.json` → `Local`; neither →
+  `None`), never stored. Every ignore rule a flow adds goes through
+  `reverse_sync::ignore_sink_for(main_root)`, which fails SAFE: only `Committed`
+  maps to the `.gitignore` sink; `Local` and `None` map to the `LocalExclude`
+  sink, so an unknown state can never dirty a tracked file. The `LocalExclude`
+  writer appends a root-anchored, metacharacter-escaped literal to
+  `<git-common-dir>/info/exclude` (shared by the main checkout and all linked
+  worktrees), skips paths git already ignores, and RE-CHECKS with git because
+  `info/exclude` has lower precedence than a tracked `.gitignore`: a tracked
+  negation must become an error naming the path, never a silent leak. The local
+  install refuses (exit 1, nothing written) beside a committed install (a
+  `magic.json`, or a `config.json` `setup` classified as migrate/normal), when
+  either local file is tracked under ANY capitalization (the whole index is
+  listed and compared ASCII-case-insensitively, because a literal pathspec
+  misses `.superset/CONFIG.LOCAL.JSON` while a case-insensitive filesystem
+  writes straight into it; `:(icase)` magic is not used because
+  `GIT_LITERAL_PATHSPECS=1` silently disables it), or when `.superset` or either
+  local file is a symlink (the JSON writers rename onto a link's resolved
+  target, so an untracked `config.local.json -> config.json` link would rewrite
+  the tracked `config.json`; an `lstat` error other than not-found refuses
+  too); it always targets the MAIN checkout, also when
+  run from a worktree; and it validates every input in memory, then writes the
+  `info/exclude` rules, and only then the two JSON files, so a failure leaves at
+  most untracked exclude lines, never an unignored local file. Flag: any path of
+  a local install that writes a tracked file (`.gitignore`, `config.json`,
+  `magic.json`, `magic.sh`); a sink choice that defaults an unknown install mode
+  to `.gitignore`; an `info/exclude` append without the git re-check; a
+  `config.local.json` rewrite when the merge changed nothing; or a `setup` merge
+  that drops an existing entry or key, or overwrites a `setup` of an unexpected
+  JSON type instead of refusing it. `superset_files::classify_local_setup`
+  checks the SHAPE before the marker (`setup` must be an array or an object
+  whose `before`/`after` are absent or arrays, and the marker counts only in
+  their string items), so `{"setup": "ss-magic sync"}` is refused rather than
+  read as already registered. Also flag a tracked-file check that relies on a
+  literal pathspec, or a symlink check that resolves the link instead of
+  refusing it.
+- **`.superset/config.local.json` NEVER reverse-syncs into main.** It holds
+  commands Superset runs for every new workspace, so a worktree edit must not
+  reach main through reverse sync. `is_forward_only_rel` (component-wise,
+  ASCII-case-insensitive, in every install mode) drops it from both
+  `compute_candidates` (bulk `reverse-sync`) and `compute_reconcile_set` (the
+  cockpit), at the enumeration layer. Forward sync and pack still handle it, so
+  it is deliberately NOT an `EXCLUDED_TREES` entry. Flag a reverse-sync path
+  that can push, merge or delete it, a filter applied to a downstream list
+  instead of both candidate computations, or its addition to `EXCLUDED_TREES`.
+  The comparison is core's `superset_files::rel_eq_ignore_ascii_case`, shared
+  with the local install's tracked-file refusal. The guard is path-based by
+  design: whatever the file runs or links to is ordinary sync content.
+- When a committed install coexists with a `config.local.json` whose `setup`
+  still carries `ss-magic sync`, the main-checkout menu and committed `init`
+  print a warning (`migrate::duplicate_sync_entry_warning`), and its advice
+  depends on the form. A `{before, after}` object WRAPS the committed setup,
+  so the sync runs twice and the advice is to remove the local entry. A plain
+  array REPLACES the committed setup (`magic.sh` never runs), so that entry is
+  the only sync and the warning must NOT tell the user to remove it. It is
+  advisory: a malformed or unreadable `config.local.json`, or an unsupported
+  `setup` shape, yields no warning, never an error. Flag making
+  that warning fatal or letting a committed flow rewrite `config.local.json`.
 - `git/gitignore.rs::ensure_entry` appends a line only if no exact match exists,
   creates the file if absent, and never reorders. Flag changes that reorder or
   dedupe existing `.gitignore` content.
@@ -1217,7 +1297,17 @@ documentation or a status report that claims `file-changed` is active
 - `magic.json` (committed) is overlaid with `magic.local.json` (gitignored,
   per-machine) via `load_overlaid`: `files` are UNION + DEDUPE with
   `magic.json` order first. Flag overlay changes that reorder base entries or
-  drop the dedupe.
+  drop the dedupe. `load_overlaid` keeps its exact behavior (the plugin calls
+  it); sync, reverse sync, the cockpit and pack go through `load_sync_config`
+  instead, which returns that overlay when `magic.json` exists and the
+  `magic.local.json` config ALONE on a local install. Flag a CLI flow that still
+  requires `magic.json`, or a change to `load_overlaid` itself.
+- `config.local.json` (Superset's per-machine override) is read as a raw map by
+  `load_config_local_json` (absent → `None`, malformed → a hard error naming the
+  path) and written only by `write_config_local_json`, atomically. Its `setup`
+  merge inserts `ss-magic sync` into `setup.before` (or at the front of a plain
+  array), preserves every other key and entry, is idempotent, and refuses any
+  other `setup` type. Flag a non-atomic write or a merge that loses data.
 - `setup_config.json` / `SetupConfig` is a READ-ONLY legacy migration path
   (its `files` are carried into `magic.json`); it is never written. Flag any
   code that writes `setup_config.json`.

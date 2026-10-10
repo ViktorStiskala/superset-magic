@@ -189,6 +189,9 @@ Once the contract is committed, every worktree created through Superset.sh app
 gets the matching files copied in automatically. In a worktree created any
 other way, run `ss-magic sync` yourself.
 
+Not ready to propose ss-magic to the team? A [local install](#local-install-ss-magic-init---local)
+does the same for you alone and changes no tracked file.
+
 ## Commands
 
 ```plaintext
@@ -201,6 +204,9 @@ ss-magic pack         # archive the configured files into ss-magic-<repo>.tar.bz
 ss-magic update       # force a self-update to the newest CLI release
 ss-magic init [PATTERN...]   # non-interactively seed .superset (magic.json
                              # layout); extra args become magic.json `files`
+ss-magic init --local [PATTERN...]
+                      # local install: no tracked file changes; patterns go to
+                      # the gitignored magic.local.json (see "Local install")
 ss-magic --help       # usage
 ss-magic --version    # print the version and exit
 ```
@@ -224,12 +230,15 @@ unknown-subcommand error.
 The bare invocation opens a menu whose options depend on where you run it:
 
 - **Main checkout** — one lifecycle operation, chosen from the detected state:
-  init the contract, migrate an old `setup.sh` layout, or edit the
-  synced-files config.
+  init the contract (or **Initialize ss-magic locally**, see
+  [Local install](#local-install-ss-magic-init---local)), migrate an old
+  `setup.sh` layout, or edit the synced-files config. On a local install the
+  menu offers to edit its patterns (the selection replaces the list) and to
+  pack.
 - **Worktree** – a single **Sync** entry: the interactive merge cockpit,
   reconciling every configured file against main in both directions.
-- **Pack** is offered wherever an initialized `magic.json` exists (any
-  worktree, or the main checkout once set up).
+- **Pack** is offered wherever a pattern list exists (any worktree, or the
+  main checkout once set up – committed or local).
 
 Nothing runs until you pick it; Esc / Ctrl-C leaves the tree untouched.
 
@@ -269,10 +278,12 @@ If nothing on disk changed, the commit step is skipped automatically.
 Non-interactive, files-only — the command the Superset app setup hook runs:
 
 1. Resolve the main checkout root (parent of `git --git-common-dir`).
-2. Require `.superset/magic.json` there (hard error, non-zero exit, if absent
-   or malformed — a visible failure beats a silent no-copy inside Superset
+2. Require a pattern list there: `.superset/magic.json`, or on a
+   [local install](#local-install-ss-magic-init---local) `.superset/magic.local.json`
+   alone (hard error, non-zero exit, if both are absent or either is malformed — a visible failure beats a silent no-copy inside Superset
    setup).
-3. Load the overlaid config (`magic.json` + `magic.local.json`) from main.
+3. Load the overlaid config (`magic.json` + `magic.local.json`, or the local
+   file alone on a local install) from main.
 4. Copy every match into the current working tree, following the
    [pattern semantics](#pattern-semantics) below. Matched directories are
    copied recursively; existing files in the destination are overwritten.
@@ -390,14 +401,16 @@ sides fully untouched.
 
 Snapshot the files defined by the config into a single portable archive —
 useful for backup, transfer to a new machine, or handing the bundle to a
-teammate. Non-interactive, and also offered from the menu wherever an
-initialized `magic.json` exists. The flow, all relative to the current git
-repo root:
+teammate. Non-interactive, and also offered from the menu wherever a pattern
+list exists (a committed `magic.json`, or a local install's
+`magic.local.json`). The flow, all relative to the current git repo root:
 
-1. Resolve the current repo root; require `.superset/magic.json` there (hard
-   error, non-zero exit, if absent or malformed).
-2. Load the overlaid config (`magic.json` + `magic.local.json`) and expand the
-   patterns with the same [pattern semantics](#pattern-semantics) as forward
+1. Resolve the current repo root; require a pattern list there –
+   `.superset/magic.json`, or on a local install `.superset/magic.local.json`
+   alone (hard error, non-zero exit, if both are absent or either is malformed).
+2. Load the sync pattern list (the `magic.json` + `magic.local.json` overlay
+   on a committed install, `magic.local.json` alone on a local one) and expand
+   the patterns with the same [pattern semantics](#pattern-semantics) as forward
    sync (matched directories included recursively, de-duped).
 3. Write every match — preserving its repo-relative path — into
    `ss-magic-<repo>.tar.bz2` at the git root. Compression is bzip2; the
@@ -429,6 +442,83 @@ contract without prompts (for CI / automated provisioning) and leaves the
 changes uncommitted on disk. Extra arguments become the `files` patterns in
 `magic.json`. It preserves an existing `magic.local.json`, performs no git/gh
 operations, and skips the auto-update gate.
+
+### Local install: `ss-magic init --local`
+
+A **local install** sets ss-magic up for you alone, without changing any tracked
+file – nothing to commit, nothing to propose to the team, and every Superset
+worktree you create afterwards still receives your files.
+
+```sh
+ss-magic init --local '.env' 'config/local/*'
+```
+
+Run it in the main checkout or in any linked worktree: the install always lands
+in the **main checkout**, because Superset and `ss-magic sync` read it from
+there, and the output names the checkout it used. Without patterns it just sets
+up the machinery; the main-checkout menu's **Initialize ss-magic locally** entry
+is the interactive form (a pattern picker, no commit prompt). `--local` is
+recognised anywhere in the arguments, so it can never fall through to a
+committed init.
+
+It writes only gitignored files:
+
+| File | What it holds |
+|---|---|
+| `.superset/magic.local.json` | the pattern list – seeded with `.superset/magic.local.json`, `.superset/config.local.json` and your patterns. A local install has **no** `magic.json`. |
+| `.superset/config.local.json` | Superset's per-machine override of `config.json`. `ss-magic sync` is added to `setup.before`, so it runs ahead of the team's committed setup steps and your files exist before `bun install` or migrations. When `setup` is already a plain list (which replaces the committed setup on this machine), the sync goes to the front of that list instead. Every other key and existing step is kept, and a re-run does not rewrite the file. |
+
+No `magic.sh`, no `magic.json` and no change to `.superset/config.json` is
+written. Superset runs the `ss-magic` binary directly from
+`config.local.json`, so **the environment Superset runs setup in must resolve
+`ss-magic` on its `PATH`**. The command warns when the current shell cannot find
+it, but that check is advisory: it cannot prove Superset's environment can. If
+setup fails with "command not found", fix that `PATH` or install the binary
+somewhere Superset's shell looks.
+
+Every ignore rule goes to the repository's shared **`info/exclude`**
+(`.git/info/exclude`, read by the main checkout and every linked worktree, never
+tracked) instead of a `.gitignore`: the two local files, the
+`.superset/backups/` tree and the plugin's `.superset/.magic/` tree. Each rule is
+a root-anchored literal, skipped when git already ignores the path, and
+verified afterwards – a tracked `.gitignore` negation that would expose the file
+is an error naming the path, not a silent leak. After a local install in a clean
+checkout, `git status --porcelain` is empty.
+
+The same rule holds later: on any checkout without a committed `magic.json`,
+the rules that reverse sync adds (the backups tree and the "ignore this secret in
+main" gate) also go to `info/exclude`, never to a tracked `.gitignore`. Only a
+committed install writes `.gitignore`.
+
+Behaviour to know:
+
+- `ss-magic sync`, `reverse-sync`, the Sync cockpit and `pack` all accept a
+  checkout whose only pattern list is `magic.local.json`.
+- `config.local.json` is copied from main into worktrees, but **never** pushed
+  back: reverse sync (bulk and cockpit) drops it from its candidates, because it
+  holds commands Superset runs for every new workspace.
+- Re-running appends: `init --local PATTERN` adds the pattern to the existing
+  list and never drops one. The interactive entry replaces the list with your
+  picker selection (the two local files are always kept), so deselecting
+  removes a pattern.
+- It refuses, writing nothing, when the main checkout already has a committed
+  install (a `magic.json`, or a `config.json` setup that ss-magic's init/migrate
+  recognises), when either local file is tracked by git (under any
+  capitalization), or when `.superset` or either local file is a symlink (the
+  write would land on the link's target, which may be a tracked file).
+- If you later turn it into a committed install, the main-checkout menu and
+  committed `init` warn about a leftover `ss-magic sync` entry in
+  `config.local.json`. With the `{"before": [...]}` form Superset would run the
+  sync twice, so remove the entry. With a plain-array `setup`, the array
+  replaces the committed setup and that entry is the only sync, so keep it, or
+  delete the local `setup` key to run the committed setup instead.
+- **Update to 0.12.0 or newer first**; older binaries do not know `--local`.
+  Likewise, Superset's setup runs whatever `ss-magic` it resolves, so keep that
+  binary current.
+- **Do not enable the Claude Code plugin on a local install.** The plugin reads
+  its settings through the committed `magic.json`, so on a local install it stays
+  off, and `enable` would create a tracked `magic.json`, turning this into a
+  committed install.
 
 ### `ss-magic update` — force a self-update
 

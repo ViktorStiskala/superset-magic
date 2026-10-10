@@ -69,34 +69,34 @@ fn cfg(setup: Vec<&str>, teardown: Vec<&str>, run: Vec<&str>) -> Config {
 #[test]
 fn ae5_detect_neither_marker_is_init() {
     let c = cfg(vec!["uv sync", "pnpm install"], vec![], vec![]);
-    assert_eq!(detect_branch(Some(&c)), Branch::Init);
+    assert_eq!(detect_branch(Some(&c), InstallMode::None), Branch::Init);
 }
 
 /// config.json absent → Init.
 #[test]
 fn detect_absent_config_is_init() {
-    assert_eq!(detect_branch(None), Branch::Init);
+    assert_eq!(detect_branch(None, InstallMode::None), Branch::Init);
 }
 
 /// Old setup.sh reference → Migrate.
 #[test]
 fn detect_setup_sh_is_migrate() {
     let c = cfg(vec!["./.superset/setup.sh"], vec![], vec![]);
-    assert_eq!(detect_branch(Some(&c)), Branch::Migrate);
+    assert_eq!(detect_branch(Some(&c), InstallMode::None), Branch::Migrate);
 }
 
 /// magic.sh marker only → Normal.
 #[test]
 fn detect_magic_marker_only_is_normal() {
     let c = cfg(vec![MAGIC_WRAPPER_ENTRY], vec![], vec![]);
-    assert_eq!(detect_branch(Some(&c)), Branch::Normal);
+    assert_eq!(detect_branch(Some(&c), InstallMode::None), Branch::Normal);
 }
 
 /// `ss-magic sync` style marker (no magic.sh) → Normal.
 #[test]
 fn detect_ss_magic_sync_marker_is_normal() {
     let c = cfg(vec!["ss-magic sync"], vec![], vec![]);
-    assert_eq!(detect_branch(Some(&c)), Branch::Normal);
+    assert_eq!(detect_branch(Some(&c), InstallMode::None), Branch::Normal);
 }
 
 /// Both markers present → Migrate wins.
@@ -107,14 +107,14 @@ fn detect_both_markers_is_migrate() {
         vec![],
         vec![],
     );
-    assert_eq!(detect_branch(Some(&c)), Branch::Migrate);
+    assert_eq!(detect_branch(Some(&c), InstallMode::None), Branch::Migrate);
 }
 
 /// Empty setup → Init (neither marker).
 #[test]
 fn detect_empty_setup_is_init() {
     let c = cfg(vec![], vec![], vec![]);
-    assert_eq!(detect_branch(Some(&c)), Branch::Init);
+    assert_eq!(detect_branch(Some(&c), InstallMode::None), Branch::Init);
 }
 
 /// Malformed config.json is a HARD ERROR at the load seam — never silently
@@ -261,7 +261,7 @@ fn migration_transforms_old_layout_into_new() {
     // legacy files are gone and the new ones are present.
     superset_files::copy_into_repo(stage.path(), repo.path(), &[SETUP_SH_REL]).unwrap();
     rename_setup_config(repo.path()).unwrap();
-    gitignore::ensure_entry(repo.path(), MAGIC_LOCAL_REL).unwrap();
+    gitignore::ensure_entry(repo.path(), MAGIC_LOCAL_PATTERN).unwrap();
 
     let dot = repo.path().join(".superset");
     assert!(!dot.join("setup.sh").exists(), "setup.sh must be deleted");
@@ -286,7 +286,7 @@ fn migration_transforms_old_layout_into_new() {
 
     // .gitignore now ignores magic.local.json.
     let gi = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-    assert!(gi.lines().any(|l| l == MAGIC_LOCAL_REL));
+    assert!(gi.lines().any(|l| l == MAGIC_LOCAL_PATTERN));
 }
 
 /// KTD2: the same pre-existing `.superset/.magic/` plugin state survives
@@ -391,7 +391,7 @@ fn migration_both_markers_strips_setup_sh_keeps_wrapper() {
 #[test]
 fn ae6_already_migrated_is_normal_and_idempotent() {
     let migrated = cfg(vec![MAGIC_WRAPPER_ENTRY, "uv sync"], vec!["./drop.sh"], vec![]);
-    assert_eq!(detect_branch(Some(&migrated)), Branch::Normal);
+    assert_eq!(detect_branch(Some(&migrated), InstallMode::None), Branch::Normal);
     // migrated_setup is only called on the Migrate branch, but prove it's
     // a structural no-op should it ever run on already-migrated input.
     assert_eq!(
@@ -556,7 +556,7 @@ fn run_init_noninteractive_writes_layout_from_patterns() {
     assert_eq!(cfg.setup, vec![MAGIC_WRAPPER_ENTRY.to_string()]);
 
     let gi = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-    assert!(gi.lines().any(|l| l == MAGIC_LOCAL_REL));
+    assert!(gi.lines().any(|l| l == MAGIC_LOCAL_PATTERN));
     // The backups tree is gitignored up front by the same bootstrap step, so a
     // recovered secret is never committed even before the first sync runs.
     assert!(
@@ -920,10 +920,152 @@ fn bootstrap_gitignores_cover_local_config_backups_and_state_tree() {
     ensure_bootstrap_gitignores(repo.path()).unwrap();
 
     let gi = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-    for rule in [MAGIC_LOCAL_REL, ".superset/backups/", ".superset/.magic/"] {
+    for rule in [MAGIC_LOCAL_PATTERN, ".superset/backups/", ".superset/.magic/"] {
         assert!(
             gi.lines().any(|l| l == rule),
             "ensure_bootstrap_gitignores must write {rule:?}, got: {gi:?}"
         );
     }
+}
+
+// ── detect_branch: the local-install column ──────────────────────────────
+
+/// A `setup.sh` reference still wins over a local install: the committed
+/// layout needs migrating whatever else is on disk.
+#[test]
+fn detect_setup_sh_with_local_mode_is_still_migrate() {
+    let c = cfg(vec!["./.superset/setup.sh"], vec![], vec![]);
+    assert_eq!(detect_branch(Some(&c), InstallMode::Local), Branch::Migrate);
+}
+
+/// The magic marker in `config.json` is still a committed install, even when
+/// a `magic.local.json` exists beside it.
+#[test]
+fn detect_magic_marker_with_local_mode_is_still_normal() {
+    let c = cfg(vec![MAGIC_WRAPPER_ENTRY], vec![], vec![]);
+    assert_eq!(detect_branch(Some(&c), InstallMode::Local), Branch::Normal);
+}
+
+/// Neither marker plus a local install → Local, with or without a
+/// `config.json` (a local install never writes one).
+#[test]
+fn detect_neither_marker_with_local_mode_is_local() {
+    let c = cfg(vec!["bun install"], vec![], vec![]);
+    assert_eq!(detect_branch(Some(&c), InstallMode::Local), Branch::Local);
+    assert_eq!(detect_branch(None, InstallMode::Local), Branch::Local);
+}
+
+/// Neither marker without a local install keeps the committed answer: Init,
+/// also when a `magic.json` exists (the committed edit path runs `run_init`).
+#[test]
+fn detect_neither_marker_without_local_mode_is_init() {
+    let c = cfg(vec!["bun install"], vec![], vec![]);
+    assert_eq!(detect_branch(Some(&c), InstallMode::None), Branch::Init);
+    assert_eq!(detect_branch(Some(&c), InstallMode::Committed), Branch::Init);
+    assert_eq!(detect_branch(None, InstallMode::Committed), Branch::Init);
+}
+
+// ── R13: duplicate `ss-magic sync` entry beside a committed install ──────
+
+fn write_rel(root: &Path, rel: &str, body: &str) {
+    let path = root.join(rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, body).unwrap();
+}
+
+/// A committed install (`magic.json`) whose `config.local.json` still
+/// registers `ss-magic sync` gets a warning naming the entry and the file.
+#[test]
+fn duplicate_sync_entry_warning_fires_for_committed_install_with_marker() {
+    let repo = fresh();
+    write_rel(repo.path(), ".superset/magic.json", r#"{"files":[]}"#);
+    write_rel(
+        repo.path(),
+        ".superset/config.local.json",
+        r#"{"setup":{"before":["ss-magic sync"]}}"#,
+    );
+    let warning = duplicate_sync_entry_warning(repo.path())
+        .expect("a committed install with the marker must warn");
+    assert!(warning.contains("ss-magic sync"), "warning: {warning}");
+    assert!(warning.contains(".superset/config.local.json"), "warning: {warning}");
+    assert!(warning.contains("twice"), "warning: {warning}");
+}
+
+/// A plain-array `setup` REPLACES the committed one, so `magic.sh` never runs
+/// and the local entry is the only sync: the note must not call it a duplicate
+/// or tell the user to remove it (that would leave no sync at all).
+#[test]
+fn duplicate_sync_entry_warning_array_form_keeps_the_only_sync() {
+    let repo = fresh();
+    write_rel(repo.path(), ".superset/magic.json", r#"{"files":[]}"#);
+    write_rel(
+        repo.path(),
+        ".superset/config.local.json",
+        r#"{"setup":["ss-magic sync","./mine.sh"]}"#,
+    );
+    let warning = duplicate_sync_entry_warning(repo.path())
+        .expect("the array form still gets a note");
+    assert!(warning.contains("plain array"), "warning: {warning}");
+    assert!(warning.contains("only sync"), "warning: {warning}");
+    assert!(!warning.contains("twice"), "warning: {warning}");
+    assert!(!warning.contains("Remove the"), "warning: {warning}");
+}
+
+/// A `setup` shape Superset does not support yields no warning (the committed
+/// flows never fail or advise on a file they do not own), even when it
+/// contains the command text.
+#[test]
+fn duplicate_sync_entry_warning_is_silent_on_an_unsupported_shape() {
+    let repo = fresh();
+    write_rel(repo.path(), ".superset/magic.json", r#"{"files":[]}"#);
+    for body in [
+        r#"{"setup":"ss-magic sync"}"#,
+        r#"{"setup":{"before":"x","after":["ss-magic sync"]}}"#,
+    ] {
+        write_rel(repo.path(), ".superset/config.local.json", body);
+        assert_eq!(duplicate_sync_entry_warning(repo.path()), None, "{body}");
+    }
+}
+
+/// An `after`-only marker in the wrap form still runs alongside the committed
+/// setup, so it is the duplicate case.
+#[test]
+fn duplicate_sync_entry_warning_counts_an_after_entry() {
+    let repo = fresh();
+    write_rel(repo.path(), ".superset/magic.json", r#"{"files":[]}"#);
+    write_rel(
+        repo.path(),
+        ".superset/config.local.json",
+        r#"{"setup":{"after":["ss-magic sync"]}}"#,
+    );
+    let warning = duplicate_sync_entry_warning(repo.path()).expect("must warn");
+    assert!(warning.contains("twice"), "warning: {warning}");
+}
+
+/// A local install's own entry is not a duplicate: it is the only one.
+#[test]
+fn duplicate_sync_entry_warning_is_silent_on_a_local_install() {
+    let repo = fresh();
+    write_rel(repo.path(), ".superset/magic.local.json", r#"{"files":[]}"#);
+    write_rel(
+        repo.path(),
+        ".superset/config.local.json",
+        r#"{"setup":{"before":["ss-magic sync"]}}"#,
+    );
+    assert_eq!(duplicate_sync_entry_warning(repo.path()), None);
+}
+
+/// A committed install whose `config.local.json` is absent, or carries no
+/// marker, has nothing to warn about.
+#[test]
+fn duplicate_sync_entry_warning_is_silent_without_the_marker() {
+    let repo = fresh();
+    write_rel(repo.path(), ".superset/magic.json", r#"{"files":[]}"#);
+    assert_eq!(duplicate_sync_entry_warning(repo.path()), None);
+    write_rel(
+        repo.path(),
+        ".superset/config.local.json",
+        r#"{"setup":["./mine.sh"]}"#,
+    );
+    assert_eq!(duplicate_sync_entry_warning(repo.path()), None);
 }

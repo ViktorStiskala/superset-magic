@@ -1,4 +1,5 @@
-//! The pack engine: expand the sync patterns from the overlaid `magic.json`,
+//! The pack engine: expand the sync patterns (the overlaid `magic.json`, or a
+//! local install's `magic.local.json`),
 //! collect every matching file/directory from the current git repo root, and
 //! write them — preserving repo-relative structure — into a single
 //! `ss-magic-<repo>.tar.bz2` at the git root (name derived by
@@ -7,7 +8,9 @@
 //! This reuses the existing seams verbatim:
 //! - [`git::cwd_repo_root`] resolves the repo root (config source, match target,
 //!   and archive destination are all this one root — see the plan's KTD1).
-//! - [`superset_files::load_overlaid`] reads `magic.json` + `magic.local.json`.
+//! - `crate::load_magic_or_exit` reads the pattern list through
+//!   `superset_files::load_sync_config`: `magic.json` + `magic.local.json` on
+//!   a committed install, `magic.local.json` alone on a local install.
 //! - [`apply::match_paths`] expands the patterns with the same syntax checks,
 //!   `DEFAULT_EXCLUDES`, and de-dupe that forward/reverse sync use.
 //!
@@ -15,7 +18,7 @@
 //! C toolchain is needed — consistent with the crate's hermetic-build posture.
 //!
 //! The control flow deliberately mirrors `main::sync_core`: resolve root →
-//! probe `magic.json` → load overlaid config → empty-guard → do work.
+//! load the pattern list → empty-guard → do work.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -101,15 +104,17 @@ pub enum PackEvent {
 
 /// Core pack flow, shared by `ss-magic pack` and the interactive menu.
 ///
-/// Resolves the current repo root, verifies `.superset/magic.json` exists there,
-/// loads the overlaid config, expands the patterns against that root, and writes
-/// the matched files into `<root>/ss-magic-<repo>.tar.bz2` (see [`archive_file_name`]) with repo-relative
-/// paths. Extracted as `pack_core` (taking an `on_event` closure) so tests can
-/// collect events without side effects on stdout.
+/// Resolves the current repo root, loads its sync pattern list (committed
+/// overlay, or a local install's `magic.local.json`), expands the patterns
+/// against that root, and writes the matched files into
+/// `<root>/ss-magic-<repo>.tar.bz2` (see [`archive_file_name`]) with
+/// repo-relative paths. Extracted as `pack_core` (taking an `on_event` closure)
+/// so tests can collect events without side effects on stdout.
 ///
 /// Hard errors (non-zero exit), paralleling `sync_core`:
 /// - Cannot resolve the git repo root (not in a repo, or git fails).
-/// - `.superset/magic.json` absent in the resolved root.
+/// - Neither `.superset/magic.json` nor `.superset/magic.local.json` in the
+///   resolved root.
 /// - Malformed `magic.json` or `magic.local.json`.
 pub fn pack_core<F>(cwd: &Path, mut on_event: F) -> Result<ExitCode>
 where
@@ -131,7 +136,7 @@ where
         }
     };
 
-    // 2-3. Probe + load the overlaid magic.json (hard error on absent/malformed).
+    // 2-3. Load the sync pattern list (hard error on absent/malformed).
     //       Shared with `sync_core` via `crate::load_magic_or_exit`.
     let cfg = match crate::load_magic_or_exit(&root) {
         Ok(c) => c,
@@ -142,7 +147,7 @@ where
     if cfg.files.is_empty() {
         println!(
             "{}",
-            style::info("magic.json `files` is empty — nothing to pack.")
+            style::info("the configured `files` list is empty — nothing to pack.")
         );
         return Ok(ExitCode::SUCCESS);
     }

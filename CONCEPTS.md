@@ -30,6 +30,23 @@ previously configured file list forward. Both stage the whole tree and
 materialize it in one step behind a finishing prompt, so an aborted run
 leaves the previous contract intact.
 
+### Local install
+A way to use ss-magic on a repository without changing any tracked file, for a
+developer who does not want to propose the workspace contract to the team. It is
+the alternative to the workspace contract: instead of a committed pattern list
+and wrapper script, the pattern list lives only in the per-checkout local
+pattern file, the sync step is registered in Superset's own per-machine
+configuration override (which Superset runs directly, with no wrapper), and
+every ignore rule goes into the repository's shared, untracked exclude file
+rather than a committed ignore file. A fresh local install leaves the git status
+clean. It always lives in the main checkout – also when set up from a worktree –
+because workspace creation and sync read the main checkout's copy. Whether a
+repository has a local or a committed install is derived from which files exist,
+never stored: a committed pattern list always wins, and setting up a local
+install beside a committed one is refused. Because Superset's configuration
+override holds commands it runs for every new workspace, it travels from the
+main checkout to worktrees but is never written back by reverse sync.
+
 ### Main checkout
 The primary git checkout that linked worktrees branch from and share a common
 git directory with — the canonical tree reverse sync writes back into and the
@@ -38,7 +55,8 @@ source forward sync copies from.
 ### Sync patterns
 The glob patterns that drive both forward and reverse sync, formed by overlaying
 a committed, shared pattern list with an optional per-checkout local list (union,
-de-duplicated). They select which local or untracked files cross between the main
+de-duplicated). A [local install](#local-install) has no committed list, so the
+local list alone is the pattern set. They select which local or untracked files cross between the main
 checkout and a worktree. The local list is itself gitignored and is itself a
 forward-sync target, so it travels from the main checkout into a worktree like
 any other local file – which is why a setting that must not be overridable per
@@ -59,6 +77,13 @@ merge. The interactive merge cockpit, opened from the worktree menu's unified
 Sync entry, can also push a tracked candidate's worktree bytes into main on
 request; that push skips the gitignore step, since a tracked file is not a
 secret and already reaches main through a normal git merge.
+
+Before an untracked file lands in main, reverse sync makes sure git ignores it
+there: in a committed install by adding a rule to a committed ignore file, in a
+[local install](#local-install) by adding it to the shared, untracked exclude
+file instead, so reverse sync never dirties a tracked file on a repository that
+did not adopt ss-magic. Superset's per-machine configuration override is never
+pushed, merged or deleted by reverse sync, in either direction of the cockpit.
 
 ### Merge cockpit
 The full-screen interactive UI the worktree menu's unified Sync entry opens

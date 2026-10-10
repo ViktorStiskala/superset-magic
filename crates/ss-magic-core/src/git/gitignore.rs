@@ -24,12 +24,24 @@ pub enum PathKind {
     Dir,
 }
 
+/// Where a new ignore rule is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IgnoreSink {
+    /// A tracked-style `.gitignore` (the committed-install behavior, exactly
+    /// [`ensure_path_ignored`]).
+    Gitignore,
+    /// The repository's shared, untracked `<git-common-dir>/info/exclude`, so a
+    /// local install leaves `git status` clean.
+    LocalExclude,
+}
+
 /// The outcome of [`ensure_path_ignored`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ignored {
     /// git already ignored the path — nothing was written.
     Already,
-    /// A rule was appended to a `.gitignore`.
+    /// A rule was appended to a `.gitignore` (or, for the `LocalExclude` sink,
+    /// to `info/exclude`).
     Appended,
 }
 
@@ -44,11 +56,17 @@ pub enum Ignored {
 // The append primitive behind [`ensure_path_ignored`]; also called directly by
 // callers that already know the exact rule text.
 pub fn ensure_entry(git_root: &Path, line: &str) -> Result<()> {
-    let path = git_root.join(".gitignore");
+    append_line(&git_root.join(".gitignore"), line)
+}
 
+/// The append body shared by [`ensure_entry`] (a `.gitignore`) and the
+/// local-exclude writer (`info/exclude`): add `line` to the file at `path` when
+/// no exact line match exists, create the file when absent, and never reorder or
+/// rewrite existing content.
+fn append_line(path: &Path, line: &str) -> Result<()> {
     if path.exists() {
         let contents =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
         // Exact line match: any line in the file equals `line` after stripping
         // the trailing newline.
@@ -60,7 +78,7 @@ pub fn ensure_entry(git_root: &Path, line: &str) -> Result<()> {
         // Append: ensure the new entry starts on its own line.
         let mut file = fs::OpenOptions::new()
             .append(true)
-            .open(&path)
+            .open(path)
             .with_context(|| format!("opening {} for append", path.display()))?;
 
         // If the file is non-empty and its last byte is not a newline,
@@ -72,7 +90,7 @@ pub fn ensure_entry(git_root: &Path, line: &str) -> Result<()> {
         writeln!(file, "{}", line).with_context(|| format!("writing {}", path.display()))?;
     } else {
         // File absent — create it with just the entry + trailing newline.
-        fs::write(&path, format!("{}\n", line))
+        fs::write(path, format!("{}\n", line))
             .with_context(|| format!("creating {}", path.display()))?;
     }
 
@@ -240,11 +258,19 @@ pub fn ensure_path_ignored(
 /// to a literal append. A `Dir` is queried with a trailing slash so a `foo/bar/`
 /// rule matches before the directory exists on disk.
 fn is_ignored_opt(root: &Path, rel: &Path, kind: PathKind) -> Option<bool> {
-    let mut s = rel.to_str()?.to_string();
-    if kind == PathKind::Dir && !s.ends_with('/') {
-        s.push('/');
+    git::is_ignored_str(root, &with_dir_slash(rel.to_str()?, kind)).ok()
+}
+
+/// `path` with a trailing `/` added when `kind` is [`PathKind::Dir`] and it
+/// does not already end in one, else `path` unchanged. The one spelling rule
+/// for a directory, shared by the probes (git matches a directory-only `foo/`
+/// rule against a slash-terminated query even before the directory exists) and
+/// by the `.gitignore` rule written for it.
+fn with_dir_slash(path: &str, kind: PathKind) -> String {
+    match kind {
+        PathKind::Dir if !path.ends_with('/') => format!("{path}/"),
+        _ => path.to_string(),
     }
-    git::is_ignored_str(root, &s).ok()
 }
 
 /// The deepest ancestor directory of `rel` (under `target_root`) that already
@@ -292,10 +318,99 @@ fn anchored_literal(
             .with_context(|| format!("non-UTF-8 path: {}", sub.display()))?;
         format!("/{sub_str}")
     };
-    Ok(match kind {
-        PathKind::Dir if !base.ends_with('/') => format!("{base}/"),
-        _ => base,
-    })
+    Ok(with_dir_slash(&base, kind))
+}
+
+/// Ensure `rel` (of `kind`) is ignored under `target_root`, writing any new rule
+/// to the place `sink` names.
+///
+/// - [`IgnoreSink::Gitignore`] is exactly [`ensure_path_ignored`] (the committed
+///   install's behavior), including its git-tolerant degradation and its use of
+///   `rule_source_root` to copy a covering glob.
+/// - [`IgnoreSink::LocalExclude`] writes to `<git-common-dir>/info/exclude`
+///   instead, so a local install leaves every tracked file and `git status`
+///   untouched (KTD3: git reads that one untracked file for the main checkout
+///   and for every linked worktree). It never copies a glob from
+///   `rule_source_root` (which it ignores): a rule written to a shared file must
+///   not depend on which checkout it was resolved from, so the new rule is
+///   always the root-anchored literal for `rel`. It is git-STRICT, unlike the
+///   `Gitignore` sink: a git failure (no common dir, an unanswerable probe) is an
+///   error, never a guess, because there is no non-git local install to degrade
+///   for.
+///
+/// The `LocalExclude` writer probes git first and skips the write when the path
+/// is already ignored; otherwise it appends the rule (creating `info/` and the
+/// file when missing, never reordering) and then asks git AGAIN. `info/exclude`
+/// has LOWER precedence than any tracked `.gitignore`, so a tracked negation such
+/// as `!/.superset/backups/` can still win; when the re-check says the path is
+/// not ignored the function errors naming the path, turning what would be a
+/// silent leak of a secret into a loud failure.
+pub fn ensure_path_ignored_in(
+    sink: IgnoreSink,
+    target_root: &Path,
+    rule_source_root: &Path,
+    rel: &Path,
+    kind: PathKind,
+) -> Result<Ignored> {
+    match sink {
+        IgnoreSink::Gitignore => ensure_path_ignored(target_root, rule_source_root, rel, kind),
+        IgnoreSink::LocalExclude => ensure_in_local_exclude(target_root, rel, kind),
+    }
+}
+
+/// The [`IgnoreSink::LocalExclude`] writer behind [`ensure_path_ignored_in`].
+fn ensure_in_local_exclude(target_root: &Path, rel: &Path, kind: PathKind) -> Result<Ignored> {
+    let rel_str = rel
+        .to_str()
+        .with_context(|| format!("non-UTF-8 path: {}", rel.display()))?;
+    // Probe with the same trailing-slash convention the rule is written with.
+    let probe = with_dir_slash(rel_str, kind);
+    if git::is_ignored_str(target_root, &probe)? {
+        return Ok(Ignored::Already);
+    }
+
+    let rule = exclude_literal(rel_str, kind)?;
+    let info_dir = git::git_common_dir(target_root)?.join("info");
+    fs::create_dir_all(&info_dir).with_context(|| format!("creating {}", info_dir.display()))?;
+    append_line(&info_dir.join("exclude"), &rule)?;
+
+    if !git::is_ignored_str(target_root, &probe)? {
+        bail!(
+            "wrote `{rule}` to {} but git still does not ignore `{rel_str}` – a tracked \
+             .gitignore rule (for example a `!` negation) takes precedence over info/exclude",
+            info_dir.join("exclude").display()
+        );
+    }
+    Ok(Ignored::Appended)
+}
+
+/// The root-anchored literal `info/exclude` rule for `rel`: a leading `/`, the
+/// path with gitignore glob metacharacters (`\`, `*`, `?`, `[`) and a trailing
+/// space backslash-escaped so the rule matches exactly that path, and a trailing
+/// slash for a directory. A name containing a newline cannot be one line of the
+/// file and is refused rather than split into two rules.
+fn exclude_literal(rel: &str, kind: PathKind) -> Result<String> {
+    if rel.contains('\n') || rel.contains('\r') {
+        bail!("cannot write an ignore rule for a path containing a line break: {rel:?}");
+    }
+    let rel = rel.trim_end_matches('/');
+    let mut out = String::with_capacity(rel.len() + 2);
+    out.push('/');
+    for c in rel.chars() {
+        if matches!(c, '\\' | '*' | '?' | '[') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    if out.ends_with(' ') {
+        // git strips unescaped trailing spaces from a rule.
+        out.pop();
+        out.push_str("\\ ");
+    }
+    if kind == PathKind::Dir {
+        out.push('/');
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
