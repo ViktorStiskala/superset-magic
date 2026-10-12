@@ -463,7 +463,9 @@ The modules, by purpose:
   – a whole-slice scan for `--no-backup`/`-n` anywhere in argv (before OR after
   the subcommand token, deliberately asymmetric with the terminal `-h`/`--help`
   short-circuit). `Sync` also carries `no_orca_skip`, set the same way by
-  `has_no_orca_skip` (long form only). `orca` is the ONE subcommand after which
+  `has_no_orca_skip` – a whole-slice scan for `--no-orca-skip` (long form
+  only), the flag that makes forward sync in an Orca worktree copy the
+  `.worktreeinclude` paths too instead of leaving them to Orca. `orca` is the ONE subcommand after which
   a `-h`/`--help` still yields `Parsed::Help`: it rewrites files in the shared
   main checkout, and "what does this do?" must not be answered by doing it.
   `Command` stays `Copy`/`Eq` (`bool` is both). `init
@@ -765,7 +767,8 @@ The modules, by purpose:
   `sync::apply::run_filtered` unless `--no-backup`. `env` is how the Orca
   variables are read: production passes the process environment, tests pass a
   closure, so no test depends on the terminal it was launched from (which may
-  itself be an Orca terminal). In an Orca worktree (`orca::detect`) the copy's
+  itself be an Orca terminal). In an Orca worktree (`orca::detect`), and unless
+  `--no-orca-skip` was given, the copy's
   `PathFilter` is the skip set built by `orca_skip_filter` – read ONCE from the
   main checkout's `.worktreeinclude`, before anything is copied – and a
   successful copy is followed by `orca::write::refresh_snapshot`, reported by
