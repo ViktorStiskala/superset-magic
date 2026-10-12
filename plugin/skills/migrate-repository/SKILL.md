@@ -102,21 +102,21 @@ in every worktree of this repository on this machine.
 
 ### 4. Convert this branch's checklist
 
-1. Find this branch's legacy file. None: go to step 5. Several, or only a non-exact match: ask.
-2. Derive the stem and the document path `docs/actions/<stem>.checklist.json`. Committed already:
-   this branch is converted – skip to step 5. Untracked: ask to discard it and convert again; on
-   yes `git clean -f -- <path>`, on no stop and report with nothing committed. Staged: stop, and
-   give the operator `git restore --staged -- <path>` to run before re-running.
-3. Over 80 items or 60 KB: ask, quoting "up to about 6 × N = M verb calls" per converting choice:
-   open items only (default), keep Markdown (go to step 5), or convert everything (up to 200 items).
-4. Read the legacy file if step 3 did not – once enabled and past the gate threshold, only in
-   windows of at most `min(1500, gate.threshold_lines)` lines or through a subagent. Then `init`,
-   retitle the four sections, record `migrated-from-legacy`, and add every item per the conversion
-   rules – legacy text on stdin only; batch items one subshell each, never concurrently.
-5. `ss-magic-plugin checklist verify docs/actions/<stem>.checklist.json`. Red: show the findings,
-   fix them once through `set`, verify again; still red, stop and report – nothing is committed.
-6. Green: replace or annotate the legacy file (stub, or notice plus "History (not converted)"),
-   keeping its folder and siblings. Ask to commit the document and the legacy file.
+- 4a. Find this branch's legacy file. None: go to step 5. Several, or only a non-exact match: ask.
+- 4b. Derive the stem and the document path `docs/actions/<stem>.checklist.json`. Committed already:
+  this branch is converted – skip to step 5. Untracked: ask to discard it and convert again; on yes
+  `git clean -f -- <path>`, on no stop and report with nothing committed. Staged: stop, and give the
+  operator `git restore --staged -- <path>` to run before re-running.
+- 4c. Over 80 items or 60 KB: ask, quoting "up to about 6 × N = M verb calls" per converting choice:
+  open items only (default), keep Markdown (step 5), or convert everything (up to 200 items).
+- 4d. Read the legacy file unless step 3 already read it – once enabled and past the gate threshold,
+  only in windows of up to `min(1500, gate.threshold_lines)` lines or through a subagent. Then
+  `init`, retitle the four sections, record `migrated-from-legacy`, and add every item per the
+  conversion rules – legacy text on stdin only; batch items one subshell each, never concurrently.
+- 4e. `ss-magic-plugin checklist verify docs/actions/<stem>.checklist.json`. Red: show the findings,
+  fix them once through `set`, verify again; still red, stop and report – nothing is committed.
+- 4f. Green: replace or annotate the legacy file (stub, or notice plus "History (not converted)"),
+  keeping its folder and siblings. Ask to commit the document and the legacy file.
 
 ### 5. CI
 
