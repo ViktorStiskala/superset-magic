@@ -13,14 +13,16 @@
 //! main checkout as it is right now:
 //!
 //! 1. [`walk_candidates`] walks the checkout and records every directory that is
-//!    one of the known kinds or matches a stored pattern, never descending into
-//!    a directory it recorded – which is why a `node_modules` nested inside
-//!    another `node_modules` can never appear.
+//!    one of the known kinds or matches a stored pattern. It never descends
+//!    into a known kind – which is why a `node_modules` nested inside another
+//!    `node_modules` can never appear.
 //! 2. The stored patterns are matched against those candidates.
 //! 3. One `git check-ignore` call keeps only the directories git positively
 //!    reports as ignored. Orca refuses to share a directory that is not
 //!    gitignored, and a tracked `venv/` is somebody's source, not a cache.
-//! 4. The list is sorted and capped at Orca's limit of [`MAX_SHARED_DIRS`].
+//! 4. A directory inside another kept directory is dropped (sharing the outer
+//!    one already brings it), and the list is sorted and capped at Orca's limit
+//!    of [`MAX_SHARED_DIRS`].
 
 use std::path::{Path, PathBuf};
 
@@ -88,13 +90,33 @@ pub fn expand(root: &Path, patterns: &[String]) -> Expansion {
     cap(ignored_dirs(root, &matched))
 }
 
-/// Sort-and-cap applied to an already-filtered directory list.
-fn cap(mut dirs: Vec<String>) -> Expansion {
-    dirs.sort();
-    dirs.dedup();
+/// Sort, drop nested directories, and cap an already-filtered directory list.
+fn cap(dirs: Vec<String>) -> Expansion {
+    let mut dirs = outermost(dirs);
     let dropped = dirs.len().saturating_sub(MAX_SHARED_DIRS);
     dirs.truncate(MAX_SHARED_DIRS);
     Expansion { dirs, dropped }
+}
+
+/// `dirs` sorted and de-duplicated, without any directory that lies inside
+/// another one of them. Sharing the outer directory already brings the inner
+/// one, and a nested entry would only spend one of Orca's 100 slots.
+fn outermost(mut dirs: Vec<String>) -> Vec<String> {
+    dirs.sort();
+    dirs.dedup();
+    let mut kept: Vec<String> = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        // Compared on whole components, so `a/b` is inside `a` but `a-b` is
+        // not. An outer directory need not be the entry just before this one
+        // (`a`, `a-b`, `a/c` sort in that order), so every kept one is checked.
+        let nested = kept
+            .iter()
+            .any(|outer| Path::new(&dir).starts_with(outer) && dir != *outer);
+        if !nested {
+            kept.push(dir);
+        }
+    }
+    kept
 }
 
 /// One row of the shared-directory picker: a pattern and the gitignored
@@ -118,11 +140,13 @@ pub fn matches_by_pattern(root: &Path, patterns: &[String]) -> Vec<PatternMatche
             let dirs = match Glob::new(pattern) {
                 Ok(glob) => {
                     let matcher = glob.compile_matcher();
-                    ignored
-                        .iter()
-                        .filter(|dir| matcher.is_match(Path::new(dir)))
-                        .cloned()
-                        .collect()
+                    outermost(
+                        ignored
+                            .iter()
+                            .filter(|dir| matcher.is_match(Path::new(dir)))
+                            .cloned()
+                            .collect(),
+                    )
                 }
                 Err(_) => Vec::new(),
             };
@@ -177,14 +201,21 @@ pub fn picker_preselected(stored: Option<&[String]>, rows: &[PatternMatches]) ->
         .collect()
 }
 
-/// The patterns to store when nobody is asked: the stored list when
-/// `magic.json` has the key – an empty list included, which is a choice – and
-/// otherwise every default kind that matches something in `root`. Used by the
-/// non-interactive init and by migrate.
-pub fn stored_or_detected(root: &Path, stored: Option<&[String]>) -> Vec<String> {
+/// The patterns to store when nobody is asked – what the non-interactive init
+/// and migrate write as `magic.json`'s `sharedDirectories`:
+///
+/// - the stored list when `magic.json` already has the key, an empty list
+///   included, since that is a choice someone made;
+/// - otherwise every default kind that matches something in `root`;
+/// - and `None`, leaving the key ABSENT, when there is no stored choice and
+///   nothing was detected. Writing `[]` there would record "chose none" on
+///   behalf of nobody, and freeze it: a scripted init run in a fresh checkout,
+///   before any dependencies are installed, would stop every later run from
+///   detecting them.
+pub fn stored_or_detected(root: &Path, stored: Option<&[String]>) -> Option<Vec<String>> {
     match stored {
-        Some(stored) => stored.to_vec(),
-        None => detected_default_patterns(root),
+        Some(stored) => Some(stored.to_vec()),
+        None => Some(detected_default_patterns(root)).filter(|detected| !detected.is_empty()),
     }
 }
 
@@ -210,8 +241,13 @@ fn glob_set(patterns: &[String]) -> Option<GlobSet> {
 ///
 /// The walk never follows a symlink and never descends into:
 ///
-/// - a directory it recorded – the reason a nested `node_modules` never shows
-///   up, and what keeps the walk out of the largest trees in the checkout;
+/// - a directory of a known kind – the reason a nested `node_modules` never
+///   shows up, and what keeps the walk out of the largest trees in the
+///   checkout. A directory recorded only because a stored PATTERN matched it is
+///   still entered: whether it ends up shared depends on git, which is asked
+///   later, and a pattern that happens to match a tracked parent directory
+///   (`apps/*`) must not hide the `node_modules` beneath it. Nested results are
+///   removed once the ignore answers are in ([`outermost`]);
 /// - the excluded trees (`.git`, `.superset/backups`, `.superset/.magic`,
 ///   `.scratchpad`);
 /// - a directory holding a `.git` entry – a submodule or a nested repository.
@@ -244,11 +280,13 @@ pub fn walk_candidates(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
             continue;
         }
         let name = entry.file_name();
-        let is_kind = KIND_NAMES.iter().any(|kind| name == std::ffi::OsStr::new(kind));
-        if is_kind || custom.as_ref().is_some_and(|set| set.is_match(rel)) {
+        if KIND_NAMES.iter().any(|kind| name == std::ffi::OsStr::new(kind)) {
             found.push(rel.to_path_buf());
             walker.skip_current_dir();
             continue;
+        }
+        if custom.as_ref().is_some_and(|set| set.is_match(rel)) {
+            found.push(rel.to_path_buf());
         }
         if name == std::ffi::OsStr::new(".next") {
             let cache = entry.path().join("cache");

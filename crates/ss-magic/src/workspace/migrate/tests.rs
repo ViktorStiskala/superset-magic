@@ -234,7 +234,7 @@ fn migration_transforms_old_layout_into_new() {
         .unwrap();
 
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, None).unwrap();
 
     // Staged magic.json carries setup_config.json's files verbatim.
     let staged_magic = superset_files::load_overlaid(stage.path())
@@ -303,7 +303,7 @@ fn migration_preserves_plugin_state_ktd2() {
         .unwrap();
 
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, None).unwrap();
     superset_files::copy_into_repo(stage.path(), repo.path(), &[SETUP_SH_REL]).unwrap();
     rename_setup_config(repo.path()).unwrap();
 
@@ -326,7 +326,7 @@ fn migration_preserves_existing_magic_local_json() {
     let existing = superset_files::load_config(repo.path()).unwrap().unwrap();
 
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, None).unwrap();
 
     // The guard kept magic.local.json OUT of the stage.
     assert!(
@@ -366,7 +366,7 @@ fn migration_both_markers_strips_setup_sh_keeps_wrapper() {
         .unwrap();
 
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, None).unwrap();
 
     let staged_cfg = superset_files::load_config(stage.path())
         .unwrap()
@@ -430,7 +430,7 @@ fn staging_does_not_mutate_repo_until_materialized() {
         .unwrap()
         .unwrap();
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, None).unwrap();
 
     // Repo is byte-identical: nothing was written, renamed, or deleted.
     assert_eq!(
@@ -635,7 +635,7 @@ fn stage_migration_without_setup_config_yields_empty_files() {
         .unwrap();
 
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, None).unwrap();
     let staged_magic = superset_files::load_overlaid(stage.path())
         .unwrap()
         .unwrap();
@@ -666,7 +666,7 @@ fn stage_migration_preserves_existing_magic_json_unknown_keys() {
         .unwrap();
 
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, None).unwrap();
 
     let raw = fs::read_to_string(stage.path().join(".superset/magic.json")).unwrap();
     let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -1020,7 +1020,11 @@ fn noninteractive_init_outside_git_writes_empty_orca_lists() {
         read_text(repo.path(), "orca.yaml"),
         "scripts:\n  setup: |\n    ./.superset/magic.sh sync\nworktree:\n  sharedDirectories: []\n"
     );
-    assert_eq!(stored_shared(repo.path()), Some(Vec::new()));
+    assert_eq!(
+        stored_shared(repo.path()),
+        None,
+        "nothing detected and nobody asked: the key is left out, not frozen at `[]`"
+    );
     let include = read_text(repo.path(), worktreeinclude::FILE_NAME);
     assert!(worktreeinclude::entries(&include).is_empty(), "{include}");
     assert!(include.contains("ss-magic"), "the section markers are there: {include}");
@@ -1234,7 +1238,12 @@ fn migration_writes_the_orca_files_alongside_the_new_layout() {
     write_file(root, "node_modules/a/index.js", "x");
     let existing = superset_files::load_config(root).unwrap().unwrap();
     let shared = shared_dirs::stored_or_detected(root, None);
-    let plan = orca_write::plan(root, &shared, SetupPolicy::Ensure);
+    assert_eq!(shared, Some(strings(&["**/node_modules"])));
+    let plan = orca_write::plan(
+        root,
+        shared.as_deref().unwrap_or_default(),
+        SetupPolicy::Ensure,
+    );
     assert_eq!(
         plan.summary_lines(),
         vec![
@@ -1244,7 +1253,7 @@ fn migration_writes_the_orca_files_alongside_the_new_layout() {
         ]
     );
 
-    materialize_migration(root, &existing, &shared, &plan).unwrap();
+    materialize_migration(root, &existing, shared.as_deref(), &plan).unwrap();
 
     // The migrated Superset tree ...
     assert!(!root.join(".superset/setup.sh").exists());
@@ -1341,4 +1350,30 @@ fn the_finishing_action_stages_orca_yaml_and_never_the_snapshot() {
         !staged.lines().any(|l| l == worktreeinclude::FILE_NAME),
         "the snapshot is gitignored and must not be staged: {staged}"
     );
+}
+
+/// A scripted init that detects nothing must not record a choice nobody made.
+/// Run before dependencies are installed, it leaves `sharedDirectories` out of
+/// `magic.json`; run again once they exist, it detects and stores them.
+#[test]
+fn an_init_that_detects_nothing_leaves_the_choice_open_for_a_later_run() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n");
+
+    run_init_noninteractive(root, &[]).unwrap();
+
+    assert_eq!(stored_shared(root), None);
+    assert!(
+        !read_text(root, ".superset/magic.json").contains("sharedDirectories"),
+        "the key must be absent from the file"
+    );
+    assert!(orca_dirs(root).is_empty());
+
+    // `npm install` happens, then init runs again.
+    write_file(root, "node_modules/a/index.js", "x");
+    run_init_noninteractive(root, &[]).unwrap();
+
+    assert_eq!(stored_shared(root), Some(strings(&["**/node_modules"])));
+    assert_eq!(orca_dirs(root), strings(&["node_modules"]));
 }

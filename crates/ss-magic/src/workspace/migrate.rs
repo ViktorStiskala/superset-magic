@@ -286,12 +286,13 @@ fn migration_summary(existing: &Config) -> Vec<String> {
 /// repo.
 ///
 /// `shared` becomes `magic.json`'s `sharedDirectories` – the patterns naming
-/// the dependency directories Orca shares with a new worktree.
+/// the dependency directories Orca shares with a new worktree – and `None`
+/// leaves that key out of the file.
 fn stage_migration(
     repo_root: &Path,
     stage_root: &Path,
     existing: &Config,
-    shared: &[String],
+    shared: Option<&[String]>,
 ) -> Result<()> {
     // setup_config.json `files` carry across to magic.json. Absent → empty.
     let files = superset_files::load_setup_config(repo_root)?
@@ -301,12 +302,13 @@ fn stage_migration(
     // magic.json — a repo mid-migration (both the old setup.sh marker and
     // the new magic.sh marker present in `setup`) can already have one.
     // `shared` is the Orca shared-directory pattern list the caller settled on
-    // (the stored one, or the detected defaults); it is stored as given.
+    // (the stored one, or the detected defaults); it is stored as given, and
+    // `None` leaves the key absent.
     let existing_magic = superset_files::load_magic_json(repo_root)?;
     let magic_cfg = superset_files::merge_files_into_magic_config(
         existing_magic.as_ref(),
         files,
-        Some(shared.to_vec()),
+        shared.map(<[String]>::to_vec),
     );
     superset_files::write_magic_json(stage_root, &magic_cfg)?;
 
@@ -360,7 +362,11 @@ pub fn run_migrate(repo_root: &Path, existing: &Config) -> Result<ExitCode> {
     let stored_shared = superset_files::load_magic_json(repo_root)?
         .and_then(|magic| magic.shared_directories);
     let shared = shared_dirs::stored_or_detected(repo_root, stored_shared.as_deref());
-    let orca_plan = orca_write::plan(repo_root, &shared, SetupPolicy::Ensure);
+    let orca_plan = orca_write::plan(
+        repo_root,
+        shared.as_deref().unwrap_or_default(),
+        SetupPolicy::Ensure,
+    );
 
     // ---- Change summary (printed BEFORE the prompt). ----
     println!();
@@ -384,7 +390,8 @@ and must be recreated."
     // ---- staged or materialized: the old layout stays intact on disk. ----
     let action = ui::pick_final_action()?;
 
-    let orca_notices = materialize_migration(repo_root, existing, &shared, &orca_plan)?;
+    let orca_notices =
+        materialize_migration(repo_root, existing, shared.as_deref(), &orca_plan)?;
 
     println!();
     println!("{}", style::ok("Wrote .superset/magic.json"));
@@ -407,7 +414,7 @@ and must be recreated."
 fn materialize_migration(
     repo_root: &Path,
     existing: &Config,
-    shared: &[String],
+    shared: Option<&[String]>,
     orca_plan: &orca_write::Plan,
 ) -> Result<Vec<Notice>> {
     // Stage into a tempdir. Drop on early return cleans up.
@@ -584,12 +591,14 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
 
     let action = ui::pick_final_action()?;
 
+    // The picker's answer is always stored, an empty one included: here
+    // someone did choose.
     let written = materialize_init(
         repo_root,
         existing,
         existing_magic.as_ref(),
         files,
-        shared,
+        Some(shared),
         &orca_plan,
     )?;
 
@@ -621,8 +630,9 @@ struct InitWritten {
 /// interactive [`run_init`] (also the edit-config path) and
 /// [`run_init_noninteractive`], so the two cannot drift apart.
 ///
-/// Stages `magic.json` (with `files` and `shared` as its two lists, every
-/// unknown key of `existing_magic` carried over), `magic.sh`, `config.json`
+/// Stages `magic.json` (with `files` and `shared` as its two lists – `shared`
+/// being `None` leaves `sharedDirectories` out of the file – and every unknown
+/// key of `existing_magic` carried over), `magic.sh`, `config.json`
 /// (the wrapper entry as `setup`, `teardown`/`run` of `existing_config`
 /// preserved) and, when the repository has none, a fresh `magic.local.json`;
 /// copies the stage in; adds the bootstrap gitignore rules; then writes the
@@ -633,7 +643,7 @@ fn materialize_init(
     existing_config: Option<&Config>,
     existing_magic: Option<&MagicConfig>,
     files: Vec<String>,
-    shared: Vec<String>,
+    shared: Option<Vec<String>>,
     orca_plan: &orca_write::Plan,
 ) -> Result<InitWritten> {
     let staging = tempfile::Builder::new()
@@ -641,8 +651,7 @@ fn materialize_init(
         .tempdir()
         .context("creating init staging tempdir")?;
     let stage_root = staging.path();
-    let magic_cfg =
-        superset_files::merge_files_into_magic_config(existing_magic, files, Some(shared));
+    let magic_cfg = superset_files::merge_files_into_magic_config(existing_magic, files, shared);
     superset_files::write_magic_json(stage_root, &magic_cfg)?;
     superset_files::write_magic_sh(stage_root)?;
     let merged = superset_files::merge_setup_into_config(
@@ -681,7 +690,9 @@ fn materialize_init(
 /// The Orca files are written too. With nobody to ask, the shared-directory
 /// patterns are the ones `magic.json` already stores – an empty list included,
 /// since that is a choice someone made – and otherwise every default kind that
-/// matches a gitignored directory in the checkout.
+/// matches a gitignored directory in the checkout. When nothing is stored and
+/// nothing is detected the key is left out of `magic.json`, so a later run can
+/// still detect directories that did not exist yet.
 pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<ExitCode> {
     let files = init_magic_files(patterns);
     let existing_magic = superset_files::load_magic_json(repo_root)?;
@@ -690,7 +701,11 @@ pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<
         .as_ref()
         .and_then(|magic| magic.shared_directories.clone());
     let shared = shared_dirs::stored_or_detected(repo_root, stored_shared.as_deref());
-    let orca_plan = orca_write::plan(repo_root, &shared, SetupPolicy::Ensure);
+    let orca_plan = orca_write::plan(
+        repo_root,
+        shared.as_deref().unwrap_or_default(),
+        SetupPolicy::Ensure,
+    );
 
     let written = materialize_init(
         repo_root,

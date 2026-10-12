@@ -265,11 +265,56 @@ fn without_a_stored_choice_the_detected_kinds_are_stored() {
 
     assert_eq!(
         stored_or_detected(root, None),
-        strings(&["**/node_modules", "**/.venv"])
+        Some(strings(&["**/node_modules", "**/.venv"]))
     );
-    assert_eq!(stored_or_detected(root, Some(&[])), Vec::<String>::new());
+    // A stored choice wins, and a stored "none" is a choice.
+    assert_eq!(stored_or_detected(root, Some(&[])), Some(Vec::new()));
     assert_eq!(
         stored_or_detected(root, Some(&strings(&["**/dist"]))),
-        strings(&["**/dist"])
+        Some(strings(&["**/dist"]))
+    );
+    // No stored choice and nothing to detect: the key stays absent.
+    let empty = init_main_repo("main");
+    assert_eq!(stored_or_detected(empty.path(), None), None);
+}
+
+/// A stored pattern that happens to match a TRACKED parent directory must not
+/// hide the dependency directories beneath it: the parent is not shared (git
+/// does not ignore it), and the `node_modules` inside it still is.
+#[test]
+fn a_pattern_matching_a_tracked_parent_does_not_hide_what_is_beneath_it() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n");
+    write_file(root, "apps/web/src/index.ts", "x");
+    write_file(root, "apps/web/node_modules/a/index.js", "x");
+    write_file(root, "apps/api/node_modules/b/index.js", "x");
+
+    let expansion = expand(root, &strings(&["apps/*", "**/node_modules"]));
+
+    assert_eq!(
+        expansion.dirs,
+        strings(&["apps/api/node_modules", "apps/web/node_modules"])
+    );
+}
+
+/// A directory inside another shared directory is not listed: sharing the outer
+/// one already brings it, and each entry spends one of Orca's 100 slots.
+#[test]
+fn a_directory_inside_another_shared_directory_is_not_listed() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "build/\n");
+    write_file(root, "build/out/app.js", "x");
+    write_file(root, "build/cache/node_modules/a/index.js", "x");
+    write_file(root, "build-tools/readme.md", "x");
+
+    let expansion = expand(root, &strings(&["build", "**/node_modules"]));
+
+    assert_eq!(expansion.dirs, strings(&["build"]));
+    assert_eq!(
+        outermost(strings(&["a/c", "a", "a-b", "a/c/d", "b/a"])),
+        strings(&["a", "a-b", "b/a"]),
+        "nesting is by whole component, and the outer entry need not be adjacent"
     );
 }

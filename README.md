@@ -588,7 +588,9 @@ changes uncommitted on disk. Extra arguments become the `files` patterns in
 operations, and skips the auto-update gate. The Orca files are written too:
 with nobody to ask, the shared-directory patterns are the ones `magic.json`
 already stores (an empty list included) or, failing that, every kind detected in
-the checkout.
+the checkout. When nothing is stored and nothing is detected – a fresh clone
+before `npm install`, say – the key is left out of `magic.json`, so a later run
+can still detect directories that did not exist yet.
 
 ### `ss-magic update` — force a self-update
 
@@ -1009,8 +1011,9 @@ Derived from `magic.json` and written at the repository root, outside
 `sharedDirectories` can hold any glob that matches gitignored directories. The
 kinds offered by default are `**/node_modules`, `**/.venv`, `**/venv`,
 `**/.cache`, `**/.turbo`, `**/.parcel-cache` and `**/.next/cache`. A
-`node_modules` nested inside another `node_modules` is never listed, and a
-directory that is tracked or not gitignored is never shared.
+`node_modules` nested inside another `node_modules` is never listed, nor is any
+directory that sits inside another shared one, and a directory that is tracked
+or not gitignored is never shared.
 
 ## Pattern semantics
 

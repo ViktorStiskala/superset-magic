@@ -508,7 +508,8 @@ The modules, by purpose:
   `sharedDirectories`: what starts checked is the stored list when the key
   exists (a stored "none" included) and otherwise every kind that matches
   something. With nobody to ask, `shared_dirs::stored_or_detected` keeps a
-  stored list and otherwise stores every default kind that matches.
+  stored list and otherwise stores every default kind that matches, leaving the
+  key absent when none does.
   `execute_final_action` stages `FINAL_ACTION_PATHS` – `.superset`,
   `.gitignore` and `orca.yaml`, NEVER the per-machine `.worktreeinclude`. All
   three write paths (`run_migrate`, `run_init`,
@@ -879,15 +880,23 @@ The modules, by purpose:
 - `orca/shared_dirs.rs` – expands the `sharedDirectories` GLOBS stored in
   `magic.json` to LITERAL directories. `walk_candidates` records a directory
   that is a known kind (`node_modules`, `.venv`, `venv`, `.cache`, `.turbo`,
-  `.parcel-cache`, and `.next/cache`) or matches a stored pattern and NEVER
-  descends into what it recorded – the only reason a nested `node_modules`
-  never appears. It follows no symlink and stays out of the excluded trees, any
-  directory holding a `.git` entry, any directory tagged with `CACHEDIR.TAG`
-  (a Rust `target/`), and `.next` beyond its `cache` child. `expand` keeps only
-  what `git::ignored_untracked` positively reports (queried with a trailing
-  slash), sorts, and caps at `MAX_SHARED_DIRS` (100). `matches_by_pattern`,
+  `.parcel-cache`, and `.next/cache`) or matches a stored pattern. It NEVER
+  descends into a known kind – the only reason a nested `node_modules` never
+  appears – but it does enter a directory recorded only because a pattern
+  matched it: whether that directory is shared depends on git, which is asked
+  later, and a pattern that happens to match a tracked parent (`apps/*`) must
+  not hide the `node_modules` beneath it. It follows no symlink and stays out of
+  the excluded trees, any directory holding a `.git` entry, any directory tagged
+  with `CACHEDIR.TAG` (a Rust `target/`), and `.next` beyond its `cache` child.
+  `expand` keeps only what `git::ignored_untracked` positively reports (queried
+  with a trailing slash), drops a directory that lies inside another kept one
+  (`outermost`), sorts, and caps at `MAX_SHARED_DIRS` (100). `matches_by_pattern`,
   `picker_patterns` and `picker_preselected` feed the picker;
-  `stored_or_detected` is the choice made when nobody is asked.
+  `stored_or_detected` is the choice made when nobody is asked: a stored list
+  as it is (an empty one included), else the detected default kinds, else `None`
+  – the key stays ABSENT when nothing is stored and nothing is detected, so a
+  scripted init run before dependencies exist does not record "chose none" on
+  nobody's behalf.
 - `orca/snapshot.rs` – `compute` is "what forward sync would copy, filtered to
   what Orca would copy": `apply::match_paths` on main, directory matches walked
   into FILES (the snapshot never lists a directory) with the excluded trees,

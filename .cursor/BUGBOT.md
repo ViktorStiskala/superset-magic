@@ -650,21 +650,36 @@ hand-written lines are counted. `git::ignored_untracked` builds its own
 helper thread while it reads the answers – flag a rewrite that writes all of
 stdin before reading stdout, which deadlocks past a pipe buffer.
 
-### Shared directories: a walk that never descends into what it records
+### Shared directories: a walk that never descends into a known kind
 
 `orca::shared_dirs` expands the `sharedDirectories` GLOBS stored in `magic.json`
 to LITERAL directories on every write. The walk records a directory that is a
 known kind (`node_modules`, `.venv`, `venv`, `.cache`, `.turbo`,
-`.parcel-cache`, and `.next/cache`) or matches a stored pattern, and NEVER
-descends into a recorded directory – which is the only reason a `node_modules`
-nested inside another can never appear. It does not follow symlinks and stays
-out of the excluded trees, directories holding a `.git` entry, directories
-tagged with `CACHEDIR.TAG`, and `.next` beyond its `cache` child. Only
-directories git positively reports as ignored are kept (queried WITH a trailing
-slash), the list is sorted and capped at Orca's 100. Rust's `target/` is
-deliberately not a default kind. Flag a walk that enters a recorded candidate,
-follows a symlink, shares a tracked or unignored directory, or reads
-`sharedDirectories` from `magic.local.json`.
+`.parcel-cache`, and `.next/cache`) or matches a stored pattern. It NEVER
+descends into a known kind – which is the only reason a `node_modules` nested
+inside another can never appear, and what keeps it out of the largest trees.
+A directory recorded only because a stored PATTERN matched it IS entered: a
+pattern that happens to match a tracked parent (`apps/*`) must not hide the
+`node_modules` beneath it. The walk does not follow symlinks and stays out of
+the excluded trees, directories holding a `.git` entry, directories tagged with
+`CACHEDIR.TAG`, and `.next` beyond its `cache` child. Only directories git
+positively reports as ignored are kept (queried WITH a trailing slash); a
+directory inside another kept one is then dropped (`outermost`, compared by
+whole path component), and the list is sorted and capped at Orca's 100. Rust's
+`target/` is deliberately not a default kind.
+
+When nobody is asked (the scripted init, migrate), `stored_or_detected` keeps a
+stored list as it is – an empty one included, since that is a choice – and
+otherwise stores the default kinds that match. With nothing stored and nothing
+detected it returns `None` and the key stays ABSENT: writing `[]` there would
+record "chose none" on nobody's behalf and stop every later run from detecting
+directories that did not exist yet. Only the interactive picker's answer is
+stored unconditionally.
+
+Flag a walk that enters a known kind, follows a symlink, shares a tracked or
+unignored directory, lists a directory nested in another listed one, reads
+`sharedDirectories` from `magic.local.json`, or a non-interactive path that
+stores an empty list it did not find in the file.
 
 ### `orca.yaml` is edited as TEXT and verified by re-parsing
 
