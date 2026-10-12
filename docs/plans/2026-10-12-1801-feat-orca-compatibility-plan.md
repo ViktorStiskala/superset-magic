@@ -290,6 +290,14 @@ flowchart TB
 - Whether the CLI's `Command::Sync` field churn (about nine literal patterns in tests) is cheaper than introducing a small options struct; either is acceptable.
 - Exact warning wording for the Orca-limit and refusal messages.
 
+### Settled during implementation
+
+Three points the text above left open or worded more narrowly than the code needed. Each was put to the user while the plan was being implemented and decided there.
+
+- **A scripted init or migrate that detects no shared directory leaves `sharedDirectories` out of `magic.json`.** Refines KTD7, which says to "store every default kind that matched" without covering the case where none did. (session-settled: user-approved – chosen over storing an empty list: KTD7 defines `[]` as "chose none", and a run made before dependencies are installed would otherwise freeze that for every later scripted run.)
+- **`saphyr` is refused mechanically, not only by the one-off gate.** `scripts/build-plugin-zip.py --check` (its `workspace shape` assertion) and the `cargo tree` loop in `.github/workflows/ci.yml` now reject it in the plugin and core manifests, alongside `self_update`, `inquire` and `ratatui`. Extends KTD1 and the Verification Contract's "YAML stays out of the plugin" gate to two files no unit lists. (session-settled: user-approved – chosen over leaving the rule documented and checked by hand only.)
+- **An `ORCA_WORKTREE_ID` ending in `::workspace:<uuid>` has that suffix removed before its path is compared.** Refines KTD9's "text after the first `::`": the Orca 1.4.221 bundle shows an id can carry the suffix, and R15 keys detection on the path inside the id. (session-settled: user-approved – chosen over the literal reading, under which such an id would never match.)
+
 ---
 
 ## Implementation Units
