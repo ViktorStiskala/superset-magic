@@ -7,8 +7,8 @@ are in [reference.md](./reference.md).
 ## The repository before
 
 **Legacy checklists.** One `docs/actions/<YYYY-MM-branch>/CHECKLIST.md` per branch: about a dozen
-folders, from 2.5 KB to about 380 KB, holding from 4 to about 375 items each. Every file starts
-with a mandatory header:
+folders, from a few KB to several hundred KB, holding from a handful to a few hundred items each.
+Every file starts with a mandatory header:
 
 ```markdown
 # <Title>
@@ -21,16 +21,21 @@ Branch name: `<branch>`
 `Post-Deploy Requirements`, `Post-Deploy Verification` and `Visual/Functional Checks`, plus ad-hoc
 ones in some files. Inside them, `### <Area>` subsections named after a console or an owner.
 
-**Items.** Two styles, an older and a newer one. `<P>` stands for the priority emoji some rows
-carry:
+**Items.** Two styles, an older and a newer one. `<P>` stands for the priority marker: an emoji
+some rows carry at their start, before the action text.
 
 ```markdown
 - [ ] **<action>** **PASS:** <expected result>
 - [ ] <P> <action> – <expected result> (<why>)
 - [x] <action> – <expected result> – done <YYYY-MM-DD>
+- [x] <action> – <expected result> (done <YYYY-MM-DD>)
 - [ ] **Decision: <question>?** Default: <the option taken if nobody decides>
   > Superseded <YYYY-MM-DD>: <what changed>
 ```
+
+A ticked row ends in one of two completion markers, ` – done <date>` or `(done <date>)`. Both
+convert the same way: when the date is a real calendar day, the marker is dropped and its date
+becomes `completed`. The second is a parenthetical, but it is never the row's `why`.
 
 **Governance and tooling.**
 
@@ -51,7 +56,7 @@ the repository.
 ### Preflight
 
 ```plaintext
-Preflight (read only)
+Inventory (read only)
   binary: installed, ss-magic-plugin 1.1.0, versions aligned
   repository: linked worktree; main checkout at <main checkout path>
   branch: area-a-rollout (default branch: main, compared against origin/main)
@@ -61,21 +66,34 @@ Preflight (read only)
   legacy checklists: about a dozen folders under docs/actions/
   this branch: docs/actions/2026-09-area-a-rollout/CHECKLIST.md – 14 KB, 31 items, 9 done
   legacy skill: .claude/skills/operator-checklist/ (here and on origin/main)
-  project rules: several matches across a handful of files
+  project rules: several matches in a handful of files (CLAUDE.md, docs/actions/CLAUDE.md, …), outside the legacy skill
   CI workflow: state: absent
   problems:
     - git does not ignore .superset/.magic/ — every state-writing hook refuses to write anything while that is true. `ss-magic-plugin enable` adds the rule.
     - `plugin.enabled` is not true in <main checkout path> — every hook no-ops, whatever the harness has loaded. Turn it on with `ss-magic-plugin enable`.
 ```
 
+This is the inventory report's shape without its `Stopped at:` line, because the run continues.
+There is no `origin:` line: the credential test did not match.
+
 Not the default branch, not yet migrated: full migration. The file is under 80 items and 60 KB, so
-no size question will be asked. Preflight read it whole with the Read tool, before enabling.
+no size question will be asked. Preflight measured the file with `wc` and `awk`; it did not Read
+it.
 
 ### Enable
 
 The skill asks committed, `--local`, both or no, and recommends both: `enabled` is read from the
 main checkout, so a committed-only enable written in this worktree acts only once the commit
 reaches it; `--local` acts now in every worktree on this machine. The operator picks both.
+
+The answer is a yes, so the skill settles the conversion before it runs any `enable`:
+
+- the folder is an exact match, so there is no folder question;
+- no document exists yet (`test -e 'docs/actions/2026-09-area-a-rollout.checklist.json'` fails);
+- the file is under the size thresholds, so there is no size question.
+
+Conversion is certain. The skill Reads the legacy file now with the Read tool, before the first
+`enable`, while the Read gate is still off.
 
 The bootstrap already seeded the `plugin` key, so `seed-config` is skipped.
 
@@ -121,7 +139,12 @@ SSMAGIC_LEGACY
 ```
 
 The other three sections are retitled the same way. `base` is the legacy file's first commit,
-`2026-09-02T09:30:00+02:00`.
+`2026-09-02T09:30:00+02:00`. The offset for dates taken from prose is derived once, in the same
+form:
+
+```bash
+off=$(date +%z); off="${off%??}:${off#???}"    # +0200 becomes +02:00
+```
 
 ### Three converted items
 
@@ -129,34 +152,37 @@ The other three sections are retitled the same way. `base` is the legacy file's 
 
 ```markdown
 ### Admin console
-- [ ] <P> Rotate the staging API key – requests signed with the old key return 401 (the old key was pasted into a shared ticket)
-  > Superseded 2026-09-10: rotate the production key in the same window
+- [ ] <P> Enable the maintenance notice – every page shows the notice (the rollout restarts the background jobs)
+  > Superseded 2026-09-10: enable it one hour earlier, the restart was moved forward
 ```
 
 ```bash
 set -e
-ss-magic-plugin checklist add-item verification rotate-the-staging-api-key <<'SSMAGIC_LEGACY'
-Admin console: Rotate the staging API key
+ss-magic-plugin checklist add-item verification enable-the-maintenance-notice <<'SSMAGIC_LEGACY'
+Admin console: Enable the maintenance notice
 SSMAGIC_LEGACY
-ss-magic-plugin checklist set rotate-the-staging-api-key expected <<'SSMAGIC_LEGACY'
-requests signed with the old key return 401
+ss-magic-plugin checklist set enable-the-maintenance-notice expected <<'SSMAGIC_LEGACY'
+every page shows the notice
 SSMAGIC_LEGACY
-ss-magic-plugin checklist set rotate-the-staging-api-key why <<'SSMAGIC_LEGACY'
-the old key was pasted into a shared ticket
+ss-magic-plugin checklist set enable-the-maintenance-notice why <<'SSMAGIC_LEGACY'
+the rollout restarts the background jobs
 SSMAGIC_LEGACY
-ss-magic-plugin checklist set rotate-the-staging-api-key steps <<'SSMAGIC_LEGACY'
-Rotate the staging API key
+ss-magic-plugin checklist set enable-the-maintenance-notice steps <<'SSMAGIC_LEGACY'
+Enable the maintenance notice
 SSMAGIC_LEGACY
-ss-magic-plugin checklist set rotate-the-staging-api-key priority blocking
-ss-magic-plugin checklist set rotate-the-staging-api-key created 2026-09-02T09:30:03+02:00
-ss-magic-plugin checklist add-entry note-rotate-the-staging-api-key <<'SSMAGIC_LEGACY'
-rotate-the-staging-api-key: Superseded 2026-09-10: rotate the production key in the same window
+ss-magic-plugin checklist set enable-the-maintenance-notice priority blocking
+ss-magic-plugin checklist set enable-the-maintenance-notice created 2026-09-02T09:30:03+02:00
+ss-magic-plugin checklist add-entry note-enable-the-maintenance-notice <<'SSMAGIC_LEGACY'
+enable-the-maintenance-notice: Superseded 2026-09-10: enable it one hour earlier, the restart was moved forward
 SSMAGIC_LEGACY
-ss-magic-plugin checklist set note-rotate-the-staging-api-key created 2026-09-10T12:00:00+0200
+ss-magic-plugin checklist set note-enable-the-maintenance-notice created 2026-09-10T12:00:00+02:00
 ```
 
 **A done row in the older style, with a command and an apostrophe in its title** – the 7th row
-(`n = 6`). The title is stored verbatim; the command is transcribed into `steps` and never run:
+(`n = 6`). The title is stored verbatim; the command is transcribed into `steps` and never run.
+The trailing ` – done 2026-09-05` is the completion marker: it is dropped from the text and its
+date becomes `completed`. A row ending `(done 2026-09-05)` would produce the same calls, and no
+`why`:
 
 ```markdown
 - [x] **Run `./scripts/migrate --env staging` and check the operator's log** **PASS:** the log ends with the new revision – done 2026-09-05
@@ -175,7 +201,7 @@ Run `./scripts/migrate --env staging` and check the operator's log
 SSMAGIC_LEGACY
 ss-magic-plugin checklist set run-scripts-migrate-env-staging-and created 2026-09-02T09:30:06+02:00
 ss-magic-plugin checklist done run-scripts-migrate-env-staging-and
-ss-magic-plugin checklist set run-scripts-migrate-env-staging-and completed 2026-09-05T12:00:00+0200
+ss-magic-plugin checklist set run-scripts-migrate-env-staging-and completed 2026-09-05T12:00:00+02:00
 ```
 
 **A decision row with a stated default** – the 22nd row (`n = 21`), under the third legacy
@@ -256,6 +282,17 @@ A  .github/workflows/ss-magic-checklist.yml
 Not changed: the docs-reference checker (no file it lists was deleted), the standing checklist, and
 the code comments linking a historical checklist (their folders still exist).
 
+On a yes to the commit gate: the skill directory was removed with `git rm -r`, so its two paths
+are already staged and no longer exist. They are left out of `git add` and still named in the
+commit.
+
+```plaintext
+$ git add -- CLAUDE.md docs/actions/CLAUDE.md <each domain CLAUDE.md> .github/workflows/ss-magic-checklist.yml
+$ git commit -m 'Retire the hand-written checklist rules' -- \
+    .claude/skills/operator-checklist/SKILL.md '.claude/skills/operator-checklist/<resolver script>' \
+    CLAUDE.md docs/actions/CLAUDE.md <each domain CLAUDE.md> .github/workflows/ss-magic-checklist.yml
+```
+
 ### Final report
 
 ```markdown
@@ -272,13 +309,13 @@ Commits (none pushed):
 - <hash> Retire the hand-written checklist rules
 
 Items left open:
-- rotate-the-staging-api-key – Admin console: Rotate the staging API key
+- enable-the-maintenance-notice – Admin console: Enable the maintenance notice
 - keep-the-legacy-export-endpoint-for – keep the legacy export endpoint for one more release?
 - … (20 more)
 
 Next:
 - In every other worktree of this repository, run `git restore .superset/magic.json` before it
-  merges the default branch (the session-start bootstrap left an unstaged seed there).
+  merges the default branch, if the session-start bootstrap left an unstaged seed there.
 - Other open branches merge the default branch first, then run `/ss-magic:migrate-repository`;
   it takes branch-only mode there.
 - Run this repository's own checks before pushing.
