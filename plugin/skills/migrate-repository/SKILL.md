@@ -108,7 +108,7 @@ in every worktree of this repository on this machine.
   `git clean -f -- <path>`, on no stop and report with nothing committed. Staged: stop, and give the
   operator `git restore --staged -- <path>` to run before re-running.
 - 4c. Over 80 items or 60 KB: ask, quoting "up to about 6 × N = M verb calls" per converting choice:
-  open items only (default), keep Markdown (step 5), or convert everything (up to 200 items).
+  open items only (default), keep Markdown (go to step 5), or convert everything (up to 200 items).
 - 4d. Read the legacy file unless step 3 already read it – once enabled and past the gate threshold,
   only in windows of up to `min(1500, gate.threshold_lines)` lines or through a subagent. Then
   `init`, retitle the four sections, record `migrated-from-legacy`, and add every item per the
