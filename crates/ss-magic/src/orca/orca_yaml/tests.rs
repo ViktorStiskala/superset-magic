@@ -807,3 +807,33 @@ fn setup_of_lenient(text: &str) -> Option<String> {
     MarkedYaml::load_from_str(text).ok()?;
     setup_of(text)
 }
+
+// --- reading the current list ---------------------------------------------------
+
+#[test]
+fn shared_directories_reads_the_list_orca_would_use() {
+    assert_eq!(
+        shared_directories("worktree:\n  sharedDirectories:\n    - node_modules\n    - \"apps/web/.next/cache\"\n"),
+        dirs(&["node_modules", "apps/web/.next/cache"])
+    );
+    assert_eq!(
+        shared_directories("\u{feff}worktree: {sharedDirectories: [a, b]}\n"),
+        dirs(&["a", "b"])
+    );
+}
+
+#[test]
+fn shared_directories_is_empty_for_anything_it_cannot_read() {
+    for text in [
+        "",
+        "scripts:\n  setup: make\n",
+        "worktree:\n",
+        "worktree:\n  sharedDirectories: oops\n",
+        "worktree: [not, a, mapping]\n",
+        "- a\n",
+        "a: 1\n---\nworktree:\n  sharedDirectories: [x]\n",
+        "worktree: [unclosed\n",
+    ] {
+        assert!(shared_directories(text).is_empty(), "for {text:?}");
+    }
+}

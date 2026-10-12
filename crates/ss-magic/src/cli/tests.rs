@@ -1,12 +1,24 @@
 use super::*;
 
+/// `ss-magic sync` with no flags.
+const PLAIN_SYNC: Command = Command::Sync {
+    no_backup: false,
+    no_orca_skip: false,
+};
+
+/// `ss-magic sync --no-backup`.
+const SYNC_NO_BACKUP: Command = Command::Sync {
+    no_backup: true,
+    no_orca_skip: false,
+};
+
 fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
 
 #[test]
 fn sync_token_dispatches_to_sync() {
-    assert_eq!(parse(&argv(&["sync"])), Parsed::Command(Command::Sync { no_backup: false }));
+    assert_eq!(parse(&argv(&["sync"])), Parsed::Command(PLAIN_SYNC));
 }
 
 #[test]
@@ -68,7 +80,7 @@ fn unknown_flag_before_subcommand_is_skipped() {
     // subcommand token.
     assert_eq!(
         parse(&argv(&["--verbose", "sync"])),
-        Parsed::Command(Command::Sync { no_backup: false })
+        Parsed::Command(PLAIN_SYNC)
     );
 }
 
@@ -81,7 +93,7 @@ fn flags_only_with_no_subcommand_routes_to_bare() {
 fn extra_args_after_subcommand_are_ignored() {
     assert_eq!(
         parse(&argv(&["sync", "extra"])),
-        Parsed::Command(Command::Sync { no_backup: false })
+        Parsed::Command(PLAIN_SYNC)
     );
 }
 
@@ -113,7 +125,7 @@ fn reverse_sync_token_dispatches_to_reverse_sync() {
 fn sync_no_backup_long_flag() {
     assert_eq!(
         parse(&argv(&["sync", "--no-backup"])),
-        Parsed::Command(Command::Sync { no_backup: true })
+        Parsed::Command(SYNC_NO_BACKUP)
     );
 }
 
@@ -121,7 +133,7 @@ fn sync_no_backup_long_flag() {
 fn sync_no_backup_short_flag() {
     assert_eq!(
         parse(&argv(&["sync", "-n"])),
-        Parsed::Command(Command::Sync { no_backup: true })
+        Parsed::Command(SYNC_NO_BACKUP)
     );
 }
 
@@ -131,7 +143,7 @@ fn sync_no_backup_before_subcommand() {
     // just one trailing after the subcommand token.
     assert_eq!(
         parse(&argv(&["--no-backup", "sync"])),
-        Parsed::Command(Command::Sync { no_backup: true })
+        Parsed::Command(SYNC_NO_BACKUP)
     );
 }
 
@@ -237,5 +249,57 @@ fn help_mentions_version() {
     assert!(
         usage().contains("--version"),
         "usage should mention --version"
+    );
+}
+
+// ── `--no-orca-skip` ─────────────────────────────────────────────────────
+
+/// The flag is recognized anywhere in argv, like `--no-backup`, and the two
+/// combine in either order.
+#[test]
+fn sync_no_orca_skip_is_parsed_before_or_after_the_subcommand() {
+    let skip_only = Command::Sync {
+        no_backup: false,
+        no_orca_skip: true,
+    };
+    assert_eq!(
+        parse(&argv(&["sync", "--no-orca-skip"])),
+        Parsed::Command(skip_only)
+    );
+    assert_eq!(
+        parse(&argv(&["--no-orca-skip", "sync"])),
+        Parsed::Command(skip_only)
+    );
+
+    let both = Command::Sync {
+        no_backup: true,
+        no_orca_skip: true,
+    };
+    assert_eq!(
+        parse(&argv(&["sync", "--no-orca-skip", "--no-backup"])),
+        Parsed::Command(both)
+    );
+    assert_eq!(
+        parse(&argv(&["-n", "sync", "--no-orca-skip"])),
+        Parsed::Command(both)
+    );
+    assert_eq!(parse(&argv(&["sync", "-n"])), Parsed::Command(SYNC_NO_BACKUP));
+}
+
+/// The flag belongs to forward sync only: `reverse-sync` has no field for it,
+/// and its presence there changes nothing.
+#[test]
+fn no_orca_skip_does_not_change_reverse_sync() {
+    assert_eq!(
+        parse(&argv(&["reverse-sync", "--no-orca-skip"])),
+        Parsed::Command(Command::ReverseSync { no_backup: false })
+    );
+}
+
+#[test]
+fn usage_lists_the_no_orca_skip_flag() {
+    assert!(
+        usage().contains("--no-orca-skip"),
+        "usage should mention --no-orca-skip"
     );
 }

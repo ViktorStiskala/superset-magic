@@ -27,7 +27,11 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use walkdir::WalkDir;
+
+use crate::sync::apply::{self, PathFilter};
 
 /// The file's name, at the root of the main checkout.
 pub const FILE_NAME: &str = ".worktreeinclude";
@@ -123,6 +127,56 @@ fn normalize_entry(line: &str) -> Option<String> {
         return None;
     }
     Some(entry.to_string())
+}
+
+/// The paths forward sync leaves alone in `worktree_root` because Orca already
+/// put them there: every `listed` entry that EXISTS in the worktree, file by
+/// file.
+///
+/// Existence is checked without following a symlink, and per file rather than
+/// per entry. A listed directory is expanded to the files actually present
+/// under it in the worktree, so when Orca stopped partway through a directory
+/// (it has a copy budget) the files it did not get to are not in the result and
+/// forward sync still copies them (R14). A listed path that is absent from the
+/// worktree contributes nothing, for the same reason.
+///
+/// The expansion never enters an excluded tree or a `node_modules` / `.venv`
+/// directory. Forward sync does not copy those as matches, so walking a whole
+/// dependency tree here would only cost time; a file under one that a broad
+/// directory pattern reaches is copied by ss-magic as it is today.
+pub fn copied_by_orca(worktree_root: &Path, listed: &[String]) -> PathFilter {
+    let mut present: Vec<PathBuf> = Vec::new();
+    for entry in listed {
+        let rel = Path::new(entry);
+        let Ok(meta) = fs::symlink_metadata(worktree_root.join(rel)) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            present.push(rel.to_path_buf());
+            continue;
+        }
+        let mut walker = WalkDir::new(worktree_root.join(rel))
+            .follow_links(false)
+            .into_iter();
+        while let Some(found) = walker.next() {
+            let Ok(found) = found else { continue };
+            let Ok(found_rel) = found.path().strip_prefix(worktree_root) else {
+                continue;
+            };
+            if found.file_type().is_dir() {
+                let name = found.file_name();
+                let dependency_tree = apply::DEFAULT_EXCLUDES
+                    .iter()
+                    .any(|excluded| name == std::ffi::OsStr::new(excluded));
+                if dependency_tree || crate::sync::under_excluded_tree(found_rel) {
+                    walker.skip_current_dir();
+                }
+            } else {
+                present.push(found_rel.to_path_buf());
+            }
+        }
+    }
+    PathFilter::new(present)
 }
 
 /// Whether `path` can be written as a line that Orca reads back as exactly

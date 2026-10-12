@@ -21,6 +21,10 @@ pub enum Command {
     Sync {
         /// `--no-backup`/`-n`: skip the pre-overwrite backup pass.
         no_backup: bool,
+        /// `--no-orca-skip`: in an Orca worktree, copy the paths listed in
+        /// the main checkout's `.worktreeinclude` too, instead of leaving the
+        /// ones Orca already copied alone. No effect outside an Orca worktree.
+        no_orca_skip: bool,
     },
     /// Non-interactive reverse copy, current worktree → main, for git-untracked
     /// files matching the configured patterns. Backs up every overwritten main
@@ -76,6 +80,9 @@ Options:
   -n, --no-backup   Skip the pre-overwrite backup on `sync`/`reverse-sync`.
                     WARNING: overwriting or deleting an untracked secret then
                     leaves NO recovery path (no git history, no backup).
+      --no-orca-skip
+                    On `sync` in an Orca worktree: also copy the paths Orca
+                    already copied from `.worktreeinclude` (default: skip them).
   -h, --help        Print this help (recognized before the subcommand)
   -V, --version     Print the version and exit (recognized anywhere in argv)";
 
@@ -109,6 +116,7 @@ pub fn parse(args: &[String]) -> Parsed {
         return match arg.as_str() {
             "sync" => Parsed::Command(Command::Sync {
                 no_backup: has_no_backup(args),
+                no_orca_skip: has_no_orca_skip(args),
             }),
             "reverse-sync" => Parsed::Command(Command::ReverseSync {
                 no_backup: has_no_backup(args),
@@ -137,6 +145,14 @@ pub fn parse(args: &[String]) -> Parsed {
 /// maintainer should NOT "fix" one to match the other.
 fn has_no_backup(args: &[String]) -> bool {
     args.iter().any(|a| a == "--no-backup" || a == "-n")
+}
+
+/// True when `--no-orca-skip` appears ANYWHERE in argv, for the same reason
+/// [`has_no_backup`] scans the whole slice: the flag is as valid after the
+/// `sync` token as before it. It has no short form – it is the rarely needed
+/// opt-out of a default, not something typed often.
+fn has_no_orca_skip(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--no-orca-skip")
 }
 
 /// True when `--version`/`-V` appears anywhere in argv.

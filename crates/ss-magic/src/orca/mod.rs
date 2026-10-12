@@ -10,7 +10,9 @@
 // Wired into the commands unit by unit; lifted once every item has a caller.
 #![allow(dead_code)]
 
+pub(crate) mod detect;
 pub(crate) mod orca_yaml;
 pub(crate) mod shared_dirs;
 pub(crate) mod snapshot;
 pub(crate) mod worktreeinclude;
+pub(crate) mod write;

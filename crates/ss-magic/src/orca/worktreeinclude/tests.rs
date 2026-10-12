@@ -218,3 +218,83 @@ fn read_tells_absent_text_and_unreadable_apart() {
     fs::create_dir(dir.path().join(FILE_NAME)).unwrap();
     assert!(matches!(read(dir.path()), Existing::Unreadable(_)));
 }
+
+// --- the forward-sync skip set -------------------------------------------------
+
+fn touch(root: &Path, rel: &str) {
+    let path = root.join(rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, "x").unwrap();
+}
+
+/// A listed path is left to Orca only when it exists in the worktree; one Orca
+/// did not copy is not in the set, so forward sync still copies it (R14).
+#[test]
+fn only_listed_paths_that_exist_in_the_worktree_are_left_to_orca() {
+    let wt = tempfile::tempdir().unwrap();
+    touch(wt.path(), ".env");
+
+    let filter = copied_by_orca(wt.path(), &strings(&[".env", "apps/api/.env"]));
+
+    assert!(filter.covers(Path::new(".env")));
+    assert!(!filter.covers(Path::new("apps/api/.env")));
+    assert!(copied_by_orca(wt.path(), &[]).is_empty());
+}
+
+/// A listed directory covers the files actually present under it, one by one.
+/// A file Orca did not get to (its copy budget ran out partway through the
+/// directory) is absent, so it is not covered and is still synced.
+#[test]
+fn a_listed_directory_covers_only_the_files_present_under_it() {
+    let wt = tempfile::tempdir().unwrap();
+    touch(wt.path(), "config/local/a.json");
+    touch(wt.path(), "config/local/nested/b.json");
+
+    let filter = copied_by_orca(wt.path(), &strings(&["config/local"]));
+
+    assert!(filter.covers(Path::new("config/local/a.json")));
+    assert!(filter.covers(Path::new("config/local/nested/b.json")));
+    assert!(
+        !filter.covers(Path::new("config/local/c.json")),
+        "a file that is not in the worktree must still be synced"
+    );
+    assert!(
+        !filter.covers(Path::new("config/local")),
+        "the directory itself is not skipped wholesale"
+    );
+}
+
+/// Existence is checked without following a symlink: a dangling link Orca
+/// copied is still "there".
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_in_the_worktree_counts_as_present() {
+    let wt = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("/nonexistent/target", wt.path().join(".env")).unwrap();
+
+    let filter = copied_by_orca(wt.path(), &strings(&[".env"]));
+
+    assert!(filter.covers(Path::new(".env")));
+}
+
+/// Expanding a listed directory never walks a dependency tree or an excluded
+/// tree – forward sync does not copy those as matches, so they need no entry.
+#[test]
+fn expanding_a_listed_directory_stays_out_of_dependency_and_excluded_trees() {
+    let wt = tempfile::tempdir().unwrap();
+    touch(wt.path(), "apps/web/.env");
+    touch(wt.path(), "apps/web/node_modules/pkg/index.js");
+    touch(wt.path(), "apps/web/.venv/pyvenv.cfg");
+    touch(wt.path(), ".superset/magic.local.json");
+    touch(wt.path(), ".superset/backups/20260101-000000/worktree/.env");
+    touch(wt.path(), "node_modules/pkg/index.js");
+
+    let filter = copied_by_orca(
+        wt.path(),
+        &strings(&["apps/web", ".superset", "node_modules"]),
+    );
+
+    assert!(filter.covers(Path::new("apps/web/.env")));
+    assert!(filter.covers(Path::new(".superset/magic.local.json")));
+    assert_eq!(filter.len(), 2, "nothing from a pruned tree is recorded");
+}

@@ -4,6 +4,7 @@
 //! `ss_magic_core::testutil`, enabled through this crate's `[dev-dependencies]`
 //! `testutil` feature; per-module test files reference them by that path.
 
+mod orca_flow;
 mod sync;
 mod reverse_sync_flow;
 mod update_gate;

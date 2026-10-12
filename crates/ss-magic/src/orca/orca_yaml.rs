@@ -164,6 +164,35 @@ pub fn managed_block(shared_dirs: &[String], ensure_setup: bool) -> String {
     out
 }
 
+/// The directories `worktree.sharedDirectories` holds in `text` right now – the
+/// list Orca itself would use. Lenient by design: text that does not parse, has
+/// no such key, or holds something other than a list of strings yields an empty
+/// list, because the caller only asks "which directories does Orca share
+/// already" and "none that we can tell" is the safe answer.
+pub fn shared_directories(text: &str) -> Vec<String> {
+    let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let Ok(docs) = MarkedYaml::load_from_str(body) else {
+        return Vec::new();
+    };
+    let [root] = docs.as_slice() else {
+        return Vec::new();
+    };
+    entries(root)
+        .and_then(|list| find(&list, WORKTREE))
+        .and_then(|(_, worktree)| entries(worktree))
+        .and_then(|list| find(&list, SHARED_DIRECTORIES))
+        .and_then(|(_, shared)| match &shared.data {
+            YamlData::Sequence(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| string_value(item).map(str::to_string))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// The version named by a `%YAML` directive that is not `1.2`, if the text has
 /// one. saphyr accepts `%YAML 1.1` silently and still parses with 1.2 rules,
 /// while Orca's parser would switch to 1.1 semantics (`yes` becomes a boolean),
