@@ -47,13 +47,16 @@
 //!   whenever the layout is unusual (R20, R21). This gate is where nearly
 //!   every `PreToolUse` invocation stops, so it is the one whose cost every
 //!   tool call pays; when the walk did decline, the row's `detail` ends with
-//!   `discovery: fallback (<reason>)` so the rate of fallbacks is readable
-//!   from `status`.
+//!   `discovery: fallback (<reason>)`, so the fallback rate is the count of
+//!   such rows in `hooks.jsonl` (`grep -c 'discovery: fallback'`). `status`
+//!   does not report it.
 //! - **Does git report `.superset/.magic/` ignored?** The state tree holds
 //!   session notes and cached conclusions, and no hook may ever write it into
 //!   somewhere git can see. The rule that makes it ignored is written only by
-//!   explicit `ss-magic` invocations — `init`, `migrate`, `plugin enable` —
-//!   never by a hook, so a repository that enabled the plugin by hand-editing
+//!   explicit invocations – `ss-magic init`, the migrate / init / edit-config
+//!   entries of the bare `ss-magic` menu, or `ss-magic-plugin enable` and
+//!   `ss-magic-plugin config set` (when it turns `enabled` on) – never by a
+//!   hook, so a repository that enabled the plugin by hand-editing
 //!   `magic.json` genuinely can reach a hook with an unignored tree. The check
 //!   is fail-closed in both directions: "git says no" and "git could not be
 //!   asked" both refuse.

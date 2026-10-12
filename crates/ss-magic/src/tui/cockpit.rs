@@ -1,7 +1,6 @@
-//! Full-screen reverse-sync "merge cockpit" (R1–R9, R12, R16).
+//! Full-screen unified Sync "merge cockpit" (R1–R9, R12, R16).
 //!
-//! This is the interactive layer that replaces the old re-printing
-//! `inquire::Select` picker. It presents a left file-list pane beside a live
+//! This is the interactive layer of the unified Sync. It presents a left file-list pane beside a live
 //! side-by-side diff, lets the developer set each file's direction with
 //! explicit keys (`p` push / `l` pull / `m` merge / `d` delete / `u`
 //! undecided), and returns

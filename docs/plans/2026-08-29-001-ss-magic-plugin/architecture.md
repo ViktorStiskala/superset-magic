@@ -163,7 +163,7 @@ Two smaller rules that fall out of the same discipline:
 
 The plugin's hook command is the ss-magic binary itself (`ss-magic plugin hook <event>`), not a shell or Node script. Three measured reasons:
 
-1. **The koolman original used `npx tsx`** – ss-magic ships no ambient Node toolchain, so that does not transfer. The same reasoning is why the checklist schema, validator and renderer are Rust rather than a ported TypeScript module.
+1. **The reference original used `npx tsx`** – ss-magic ships no ambient Node toolchain, so that does not transfer. The same reasoning is why the checklist schema, validator and renderer are Rust rather than a ported TypeScript module.
 2. **Shell slugify silently broke in the spike.** BSD `sed` (macOS default) does not support `\+`, so `"Magic plugin"` kept its space and produced an invalid directory name — with no error. A compiled implementation cannot fail that way.
 3. **Hook behavior versions with a single artifact.** Note this is no longer the binary's *self-update* doing the versioning: the plugin path is excluded from the update gate and the binary it runs is pinned (R69), precisely so the skills, hooks and Markdown the marketplace ships stay in step with the binary that reads them. What the argument survives on is that one versioned artifact carries all of it, instead of loose scripts on disk drifting independently.
 

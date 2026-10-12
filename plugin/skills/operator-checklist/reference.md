@@ -13,10 +13,12 @@ see the real shape, run `ss-magic-plugin checklist init <slug>` and read what it
 `sections` is an **ordered array**, not a map. Each entry is an `id`, a human `title`, and the
 `items` it holds. Position carries order; `id` carries identity.
 
-- The **declared order is the render order**. A project that declares its own section set gets
-  exactly that order.
-- A project that declares none gets the binary's default set. There is no fixed trailing
-  release-approval block appended to either.
+- The **declared order is the render order**; the verbs never reorder sections.
+- `init` writes the binary's four default sections – `verification`, `rollout`, `decisions` and
+  `follow-ups` – and nothing is appended to them. There is no fixed trailing release-approval block.
+- No verb adds, removes or reorders a section. The one section edit is retitling:
+  `ss-magic-plugin checklist set <section-id> title <text>`. Items, added with `add-item`, are the
+  only thing a section gains.
 - The vocabulary is project-agnostic on purpose. Nothing in the format assumes a deploy, a
   release train, or a web property, so "sections" means whatever phases the work in front of you
   actually has.
@@ -73,7 +75,7 @@ changed rather than where things moved.
 
 ## When something looks wrong
 
-Run `ss-magic-plugin checklist verify`. It exits non-zero on any violation and names the item, which
+Run `ss-magic-plugin checklist verify`. It exits non-zero on any error (warnings are printed but do not fail it) and names the item, which
 is faster and more reliable than reading the file – and reading the file directly is denied anyway.
 
 Checklist prose is repository-controlled free-form text, so every surface that renders it wraps it

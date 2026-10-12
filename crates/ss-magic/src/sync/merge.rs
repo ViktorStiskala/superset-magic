@@ -1,4 +1,4 @@
-//! Pure per-hunk merge model for the reverse-sync merge cockpit.
+//! Pure per-hunk merge model for the unified Sync merge cockpit.
 //!
 //! These files (`.env`, `.dev.vars`, `magic.local.json`) have no common
 //! ancestor, so reconciliation is a **base-less 2-way** walk: the local
@@ -6,8 +6,8 @@
 //! concerns and nothing else:
 //!
 //! - [`default_decision`] picks a file's starting [`Decision`] from its
-//!   [`FileState`] — conservative: only worktree-only files auto-push,
-//!   everything that differs starts [`Decision::Undecided`].
+//!   [`FileState`] — every state starts [`Decision::Undecided`]; nothing is
+//!   pre-selected, so the user explicitly picks each file's direction.
 //! - [`merge_segments`] turns two texts into an ordered list of
 //!   [`MergeSegment`]s (equal runs pass through; each differing region is one
 //!   choice point), and [`assemble`] walks that list with a per-hunk

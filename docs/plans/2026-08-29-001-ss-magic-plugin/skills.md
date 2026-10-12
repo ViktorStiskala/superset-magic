@@ -253,9 +253,9 @@ overlay is itself forward-synced, so setting it there is clobbered by the next `
 `disable` flips the overlay only; removing the plugin from the machine is `claude plugin uninstall
 ss-magic@ss-magic`, which also deletes `${CLAUDE_PLUGIN_DATA}` unless `--keep-data` is passed.
 
-## What the koolman original contributed, and what it did not
+## What the reference original contributed, and what it did not
 
-Earlier drafts of this document recorded that the koolman original's CI job – the one that renders the
+Earlier drafts of this document recorded that the reference original's CI job – the one that renders the
 checklist into a pull-request comment – "does not transfer", on the reasoning that ss-magic has no
 per-branch operator artifact reviewed on a PR. **That is backwards, and it is corrected here.** The
 checklist is exactly such an artifact: committed under `docs/actions/`, reviewed on the pull request,
@@ -267,7 +267,7 @@ What genuinely does not transfer is the original's **domain and runtime**, not i
 - **The four fixed deploy-lifecycle sections** (`pre-deploy`, `post-deploy`, `verification`,
   `visual`) and the trailing release-approval block. Replaced by R83's ordered, declarable `sections`
   array with a binary-owned default.
-- **The e-commerce specifics** – Google Search Console verification and the rest. Nothing generic
+- **The site-specific items** – a search-engine verification step and the rest. Nothing generic
   survives them.
 - **`priority` defined as "blocks the deploy".** Replaced by the domain-neutral blocking /
   decision-blocking / follow-up vocabulary.

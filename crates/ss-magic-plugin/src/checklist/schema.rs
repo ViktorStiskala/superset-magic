@@ -422,12 +422,14 @@ where
 
 // ── Construction ──────────────────────────────────────────────────────────────
 
-/// The section set a checklist starts from when a project declares none.
+/// The four sections `checklist init` writes into every new checklist.
 ///
 /// Binary-owned and domain-neutral: nothing here assumes a deploy, a release
-/// train or a web property. A project that declares its own set gets exactly
-/// that set in exactly that order, and nothing is ever appended to either —
-/// there is no fixed trailing approval block.
+/// train or a web property. No verb adds or removes a section; a project
+/// renames these with `checklist set <section-id> title`. A document holding
+/// another set (built through [`Document::with_sections`], or written by hand)
+/// keeps exactly that set in exactly that order, and nothing is ever appended
+/// to it – there is no fixed trailing approval block.
 pub fn default_sections() -> Vec<Section> {
     [
         ("verification", "Verification"),

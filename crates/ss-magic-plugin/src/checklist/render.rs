@@ -1,9 +1,12 @@
 //! Markdown rendering for an operator checklist.
 //!
 //! [`render`] is the one entry point: it turns a parsed [`Document`] into the
-//! text every consumer — `checklist list`, `checklist verify`, the
-//! commit-time nudge and the CI pull-request comment — actually prints or
-//! posts, byte-for-byte the same regardless of which one calls it.
+//! text its consumers actually print or post: `checklist list` (the bounded
+//! view for whoever ran it) and `checklist render-md` (the body a CI job posts as
+//! the pull-request comment: unbounded unless `--max-bytes` is given, which the
+//! shipped workflow does). Both go through the one function, so the two outputs
+//! differ only in the byte budget the caller passes. `checklist
+//! verify` does not render, and the commit-time nudge does not render either.
 //!
 //! ## Ported, not reused (R85)
 //!
@@ -33,10 +36,10 @@
 //! An item's title, its steps, its description, its `why`, and every
 //! reference label are free-form prose a repository controls, per
 //! `plugin/skills/operator-checklist/reference.md`. That prose ends up
-//! somewhere a model reads — the CLI's own terminal output, a commit-time
-//! nudge injected into a running session, a comment posted to a pull request
+//! somewhere a model reads — the CLI's own terminal output from `checklist
+//! list`, and the pull-request comment body from `checklist render-md`, which
 //! another session may later read as context. Rather than have each of those
-//! four surfaces remember to wrap what they show, `render` wraps it once,
+//! two surfaces remember to wrap what they show, `render` wraps it once,
 //! through [`crate::cache::envelope`] — the same call the conclusion
 //! cache and `hook::subagent_stop`'s salvaged transcripts already make (R64).
 //! One envelope format, applied in one place, is the whole point: two
@@ -76,8 +79,9 @@ use crate::scratchpad::format_rfc3339;
 /// a repository line rather than this function guessing at one or resolving
 /// it itself. `budget` passes straight through to `cache::envelope`:
 /// `Budget::Unbounded` for a destination with no size limit of its own (a
-/// file, a pull-request comment body), `Budget::Bytes(n)` for one injected
-/// into a model's context that has to stay small.
+/// file, or each document `render-md` emits whole), `Budget::Bytes(n)` for
+/// one that has to stay small: the terminal output of `list`, or the first
+/// document `render-md --max-bytes` must cut inside its own envelope.
 pub fn render(doc: &Document, path: &Path, repo_url: Option<&str>, budget: Budget) -> String {
     let body = render_body(doc, repo_url);
     let head = render_head(path);
@@ -404,7 +408,7 @@ fn escape_inline_char(ch: char, out: &mut String) {
 /// that is quoting it, no matter what its author wrote. `<br>` is the only
 /// literal HTML this function ever emits, and it carries none of the input,
 /// so it cannot itself be turned into something else.
-fn prose_inline(text: &str) -> String {
+pub(super) fn prose_inline(text: &str) -> String {
     text.lines()
         .map(|line| {
             let mut escaped = String::with_capacity(line.len());

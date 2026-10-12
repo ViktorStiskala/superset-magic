@@ -11,7 +11,7 @@ description: >
 
 The checklist is committed repository content: one JSON document per action at
 `docs/actions/<YYYY-MM-slug>.checklist.json`. It is reviewed on the pull request like any other file,
-and CI renders it into a PR comment on every push to the PR.
+and CI renders it into a PR comment whenever the pull request adds or changes it.
 
 **You cannot read or edit it directly.** `Read`, `Edit`, `Write` and notebook edits on a checklist
 path are denied, and the denial names the verb to use instead. This is deliberate: the file is
@@ -26,8 +26,16 @@ is invisible until the render breaks. Go through the CLI.
     ss-magic-plugin checklist set <id> <dotted-key> <value>
     ss-magic-plugin checklist done <id>
     ss-magic-plugin checklist list                   # rendered, in canonical order
-    ss-magic-plugin checklist verify                 # exits non-zero on any violation
-    ss-magic-plugin checklist render-md              # the Markdown CI posts
+    ss-magic-plugin checklist verify [FILE...]       # exits non-zero on any error; warnings do not fail
+    ss-magic-plugin checklist render-md [--max-bytes N] [FILE...]   # the Markdown CI posts
+
+With no `FILE`, `verify` and `render-md` work on the active checklist. A `FILE` is a
+repository-relative `docs/actions/<stem>.checklist.json` – the form CI passes for each checklist a
+pull request changes; an absolute path, a `..`, a nested or differently named file, a symlink or a
+path outside the repository is refused with exit 2. Several files are verified one by one (exit 1 if
+any is invalid) or rendered one after another. `--max-bytes N` (at least 2048) bounds the whole
+rendered body and names any document it had to leave out. Neither verb moves the active-checklist
+pointer.
 
 Multi-line bodies – an action step, a `why`, a description – are read from **stdin** rather than
 passed as an argument, so newlines and quoting survive intact. Dotted keys follow the same

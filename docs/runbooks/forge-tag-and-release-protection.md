@@ -10,8 +10,8 @@ remains the record of what to put back if either is ever removed.
 | tag ruleset | `Protect tags`, id `21921226`, `active`, all tags, no bypass actors, rules `deletion`, `non_fast_forward`, `update`, `required_signatures` |
 | release immutability | enabled (`enforced_by_owner: false`); `v0.11.0` and `v0.10.0` immutable, `v0.9.0` and older not (published before it was enabled) |
 
-The ruleset carries one rule beyond the three this runbook originally specified,
-`required_signatures`, and its meaning was measured rather than assumed – see the R99 table.
+The ruleset carries four rules. The fourth, `required_signatures`, has a meaning that was measured
+rather than assumed – see the R99 table.
 
 ## Why these two settings exist
 
@@ -158,9 +158,8 @@ created `2026-08-31T12:52:13+02:00`.
 Then prove it against a real tag, as the repository owner – the point of the check is that the owner
 is not exempt. Run steps 1 and 2 against **both** shapes, since a ruleset scoped to one of them would
 pass a check that only ever exercises that one – but only ever against a tag that has actually been
-published on that line. When this was first written every published tag was on the CLI line, so the
-`ss-magic-plugin-v*` half of steps 1 and 2 had to wait. Since 2026-09-30 `ss-magic-plugin-v1.0.0`
-exists on origin (published empty, see the incident above), so both halves can be run. Do not fill
+published on that line. Both lines have published tags on origin (the newest plugin tag is
+`ss-magic-plugin-v1.0.1`, the newest CLI tag `v0.11.2`), so both halves can be run. Do not fill
 in the crate's version and run it anyway. Deleting a tag that origin does not have fails with `remote ref
 does not exist`, which says nothing about the ruleset; and force-pushing one is a *creation*, which
 the ruleset deliberately permits, which the release workflow picks up as a real plugin release cut
@@ -204,9 +203,8 @@ Two disposable tags therefore exist permanently on the remote, both pointing at 
 annotated tag) and `test-unsigned-probe` (a lightweight tag that landed because the signature rule
 checks the commit, not the tag – its own delete attempt was then refused with `Cannot delete this
 tag`, which is one more confirmation). Neither is version-shaped, so neither triggered the release
-workflow. The `ss-magic-plugin-v*` half of steps 1 and 2 has not been run. A plugin-line tag now
-exists (`ss-magic-plugin-v1.0.0`, published empty – see the incident above), so it can be run against
-that tag; the refusal leaves nothing changed.
+workflow. The `ss-magic-plugin-v*` half of steps 1 and 2 has not been run. It can be run against any
+published plugin tag, such as `ss-magic-plugin-v1.0.1`; the refusal leaves nothing changed.
 
 ## R100 – release immutability
 
@@ -241,15 +239,14 @@ mark did not take. The same workflow is `workflow_dispatch`-able as the manual f
 
 ### Verifying it (AE84)
 
-Substitute a tag that actually exists on each line. At the time of writing the newest published CLI
-release is `v0.11.0` and no plugin release has been cut at all, so the second command is the one to
-run first; naming an unreleased tag here would fail for a reason that has nothing to do with the
-setting under test.
+Substitute a tag that actually exists on each line, such as `ss-magic-plugin-v1.0.1` and `v0.11.2`
+(or `v0.11.0`, the release the 2026-09-08 check ran against). Naming an unreleased tag here would
+fail for a reason that has nothing to do with the setting under test.
 
 ```bash
 # Replacing a published asset under its existing name must be refused, on either line.
 gh release upload <newest ss-magic-plugin-v* tag> ss-magic-plugin-v<X.Y.Z>.zip --clobber
-gh release upload v0.11.0 ss-magic-x86_64-unknown-linux-gnu.tar.gz --clobber
+gh release upload v0.11.2 ss-magic-x86_64-unknown-linux-gnu.tar.gz --clobber
 ```
 
 Expect a refusal. A release published **before** immutability was enabled will accept this, which is

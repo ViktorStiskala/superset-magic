@@ -1,0 +1,206 @@
+# Render this repository's ss-magic operator checklist into a pull-request
+# comment, and fail the pull request when the checklist is not valid.
+#
+# Written by `ss-magic plugin setup-github-ci`, which substitutes the pinned
+# version below. Do not hand-edit: `setup-github-ci` compares this file against
+# the version it would write, and a local edit makes every later run report the
+# file as "differing" instead of quietly advancing the pin.
+#
+# ── Why there are two jobs ───────────────────────────────────────────────────
+#
+# A single job that both checks out pull-request code and holds a write token is
+# the classic Actions privilege-escalation shape: the checked-out code is
+# authored by whoever opened the pull request, anything that runs it (a build
+# script, a test, a formatter) runs as the workflow, and the token it can reach
+# is one that writes to this repository. The split below removes the overlap
+# rather than relying on nobody adding such a step later:
+#
+#   render   checks out the pull request, holds `contents: read` and nothing
+#            else, and hands its output on as an artifact.
+#   comment  holds `pull-requests: write`, checks out no code at all, and only
+#            downloads that artifact and posts it.
+#
+# For the same reason the trigger is `pull_request` and never
+# `pull_request_target`: `pull_request_target` runs in the context of the base
+# branch with a write-capable token and a fork's code, which is the exact
+# combination the split exists to prevent.
+#
+# The cost of that choice is stated rather than worked around: on a pull request
+# opened from a fork, GitHub issues a read-only token no matter what this file
+# asks for, so the comment cannot be posted. The comment job is therefore
+# skipped for fork pull requests instead of failing the run on every one of
+# them; the render job still runs, so an invalid checklist is still caught.
+#
+# ── Why no checklist text reaches a shell ────────────────────────────────────
+#
+# A checklist is repository content: its prose is written by whoever opened the
+# pull request. Rendered Markdown therefore travels as a file from the moment it
+# is produced to the moment `gh` reads it with `--body-file`, and is never
+# interpolated into a command line, an `echo`, or a `${{ }}` expression inside a
+# `run:` block.
+
+name: Operator checklist
+
+on:
+  pull_request:
+
+# Deny everything at the workflow level; each job opts back into the single
+# scope it needs. Without this line a job with no `permissions:` of its own
+# inherits the repository default, which on many repositories is write.
+permissions: {}
+
+# One run per pull request. Superseded runs are cancelled so two of them cannot
+# race to edit the same comment.
+concurrency:
+  group: ss-magic-checklist-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # The pinned ss-magic. `ss-magic plugin setup-github-ci` owns this value and
+  # is the only thing that should change it - the binary, the skills and the
+  # checklist format are released together, so a hand-bumped pin here can name
+  # a version whose output this workflow does not expect.
+  SS_MAGIC_VERSION: "@SS_MAGIC_VERSION@"
+  SS_MAGIC_REPO: ViktorStiskala/superset-magic
+
+jobs:
+  render:
+    name: render the checklist
+    runs-on: ubuntu-latest
+    # A wedged run must fail rather than hold the pull request for GitHub's
+    # 360-minute default.
+    timeout-minutes: 10
+    # Read-only. This is the job that runs pull-request code, so it holds
+    # nothing that could write to the repository.
+    permissions:
+      contents: read
+    outputs:
+      # Whether this branch has a checklist at all, so the comment job knows
+      # there is something to post.
+      present: ${{ steps.probe.outputs.present }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Do not leave the job's token in .git/config, where a later step -
+          # or a build script the checked-out code brings with it - could read
+          # it back out.
+          persist-credentials: false
+
+      - name: Look for a checklist
+        id: probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          found=(docs/actions/*.checklist.json)
+          if [ ${#found[@]} -eq 0 ]; then
+            echo 'present=false' >>"$GITHUB_OUTPUT"
+            echo 'No docs/actions/*.checklist.json on this branch; nothing to render.'
+          else
+            echo 'present=true' >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Install the pinned ss-magic
+        if: steps.probe.outputs.present == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=x86_64-unknown-linux-gnu
+          archive="ss-magic-$target.tar.gz"
+          base="https://github.com/$SS_MAGIC_REPO/releases/download/v$SS_MAGIC_VERSION"
+
+          # Everything lands outside the checkout, so a repository cannot ship a
+          # file that the download or the extraction would overwrite.
+          work=$(mktemp -d)
+          cd "$work"
+
+          # `-f` makes a 404 an error instead of a saved error page. A pin that
+          # names an unpublished release therefore fails here, loudly, rather
+          # than producing a broken binary further down.
+          curl -fsSL --retry 3 -o "$archive" "$base/$archive"
+          curl -fsSL --retry 3 -o "$archive.sha256" "$base/$archive.sha256"
+
+          # The release publishes a `<archive>.sha256` sibling in sha256sum's
+          # own format, so this is a plain `--check` rather than a hand-rolled
+          # comparison. It fails closed: an empty, truncated or reformatted
+          # checksum file makes `--check` error out, and the binary is never
+          # installed.
+          sha256sum --check "$archive.sha256"
+
+          tar -xzf "$archive"
+          # cargo-dist nests the binary one directory deep, named after the
+          # archive.
+          install -m 0755 "ss-magic-$target/ss-magic" "$RUNNER_TEMP/ss-magic"
+          cd - >/dev/null
+          rm -rf "$work"
+
+      - name: Verify the checklist
+        if: steps.probe.outputs.present == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/ss-magic" plugin checklist verify
+
+      - name: Render the comment body
+        if: steps.probe.outputs.present == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/ss-magic" plugin checklist render-md >"$RUNNER_TEMP/checklist.md"
+
+      - name: Upload the rendered body
+        if: steps.probe.outputs.present == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ss-magic-checklist-comment
+          path: ${{ runner.temp }}/checklist.md
+          # An empty upload here would surface in the next job as a confusing
+          # "artifact not found"; fail where the cause is visible instead.
+          if-no-files-found: error
+          retention-days: 1
+
+  comment:
+    name: post the checklist comment
+    needs: render
+    # Two conditions, and the second is the fork case described in the header:
+    # a fork pull request gets a read-only token, so posting would fail on every
+    # one of them.
+    if: >-
+      needs.render.outputs.present == 'true' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The only job holding a write scope, and the only one that checks out
+    # nothing. Both halves are the point; adding a checkout step here would
+    # rejoin exactly what the split separates.
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download the rendered body
+        uses: actions/download-artifact@v8
+        with:
+          name: ss-magic-checklist-comment
+          path: ${{ runner.temp }}/comment
+
+      - name: Post or update the comment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # `gh` has no checkout to infer the repository from, so it is named
+          # explicitly. Both of these are values GitHub supplies, not repository
+          # content.
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # The rendered Markdown is read from the file by `gh` itself. It is
+          # never an argument, so no amount of quoting, backticks or `$(...)` in
+          # a checklist can reach this shell.
+          #
+          # `--edit-last --create-if-none` keeps one comment per pull request:
+          # the first push creates it and every later push rewrites that same
+          # comment rather than appending another.
+          gh pr comment "$PR_NUMBER" \
+            --body-file "$RUNNER_TEMP/comment/checklist.md" \
+            --edit-last \
+            --create-if-none

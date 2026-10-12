@@ -47,11 +47,10 @@ use crate::cli::{Command, Parsed};
 ///
 /// Keep this an INCLUSION list. Inverting it to exclusions would mean every
 /// future command self-updates unless someone remembers to opt it out, and the
-/// list is short enough that naming each member costs nothing. The plugin used
-/// to be the reason this mattered most — `ss-magic plugin …` had to reach its
-/// verb tree without ever passing through here — and it is now a separate
-/// binary that links no updater at all, so that concern is structural rather
-/// than a rule this list has to keep.
+/// list is short enough that naming each member costs nothing. The plugin is a
+/// separate binary (`ss-magic-plugin`) that links no updater at all, so keeping
+/// it out of the self-update path is structural and not a rule this list has
+/// to uphold.
 pub fn should_run_update_gate(cmd: Command, guard_active: bool) -> bool {
     if guard_active {
         return false;
