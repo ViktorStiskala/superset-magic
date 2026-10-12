@@ -193,9 +193,8 @@ fn an_empty_setup_value_is_filled_with_the_line() {
     }
 }
 
-/// R25. With the switch off, `scripts` is not looked at: a line someone removed
-/// stays removed, and even a layout ss-magic could not edit is no reason to
-/// refuse.
+/// R25. With the switch off, the setup script is neither compared nor edited: a
+/// line someone removed stays removed, and no `scripts` block is created.
 #[test]
 fn setup_switch_off_leaves_scripts_untouched() {
     let current = "scripts:\n  setup: pnpm install\n";
@@ -204,12 +203,41 @@ fn setup_switch_off_leaves_scripts_untouched() {
     assert_eq!(setup_of(&out).as_deref(), Some("pnpm install"));
     assert_eq!(shared_of(&out), Some(dirs(&["node_modules"])));
 
-    let flow = "scripts: {setup: make}\n";
-    let out = edit(Some(flow), &dirs(&["node_modules"]), false).unwrap();
-    assert!(out.starts_with(flow));
+    // A setup value the switched-on editor would refuse (not a string) is not
+    // even looked at.
+    let not_a_string = "scripts:\n  setup: [a, b]\n";
+    let out = edit(Some(not_a_string), &dirs(&["node_modules"]), false).unwrap();
+    assert!(out.starts_with(not_a_string));
 
     let none = edit(Some("defaultTabs: []\n"), &[], false).unwrap();
     assert!(!none.contains("scripts"), "no scripts block is created:\n{none}");
+}
+
+/// The refusal ladder (KTD3) names `scripts` as a managed parent without
+/// qualification, so it holds on a refresh as well: the switch only decides
+/// whether the setup script is edited, not which files are editable.
+#[test]
+fn setup_switch_off_still_applies_the_ladder_to_scripts() {
+    let cases = [
+        ("scripts: {setup: make}\n", "`scripts` is a flow mapping"),
+        ("scripts:\nother: 1\n", "`scripts` is present but empty"),
+        ("scripts: just a string\n", "`scripts` is not a mapping"),
+        ("base: &b\n  setup: make\nscripts: *b\n", "`scripts` is an alias"),
+        ("base: &b\n  x: 1\nscripts:\n  <<: *b\n  setup: make\n", "`scripts` uses a merge key"),
+        ("cmd: &c make\nscripts:\n  setup: *c\n", "`scripts.setup` is an alias"),
+    ];
+    for (current, expected) in cases {
+        let r = refusal(current, &["node_modules"], false);
+        assert!(
+            r.reason.contains(expected),
+            "for {current:?} expected {expected:?}, got {:?}",
+            r.reason
+        );
+        assert!(
+            !r.manual_block.contains("scripts"),
+            "with the setup switch off the block to add holds only the list"
+        );
+    }
 }
 
 /// A comment after the old value would become script text once the value is a
@@ -720,13 +748,60 @@ fn an_anchor_that_another_key_refers_to_makes_the_edit_a_refusal() {
     }
 }
 
-/// A layout that needs no edit is no reason to refuse: the file already says
-/// what was intended.
+/// The ladder describes the file, not the edit: every one of these already
+/// holds exactly the intended setup line and directory list, and each is still
+/// refused for the layout KTD3 names.
 #[test]
-fn an_unusual_layout_that_already_holds_the_intended_values_is_accepted() {
-    let current =
-        "scripts: {setup: ./.superset/magic.sh sync}\nworktree: {sharedDirectories: [node_modules]}\n";
-    assert_eq!(edit(Some(current), &dirs(&["node_modules"]), true).unwrap(), current);
+fn the_ladder_applies_even_when_the_values_are_already_right() {
+    const SETUP_OK: &str = "scripts:\n  setup: ./.superset/magic.sh sync\n";
+    const LIST_OK: &str = "worktree:\n  sharedDirectories: [node_modules]\n";
+    let cases = [
+        (
+            format!("scripts: {{setup: ./.superset/magic.sh sync}}\n{LIST_OK}"),
+            "`scripts` is a flow mapping",
+        ),
+        (
+            format!("{SETUP_OK}worktree: {{sharedDirectories: [node_modules]}}\n"),
+            "`worktree` is a flow mapping",
+        ),
+        (
+            format!("base: &w\n  sharedDirectories: [node_modules]\nworktree: *w\n{SETUP_OK}"),
+            "`worktree` is an alias",
+        ),
+        (
+            format!("list: &l [node_modules]\nworktree:\n  sharedDirectories: *l\n{SETUP_OK}"),
+            "`worktree.sharedDirectories` is an alias",
+        ),
+        (
+            format!("cmd: &c ./.superset/magic.sh sync\nscripts:\n  setup: *c\n{LIST_OK}"),
+            "`scripts.setup` is an alias",
+        ),
+        (
+            format!(
+                "base: &b\n  x: 1\nworktree:\n  <<: *b\n  sharedDirectories: [node_modules]\n{SETUP_OK}"
+            ),
+            "`worktree` uses a merge key",
+        ),
+        (
+            format!("base: &b\n  x: 1\n<<: *b\n{SETUP_OK}{LIST_OK}"),
+            "its top level uses a merge key",
+        ),
+    ];
+    for (current, expected) in &cases {
+        let r = refusal(current, &["node_modules"], true);
+        assert!(
+            r.reason.contains(expected),
+            "for {current:?} expected {expected:?}, got {:?}",
+            r.reason
+        );
+    }
+
+    // The same values in plain block layout are simply kept.
+    let plain = format!("{SETUP_OK}{LIST_OK}");
+    assert_eq!(
+        edit(Some(&plain), &dirs(&["node_modules"]), true).unwrap(),
+        plain
+    );
 }
 
 /// An anchor that another key refers to makes an edit reach outside the managed
@@ -743,6 +818,19 @@ fn the_yaml_1_2_directive_is_accepted() {
     let current = "%YAML 1.2\n---\nscripts:\n  setup: make\n";
     let out = edit(Some(current), &[], true).unwrap();
     assert_eq!(setup_of(&out).as_deref(), Some("./.superset/magic.sh sync\nmake"));
+}
+
+/// The ladder names `%YAML 1.1` and nothing wider: it is the one version whose
+/// rules Orca's parser would switch to while saphyr keeps reading 1.2.
+#[test]
+fn only_the_yaml_1_1_directive_counts_as_declared() {
+    assert!(declares_yaml_1_1("%YAML 1.1\n---\na: 1\n"));
+    assert!(declares_yaml_1_1("# header\n%YAML   1.1   # old tooling\n---\na: 1\n"));
+    assert!(!declares_yaml_1_1("%YAML 1.2\n---\na: 1\n"));
+    assert!(!declares_yaml_1_1("%YAML 1.10\n---\na: 1\n"));
+    assert!(!declares_yaml_1_1("%TAG ! tag:example.com,2000:\n---\na: 1\n"));
+    assert!(!declares_yaml_1_1("a: \"%YAML 1.1\"\n"));
+    assert!(!declares_yaml_1_1("a: |\n  %YAML 1.1\n"));
 }
 
 // --- the pieces ----------------------------------------------------------------

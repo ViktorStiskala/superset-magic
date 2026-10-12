@@ -628,10 +628,14 @@ Orca would copy":
    (`node_modules`, `.venv`) at any depth, and any directory holding a `.git`
    entry (a submodule or nested repository). A broad `**` must never list a
    dependency tree or a recovered secret under `.superset/backups/`.
-3. Symlinks, anything beneath a symlinked directory, and anything inside a
-   directory holding a `.git` entry are dropped BEFORE git is asked – git aborts
-   a whole `check-ignore` batch (exit 128) on such a pathspec, which would lose
-   the answer for every other path.
+3. Anything beneath a symlinked directory and anything inside a directory
+   holding a `.git` entry is dropped BEFORE git is asked – git aborts a whole
+   `check-ignore` batch (exit 128) on such a pathspec, which would lose the
+   answer for every other path. A symlink that is ITSELF a pattern match and
+   points at a regular file stays a candidate: forward sync follows it and
+   copies the target's content, and Orca's copier resolves a listed link and
+   copies its target the same way. A link to a directory, a dangling link, and
+   a link met while walking a matched directory are not candidates.
 4. ONE `git check-ignore --stdin -z` call (`git::ignored_untracked`) answers
    "ignored AND untracked" for the whole list. `check-ignore` consults the index
    by default and never reports a tracked path. A git failure or a non-git root
@@ -706,12 +710,21 @@ unmanaged keys.
   identical to `migrate::MAGIC_WRAPPER_ENTRY` (a test pins the two constants).
 - `worktree.sharedDirectories` is OWNED outright and replaced on every write; a
   hand-added entry does not survive.
-- Whole-document problems always refuse: unparsable text (duplicate keys
-  included), more than one document, a `%YAML` directive other than 1.2, a top
-  level that is not a block mapping. A problem with one managed key refuses only
-  when that key needs an edit: a parent that is a flow mapping, a null, an alias
-  or otherwise not a block mapping; an alias or merge key on the path; a
-  `scripts.setup` that is not a string.
+- The refusal ladder describes the FILE, not the edit, so it applies even when
+  both managed values are already right, and on a refresh (which does not edit
+  the setup script) as much as on init: unparsable text (duplicate keys
+  included); more than one document; a `%YAML 1.1` directive, and only that
+  version; a top level that is not a block mapping or carries a merge key
+  (`<<`); a managed parent (`scripts`, `worktree`) that is a flow mapping, a
+  null, an alias or not a mapping, or carries a merge key; a managed value
+  (`scripts.setup`, `worktree.sharedDirectories`) that is an alias. Flag a
+  change that skips the ladder when no edit is needed, that skips it for
+  `scripts` when the setup script is not being ensured, or that widens the
+  directive check beyond `%YAML 1.1`.
+- Beyond the ladder, an edit that cannot be carried out is also a refusal: a
+  `scripts.setup` that is not a string, a block layout the editor has no rule
+  for, or a result that fails the re-parse check. A MISSING parent key is never
+  a refusal; a new block is appended at the end of the file.
 - An ANCHOR or a TAG on a managed node is NOT a refusal by itself. It stays
   where it is (the replaced text starts after it) and the edit goes ahead; the
   re-parse check decides. When another key refers to the anchor, that key's

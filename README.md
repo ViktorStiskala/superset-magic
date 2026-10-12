@@ -995,6 +995,18 @@ Derived from `magic.json` and written at the repository root, outside
   An existing `scripts.setup` keeps its commands and gains the `magic.sh sync`
   line in front of them, so secrets are in place before a `pnpm install` in the
   same script.
+
+  Some layouts ss-magic does not edit at all. It leaves the file untouched and
+  prints the lines to add by hand when `orca.yaml`:
+
+  - does not parse, holds more than one document, or declares `%YAML 1.1`;
+  - uses an alias (`*name`) or a merge key (`<<`) on the way to either key;
+  - writes `scripts` or `worktree` as a flow mapping (`{ … }`), as an empty
+    value, or as anything that is not a mapping.
+
+  This holds even when both keys already say the right thing, and for the
+  `ss-magic orca` refresh as well. A file without a `scripts` or `worktree`
+  key is fine: the block is added at the end.
 - `.worktreeinclude` – gitignored. ss-magic's entries sit between two marker
   comments; lines outside them are yours:
 
@@ -1010,7 +1022,9 @@ Derived from `magic.json` and written at the repository root, outside
   reports as ignored and untracked. A tracked file your patterns match stays
   out of it and is still copied by ss-magic's own sync. A file under a
   directory Orca shares is left out as well, since Orca brings the whole
-  directory. The exclusions described under
+  directory. A matched symlink that points at a regular file is listed like a
+  file, because Orca copies what it points at, just as forward sync does; a
+  link to a directory is not listed. The exclusions described under
   [Pattern semantics](#pattern-semantics) apply here exactly as they do to
   forward sync.
 

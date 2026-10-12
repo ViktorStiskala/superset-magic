@@ -96,9 +96,12 @@ pub fn compute(
 /// Left out as well, each for a reason that would otherwise cost the whole
 /// answer or produce a line Orca misreads:
 ///
-/// - a symlink, and anything below a symlinked directory or inside a directory
-///   holding a `.git` entry – git aborts the entire `check-ignore` batch on such
-///   a path (KTD6), so they must be gone before the call;
+/// - anything below a symlinked directory or inside a directory holding a `.git`
+///   entry – git aborts the entire `check-ignore` batch on such a path (KTD6),
+///   so they must be gone before the call;
+/// - a symlink met while walking a matched directory (forward sync's recursive
+///   copy skips those too), and a symlink that is itself a match unless it
+///   points at a regular file ([`is_link_to_file`]);
 /// - a path that is not valid UTF-8, or that cannot be written as one line Orca
 ///   reads back unchanged ([`worktreeinclude::is_listable`]).
 fn candidate_files(main_root: &Path, patterns: &[String]) -> Vec<String> {
@@ -110,12 +113,13 @@ fn candidate_files(main_root: &Path, patterns: &[String]) -> Vec<String> {
         let Ok(meta) = fs::symlink_metadata(main_root.join(&rel)) else {
             continue;
         };
-        if meta.is_file() {
+        if meta.is_file() || is_link_to_file(main_root, &rel, &meta) {
             files.push(rel);
         } else if meta.is_dir() {
             walk_files(main_root, &rel, &mut files);
         }
-        // A symlink or a special file is left to ss-magic's own sync.
+        // A link to a directory, a dangling link or a special file is left to
+        // ss-magic's own sync.
     }
 
     let mut blocked_dirs: HashMap<PathBuf, bool> = HashMap::new();
@@ -134,6 +138,19 @@ fn candidate_files(main_root: &Path, patterns: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether the pattern match `rel` is a symlink whose target is a regular file.
+///
+/// Such a match belongs in the snapshot, because it is something forward sync
+/// copies: `apply` follows the link and writes the target's content as a plain
+/// file. Orca does the same with a listed symlink – it resolves the link and
+/// copies what it points at – so either tool leaves the same file in the
+/// worktree. A link to a DIRECTORY is not listed, since the snapshot never
+/// lists a directory (R23).
+fn is_link_to_file(main_root: &Path, rel: &Path, meta: &fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
+        && fs::metadata(main_root.join(rel)).is_ok_and(|target| target.is_file())
 }
 
 /// Collect the regular files under the matched directory `rel` into `files`,

@@ -73,20 +73,30 @@ pub struct Refusal {
 /// `ensure_setup` decides whether `scripts.setup` is looked at all: when set,
 /// the [`SETUP_LINE`] is added if no line of the script already equals it
 /// (prepended, so secrets land before any `pnpm install` in the same script);
-/// when clear, `scripts` is left exactly as it is, which is how a refresh avoids
-/// re-adding a line someone removed on purpose (R25).
+/// when clear, the setup script is left exactly as it is, which is how a refresh
+/// avoids re-adding a line someone removed on purpose (R25).
 ///
 /// The returned text equals `current` byte for byte when nothing needed to
 /// change, so a caller can compare the two to decide whether to write.
 ///
-/// A [`Refusal`] means the file must be left untouched. Whole-document problems
-/// always refuse, because Orca itself would ignore or misread such a file: text
-/// that does not parse (duplicate keys included), more than one document, a
-/// `%YAML` directive other than 1.2, or a top level that is not a block mapping.
-/// A problem with one managed key refuses only when that key actually needs an
-/// edit: a parent (`scripts`, `worktree`) that is a flow mapping, a null, an
-/// alias or otherwise not a block mapping; an alias or merge key on the path;
-/// or a `scripts.setup` that is not a string.
+/// A [`Refusal`] means the file must be left untouched. The refusal ladder is
+/// explicit (KTD3), and it describes the FILE, not the edit: it applies whether
+/// or not the managed values happen to be right already.
+///
+/// - The text does not parse (duplicate keys included), holds more than one
+///   document, or declares `%YAML 1.1`.
+/// - The top level is not a block mapping, or carries a merge key (`<<`).
+/// - A managed parent (`scripts`, `worktree`) is a flow collection, a null, an
+///   alias or not a mapping, or carries a merge key.
+/// - A managed value (`scripts.setup`, `worktree.sharedDirectories`) is an
+///   alias.
+///
+/// `ensure_setup` does not narrow the ladder: with it clear, `scripts.setup` is
+/// neither compared nor edited, but a `scripts` the ladder names still refuses.
+///
+/// Beyond the ladder, an edit that cannot be carried out is a refusal too: a
+/// `scripts.setup` that is not a string, a block layout this editor has no rule
+/// for, or a result that does not parse back to the intended values.
 ///
 /// An ANCHOR or a TAG on a managed node is not a refusal on its own. It is left
 /// in place and the edit goes ahead; whether that was safe is decided the same
@@ -118,10 +128,10 @@ pub fn edit(
             "it holds more than one YAML document".to_string(),
         ));
     }
-    if let Some(version) = foreign_yaml_directive(body) {
-        return Err(refuse(format!(
-            "it declares `%YAML {version}`, and ss-magic only edits YAML 1.2"
-        )));
+    if declares_yaml_1_1(body) {
+        return Err(refuse(
+            "it declares `%YAML 1.1`, and ss-magic only edits YAML 1.2".to_string(),
+        ));
     }
 
     let src = Source::new(body);
@@ -199,15 +209,15 @@ pub fn shared_directories(text: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The version named by a `%YAML` directive that is not `1.2`, if the text has
-/// one. saphyr accepts `%YAML 1.1` silently and still parses with 1.2 rules,
-/// while Orca's parser would switch to 1.1 semantics (`yes` becomes a boolean),
-/// so the two could disagree about what the file says.
-fn foreign_yaml_directive(body: &str) -> Option<String> {
-    body.lines().find_map(|line| {
-        let rest = line.strip_prefix("%YAML")?;
-        let version = rest.split_whitespace().next().unwrap_or("");
-        (version != "1.2").then(|| version.to_string())
+/// Whether the text declares `%YAML 1.1`. saphyr accepts that directive
+/// silently and still parses with 1.2 rules, while Orca's parser would switch to
+/// 1.1 semantics (`yes` becomes a boolean), so the two could disagree about what
+/// the file says.
+fn declares_yaml_1_1(body: &str) -> bool {
+    body.lines().any(|line| {
+        line.strip_prefix("%YAML")
+            .and_then(|rest| rest.split_whitespace().next())
+            == Some("1.1")
     })
 }
 
@@ -585,6 +595,22 @@ struct Plan<'p> {
     root_unit: usize,
 }
 
+/// Where one managed key sits, once its parent is known to exist and the
+/// refusal ladder has passed.
+struct Located<'a, 'input> {
+    /// The parent key node (`scripts` or `worktree`).
+    parent_key: &'a MarkedYaml<'input>,
+    /// Index of the first content after the parent's colon and any anchor or
+    /// tag, or `None` when nothing follows.
+    lead: Option<usize>,
+    /// The parent mapping's entries, in document order.
+    children: Vec<Entry<'a, 'input>>,
+    /// The managed child (`setup` or `sharedDirectories`), when present.
+    existing: Option<Entry<'a, 'input>>,
+    /// Where the child's value starts, past its colon and any anchor or tag.
+    value_start: Option<usize>,
+}
+
 impl<'p> Plan<'p> {
     fn build(
         src: &Source,
@@ -607,6 +633,10 @@ impl<'p> Plan<'p> {
                 list
             }
         };
+        // A merge key at the top level sits on the path to both managed keys.
+        if has_merge_key(&root_entries) {
+            return Err("its top level uses a merge key (`<<`)".to_string());
+        }
         let root_indent = root_entries
             .first()
             .map(|(key, _)| key.span.start.col())
@@ -648,14 +678,13 @@ impl<'p> Plan<'p> {
             }
             slot
         } else {
+            // A refresh leaves the setup script exactly as it is (R25), so
+            // nothing is compared or edited here. The ladder still applies:
+            // it is a statement about the file, and `scripts` is one of its
+            // two managed parents whatever this particular run writes.
+            Self::ladder(src, &root_entries, SCRIPTS, SETUP)?;
             Slot::Keep
         };
-
-        if has_merge_key(&root_entries)
-            && (matches!(setup, Slot::AppendBlock) || matches!(shared, Slot::AppendBlock))
-        {
-            return Err("its top level uses a merge key (`<<`)".to_string());
-        }
 
         Ok(Self {
             setup,
@@ -667,32 +696,23 @@ impl<'p> Plan<'p> {
         })
     }
 
-    /// Find `parent.child` and decide what has to happen to it. `satisfied`
-    /// looks at the child's current value: `Ok(true)` means it already is what
-    /// was intended (nothing is checked further, so an unusual layout that needs
-    /// no edit is no reason to refuse), `Ok(false)` means it must be replaced,
-    /// and an `Err` is a refusal.
-    fn locate(
+    /// Apply the refusal ladder (KTD3) to one managed key and report where it
+    /// sits. `Ok(None)` means the parent key is missing altogether, which is
+    /// never a refusal – a new block is appended instead.
+    ///
+    /// The ladder describes the file, so this runs whether or not an edit turns
+    /// out to be needed. The layout is read from the source text: the parsed
+    /// model looks the same for a block mapping, a flow mapping and a resolved
+    /// alias.
+    fn ladder<'a, 'input>(
         src: &Source,
-        root_entries: &[Entry<'_, '_>],
+        root_entries: &[Entry<'a, 'input>],
         parent: &str,
         child: &str,
-        mut satisfied: impl FnMut(&MarkedYaml<'_>) -> Result<bool, String>,
-    ) -> Result<Slot, String> {
+    ) -> Result<Option<Located<'a, 'input>>, String> {
         let Some((parent_key, parent_value)) = find(root_entries, parent) else {
-            return Ok(Slot::AppendBlock);
+            return Ok(None);
         };
-        let children = entries(parent_value);
-        if let Some((_, value)) = children.as_deref().and_then(|list| find(list, child)) {
-            if satisfied(value)? {
-                return Ok(Slot::Keep);
-            }
-        }
-
-        // An edit is needed from here on, so the parent has to be a plain block
-        // mapping. The layout is read from the source text: the parsed model
-        // looks the same for a block mapping, a flow mapping and a resolved
-        // alias.
         let after_parent = src
             .after_colon(parent_key.span.end.index())
             .ok_or_else(|| format!("`{parent}` is not written as a plain `{parent}:` key"))?;
@@ -715,12 +735,74 @@ impl<'p> Plan<'p> {
             }
             _ => {}
         }
-        let Some(children) = children else {
+        let Some(children) = entries(parent_value) else {
             return Err(format!("`{parent}` is not a mapping"));
         };
-        // For a block mapping the value starts exactly at its first key, on a
-        // line of its own. Anything else is a layout this editor has no rule
-        // for (an explicit `? key`, for one).
+        if has_merge_key(&children) {
+            return Err(format!("`{parent}` uses a merge key (`<<`)"));
+        }
+        let existing = find(&children, child);
+        // Where the child's value starts: after its colon and any anchor or
+        // tag, so those stay in the file and keep applying to a new value.
+        let value_start = existing.and_then(|(key, _)| {
+            src.after_colon(key.span.end.index())
+                .map(|after| src.skip_properties(after))
+        });
+        if let (Some((_, value)), Some(start)) = (existing, value_start) {
+            // `key:` with nothing after it has no text of its own, so the first
+            // content after it belongs to whatever comes next.
+            let has_text = !(is_null(value) && value.span.is_empty());
+            if has_text && src.first_content(start).and_then(|idx| src.get(idx)) == Some('*') {
+                return Err(format!(
+                    "`{parent}.{child}` is an alias (`*…`) to another node"
+                ));
+            }
+        }
+        Ok(Some(Located {
+            parent_key,
+            lead,
+            children,
+            existing,
+            value_start,
+        }))
+    }
+
+    /// Find `parent.child` and decide what has to happen to it.
+    ///
+    /// The refusal ladder comes first ([`Plan::ladder`]). Then `satisfied`
+    /// looks at the child's current value: `Ok(true)` means it already is what
+    /// was intended and nothing is edited, `Ok(false)` means it must be
+    /// replaced, and an `Err` is a refusal.
+    fn locate(
+        src: &Source,
+        root_entries: &[Entry<'_, '_>],
+        parent: &str,
+        child: &str,
+        mut satisfied: impl FnMut(&MarkedYaml<'_>) -> Result<bool, String>,
+    ) -> Result<Slot, String> {
+        let Some(Located {
+            parent_key,
+            lead,
+            children,
+            existing,
+            value_start,
+        }) = Self::ladder(src, root_entries, parent, child)?
+        else {
+            return Ok(Slot::AppendBlock);
+        };
+
+        // The file is off the ladder. A value that already is what was intended
+        // needs no edit, whatever block layout it is written in.
+        if let Some((_, value)) = existing {
+            if satisfied(value)? {
+                return Ok(Slot::Keep);
+            }
+        }
+
+        // An edit is needed from here on, so the parent has to be a plain block
+        // mapping: its value starts exactly at its first key, on a line of its
+        // own. Anything else is a layout this editor has no rule for (an
+        // explicit `? key`, for one).
         let Some((first_child, _)) = children.first().copied() else {
             return Err(format!("`{parent}` is not a block mapping"));
         };
@@ -729,16 +811,13 @@ impl<'p> Plan<'p> {
         {
             return Err(format!("`{parent}` is not a block mapping"));
         }
-        if has_merge_key(&children) {
-            return Err(format!("`{parent}` uses a merge key (`<<`)"));
-        }
 
         let child_indent = first_child.span.start.col();
         let unit = child_indent
             .saturating_sub(parent_key.span.start.col())
             .max(1);
 
-        let Some((key, value)) = find(&children, child) else {
+        let Some((key, value)) = existing else {
             return Ok(Slot::InsertEntry {
                 at: src.next_line_start(parent_key.span.end.index()),
                 child_indent,
@@ -746,11 +825,7 @@ impl<'p> Plan<'p> {
             });
         };
 
-        // The replaced text starts AFTER any anchor or tag on the value, so
-        // those stay in the file and keep applying to the new value.
-        let start = src
-            .after_colon(key.span.end.index())
-            .map(|after| src.skip_properties(after))
+        let start = value_start
             .ok_or_else(|| format!("`{parent}.{child}` is not written as a plain `{child}:` key"))?;
         let (end, extent) = Self::value_end(src, start, value)
             .ok_or_else(|| format!("`{parent}.{child}` is an alias (`*…`) to another node"))?;

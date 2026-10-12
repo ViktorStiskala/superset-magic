@@ -193,17 +193,58 @@ fn submodule_and_symlinked_paths_are_skipped_without_losing_the_rest() {
     write_file(root, "vendor/sub/node_modules/x/.env", "x");
     write_file(root, "real/.env", "REAL=1\n");
     std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
-    std::os::unix::fs::symlink(root.join(".env"), root.join("apps/api/.env.link")).unwrap();
 
-    let snap = snapshot(
-        root,
-        &["**/.env", ".env", "link/.env", "vendor", "apps/api/.env.link"],
-    );
+    let snap = snapshot(root, &["**/.env", ".env", "link/.env", "vendor"]);
 
     assert_eq!(
         snap.entries,
         strings(&[".env", "apps/api/.env", "real/.env"]),
-        "the submodule, the symlinked directory and the symlink itself are left to ss-magic"
+        "the submodule and the path beneath the symlinked directory are left to ss-magic"
+    );
+}
+
+/// KTD5: the snapshot is what forward sync would copy. Forward sync follows a
+/// matched symlink to a regular file and copies its content, so such a match is
+/// listed. Everything else about symlinks stays out: a link to a directory (the
+/// snapshot never lists a directory), a dangling link, and a link met while
+/// walking a matched directory, which the recursive copy skips too.
+#[cfg(unix)]
+#[test]
+fn a_matched_symlink_to_a_file_is_listed_and_other_symlinks_are_not() {
+    use std::os::unix::fs::symlink;
+
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(
+        root,
+        ".gitignore",
+        "secrets/\n.env.link\n.env.gone\nlinked-dir\nconf/\nplain.link\n!plain.link\n",
+    );
+    write_file(root, "secrets/api.env", "API=1\n");
+    write_file(root, "secrets/dir/x.env", "X=1\n");
+    write_file(root, "tracked.txt", "t\n");
+    write_file(root, "conf/a.env", "A=1\n");
+    fs::create_dir_all(root.join("apps/api")).unwrap();
+    // Matched directly, target is a regular file.
+    symlink(root.join("secrets/api.env"), root.join("apps/api/.env.link")).unwrap();
+    // Matched directly, target does not exist.
+    symlink(root.join("secrets/missing"), root.join("apps/api/.env.gone")).unwrap();
+    // Matched directly, target is a directory.
+    symlink(root.join("secrets/dir"), root.join("linked-dir")).unwrap();
+    // Met while walking the matched directory `conf`.
+    symlink(root.join("secrets/api.env"), root.join("conf/b.env")).unwrap();
+    // Matched directly and pointing at a file, but not ignored by git.
+    symlink(root.join("tracked.txt"), root.join("plain.link")).unwrap();
+
+    let snap = snapshot(
+        root,
+        &["**/.env.link", "**/.env.gone", "linked-dir", "conf", "plain.link"],
+    );
+
+    assert_eq!(
+        snap.entries,
+        strings(&["apps/api/.env.link", "conf/a.env"]),
+        "only the ignored link to a file and the directory's regular file are listed"
     );
 }
 

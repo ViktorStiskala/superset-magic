@@ -873,13 +873,24 @@ The modules, by purpose:
   `migrate::MAGIC_WRAPPER_ENTRY`), written as a `|` block scalar whose chomping
   indicator keeps the script's own trailing newlines, or double-quoted when a
   block scalar cannot carry the string; `worktree.sharedDirectories` is OWNED
-  and replaced outright. Whole-document problems always refuse (unparsable text
-  including duplicate keys, more than one document, a `%YAML` directive other
-  than 1.2, a top level that is not a block mapping); a problem with one managed
-  key refuses only when that key needs an edit (a parent that is a flow mapping,
-  a null, an alias or not a block mapping; an alias or merge key on the path; a
-  non-string `scripts.setup`). An ANCHOR or a TAG on a managed node is not a
-  refusal by itself: `Source::skip_properties` steps over it, the replaced text
+  and replaced outright. The refusal ladder is explicit (KTD3 of the Orca plan)
+  and describes the FILE, not the edit, so it holds even when both managed
+  values are already right: unparsable text (duplicate keys included), more than
+  one document, a `%YAML 1.1` directive (`declares_yaml_1_1` – exactly that
+  version, the one whose rules Orca's parser would switch to while `saphyr`
+  keeps reading 1.2), a top level that is not a block mapping or carries a
+  merge key, a managed parent (`scripts`, `worktree`) that is a flow mapping, a
+  null, an alias or not a mapping or carries a merge key, and a managed value
+  (`scripts.setup`, `worktree.sharedDirectories`) that is an alias.
+  `Plan::ladder` applies it and `Plan::locate` only then asks whether an edit
+  is needed; `ensure_setup == false` (a refresh) stops the setup script from
+  being compared or edited but does NOT narrow the ladder, so a flow-style
+  `scripts` refuses a refresh too. Beyond the ladder, an edit that cannot be
+  carried out refuses as well (a non-string `scripts.setup`, a block layout the
+  editor has no rule for, a result that fails the re-parse check). A missing
+  parent key is never a refusal – a block is appended. An ANCHOR or a TAG on a
+  managed node is not a refusal by itself: `Source::skip_properties` steps over
+  it, the replaced text
   starts after it so it stays in the file, and the re-parse check decides –
   when another key refers to the anchor, that key changes with the edit and the
   file is refused then. Line endings follow the file and a
@@ -913,8 +924,13 @@ The modules, by purpose:
   what Orca would copy": `apply::match_paths` on main, directory matches walked
   into FILES (the snapshot never lists a directory) with the excluded trees,
   the `DEFAULT_EXCLUDES` names and any directory holding a `.git` entry pruned;
-  symlinks, anything beneath a symlinked directory or inside a `.git`-holding
-  one, and any path Orca would misread dropped before git is asked; then ONE
+  anything beneath a symlinked directory or inside a `.git`-holding one, and
+  any path Orca would misread, dropped before git is asked. A symlink that is
+  ITSELF a match and points at a regular file is a candidate
+  (`is_link_to_file`), because forward sync follows it and copies the target's
+  content and Orca's copier does the same (`realpath`, then a copy); a link to
+  a directory, a dangling link, and a link met while walking a matched
+  directory (the recursive copy skips those) are not. Then ONE
   `git::ignored_untracked` call, with a git failure or a non-git root yielding
   an EMPTY snapshot. Files under a directory that made Orca's shared list are
   dropped, the rest is sorted and capped at what is left of Orca's budget.
