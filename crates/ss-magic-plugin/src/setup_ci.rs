@@ -8,7 +8,8 @@
 //! description will approximate it. The parts that matter here are exactly the
 //! parts an approximation loses: the two-job split that keeps a write token
 //! away from pull-request code, the `pull_request` trigger rather than
-//! `pull_request_target`, the checksum check on the downloaded binary. So the
+//! `pull_request_target`, the checksum check on the downloaded binary, the
+//! marker that keeps the job rewriting its own comment and nobody else's. So the
 //! bytes live in `assets/workflow/checklist.yml`, embedded at compile time, and
 //! this verb is the only thing that puts them on disk.
 //!
@@ -129,7 +130,13 @@ impl LegacyTemplate {
 /// Both generations ran `checklist verify` and `render-md` with no arguments,
 /// leaving the choice of document to the active-checklist route: later pull
 /// requests rendered the one checklist already merged, and the job failed
-/// outright once `docs/actions/` held two.
+/// outright once `docs/actions/` held two. Both also posted with `gh pr
+/// comment --edit-last`, which edits the last comment of the current user –
+/// `github-actions[bot]` for every workflow in a repository – and so could
+/// overwrite a comment another workflow posted. Today's template marks its
+/// comment with a hidden first line and edits only a comment that carries the
+/// marker and has that author, so a pull request left with an unmarked legacy
+/// comment gets one new marked comment, once.
 ///
 /// A new generation is added here whenever `assets/workflow/checklist.yml`
 /// changes in a release – copy the released file before editing the template –

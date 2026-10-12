@@ -698,6 +698,29 @@ event token as its argument.
   render-md --max-bytes 60000` (under GitHub's 65,536-character comment
   limit), so several changed checklists become one comment and none means a
   green job with no comment.
+  Its `comment` job rewrites only its OWN comment. The step writes a body file
+  that opens with the fixed marker line
+  `<!-- ss-magic-plugin:operator-checklist -->` and a blank line (45 bytes on
+  top of the 60,000-byte Markdown, still under the limit), then the rendered
+  Markdown, copied file to file. It lists the pull request's comments with `gh
+  api --paginate …/issues/$PR_NUMBER/comments?per_page=100` as its own command
+  into a file (a failed listing fails the job rather than reading as "no
+  comment yet"), and `jq` picks the highest id among the comments whose
+  `.user.login` is `github-actions[bot]` AND whose body starts with the
+  marker, the marker passed as `--arg` so no comment text is part of the jq
+  program. An id that is not all digits fails the job; a found id is edited
+  with `gh api --method PATCH …/issues/comments/<id> -F body=@<file>`; none
+  found creates the comment with `gh pr comment --body-file`. It never uses
+  `gh pr comment --edit-last`: that edits the last comment of the current
+  user, which in Actions is `github-actions[bot]` for every workflow in the
+  repository, so it could overwrite another workflow's comment – and that is
+  what both legacy generations did. Both filters are needed (the author alone
+  matches another workflow's comment, the marker alone matches a comment
+  anybody pasted it into). A pull request carrying an unmarked comment from a
+  legacy workflow gets one new marked comment, once. The marker string is also
+  in every comment already posted, so changing it orphans those comments;
+  `setup_ci/tests.rs` holds its own copy (`COMMENT_MARKER`) and pins the
+  step's shape, including that `--edit-last` appears in no executable line.
 - `compact_window.rs` – two halves, and the split IS the safety
   story (R28). `compact-window --set <TOKENS>` writes an absolute
   `autoCompactWindow` into the per-machine, gitignored

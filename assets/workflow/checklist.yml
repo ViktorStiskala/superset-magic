@@ -18,7 +18,8 @@
 #   render   checks out the pull request, holds `contents: read` and nothing
 #            else, and hands its output on as an artifact.
 #   comment  holds `pull-requests: write`, checks out no code at all, and only
-#            downloads that artifact and posts it.
+#            downloads that artifact and posts it, as a comment it creates once
+#            and rewrites on every later push.
 #
 # For the same reason the trigger is `pull_request` and never
 # `pull_request_target`: `pull_request_target` runs in the context of the base
@@ -55,11 +56,28 @@
 #
 # A checklist is repository content: its prose is written by whoever opened the
 # pull request. Rendered Markdown therefore travels as a file from the moment it
-# is produced to the moment `gh` reads it with `--body-file`, and is never
-# interpolated into a command line, an `echo`, or a `${{ }}` expression inside a
-# `run:` block. The selected file names travel the same way: NUL-separated in a
-# file, read back into an array, and passed to the binary as separate
-# arguments.
+# is produced to the moment `gh` reads it from that file (`--body-file` for a
+# new comment, `-F body=@<file>` for an update), and is never interpolated into
+# a command line, an `echo`, or a `${{ }}` expression inside a `run:` block. The
+# selected file names travel the same way: NUL-separated in a file, read back
+# into an array, and passed to the binary as separate arguments.
+#
+# The comments already on the pull request are text anybody who can comment
+# wrote, so they are handled the same way: the listing goes to a file, `jq`
+# reads that file as data with the marker passed as `--arg`, and the only thing
+# that comes back to the shell is a comment id, checked to be all digits before
+# it is used.
+#
+# ── Which comment is rewritten ───────────────────────────────────────────────
+#
+# Only this workflow's own. The body starts with a hidden HTML marker line, and
+# the comment job looks for the newest comment that both was written by
+# `github-actions[bot]` and starts with that marker; it edits that comment by
+# id and creates a new one only when there is none. `gh pr comment --edit-last`
+# is not used, because "last comment of the current user" means the last
+# comment of `github-actions[bot]`, which is the author of every workflow's
+# comments in the repository: a coverage report or a preview link posted after
+# the checklist would be overwritten with it.
 
 name: Operator checklist
 
@@ -266,14 +284,72 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          # The rendered Markdown is read from the file by `gh` itself. It is
-          # never an argument, so no amount of quoting, backticks or `$(...)` in
-          # a checklist can reach this shell.
-          #
-          # `--edit-last --create-if-none` keeps one comment per pull request:
-          # the first push creates it and every later push rewrites that same
-          # comment rather than appending another.
-          gh pr comment "$PR_NUMBER" \
-            --body-file "$RUNNER_TEMP/comment/checklist.md" \
-            --edit-last \
-            --create-if-none
+          # The first line of every comment this workflow posts. It renders as
+          # nothing, and it is how a later run recognises the comment as its
+          # own. A fixed string, never derived from the pull request.
+          marker='<!-- ss-magic-plugin:operator-checklist -->'
+
+          # The marker and a blank line add under 50 bytes to a body the render
+          # job already bounded to 60000, so the comment stays below GitHub's
+          # 65,536-character limit. The rendered Markdown is copied file to
+          # file and later read from the file by `gh` itself. It is never an
+          # argument, so no amount of quoting, backticks or `$(...)` in a
+          # checklist can reach this shell. Both files this step makes go in a
+          # directory of their own, apart from the downloaded artifact.
+          work=$(mktemp -d)
+          body="$work/body.md"
+          {
+            printf '%s\n\n' "$marker"
+            cat "$RUNNER_TEMP/comment/checklist.md"
+          } >"$body"
+
+          # Every comment on the pull request, all pages of it: `gh` prints
+          # each page as its own JSON array. Its own command writing to a file,
+          # so a failed listing fails the job here; read as "no comment yet",
+          # it would add a duplicate on every push instead.
+          existing="$work/existing.json"
+          gh api --paginate \
+            "repos/$GH_REPO/issues/$PR_NUMBER/comments?per_page=100" >"$existing"
+
+          # The comment to rewrite is the newest one that is BOTH written by
+          # `github-actions[bot]` AND starts with the marker. `gh pr comment
+          # --edit-last` would pick the last comment of the current user, and
+          # in Actions that user is `github-actions[bot]` for every workflow in
+          # the repository, so it could overwrite a comment another workflow
+          # posted. The marker alone is not enough either: anybody who can
+          # comment can paste it, and this job must not rewrite their comment.
+          # Ids are handed out in creation order, so the highest is the newest.
+          # Comment bodies are other people's text; `jq` reads them from the
+          # file as data and the marker arrives as `--arg`, so nothing from
+          # them is ever part of a command or of the jq program. (`jq`, like
+          # `gh`, is preinstalled on GitHub-hosted runners.)
+          comment_id=$(jq -n -r --arg marker "$marker" '
+            [ inputs[]
+              | select(.user.login == "github-actions[bot]")
+              | select((.body // "") | startswith($marker))
+              | .id ]
+            | max // empty
+          ' "$existing")
+
+          # The id goes into a request path, so it has to be a number and
+          # nothing else.
+          case "$comment_id" in
+            *[!0-9]*)
+              echo '::error::The existing comment id is not a number.' >&2
+              exit 1
+              ;;
+          esac
+
+          # One comment per pull request: the first push creates it and every
+          # later push rewrites that same comment rather than appending
+          # another. A pull request that already carries a comment from the
+          # workflow ss-magic-plugin 1.0.1 and earlier wrote has no marker on
+          # it, so it gets one new marked comment here and the unmarked one is
+          # left as it is; that happens once and is accepted.
+          if [ -n "$comment_id" ]; then
+            gh api --silent --method PATCH \
+              "repos/$GH_REPO/issues/comments/$comment_id" \
+              -F "body=@$body"
+          else
+            gh pr comment "$PR_NUMBER" --body-file "$body"
+          fi

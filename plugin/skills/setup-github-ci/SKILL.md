@@ -60,7 +60,12 @@ workflow is written, or the user declined – and when they declined, say at whi
 - Posts the rendered Markdown as a pull-request comment, rewriting the same comment on each push
   rather than adding a new one. The body is capped (`--max-bytes 60000`) below GitHub's comment limit;
   a note names any checklist left out.
-- Passes every checklist-derived value to the forge CLI through a file (`--body-file`) – never
+- Rewrites only its own comment. The body opens with a hidden marker line, and the job edits the
+  newest comment that both was written by `github-actions[bot]` and starts with that marker; a
+  comment another workflow posted is left alone. A pull request that still carries an unmarked
+  comment from a workflow written by 1.0.1 or earlier gets one new marked comment, once.
+- Passes every checklist-derived value to the forge CLI through a file (`--body-file` for a new
+  comment, a `body=@<file>` field for an update) – never
   interpolated into a shell step, because checklist prose is repository-controlled text. The
   selected file names reach the verbs as quoted arguments read back from a NUL-separated file, never
   spliced into a command line.

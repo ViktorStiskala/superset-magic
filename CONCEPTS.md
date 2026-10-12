@@ -297,7 +297,10 @@ explicit list of documents (`list` takes none). CI uses the explicit form: it re
 only the checklists the pull request added, modified or changed the type of
 (a deletion selects nothing, a rename is selected at its new path), posting one
 comment that holds each in turn, and does nothing when the pull request
-touches none. An explicit path must be a checklist document directly under
+touches none. Later pushes rewrite that comment in place: it opens with a
+hidden marker line, and the job edits only a comment that carries the marker
+and was written by the workflow's own bot account, never one another workflow
+posted. An explicit path must be a checklist document directly under
 `docs/actions/`, inside the repository and not a symlink; anything else is
 refused rather than read.
 

@@ -25,7 +25,8 @@ assertions), `scripts/test-bootstrap.sh` (the bootstrap's failure-path suite),
 release, its env var is `SS_MAGIC_PLUGIN_VERSION`, and it verifies and
 renders only the checklists the pull request adds or changes, passed to the
 verbs as explicit arguments – the plugin map's `setup_ci.rs` bullet has the
-selection step), `assets/workflow/legacy/` (byte-exact copies of every
+selection step and the comment step, which rewrites only the comment carrying
+its own marker), `assets/workflow/legacy/` (byte-exact copies of every
 earlier released template generation, the fixtures behind `setup_ci.rs`'s
 `LEGACY_TEMPLATES`; never edited, only added to when a release changes the
 template), `.gitattributes` (line-ending pinning for the digest),

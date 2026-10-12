@@ -1407,6 +1407,38 @@ in the template, a dropped checksum step, or a mode other than 0644.
   string instead of an array, a `${{` in a `run:` block, a selection that
   could reach a nested file or a deleted one, or a missing budget on
   `render-md`.
+- **The comment job rewrites only its own comment, found by author AND
+  marker.** The step builds the body file as the fixed marker line
+  `<!-- ss-magic-plugin:operator-checklist -->`, a blank line, then the
+  rendered Markdown copied file to file (45 bytes on top of the 60,000-byte
+  render budget, so the comment still fits GitHub's 65,536-character limit).
+  It lists the pull request's comments with `gh api --paginate` on the
+  `issues/<number>/comments` endpoint, as its OWN command writing to a file,
+  so a failed listing fails the job instead of reading as "no comment yet" and
+  adding a duplicate on every push. `jq` then reads that file and returns the
+  highest id among the comments whose `.user.login` is `github-actions[bot]`
+  AND whose body starts with the marker; the marker reaches jq through
+  `--arg`, never spliced into the program, because comment bodies are text
+  anybody who can comment wrote. An id that is not all digits fails the job. A
+  found id is edited through `gh api --method PATCH` on
+  `issues/comments/<id>` with `-F body=@<file>`; when none is found the
+  comment is created with `gh pr comment --body-file`. The step must never use
+  `gh pr comment --edit-last`: that flag edits the last comment of the current
+  user, and inside Actions the current user is `github-actions[bot]` for every
+  workflow in the repository, so it can overwrite a comment another workflow
+  posted (both legacy template generations did exactly that). A pull request
+  that still carries an unmarked comment from a legacy workflow gets one new
+  marked comment, once, which is accepted. The marker string is also in every
+  comment already posted, so changing it leaves each open pull request with an
+  orphaned comment and a new one. Flag `--edit-last` or `--create-if-none` in
+  an executable line, a selection that drops either filter (the author alone
+  matches another workflow's comment, the marker alone matches a comment
+  anybody pasted the marker into), a marker tested with anything looser than
+  a prefix match, a listing without `--paginate` or read through a pipeline or
+  a substitution, a comment body or the Markdown passed as an argument
+  (`--body`, `-f body=…`) or interpolated into the jq program, a comment id
+  used without the digits check, a changed marker string, a wider
+  `permissions:` block on the comment job, or a checkout step added to it.
 
 ### The four shipped skills follow one set of authoring rules
 

@@ -102,6 +102,19 @@ fn run_blocks() -> Vec<String> {
     blocks
 }
 
+/// One step of the job called `job`, from its `- name: <name>` line up to the
+/// next step at the same indent (or the end of the job).
+fn job_step(job: &str, name: &str) -> String {
+    let body = job_body(job);
+    let header = format!("      - name: {name}\n");
+    let start = body
+        .find(&header)
+        .unwrap_or_else(|| panic!("the {job} job has no `{name}` step"));
+    let rest = &body[start + header.len()..];
+    let end = rest.find("\n      - ").map_or(rest.len(), |i| i + 1);
+    format!("{header}{}", &rest[..end])
+}
+
 // ── The asset: the trigger and the two-job split ──────────────────────────────
 
 /// The whole reason the workflow is shipped rather than described:
@@ -202,18 +215,136 @@ fn no_run_step_interpolates_an_expression() {
 }
 
 /// The rendered Markdown reaches `gh` as a file it opens itself, never as an
-/// argument.
+/// argument, on both paths: `--body-file` when the comment is created, and a
+/// `-F body=@<file>` field when an existing one is rewritten.
 #[test]
 fn the_comment_is_posted_from_a_file() {
     let comment_job = code(&job_body("comment"));
-    assert!(comment_job.contains("--body-file"));
+    assert!(
+        comment_job.contains("gh pr comment \"$PR_NUMBER\" --body-file \"$body\""),
+        "a new comment must be created from the body file:\n{comment_job}"
+    );
+    assert!(
+        comment_job.contains("-F \"body=@$body\""),
+        "an existing comment must be rewritten from the body file:\n{comment_job}"
+    );
     assert!(
         !comment_job.contains("--body "),
         "the comment body must never be an argument"
     );
-    // One comment per pull request, rewritten on each push.
-    assert!(comment_job.contains("--edit-last"));
-    assert!(comment_job.contains("--create-if-none"));
+    // `-f` is the raw-string field flag: it would send the literal text after
+    // `body=`, which could only be the Markdown itself spliced into the
+    // command line.
+    assert!(
+        !comment_job.contains("-f body=") && !comment_job.contains("--raw-field"),
+        "the comment body must never be a raw field:\n{comment_job}"
+    );
+}
+
+// ── The asset: the job rewrites only its own comment ─────────────────────────
+
+/// The hidden first line of every comment the workflow posts, which is how a
+/// later run recognises the comment as its own.
+///
+/// A second copy of the string in the template, on purpose: it is also in
+/// every comment already posted, so changing it in the template alone would
+/// make each open pull request grow a second comment. A change has to be made
+/// in both places, which is the moment to notice that.
+const COMMENT_MARKER: &str = "<!-- ss-magic-plugin:operator-checklist -->";
+
+/// One comment per pull request, and it must be this workflow's. `gh pr
+/// comment --edit-last` edits the last comment of the current user, and inside
+/// Actions that user is `github-actions[bot]` for every workflow in the
+/// repository, so it would overwrite whatever another workflow posted last.
+/// The job therefore picks its comment by two properties together, the author
+/// and a marker at the start of the body, and edits that one by id.
+#[test]
+fn the_comment_job_rewrites_only_its_own_comment() {
+    // Over the whole file's executable text, not just this step: the flag must
+    // not come back anywhere. The comments explaining why it is absent stay.
+    assert!(
+        !code(TEMPLATE).contains("--edit-last") && !code(TEMPLATE).contains("--create-if-none"),
+        "the workflow must not edit \"the last comment of the current user\""
+    );
+
+    let step = code(&job_step("comment", "Post or update the comment"));
+
+    // The marker is a fixed string, and it opens the body ahead of the
+    // rendered Markdown, so `startswith` below can find it again.
+    assert!(
+        step.contains(&format!("marker='{COMMENT_MARKER}'")),
+        "the step must define the marker as a quoted literal:\n{step}"
+    );
+    let marker_written = step
+        .find("printf '%s\\n\\n' \"$marker\"")
+        .unwrap_or_else(|| panic!("the marker must be written as the body's first line:\n{step}"));
+    let markdown_copied = step
+        .find("cat \"$RUNNER_TEMP/comment/checklist.md\"")
+        .unwrap_or_else(|| panic!("the rendered Markdown must be copied file to file:\n{step}"));
+    assert!(
+        marker_written < markdown_copied,
+        "the marker must come before the rendered Markdown:\n{step}"
+    );
+
+    // Every page of comments, as its own command writing to a file: a listing
+    // that failed inside a pipeline or a substitution could read as "no
+    // comment yet" and add a duplicate on every push.
+    assert!(
+        step.contains(
+            "gh api --paginate \\\n            \
+             \"repos/$GH_REPO/issues/$PR_NUMBER/comments?per_page=100\" >\"$existing\""
+        ),
+        "the comments must be listed with pagination into a file:\n{step}"
+    );
+
+    // BOTH filters. The author alone would match another workflow's comment;
+    // the marker alone would match a comment anybody pasted it into.
+    assert!(
+        step.contains("select(.user.login == \"github-actions[bot]\")"),
+        "the selection must filter on the comment's author:\n{step}"
+    );
+    assert!(
+        step.contains("select((.body // \"\") | startswith($marker))"),
+        "the selection must filter on the marker opening the body:\n{step}"
+    );
+    // The marker reaches jq as a variable and the comments as a file, so no
+    // comment text is ever part of the jq program.
+    assert!(
+        step.contains("jq -n -r --arg marker \"$marker\" '") && step.contains("' \"$existing\")"),
+        "jq must read the listing from the file, with the marker as --arg:\n{step}"
+    );
+    assert!(
+        step.contains("| max // empty"),
+        "the newest matching comment is the one rewritten:\n{step}"
+    );
+
+    // The chosen comment is edited by id, and that id is checked to be digits
+    // before it becomes part of a request path.
+    assert!(
+        step.contains("*[!0-9]*)") && step.contains("exit 1"),
+        "a non-numeric comment id must fail the job:\n{step}"
+    );
+    assert!(
+        step.contains(
+            "gh api --silent --method PATCH \\\n              \
+             \"repos/$GH_REPO/issues/comments/$comment_id\""
+        ),
+        "the existing comment must be edited by its id:\n{step}"
+    );
+}
+
+/// GitHub refuses a comment over 65,536 characters. The render job bounds the
+/// Markdown to 60000 bytes; the marker line and the blank line after it are
+/// added on top of that in the comment job, so they have to fit in the room
+/// that budget leaves.
+#[test]
+fn the_marker_fits_inside_the_comment_size_limit() {
+    assert!(
+        code(&job_body("render")).contains("render-md --max-bytes 60000 "),
+        "the size check below assumes the render budget"
+    );
+    let marker_lines = COMMENT_MARKER.len() + "\n\n".len();
+    assert!(60_000 + marker_lines < 65_536);
 }
 
 // ── The asset: the pinned, verified install ───────────────────────────────────
@@ -260,14 +391,7 @@ fn the_workflow_globs_the_checklist_convention() {
 /// One step of the `render` job, from its `- name: <name>` line up to the next
 /// step at the same indent (or the end of the job).
 fn render_step(name: &str) -> String {
-    let job = job_body("render");
-    let header = format!("      - name: {name}\n");
-    let start = job
-        .find(&header)
-        .unwrap_or_else(|| panic!("the render job has no `{name}` step"));
-    let rest = &job[start + header.len()..];
-    let end = rest.find("\n      - ").map_or(rest.len(), |i| i + 1);
-    format!("{header}{}", &rest[..end])
+    job_step("render", name)
 }
 
 /// The merge ref the checkout lands on is a merge commit whose first parent is

@@ -735,8 +735,12 @@ installs the `ss-magic-plugin` release it pins (an `ss-magic-plugin-vX.Y.Z`
 archive, verified against its published `.sha256`), verifies and renders the
 pull request's checklists in a `render` job that holds only `contents: read`,
 and posts the result from a separate `comment` job that holds
-`pull-requests: write` and checks out no code. The checklists it selects are
-the top-level `docs/actions/*.checklist.json` files the pull request adds or
+`pull-requests: write` and checks out no code. That job keeps one comment per
+pull request and rewrites only its own: the body opens with a hidden marker
+line, and the job edits the newest comment that both was written by
+`github-actions[bot]` and starts with that marker, creating one when there is
+none, so a comment another workflow posted is never overwritten. The
+checklists it selects are the top-level `docs/actions/*.checklist.json` files the pull request adds or
 modifies, compared with the tip of the branch it targets: a checklist merged by
 an earlier pull request is left alone, a deleted one is not selected, a renamed
 one is selected at its new path, and a file in a subdirectory of
@@ -744,7 +748,8 @@ one is selected at its new path, and a file in a subdirectory of
 the binary as separate arguments, never interpolated into a command line, just
 as the rendered Markdown reaches `gh` only as a file. A pull request that
 touches no checklist gets a green run and no comment; one that touches several
-gets one comment holding each in turn, bounded to 60,000 bytes. The selection fails closed: a checkout
+gets one comment holding each in turn, its Markdown bounded to 60,000 bytes so
+that the comment, marker included, fits GitHub's 65,536-character limit. The selection fails closed: a checkout
 that is not the pull request's merge commit, or a failed `git diff`, fails the
 job rather than reading as "no checklists". The comment job is skipped for pull
 requests opened from a fork, whose token cannot post, while the render job
@@ -838,7 +843,10 @@ decided the local change can go. The new workflow verifies and renders only the
 checklists the pull request adds or modifies: the old one rendered whichever
 single checklist it found with no arguments, so a later pull request commented
 with a checklist merged long ago, and every run failed once `docs/actions/`
-held two.
+held two. It also rewrites only its own comment, found by a hidden marker: the
+old one edited the last comment `github-actions[bot]` had made, which could be
+another workflow's. A pull request still open across the upgrade keeps the
+unmarked comment the old workflow left and gets one new marked comment, once.
 
 ### Hooks
 
