@@ -338,3 +338,88 @@ fn ignored_untracked_answers_a_list_larger_than_a_pipe_buffer() {
     assert_eq!(got.len(), candidates.len());
     assert_eq!(got, candidates, "git answers in the order it was asked");
 }
+
+// ── One process, whatever the candidate count ────────────────────────────
+
+const SHIM_REPO: &str = "SS_MAGIC_TEST_PROBE_REPO";
+const SHIM_LOG: &str = "SS_MAGIC_TEST_PROBE_LOG";
+
+/// The bulk probe spawns ONE `git` process for a whole candidate list, however
+/// long. Proven by counting: a `git` shim placed first on `PATH` logs every
+/// invocation and then runs the real git, in a child process so the changed
+/// `PATH` exists nowhere else in the suite.
+#[cfg(unix)]
+#[test]
+fn ignored_untracked_spawns_one_process_whatever_the_candidate_count() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = init_repo("main");
+    let root = dir.path();
+    write(root, ".gitignore", "*.secret\n");
+
+    let real_git = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let shim_dir = tempfile::tempdir().unwrap();
+    let log = shim_dir.path().join("invocations.log");
+    let shim = shim_dir.path().join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"${SHIM_LOG}\"\nexec '{}' \"$@\"\n",
+            real_git.trim()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = std::ffi::OsString::from(shim_dir.path());
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    crate::testutil::run_ignored_test_in_child(
+        &crate::testutil::test_path_in_binary(module_path!(), "child_probe_under_a_counting_git"),
+        &[
+            ("PATH", path.as_os_str()),
+            (SHIM_REPO, root.as_os_str()),
+            (SHIM_LOG, log.as_os_str()),
+        ],
+        &[],
+    );
+}
+
+#[test]
+#[ignore = "child half of ignored_untracked_spawns_one_process_whatever_the_candidate_count"]
+fn child_probe_under_a_counting_git() {
+    let (Some(root), Some(log)) = (std::env::var_os(SHIM_REPO), std::env::var_os(SHIM_LOG)) else {
+        return;
+    };
+    let (root, log) = (std::path::PathBuf::from(root), std::path::PathBuf::from(log));
+    let invocations = || fs::read_to_string(&log).unwrap_or_default().lines().count();
+
+    for count in [1usize, 50, 5000] {
+        let before = invocations();
+        let candidates: Vec<String> = (0..count).map(|i| format!("dir/file-{i}.secret")).collect();
+
+        let ignored = ignored_untracked(&root, &candidates).unwrap();
+
+        assert_eq!(ignored.len(), count);
+        assert_eq!(
+            invocations() - before,
+            1,
+            "{count} candidates must cost exactly one git process"
+        );
+    }
+    assert!(
+        fs::read_to_string(&log).unwrap().lines().all(|line| line == "check-ignore"),
+        "the shim really was the git that ran"
+    );
+    // And none at all for an empty list.
+    let before = invocations();
+    assert!(ignored_untracked(&root, &[]).unwrap().is_empty());
+    assert_eq!(invocations(), before);
+}
