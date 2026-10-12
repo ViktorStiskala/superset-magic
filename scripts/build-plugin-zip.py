@@ -630,8 +630,18 @@ def check_hooks_shim(root: Path) -> list[str]:
 
 # Absent by requirement, not by accident (R2). A `cargo build` proves a
 # dependency is PRESENT and can say nothing about one being ABSENT, so the
-# absence is asserted here (and by `cargo tree -i` in CI).
-FORBIDDEN_PLUGIN_DEPS = ("self_update", "inquire", "ratatui")
+# absence is asserted here (and by `cargo tree -i` in CI). Each crate is paired
+# with the guarantee its absence gives, which is what a failure message names.
+#
+# `saphyr` is the YAML parser behind the CLI's `orca.yaml` editor. Everything
+# Orca-specific lives in the CLI crate; the plugin has no use for a YAML parser
+# and must not gain one through core.
+FORBIDDEN_PLUGIN_DEPS = {
+    "self_update": "The plugin's inability to self-update",
+    "inquire": "The plugin's inability to open a prompt",
+    "ratatui": "The plugin's inability to open a TUI",
+    "saphyr": "The plugin's freedom from a YAML parser",
+}
 _DEP_TABLES = frozenset({"dependencies", "dev-dependencies", "build-dependencies"})
 
 
@@ -685,7 +695,7 @@ def _declared_dependency_names(text: str) -> set[str]:
 
 
 def check_workspace_shape(root: Path) -> list[str]:
-    """The plugin's inability to self-update or open a TUI is STRUCTURAL (R2).
+    """What the plugin does not link is STRUCTURAL (R2): no updater, no TUI, no YAML.
 
     "The plugin never self-updates and never opens a TUI" is meant to be a fact
     about what is linked into the binary, not a convention reviewers uphold: a
@@ -694,7 +704,12 @@ def check_workspace_shape(root: Path) -> list[str]:
     harness. `cargo build` can only show that a dependency is PRESENT, so the
     absence is asserted mechanically here.
 
-    `ss-magic-core` is checked for the same three crates because the plugin links
+    The YAML parser (`saphyr`) is on the list for a different reason than the
+    other three: it belongs to the CLI's `orca.yaml` editor, and the plugin has
+    no Orca behaviour at all, so the parser arriving in the plugin would mean
+    Orca code had leaked into core.
+
+    `ss-magic-core` is checked for the same crates because the plugin links
     it: a dependency added there would reach the plugin transitively and the
     guarantee would be gone without the plugin's own manifest changing a line.
     `publish = false` on core is asserted alongside because core is a shared
@@ -708,13 +723,12 @@ def check_workspace_shape(root: Path) -> list[str]:
         declared = _declared_dependency_names(
             _read_text(root, manifest, "a workspace member manifest")
         )
-        for dep in FORBIDDEN_PLUGIN_DEPS:
+        for dep, guarantee in FORBIDDEN_PLUGIN_DEPS.items():
             if dep in declared:
                 problems.append(
-                    f"{manifest} declares a `{dep}` dependency; {why}. The plugin's "
-                    f"inability to self-update or open a TUI is structural, not a "
-                    f"convention -- remove the dependency rather than relying on no "
-                    f"code calling it."
+                    f"{manifest} declares a `{dep}` dependency; {why}. {guarantee} "
+                    f"is structural, not a convention -- remove the dependency "
+                    f"rather than relying on no code calling it."
                 )
 
     core_text = _read_text(root, CORE_MANIFEST, "the core crate manifest")
@@ -1327,8 +1341,8 @@ def selftest() -> int:
         assert found and "ss-magic-plugin" in found[0] and "ENOENT" in found[0], found
         checks.append("a hook entry naming the binary instead of the shim is rejected")
 
-    # -- The plugin must not link self_update / inquire / ratatui, directly or
-    #    through core.
+    # -- The plugin must not link self_update / inquire / ratatui / saphyr,
+    #    directly or through core.
     with tempfile.TemporaryDirectory() as f:
         clean = _version_repo(Path(f) / "clean")
         assert not check_workspace_shape(clean), check_workspace_shape(clean)
@@ -1336,6 +1350,7 @@ def selftest() -> int:
             ("self_update", 'self_update = { version = "0.44.0" }\n'),
             ("inquire", 'inquire = "0.9"\n'),
             ("ratatui", 'ratatui = "0.30.2"\n'),
+            ("saphyr", 'saphyr = { version = "0.2", default-features = false }\n'),
             ("a renamed self_update", 'tui = { package = "self_update", version = "0.44" }\n'),
             # A dotted sub-table rename: the crate name is in the body, not the header.
             ("a dotted-table rename", '\n[dependencies.tui]\npackage = "self_update"\nversion = "0.44"\n'),
@@ -1359,7 +1374,9 @@ def selftest() -> int:
         assert len(found) == 2, found  # the transitive dependency AND publish = false
         assert any("transitively" in p for p in found), found
         assert any("publish = false" in p for p in found), found
-        checks.append("workspace shape rejects self_update/inquire/ratatui and a publishable core")
+        checks.append(
+            "workspace shape rejects self_update/inquire/ratatui/saphyr and a publishable core"
+        )
 
     # -- A failed test gate must block the publish, not only the builds. The
     #    fixtures reproduce the two shapes `dist generate` emitted: the gate as a

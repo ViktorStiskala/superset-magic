@@ -25,7 +25,7 @@ tune it per crate) and `[profile.dist]` inheriting it. Members live under
 - `crates/ss-magic-core` – the shared library. `publish = false` plus
   `[package.metadata.dist] dist = false`, version `0.1.0`, never a release
   surface and never tagged.
-- `crates/ss-magic` – binary `ss-magic`, the sync CLI. Currently `0.11.2`.
+- `crates/ss-magic` – binary `ss-magic`, the sync CLI. Currently `0.12.0`.
 - `crates/ss-magic-plugin` – binary `ss-magic-plugin`, the plugin's hook runtime
   and verb tree. Currently `1.0.1`.
 
@@ -131,6 +131,7 @@ flowchart TB
     cm["main.rs, cli.rs (no plugin token)"]
     ct["tui: theme, menu, cockpit, ui"]
     ce["sync: reverse_sync, merge; pack; workspace/migrate"]
+    co["orca: detect, orca_yaml, shared_dirs, snapshot, worktreeinclude, write"]
     cu["update: apply via self_update, always a pinned tag"]
   end
   subgraph plug["ss-magic-plugin (binary, tag ss-magic-plugin-vX.Y.Z)"]
@@ -145,7 +146,11 @@ flowchart TB
 The two binaries depend on core and NEVER on each other. There is no code path
 from one to the other, and that is the whole point of the split: the plugin
 crate links neither `self_update` nor `inquire`/`ratatui`, so it cannot
-self-update or open a TUI even by mistake.
+self-update or open a TUI even by mistake. It links no YAML parser either:
+`saphyr`, which the CLI's `orca.yaml` editor uses, is a dependency of the CLI
+crate ALONE. Everything Orca-specific lives in the CLI's `orca/` module; core
+holds only the generic plumbing it calls, so the parser can never reach the
+plugin through core.
 
 `crates/ss-magic-core/src/` (library `ss-magic-core`, crate name
 `ss_magic_core`) owns what both binaries need: `git/` (probes, `gitignore`,
@@ -164,7 +169,9 @@ reverse_sync, merge}.rs` (the interactive half – they drive the cockpit – wi
 `under_excluded_tree`), `tui/` (plus `tui/theme.rs`, which installs the
 `inquire` render config from `style::enabled()`; `tui/mod.rs` re-exports
 core's `style`), `workspace/{mod, migrate}.rs` (`workspace/mod.rs` re-exports
-core's `superset_files`), `update/{mod, apply}.rs`, and the crate-root tests
+core's `superset_files`), `orca/{mod, detect, orca_yaml, shared_dirs, snapshot,
+worktreeinclude, write}.rs` (Orca compatibility – it has its own section
+below), `update/{mod, apply}.rs`, and the crate-root tests
 under `tests/`. `main.rs` re-exports core's `git` and `hashing` under their old
 `crate::` names, so a path inside the CLI reads exactly as it did before the
 split.
@@ -194,6 +201,16 @@ The modules, by purpose:
   (the `--no-index` variant that asks whether the IGNORE RULES cover a path,
   ignoring the index – what the plugin's state-tree gate needs, since a tracked
   file inside the tree must not read as "the tree is unignored"),
+  `ignored_untracked` (the BULK probe behind the Orca snapshot and
+  shared-directory list: ONE `git check-ignore --stdin -z` process answers
+  "ignored AND untracked" for a whole candidate list, since `check-ignore`
+  consults the index by default and never reports a tracked path; a directory is
+  queried with a trailing slash; exit 1 is an empty answer and any other failure
+  an `Err` the caller must read as "nothing is positively ignored". It builds its
+  own `Command` because `git_raw` nulls stdin, and writes the list from a helper
+  thread while it drains stdout, so a list larger than a pipe buffer cannot
+  deadlock. Git aborts the whole batch on a pathspec inside a submodule or
+  beneath a symlinked directory, so callers drop those candidates first),
   `status_porcelain` (parsed `(status, path)` pairs behind the checklist commit
   nudge – built on `git_raw`, NEVER the trimming `git` helper, because porcelain's
   leading column is a literal space for a worktree-only modification and a blanket
@@ -258,19 +275,26 @@ The modules, by purpose:
   array while preserving `teardown` and `run` from disk;
   `write_config_json` always rewrites pretty-printed. `load_overlaid`
   reads `magic.json` and overlays `magic.local.json` (union+dedupe
-  `files`, base order first); `load_magic_json` / `load_magic_local_json` read
+  `files`, base order first; `sharedDirectories` from the BASE file only –
+  it is expanded into the committed `orca.yaml`, so the per-machine overlay
+  must not reach it). `MagicConfig::shared_directories` is the named optional
+  field for that key: `None` ("never chosen") stays absent on write, while
+  `Some(vec![])` ("chose none") is written as `[]`, and a file without the key
+  round-trips byte-identically; `load_magic_json` / `load_magic_local_json` read
   each layer on its own (what the plugin's config write path needs, since it
   load-modify-writes exactly one file). `write_magic_json(root, &MagicConfig)`
   and `write_magic_local_json` take the whole typed config – `MagicConfig`
   carries a `#[serde(flatten)] extras` map, so an unknown key a newer build or a
   hand edit put in the file survives a rewrite instead of being dropped – and
   both commit through a staged sibling plus `rename` (`write_atomically`,
-  writing THROUGH a symlink onto its resolved target), never a truncating
+  writing THROUGH a symlink onto its resolved target – public, so the CLI's
+  Orca writers replace `orca.yaml` and `.worktreeinclude` the same way), never a truncating
   `fs::write`: `magic.json` is a tracked file with an unattended writer now
   (the plugin's `seed-config` runs from every session start), so a write that
   dies half-way must leave the previous file, not a prefix;
-  `merge_files_into_magic_config` folds a new `files` list into an existing
-  config for the same reason. `write_magic_sh`,
+  `merge_files_into_magic_config(existing, files, shared_directories)` folds
+  a new `files` list and a new `sharedDirectories` list into an existing
+  config for the same reason – both REPLACE what was stored, never merge. `write_magic_sh`,
   `bootstrap_magic_local_json`, and `default_magic_files` round out the
   init/migration writers. `load_setup_config` / `SetupConfig` survive as
   a READ-ONLY legacy path: migration reads the old `setup_config.json`
@@ -298,7 +322,9 @@ The modules, by purpose:
   subtree. It is applied at every point of FINAL enumeration –
   `apply::walk_source`, `apply::copy_dir_recursive(root, src, dst)` (which takes
   the tree root precisely so it can classify each entry's rel), reverse sync's
-  candidate computation, and pack's `append_dir_excluding_trees` – never only on
+  candidate computation, pack's `append_dir_excluding_trees`, and the CLI's
+  three Orca walks (the snapshot's directory expansion, the shared-directory
+  walk, and the skip set's expansion of a listed directory) – never only on
   an upstream match list. Distinct from `apply::DEFAULT_EXCLUDES`, which drops a
   match containing one of a few directory NAMES (`node_modules`, `.venv`) at ANY
   depth. (This generalizes the retired `reverse_sync::under_backups_dir`.)
@@ -316,7 +342,17 @@ The modules, by purpose:
   `pattern::check_syntax`. Emits an `Event` stream via a caller-supplied
   closure so tests can collect events while production prints them.
   (`load_main_config`, the old interactive apply path, was removed in
-  U13.)
+  U13.) `run_filtered` is the same engine with a `PathFilter` – a set of
+  repo-relative paths the copy must leave alone, where an entry covers itself
+  and everything beneath it by whole path component (an empty path is dropped at
+  construction, since it would cover the whole tree). The filter is applied at
+  BOTH enumeration points, on each expanded match and inside the recursive
+  directory copy (`copy_dir_recursive_filtered`), so a directory match above a
+  filtered path still skips it. A filtered path emits `SkipReason::Filtered`,
+  which never counts, and is tallied in `Summary::filtered`, apart from
+  `skipped`, so it can never turn the summary into a warning. `run` and
+  `copy_dir_recursive` delegate with the empty filter. `DEFAULT_EXCLUDES` is
+  public so the Orca snapshot prunes the same names in its own walk.
 - `style.rs` (core; the CLI reaches it as `crate::tui::style`, the plugin crate
   as `ss_magic_core::style`) – palette (gray
   info, bold green ok, bold orange/xterm 208 warn, bold red err, bold cyan
@@ -330,9 +366,13 @@ The modules, by purpose:
   `tui::theme::install()`; the plugin verb tree never installs a theme, which
   is what lets the palette live in a crate that links no prompt library.
 - `tui/ui.rs` — `inquire` wrappers. `pick_with_actions` is the shared
-  `Select`-loop driver behind `pick_patterns`; the shared `Row` shape
-  carries `dim_suffix: Option<&'static str>` for the `(no matches)`
-  flag. `pick_final_action`, `print_pattern_list`, and `validate_pattern`
+  `Select`-loop driver behind `pick_patterns` and `pick_shared_directories`;
+  the shared `Row` shape carries `suffix: Option<RowSuffix>` – `Warn` for the
+  `(no matches)` flag, `Dim` for the detail a shared-directory row shows (the
+  gitignored directories its pattern matches today, the first three by name and
+  the rest as a count). `pick_shared_directories` is the Orca shared-directory
+  picker; a pattern typed into it goes through the same `validate_pattern` as a
+  sync pattern. `pick_final_action`, `print_pattern_list`, and `validate_pattern`
   (delegating to `pattern::check_syntax`) round out the module. (The
   setup-command picker/validator and the `.envrc`/apply confirms were
   removed in U13; the reverse-sync picker + overwrite-confirm were
@@ -411,14 +451,19 @@ The modules, by purpose:
   silently invisible. The pure `draw(frame, app)` and the pure `merge_preview`
   are exercised with `ratatui`'s `TestBackend` without the event loop.
 - `cli.rs` — hand-rolled arg parser (no `clap`). `parse(&[String]) -> Parsed`
-  selects `Command::{Bare, Sync { no_backup }, ReverseSync { no_backup }, Pack,
-  Update}` from the first non-flag arg (absent → `Bare`; `sync` → forward copy,
-  `reverse-sync` → reverse copy), short-circuits `--help`/`-h` to `Parsed::Help`,
+  selects `Command::{Bare, Sync { no_backup, no_orca_skip }, ReverseSync {
+  no_backup }, Pack, Orca, Update}` from the first non-flag arg (absent →
+  `Bare`; `sync` → forward copy, `reverse-sync` → reverse copy, `orca` → the
+  explicit Orca refresh), short-circuits `--help`/`-h` to `Parsed::Help`,
   and returns `Parsed::Error(token)` for an unknown subcommand. `Sync` /
   `ReverseSync` are struct variants carrying `no_backup`, set by `has_no_backup`
   – a whole-slice scan for `--no-backup`/`-n` anywhere in argv (before OR after
   the subcommand token, deliberately asymmetric with the terminal `-h`/`--help`
-  short-circuit). `Command` stays `Copy`/`Eq` (`bool` is both). `init
+  short-circuit). `Sync` also carries `no_orca_skip`, set the same way by
+  `has_no_orca_skip` (long form only). `orca` is the ONE subcommand after which
+  a `-h`/`--help` still yields `Parsed::Help`: it rewrites files in the shared
+  main checkout, and "what does this do?" must not be answered by doing it.
+  `Command` stays `Copy`/`Eq` (`bool` is both). `init
   [PATTERN...]` parses to `Parsed::Init(patterns)` (carried apart from the
   `Command` enum). There is NO `plugin` token and no `Parsed::Plugin` variant –
   the token was deleted outright when the plugin became its own binary, with no
@@ -439,7 +484,10 @@ The modules, by purpose:
   separate forward/reverse menu entries and the old `forward_sync_in_worktree`
   handler are gone. `Pack` is offered wherever an initialized `magic.json`
   exists (any worktree, or main on a `Normal` branch), so it appears in both
-  location lists. Routes selections to their handlers via the `Select` driver;
+  location lists. `MenuOp::RefreshOrca` ("Refresh Orca files") is offered on the
+  main checkout's `Normal` branch only and runs `crate::run_orca_flow`, the same
+  operation as `ss-magic orca`; init and migrate write the Orca files
+  themselves, and the worktree list is unchanged. Routes selections to their handlers via the `Select` driver;
   Esc/Ctrl-C is inert.
 - `workspace/migrate.rs` — detect + migrate/init branching off `config.json`'s
   `setup` (old `setup.sh` reference → migrate; `magic.sh` marker →
@@ -447,7 +495,23 @@ The modules, by purpose:
   and materializes via `copy_into_repo` only after the finishing-action
   prompt. `run_init_noninteractive` is the TUI-free init behind
   `ss-magic init` (writes the layout from CLI patterns, no prompt, not
-  gated by auto-update). All three write paths (`run_migrate`, `run_init`,
+  gated by auto-update). Every write path also writes the Orca files: the
+  Orca output is PLANNED before the finishing prompt (`orca::write::plan`, so
+  the "This will:" list says whether `orca.yaml` is created, updated or cannot
+  be edited) and APPLIED after the tree materializes (`Plan::apply`).
+  `materialize_init` is the one helper behind everything `run_init` (also the
+  edit-config path) and `run_init_noninteractive` do once their decisions are
+  made – stage, `copy_into_repo`, bootstrap gitignores, Orca files – and
+  `materialize_migration` is its migrate counterpart, split from `run_migrate`
+  so the whole write is testable without a prompt. Interactive init runs a
+  second picker (`ui::pick_shared_directories`) for `magic.json`'s
+  `sharedDirectories`: what starts checked is the stored list when the key
+  exists (a stored "none" included) and otherwise every kind that matches
+  something. With nobody to ask, `shared_dirs::stored_or_detected` keeps a
+  stored list and otherwise stores every default kind that matches.
+  `execute_final_action` stages `FINAL_ACTION_PATHS` – `.superset`,
+  `.gitignore` and `orca.yaml`, NEVER the per-machine `.worktreeinclude`. All
+  three write paths (`run_migrate`, `run_init`,
   `run_init_noninteractive`) call `ensure_bootstrap_gitignores`, which gitignores
   BOTH `magic.local.json` (a `gitignore::ensure_path_ignored` `File` rule) AND
   the tool's `.superset/backups/` tree (via `reverse_sync::ensure_backups_ignored`,
@@ -473,7 +537,10 @@ The modules, by purpose:
   that differs from main, no TUI, `source_untracked` hard-coded `true`.
   `backup_forward_targets` is the pre-copy backup pass for the forward
   `ss-magic sync` (main → worktree), backing up under `cwd`'s
-  `.superset/backups/` every worktree file the copy will overwrite. Each
+  `.superset/backups/` every worktree file the copy will overwrite. It takes
+  the copy's own `PathFilter` and applies it at both of its enumeration points
+  (each match, and inside a matched directory's recursive backup): a path the
+  copy leaves to Orca is not overwritten, so it is not backed up either. Each
   `Candidate` carries `wt_untracked`, derived by POSITIVE tracked determination
   (`git::tracked_files`) and fail-closed (`true` for anything not
   positively-tracked) – the gate for the secret-safety step below.
@@ -677,7 +744,7 @@ The modules, by purpose:
   (Replaces the removed `reverse_sync::hash_file`.)
 - `main.rs` – composes everything: `cli::parse` → `tui::style::init` then
   `tui::theme::install` →
-  [auto-update gate for `Bare`/`Sync`/`ReverseSync`/`Pack`, per
+  [auto-update gate for `Bare`/`Sync`/`ReverseSync`/`Pack`/`Orca`, per
   `should_run_update_gate`] → `dispatch`. `Parsed::Version` prints
   `version_line()` and stops before any dispatch. The plugin no longer appears
   here at all: it used to be routed in a SIBLING arm of the update gate so no
@@ -685,15 +752,179 @@ The modules, by purpose:
   binary that links neither `self_update` nor `inquire` is strictly stronger
   than that arrangement. `should_run_update_gate` remains an INCLUSION list over
   `Command`. `Bare` routes to `tui::menu::run`;
-  `Sync { no_backup }` runs the non-interactive forward copy (`sync_core`),
-  which now runs a pre-copy backup pass (`reverse_sync::backup_forward_targets`)
-  before `sync::apply::run` unless `--no-backup`; `ReverseSync { no_backup }`
+  `Sync { no_backup, no_orca_skip }` runs the non-interactive forward copy
+  (`run_sync_flow` → `sync_core(cwd, SyncOptions, env, on_event)`), which runs
+  a pre-copy backup pass (`reverse_sync::backup_forward_targets`) before
+  `sync::apply::run_filtered` unless `--no-backup`. `env` is how the Orca
+  variables are read: production passes the process environment, tests pass a
+  closure, so no test depends on the terminal it was launched from (which may
+  itself be an Orca terminal). In an Orca worktree (`orca::detect`) the copy's
+  `PathFilter` is the skip set built by `orca_skip_filter` – read ONCE from the
+  main checkout's `.worktreeinclude`, before anything is copied – and a
+  successful copy is followed by `orca::write::refresh_snapshot`, reported by
+  `report_snapshot_refresh` and never allowed to change the exit status;
+  `sync_summary_line` adds "left N path(s) to Orca" to the result line only when
+  something was left. `Orca` runs `run_orca_flow` → `orca_core`, the explicit
+  refresh: it resolves the main checkout from any directory of the repository,
+  needs `magic.json` there like `pack`, and returns the notices so tests can
+  read them; `ReverseSync { no_backup }`
   runs `run_reverse_sync_flow`, which hard-errors from the main checkout
   (nothing to push) and otherwise bulk-pushes via `reverse_sync::run_bulk`;
   `Pack` runs `pack::pack_core` (`run_pack_flow` + `print_pack_event`); `Update`
   forces a self-update. `resolve_sync_roots` resolves the cwd + main-checkout
   roots shared by the forward and reverse flows. `print_event` renders the
   `sync::apply::Event` stream.
+
+## Orca compatibility (`crates/ss-magic/src/orca/`)
+
+Orca is a second worktree manager. It reads `orca.yaml` and `.worktreeinclude`
+from the repository root of the MAIN checkout, and ss-magic generates both from
+`magic.json`, which stays the single source of truth for both apps. Superset
+behavior is unchanged, and the plugin crate has no Orca code.
+
+```mermaid
+flowchart TB
+  subgraph cli["crates/ss-magic"]
+    main["main.rs: sync_core, orca_core"]
+    mig["workspace/migrate.rs: init, migrate, edit-config"]
+    menu["tui/menu.rs: Refresh Orca files"]
+    subgraph orca["orca/"]
+      det["detect: Orca worktree?"]
+      snap["snapshot: .worktreeinclude entries"]
+      shd["shared_dirs: detection walk"]
+      wi["worktreeinclude: managed section I/O, skip set"]
+      oy["orca_yaml: text edit + re-parse check"]
+      wr["write: plan / apply, automatic refresh"]
+    end
+  end
+  subgraph core["crates/ss-magic-core"]
+    apply["sync/apply.rs: match_paths, run_filtered, PathFilter"]
+    git["git/mod.rs: ignored_untracked (bulk)"]
+    sf["superset_files.rs: sharedDirectories, write_atomically"]
+  end
+  main --> det
+  main --> wi
+  main --> wr
+  mig --> wr
+  menu --> main
+  wr --> snap
+  wr --> shd
+  wr --> oy
+  wr --> wi
+  snap --> apply
+  snap --> git
+  shd --> git
+  wr --> sf
+```
+
+What Orca does with the two files, as measured against the 1.4.221 app bundle
+(the facts the module's behavior rests on):
+
+- `worktree.sharedDirectories` and `.worktreeinclude` are read from the main
+  checkout's working tree; `scripts.setup` is read from the NEW worktree's own
+  `orca.yaml`, which is why that file is committed. Shared directories and the
+  `.worktreeinclude` copies are materialized BEFORE the setup script runs.
+- `.worktreeinclude` lines are split on `\r?\n` and trimmed; blank lines and
+  lines starting with `#` are skipped; `\` becomes `/`, one leading `./` and
+  trailing `/` are stripped; an entry starting with `!` or holding `*` or `?`
+  is rejected, as is an absolute path, a `..` or empty segment, or a path
+  starting in `.git`. A file over 256 KiB is ignored whole and only the first
+  1000 entries are used. Orca runs its own `check-ignore` and drops entries
+  that are not ignored.
+- `orca.yaml` is parsed as YAML 1.2 with unique keys and ignored whole on any
+  parse error. `sharedDirectories` keeps the first 100 entries.
+- `ORCA_WORKTREE_PATH` is set for setup-script runs; `ORCA_WORKTREE_ID`, set in
+  Orca's terminals, is `<repo id>::<worktree path>` with an optional
+  `::workspace:<uuid>` suffix.
+
+The modules, by purpose:
+
+- `orca/detect.rs` – `is_orca_worktree(cwd_root, main_root, env)`: true only
+  when `cwd_root` differs from the main root AND the canonicalized
+  `ORCA_WORKTREE_PATH`, or the canonicalized path after the FIRST `::` of
+  `ORCA_WORKTREE_ID` (minus the workspace suffix), equals the canonicalized
+  `cwd_root`. Either match suffices. The variables merely existing is not the
+  signal – an Orca terminal that changes into another repository's worktree
+  must behave as a plain terminal does there – and the main checkout is never
+  an Orca worktree. `env` is an injected lookup (`EnvLookup`), the same shape
+  `git::discover::discover_with_env` uses.
+- `orca/orca_yaml.rs` – the `orca.yaml` TEXT editor. `edit(current,
+  shared_dirs, ensure_setup)` is pure: text in, text or a `Refusal { reason,
+  manual_block }` out. No Rust crate round-trips YAML with its comments, so the
+  file is never re-serialized: `saphyr` reports where the two managed keys sit
+  (character offsets, not bytes), new text is spliced in, and the result is
+  PARSED AGAIN – it is accepted only when it is one YAML 1.2 document whose
+  managed values are the intended ones and whose every other key, at the top
+  level and beside the managed keys, is unchanged in value and order. That
+  second parse is the arbiter, which is why a wrong position guess can only
+  ever produce a refusal. `scripts.setup` is ENSURED (the `SETUP_LINE` is
+  prepended when no line of the script, trimmed, already equals it – so it is
+  never duplicated; a test pins `SETUP_LINE` equal to
+  `migrate::MAGIC_WRAPPER_ENTRY`), written as a `|` block scalar whose chomping
+  indicator keeps the script's own trailing newlines, or double-quoted when a
+  block scalar cannot carry the string; `worktree.sharedDirectories` is OWNED
+  and replaced outright. Whole-document problems always refuse (unparsable text
+  including duplicate keys, more than one document, a `%YAML` directive other
+  than 1.2, a top level that is not a block mapping); a problem with one managed
+  key refuses only when that key needs an edit (a parent that is a flow mapping,
+  a null, an alias or not a block mapping; an anchor, tag, alias or merge key on
+  the path; a non-string `scripts.setup`). Line endings follow the file and a
+  BOM is preserved. `saphyr`'s span ENDS are not all usable – a quoted scalar's
+  can run over a trailing comment, a flow collection's stops before the closing
+  bracket, block scalars and block sequences run to the next token – so the
+  editor scans for those ends itself (`Source::scan_*`, `trim_*_back`).
+  `shared_directories(text)` is the lenient reader of the list a file holds
+  now, and `managed_block` is what a new file consists of and what a refusal
+  shows to add by hand.
+- `orca/shared_dirs.rs` – expands the `sharedDirectories` GLOBS stored in
+  `magic.json` to LITERAL directories. `walk_candidates` records a directory
+  that is a known kind (`node_modules`, `.venv`, `venv`, `.cache`, `.turbo`,
+  `.parcel-cache`, and `.next/cache`) or matches a stored pattern and NEVER
+  descends into what it recorded – the only reason a nested `node_modules`
+  never appears. It follows no symlink and stays out of the excluded trees, any
+  directory holding a `.git` entry, any directory tagged with `CACHEDIR.TAG`
+  (a Rust `target/`), and `.next` beyond its `cache` child. `expand` keeps only
+  what `git::ignored_untracked` positively reports (queried with a trailing
+  slash), sorts, and caps at `MAX_SHARED_DIRS` (100). `matches_by_pattern`,
+  `picker_patterns` and `picker_preselected` feed the picker;
+  `stored_or_detected` is the choice made when nobody is asked.
+- `orca/snapshot.rs` – `compute` is "what forward sync would copy, filtered to
+  what Orca would copy": `apply::match_paths` on main, directory matches walked
+  into FILES (the snapshot never lists a directory) with the excluded trees,
+  the `DEFAULT_EXCLUDES` names and any directory holding a `.git` entry pruned;
+  symlinks, anything beneath a symlinked directory or inside a `.git`-holding
+  one, and any path Orca would misread dropped before git is asked; then ONE
+  `git::ignored_untracked` call, with a git failure or a non-git root yielding
+  an EMPTY snapshot. Files under a directory that made Orca's shared list are
+  dropped, the rest is sorted and capped at what is left of Orca's budget.
+  Leaving a file out is always safe, since forward sync still copies it.
+- `orca/worktreeinclude.rs` – the file has two owners: ss-magic's entries sit
+  between two marker comments, and every other line survives each rewrite byte
+  for byte. `Document::parse` / `render` do that split (a begin marker with no
+  end marker does NOT swallow the rest of the file); `Document::budget` is
+  Orca's 1000 entries / 256 KiB minus the person's own lines; `read` tells
+  `Absent` from `Unreadable`, and an unreadable file is never rewritten by any
+  path. `entries` reads the whole file the way Orca does. `copied_by_orca` turns
+  that list into forward sync's skip set, per FILE that exists in the worktree
+  (no symlink followed): a listed directory is expanded to the files actually
+  present under it, so one Orca did not get to is still synced.
+- `orca/write.rs` – the two writers. `plan(main_root, shared_patterns,
+  SetupPolicy)` + `Plan::apply` is the shared path behind init, migrate,
+  edit-config and `ss-magic orca`: the plan edits `orca.yaml` in memory BEFORE
+  the finishing prompt (`Plan::summary_lines` feeds the "This will:" list), and
+  `apply` runs AFTER the `.superset` tree materializes – it writes `orca.yaml`,
+  gitignores `.worktreeinclude` (not when it is tracked), and only then
+  computes and writes the snapshot, so the snapshot sees the `magic.json` and
+  ignore rules just put in place. It returns `Notice`s and never fails the
+  operation. `SetupPolicy::Ensure` is init/migrate/edit-config;
+  `OnlyWhenCreating` is the explicit refresh, which never touches the
+  `scripts.setup` of an existing file. `refresh_snapshot` is the AUTOMATIC
+  end-of-sync refresh: it rewrites only the managed section of main's
+  `.worktreeinclude`, only when git positively reports that file untracked AND
+  ignored, never `orca.yaml`, and every reason not to write is a `Skipped`
+  value rather than an error. Every write goes through `write_contained`, which
+  refuses a target that resolves OUTSIDE the repository through a symlink
+  (`landing`) while writing through an in-repo link.
 
 ## The Claude Code plugin (`crates/ss-magic-plugin/src/`)
 
@@ -723,8 +954,9 @@ tree moved wholesale. Three facts shape every module in it:
   delivery path, and the binary is pinned alongside the skills, hooks and
   Markdown shipped with it; a mid-session self-update would leave the two
   describing different behavior. Since the split this is STRUCTURAL rather than
-  a routing rule: the crate links neither `self_update` nor `inquire`/`ratatui`,
-  and `--check` plus `cargo tree -i` assert that mechanically. What the plugin
+  a routing rule: the crate links neither `self_update` nor `inquire`/`ratatui`
+  (nor `saphyr`, the CLI's YAML parser), and `--check` plus `cargo tree -i`
+  assert that mechanically. What the plugin
   DOES do about releases is advise (R29–R33): `release-check` reports the
   newest known plugin release against the pin and, with `--refresh`, rewrites
   its cache from one bounded fetch; `SessionStart` reads that cache and tells
@@ -1470,6 +1702,14 @@ binary is the sole file-copy implementation.)
   must never grow ref, index, or write handling – anything beyond "where are
   the two roots" is a subprocess. No git-binding crate (`git2`, `gix`) is
   added.
+- `saphyr` (YAML 1.2, default features off) is a dependency of the CLI crate
+  ONLY, used solely by `orca/orca_yaml.rs` to locate and re-check the two
+  managed keys of `orca.yaml`. It must never be added to core or the plugin
+  crate – `--check`'s `workspace shape` assertion and CI's `cargo tree -i`
+  loop both refuse it – and it must never be used to SERIALIZE `orca.yaml`:
+  the file is edited as text so the person's comments survive. It requires
+  `thiserror` 2.0.20 or newer, which is why the lockfile's `thiserror` moved
+  when it was added.
 - Glob semantics (originally derived from the retired `setup.sh`):
   absolute / `..` rejected, literals must exist, glob-zero-match
   non-fatal, `DEFAULT_EXCLUDES` (`node_modules`, `.venv`) drop matches at
@@ -1506,7 +1746,13 @@ binary is the sole file-copy implementation.)
   fixture that needs a repository-level directory such as `docs/` to exist in
   the cwd builds a scratch tree and uses the `_from` variant. `set_var` under
   `ENV_LOCK` remains acceptable only for a variable no concurrent test's child
-  could misread (`HOME` in the checklist-deny tests). CI
+  could misread (`HOME` in the checklist-deny tests). The Orca variables follow
+  the cheaper half of the same rule: `sync_core` and `orca::detect` take the
+  environment as an INJECTED lookup, so the forward-sync and Orca flow tests
+  (`tests/sync.rs`, `tests/orca_flow.rs`) pass a closure and never read or set
+  `ORCA_WORKTREE_PATH` / `ORCA_WORKTREE_ID` in the process – which also keeps a
+  suite started from an Orca terminal from behaving differently. The one test
+  that needs the variable really set runs in a child. CI
   (`.github/workflows/ci.yml`) runs `cargo test --workspace --locked` on every
   PR commit and gates cargo-dist releases as the `custom-ci` job registered
   under `local-artifacts-jobs` (see dist-workspace.toml and the release-gate
@@ -1523,12 +1769,13 @@ binary is the sole file-copy implementation.)
   key`, `R95 version surfaces (ss-magic)`, `R95 version surfaces
   (ss-magic-plugin)`, `distinct release lines`, `hooks spawn through the shim`,
   `workspace shape`, `release gate blocks publishing` and `R96 committed digest
-  pin` (the hooks-shim manifest guard; the "no `self_update`/`inquire`/`ratatui`
-  in the plugin or core manifest plus `publish = false` on core" guard; the
+  pin` (the hooks-shim manifest guard; the "no
+  `self_update`/`inquire`/`ratatui`/`saphyr` in the plugin or core manifest plus
+  `publish = false` on core" guard; the
   generated `release.yml`'s host job waiting for and checking the test gate, see
   the release-gate rule below; and the digest);
   `cargo tree --locked -p ss-magic-plugin -i <crate>` for each of `self_update`,
-  `inquire` and `ratatui`, which must report no match – a build proves a
+  `inquire`, `ratatui` and `saphyr`, which must report no match – a build proves a
   dependency PRESENT and can never prove one ABSENT, so this is the only evidence
   for that requirement; and
   `/bin/bash scripts/test-bootstrap.sh` (the bootstrap's failure paths –
@@ -1671,7 +1918,7 @@ the real incident this run fixed.
   `.scratchpad`, `.git`) must be applied where the file set is actually
   materialized – every directory walk (`pack`'s `append_dir_excluding_trees`,
   `apply::walk_source`, `apply::copy_dir_recursive`, reverse sync's candidate
-  computation) – NOT only on the
+  computation, and the Orca snapshot / shared-directory / skip-set walks) – NOT only on the
   flat match list, because a later step that re-walks the live filesystem
   (`append_dir_all`, `copy_dir_recursive`, `WalkDir`) bypasses an upstream filter.
   The trap is a directory match that is an ANCESTOR of the excluded subtree (a bare
@@ -1685,6 +1932,49 @@ the real incident this run fixed.
   those deliberately, while its Solution and Related sections name the current
   `sync::under_excluded_tree` / `pack::append_dir_excluding_trees`.) See
   [docs/solutions/logic-errors/pack-backups-exclusion-must-guard-the-directory-walk.md](./docs/solutions/logic-errors/pack-backups-exclusion-must-guard-the-directory-walk.md).
+
+## Orca constraints (hard rules)
+
+The Orca files add two surfaces of their own: `.worktreeinclude` tells ANOTHER
+program which files to copy, and the end-of-sync refresh WRITES INTO THE SHARED
+MAIN CHECKOUT from a background setup script. Each rule below is the form the
+secret-safety rules above take here.
+
+- **A file enters the snapshot only on git's POSITIVE word, and the snapshot
+  never lists a directory.** "Ignored and untracked" is answered by one
+  `git::ignored_untracked` call; a git failure, a non-git root or an
+  unanswerable path means the file is NOT listed. That is always the safe side:
+  whatever the snapshot leaves out, forward sync still copies. Never derive
+  "ignored" by absence from a tracked set, and never add `--no-index` (it would
+  report tracked files). A matched directory is expanded to its files with the
+  excluded trees and the `DEFAULT_EXCLUDES` names pruned IN THAT WALK, so a bare
+  `.superset` or a broad `**` can never list a recovered secret or a dependency
+  tree.
+- **`orca.yaml` is edited as text and accepted only after re-parsing.** Never
+  re-serialize it, and never write a result the re-parse check did not confirm:
+  one document, the two managed values as intended, every other key unchanged.
+  A layout with no safe edit is a refusal – the file stays byte-for-byte as it
+  was, the reason and the block to add by hand are printed, and everything else
+  is still written. A refusal is never a failed command.
+- **The automatic refresh writes only `.worktreeinclude`, and only when git
+  says it is both untracked and ignored.** It never touches `orca.yaml`
+  (a tracked file must not show up modified in main), never rewrites a file it
+  cannot read, never follows a symlink out of the repository, and never changes
+  the sync's exit status. "Git could not be asked" is a no.
+- **Neither refresh touches the `scripts.setup` of an existing `orca.yaml`.**
+  A line someone removed comes back only through init, migrate or edit-config.
+- **Orca mode needs a variable that NAMES this worktree, and is never on in the
+  main checkout.** Detection compares canonicalized paths; the variables merely
+  existing changes nothing. Only forward sync behaves differently in an Orca
+  worktree – the Sync cockpit, `reverse-sync` and `pack` do not.
+- **The skip set is read once, before the copy, and counts files that EXIST.**
+  A path the end-of-sync refresh adds was not in the list Orca used, so it is
+  never skipped on the strength of it; a listed directory covers only the files
+  present under it, so one Orca did not get to is still synced. The backup pass
+  runs with the same filter as the copy.
+- **Lines ss-magic did not write survive.** In `.worktreeinclude` it owns the
+  marked section only; in `orca.yaml`, two keys. A file that cannot be read as
+  UTF-8 text is never rebuilt from an empty parse.
 
 ## Plugin constraints (hard rules)
 

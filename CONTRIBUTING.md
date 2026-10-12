@@ -66,10 +66,11 @@ cargo-dist uses and which inherits it), and lists the members under `crates/`:
 
 The two binaries are genuinely independent programs that happen to share
 plumbing. `ss-magic` has no `plugin` subcommand: the token was removed, not
-aliased. And the plugin crate depends on none of `self_update`, `inquire` or
-`ratatui`, directly or transitively through core – so "the plugin never
-self-updates and never opens a TUI" is a fact about what is linked rather than a
-convention reviewers uphold. `cargo build` can only show a dependency is
+aliased. And the plugin crate depends on none of `self_update`, `inquire`,
+`ratatui` or `saphyr` (the YAML parser of the CLI's `orca.yaml` editor),
+directly or transitively through core – so "the plugin never self-updates,
+never opens a TUI and never parses YAML" is a fact about what is linked rather
+than a convention reviewers uphold. `cargo build` can only show a dependency is
 *present*, so the absence is asserted by
 `scripts/build-plugin-zip.py --check` and by `cargo tree -i` in CI.
 
@@ -86,7 +87,8 @@ In `ss-magic-core`:
 - `sync/` – pattern validation, the working-tree scan, the glob/exclude/copy
   engine shared by forward sync, reverse sync, and pack, and the
   `EXCLUDED_TREES` rule every enumeration applies.
-- `superset_files.rs` – `.superset/` contract I/O.
+- `superset_files.rs` – `.superset/` contract I/O, including `magic.json`'s
+  `sharedDirectories` list and the atomic writer the Orca files use.
 - `style.rs` – the palette and the process-wide color decision (no `inquire`).
 - `reponame.rs` – the `<repo>` name stem the pack archive and the plugin's
   session identity both derive from.
@@ -110,13 +112,22 @@ In `ss-magic`:
   pure diff/decision models (`diffmodel`, also built on `similar`), and the
   full-screen `ratatui` reverse-sync merge cockpit (`cockpit`, on the
   `crossterm` backend). `tui/mod.rs` re-exports core's `style`.
+- `orca/` – Orca compatibility, CLI only. `orca_yaml.rs` edits `orca.yaml` as
+  text and accepts a result only after parsing it again with `saphyr`;
+  `shared_dirs.rs` and `snapshot.rs` compute the two lists Orca reads;
+  `worktreeinclude.rs` reads and renders that file around ss-magic's marked
+  section and builds forward sync's skip set; `detect.rs` decides whether the
+  current worktree is Orca's, from an injected environment lookup; `write.rs`
+  is the shared write path (plan before the finishing prompt, apply after the
+  tree materializes) and the best-effort end-of-sync refresh.
 - `workspace/` – the init/migration lifecycle (`migrate.rs`); re-exports core's
   `superset_files`.
 - `update/` – the self-update apply path and the `update` verb, on top of
   core's `release`.
 - `pack.rs`, `cli.rs`, `main.rs` – the pack engine (re-exporting core's
   `repo_name_stem`), the hand-rolled arg parser (**no `clap`** – this is also
-  where the `-n`/`--no-backup` flag for `sync`/`reverse-sync` is parsed), and
+  where the `-n`/`--no-backup` flag for `sync`/`reverse-sync` and the
+  `--no-orca-skip` flag for `sync` are parsed), and
   composition (update gate, dispatch, event rendering; `main.rs` re-exports
   core's `git` and `hashing` under their old `crate::` names).
 
@@ -184,6 +195,16 @@ A few boundaries to preserve:
   `crates/ss-magic-plugin/Cargo.toml` – or to `crates/ss-magic-core/Cargo.toml`,
   which the plugin links, so a dependency added there reaches it transitively
   and the guarantee is gone without the plugin's own manifest changing a line.
+  The same goes for `saphyr`: everything Orca-specific stays in the CLI's
+  `orca/` module, and core gets only generic plumbing.
+- `orca.yaml` is edited as text and never re-serialized, so the person's
+  comments survive. A change to `orca/orca_yaml.rs` must keep the re-parse
+  check as the last word: a result that does not parse back to the intended
+  values is a refusal, not a write.
+- The Orca snapshot lists a file only when git positively reports it ignored
+  and untracked, and never lists a directory. The end-of-sync refresh writes
+  only `.worktreeinclude`, only when git reports that file untracked and
+  ignored, and never changes the sync's exit status.
 - Do not reintroduce a `plugin` subcommand on the `ss-magic` CLI, in any form.
   It was removed outright; a compatibility alias would put the plugin's verbs
   back inside the binary that self-updates and opens a menu.
@@ -226,8 +247,8 @@ The last four cover code `cargo test` cannot reach:
   agree, with README's pinned installer tag compared `<=` rather than `==`; the
   two lines' versions differ; every `hooks.json` entry spawns `bash` on a script
   that ships inside `${CLAUDE_PLUGIN_ROOT}`; the plugin and core manifests
-  declare none of `self_update` / `inquire` / `ratatui` and core carries
-  `publish = false`; and the committed digest matches the current `plugin/`
+  declare none of `self_update` / `inquire` / `ratatui` / `saphyr` and core
+  carries `publish = false`; and the committed digest matches the current `plugin/`
   tree.
 - `test-bootstrap.sh` drives `plugin/hooks/bootstrap.sh` through the failure
   modes that matter (offline, corrupted download, hostile version pin,
@@ -258,8 +279,8 @@ The last four cover code `cargo test` cannot reach:
 One more check is not a suite but belongs in the same list, because a build can
 never make it: `cargo build` proves a dependency is *present* and says nothing
 about one being absent, so CI runs `cargo tree --locked -p ss-magic-plugin -i
-<crate>` for each of `self_update`, `inquire` and `ratatui` and requires no
-match. Run it locally when you touch either manifest.
+<crate>` for each of `self_update`, `inquire`, `ratatui` and `saphyr` and
+requires no match. Run it locally when you touch either manifest.
 
 Conventions worth knowing:
 
@@ -277,6 +298,12 @@ Conventions worth knowing:
   runs its assertion in a child process with `run_ignored_test_in_child_from`
   and a scratch cwd, the same way environment-variable tests use
   `run_ignored_test_in_child` – never `set_current_dir` in a parallel suite.
+- The forward-sync and Orca flow tests (`tests/sync.rs`, `tests/orca_flow.rs`)
+  hand `sync_core` its environment as a closure. Do not read or set
+  `ORCA_WORKTREE_PATH` / `ORCA_WORKTREE_ID` in a test: the suite may be started
+  from an Orca terminal where they are already set, and a test must not behave
+  differently because of where it was launched. The one test that needs the
+  variable really set runs its assertion in a child process.
 - Tests use `tempfile` plus shell-invoked `git init` / `git worktree add` to
   build real repos — no git mocking. They must not depend on or mutate your
   real repositories, global git config, clipboard, or installed `ss-magic`.

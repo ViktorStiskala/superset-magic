@@ -79,8 +79,9 @@ Commands:
                  magic.json: orca.yaml's shared directories and
                  .worktreeinclude (runs from any directory of the repository)
   update         Force a self-update to the latest release
-  init           Initialize .superset (magic.json layout) non-interactively;
-                 optional file-pattern args become magic.json `files`
+  init           Initialize .superset (magic.json layout) and the Orca files
+                 non-interactively; optional file-pattern args become
+                 magic.json `files`
 
 Options:
   -n, --no-backup   Skip the pre-overwrite backup on `sync`/`reverse-sync`.
