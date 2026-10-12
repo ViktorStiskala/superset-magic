@@ -281,7 +281,13 @@ fn stage_migration(repo_root: &Path, stage_root: &Path, existing: &Config) -> Re
     // magic.json — a repo mid-migration (both the old setup.sh marker and
     // the new magic.sh marker present in `setup`) can already have one.
     let existing_magic = superset_files::load_magic_json(repo_root)?;
-    let magic_cfg = superset_files::merge_files_into_magic_config(existing_magic.as_ref(), files);
+    let magic_cfg = superset_files::merge_files_into_magic_config(
+        existing_magic.as_ref(),
+        files,
+        existing_magic
+            .as_ref()
+            .and_then(|cfg| cfg.shared_directories.clone()),
+    );
     superset_files::write_magic_json(stage_root, &magic_cfg)?;
 
     // magic.sh wrapper.
@@ -508,7 +514,13 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
         .tempdir()
         .context("creating init staging tempdir")?;
     let stage_root = staging.path();
-    let magic_cfg = superset_files::merge_files_into_magic_config(existing_magic.as_ref(), files);
+    let magic_cfg = superset_files::merge_files_into_magic_config(
+        existing_magic.as_ref(),
+        files,
+        existing_magic
+            .as_ref()
+            .and_then(|cfg| cfg.shared_directories.clone()),
+    );
     superset_files::write_magic_json(stage_root, &magic_cfg)?;
     superset_files::write_magic_sh(stage_root)?;
     let merged =
@@ -558,7 +570,13 @@ pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<
         .context("creating init staging tempdir")?;
     let stage_root = staging.path();
     let existing_magic = superset_files::load_magic_json(repo_root)?;
-    let magic_cfg = superset_files::merge_files_into_magic_config(existing_magic.as_ref(), files);
+    let magic_cfg = superset_files::merge_files_into_magic_config(
+        existing_magic.as_ref(),
+        files,
+        existing_magic
+            .as_ref()
+            .and_then(|cfg| cfg.shared_directories.clone()),
+    );
     superset_files::write_magic_json(stage_root, &magic_cfg)?;
     superset_files::write_magic_sh(stage_root)?;
     let existing = superset_files::load_config(repo_root)?;

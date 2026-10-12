@@ -79,7 +79,7 @@ fn cfg(setup: Vec<&str>, teardown: Vec<&str>, run: Vec<&str>) -> Config {
 fn magic_cfg(files: &[&str]) -> MagicConfig {
     MagicConfig {
         files: files.iter().map(|s| s.to_string()).collect(),
-        extras: serde_json::Map::new(),
+        ..Default::default()
     }
 }
 
@@ -583,7 +583,7 @@ fn ae2_write_magic_json_preserves_unknown_top_level_keys() {
     let existing = load_magic_json(root).unwrap();
     let mut new_files = existing.as_ref().map(|c| c.files.clone()).unwrap_or_default();
     new_files.push("**/.dev.vars".to_string());
-    let updated = merge_files_into_magic_config(existing.as_ref(), new_files);
+    let updated = merge_files_into_magic_config(existing.as_ref(), new_files, None);
     write_magic_json(root, &updated).unwrap();
 
     let raw = fs::read_to_string(root.join(".superset/magic.json")).unwrap();
@@ -613,7 +613,7 @@ fn write_magic_json_with_empty_extras_matches_files_only_shape() {
     let root = dir.path();
     let cfg = MagicConfig {
         files: vec!["**/.env".to_string()],
-        extras: serde_json::Map::new(),
+        ..Default::default()
     };
     write_magic_json(root, &cfg).unwrap();
 
@@ -642,7 +642,7 @@ fn extras_survive_two_successive_round_trips() {
         let existing = load_magic_json(root).unwrap();
         let mut files = existing.as_ref().map(|c| c.files.clone()).unwrap_or_default();
         files.push(next_pattern.to_string());
-        let updated = merge_files_into_magic_config(existing.as_ref(), files);
+        let updated = merge_files_into_magic_config(existing.as_ref(), files, None);
         write_magic_json(root, &updated).unwrap();
     }
 
@@ -661,7 +661,7 @@ fn extras_survive_two_successive_round_trips() {
 /// nothing fabricated.
 #[test]
 fn merge_files_into_magic_config_with_none_yields_empty_extras() {
-    let merged = merge_files_into_magic_config(None, vec!["**/.env".to_string()]);
+    let merged = merge_files_into_magic_config(None, vec!["**/.env".to_string()], None);
     assert_eq!(merged.files, vec!["**/.env".to_string()]);
     assert!(merged.extras.is_empty());
 }
@@ -739,6 +739,7 @@ fn write_magic_local_json_round_trips_extras() {
     let cfg = MagicConfig {
         files: vec![],
         extras,
+        ..Default::default()
     };
     write_magic_local_json(root, &cfg).unwrap();
 
@@ -978,4 +979,148 @@ fn magic_sh_propagates_exit_code_from_ss_magic_via_exec() {
         Some(3),
         "magic.sh must propagate ss-magic's exit code (3) via exec"
     );
+}
+
+// --- sharedDirectories (the Orca shared-directory patterns) ---------------
+
+/// The list is expanded into the committed `orca.yaml`, so only the committed
+/// `magic.json` may supply it: a `sharedDirectories` key in the per-machine
+/// overlay is ignored, while the overlay's `files` are still unioned in.
+#[test]
+fn overlay_takes_shared_directories_from_the_base_file_only() {
+    let dir = fresh();
+    let root = dir.path();
+    write_magic_json_raw(
+        root,
+        r#"{"files":["**/.env"],"sharedDirectories":["**/node_modules"]}"#,
+    );
+    write_magic_local_raw(
+        root,
+        r#"{"files":[".env.local"],"sharedDirectories":["**/.venv","/etc"]}"#,
+    );
+
+    let cfg = load_overlaid(root).unwrap().unwrap();
+
+    assert_eq!(cfg.files, vec!["**/.env".to_string(), ".env.local".to_string()]);
+    assert_eq!(
+        cfg.shared_directories,
+        Some(vec!["**/node_modules".to_string()]),
+        "the local overlay must not reach the shared-directory list"
+    );
+    assert!(
+        !cfg.extras.contains_key("sharedDirectories"),
+        "the key is a named field, so it must not leak in through extras either"
+    );
+}
+
+/// With no key in the base file the overlaid value is absent, even when the
+/// local overlay carries one.
+#[test]
+fn overlay_leaves_shared_directories_absent_when_only_local_has_them() {
+    let dir = fresh();
+    let root = dir.path();
+    write_magic_json_raw(root, r#"{"files":["**/.env"]}"#);
+    write_magic_local_raw(root, r#"{"files":[],"sharedDirectories":["**/.venv"]}"#);
+
+    let cfg = load_overlaid(root).unwrap().unwrap();
+
+    assert_eq!(cfg.shared_directories, None);
+}
+
+/// "Chose none" (`[]`) and "never chosen" (key absent) are different stored
+/// states, and each survives a load-and-write round trip as itself.
+#[test]
+fn empty_shared_directories_round_trips_distinct_from_an_absent_key() {
+    let dir = fresh();
+    let root = dir.path();
+
+    write_magic_json_raw(root, r#"{"files":[],"sharedDirectories":[]}"#);
+    let chose_none = load_magic_json(root).unwrap().unwrap();
+    assert_eq!(chose_none.shared_directories, Some(Vec::new()));
+    write_magic_json(root, &chose_none).unwrap();
+    let raw = fs::read_to_string(root.join(".superset/magic.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(value["sharedDirectories"], serde_json::json!([]));
+
+    write_magic_json_raw(root, r#"{"files":[]}"#);
+    let never_chosen = load_magic_json(root).unwrap().unwrap();
+    assert_eq!(never_chosen.shared_directories, None);
+    write_magic_json(root, &never_chosen).unwrap();
+    let raw = fs::read_to_string(root.join(".superset/magic.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert!(
+        value.get("sharedDirectories").is_none(),
+        "an absent key must stay absent on write: {raw}"
+    );
+}
+
+/// The chosen list REPLACES the stored one: a pattern the person dropped is
+/// gone from the rewritten file, and unknown keys still ride along.
+#[test]
+fn merging_a_chosen_list_replaces_the_stored_shared_directories() {
+    let dir = fresh();
+    let root = dir.path();
+    write_magic_json_raw(
+        root,
+        r#"{"files":["**/.env"],"sharedDirectories":["**/node_modules","**/.venv"],"plugin":{"enabled":true}}"#,
+    );
+
+    let existing = load_magic_json(root).unwrap();
+    let updated = merge_files_into_magic_config(
+        existing.as_ref(),
+        vec!["**/.env".to_string()],
+        Some(vec!["**/node_modules".to_string()]),
+    );
+    write_magic_json(root, &updated).unwrap();
+
+    let raw = fs::read_to_string(root.join(".superset/magic.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        value["sharedDirectories"],
+        serde_json::json!(["**/node_modules"]),
+        "the dropped pattern must not survive the rewrite"
+    );
+    assert_eq!(value["plugin"], serde_json::json!({"enabled": true}));
+
+    // Passing `None` leaves the key absent rather than keeping the old list.
+    let cleared = merge_files_into_magic_config(Some(&updated), vec![], None);
+    assert_eq!(cleared.shared_directories, None);
+}
+
+/// A `magic.json` written before the key existed is byte-identical after a
+/// load and a write: the new field adds nothing to a file that never had it.
+#[test]
+fn a_file_without_the_key_round_trips_byte_identically() {
+    let dir = fresh();
+    let root = dir.path();
+    let cfg = MagicConfig {
+        files: vec!["**/.env".to_string(), ".superset/magic.local.json".to_string()],
+        ..Default::default()
+    };
+    write_magic_json(root, &cfg).unwrap();
+    let before = fs::read(root.join(".superset/magic.json")).unwrap();
+
+    let loaded = load_magic_json(root).unwrap().unwrap();
+    write_magic_json(root, &loaded).unwrap();
+
+    assert_eq!(fs::read(root.join(".superset/magic.json")).unwrap(), before);
+    assert!(!String::from_utf8(before).unwrap().contains("sharedDirectories"));
+}
+
+/// The public atomic writer replaces the target whole and leaves no staging
+/// file behind in the directory.
+#[test]
+fn write_atomically_replaces_the_file_and_leaves_no_staging_file() {
+    let dir = fresh();
+    let target = dir.path().join("orca.yaml");
+    fs::write(&target, "old\n").unwrap();
+
+    write_atomically(&target, "new\n").unwrap();
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+    let names: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["orca.yaml".to_string()], "no stray staging file");
 }

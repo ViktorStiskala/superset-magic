@@ -3,7 +3,8 @@
 //!   .superset/config.json         { setup, teardown, run }  (Superset-owned)
 //!   .superset/magic.sh            executable wrapper (embedded asset)
 //!   .superset/setup_config.json   { files: [pattern, ...] }  (legacy; read-only)
-//!   .superset/magic.json          { files: [pattern, ...] }  (committed)
+//!   .superset/magic.json          { files: [pattern, ...],
+//!                                   sharedDirectories: [pattern, ...] }  (committed)
 //!   .superset/magic.local.json    { files: [pattern, ...] }  (gitignored overlay)
 //!
 //! The embedded `magic.sh` (under `assets/`) is the single source of truth
@@ -58,7 +59,7 @@ pub struct SetupConfig {
 /// (gitignored local overlay).
 ///
 /// Named fields hold the keys this version of ss-magic actually understands
-/// (currently just `files`); everything else lands in `extras` (KTD8) via
+/// (`files` and `sharedDirectories`); everything else lands in `extras` (KTD8) via
 /// `#[serde(flatten)]` instead of being dropped. That matters because a
 /// `magic.json` written by a NEWER ss-magic can carry keys this build has
 /// never heard of (e.g. a future `plugin` block) — every writer must
@@ -72,6 +73,24 @@ pub struct MagicConfig {
     /// Glob patterns for files to sync from main into worktrees.
     #[serde(default)]
     pub files: Vec<String>,
+    /// Glob patterns naming the dependency directories Orca should share with
+    /// a new worktree (`**/node_modules`, `**/.venv`, ...). ss-magic expands
+    /// them to literal directories for `orca.yaml`'s `worktree.sharedDirectories`.
+    ///
+    /// `None` and an empty list mean different things, and both must survive a
+    /// rewrite: `None` is "never chosen" (the key is absent, and stays absent
+    /// on write), while `Some(vec![])` is "chose none" and is written as `[]`
+    /// so a later non-interactive run does not fill the list back in.
+    ///
+    /// Read from the committed `magic.json` ONLY – [`load_overlaid`] never
+    /// takes it from `magic.local.json`. The list ends up in the committed
+    /// `orca.yaml`, so a per-machine overlay must not be able to reach it.
+    #[serde(
+        default,
+        rename = "sharedDirectories",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub shared_directories: Option<Vec<String>>,
     /// Every top-level key this build of ss-magic has no named field for.
     /// Serialized back out verbatim alongside `files` on every write.
     #[serde(flatten)]
@@ -84,6 +103,10 @@ pub struct MagicConfig {
 /// - `files`: UNION + DEDUPE — magic.json order is preserved first; local
 ///   entries not already present are appended in local order. A local entry
 ///   that duplicates a base entry is silently dropped (base position kept).
+/// - `sharedDirectories`: the BASE value only. A `sharedDirectories` key in
+///   `magic.local.json` is ignored, because the list is expanded into the
+///   committed `orca.yaml` and a per-machine file must not decide what the
+///   whole team's Orca worktrees share.
 /// - Scalar / object keys (future): local value wins.
 /// - Missing base `magic.json` → `Ok(None)`.
 /// - Malformed `magic.json` OR malformed `magic.local.json` → hard error
@@ -126,6 +149,7 @@ pub fn load_overlaid(root: &Path) -> Result<Option<MagicConfig>> {
 
     Ok(Some(MagicConfig {
         files: merged_files,
+        shared_directories: base.shared_directories.clone(),
         extras: merged_extras,
     }))
 }
@@ -177,7 +201,10 @@ pub fn write_magic_local_json(root: &Path, cfg: &MagicConfig) -> Result<()> {
 /// process id and a per-process counter so concurrent writers stage
 /// different files; whichever renames last wins whole, which is the same
 /// outcome a sequential pair of writes has.
-fn write_atomically(path: &Path, body: &str) -> Result<()> {
+///
+/// Public so the CLI's Orca writers (`orca.yaml`, `.worktreeinclude`) replace
+/// their files the same way instead of hand-rolling a second staged write.
+pub fn write_atomically(path: &Path, body: &str) -> Result<()> {
     // Write THROUGH a symlink, as `fs::write` did: rename onto the link's
     // resolved target, not onto the link itself, which would silently turn
     // the link into a plain file and leave its target stale. The plugin's
@@ -212,16 +239,23 @@ fn write_atomically(path: &Path, body: &str) -> Result<()> {
     write
 }
 
-/// Build a fresh `MagicConfig` with `new_files`, carrying forward the
-/// unknown top-level keys (KTD8) from `existing`, if any. Mirrors
-/// `merge_setup_into_config`'s preservation discipline for `config.json`:
-/// every write path (init, migrate, edit-config) loads the current on-disk
-/// `magic.json`, calls this to change just `files`, then writes the result —
-/// never rebuilding a `MagicConfig` from parts alone, which would silently
-/// drop any key this build doesn't have a named field for.
+/// Build a fresh `MagicConfig` with `new_files` and `shared_directories`,
+/// carrying forward the unknown top-level keys (KTD8) from `existing`, if any.
+/// Mirrors `merge_setup_into_config`'s preservation discipline for
+/// `config.json`: every write path (init, migrate, edit-config) loads the
+/// current on-disk `magic.json`, calls this to change the keys it owns, then
+/// writes the result — never rebuilding a `MagicConfig` from parts alone, which
+/// would silently drop any key this build doesn't have a named field for.
+///
+/// `shared_directories` REPLACES the field, exactly as `new_files` replaces
+/// `files`: the caller passes the list it decided on (a pattern the person
+/// unticked must disappear from the file), or `None` to leave the key absent.
+/// It is never merged with what `existing` held – a caller that wants to keep
+/// the stored list passes `existing.shared_directories.clone()` itself.
 pub fn merge_files_into_magic_config(
     existing: Option<&MagicConfig>,
     new_files: Vec<String>,
+    shared_directories: Option<Vec<String>>,
 ) -> MagicConfig {
     let extras = match existing {
         Some(cfg) => cfg.extras.clone(),
@@ -229,6 +263,7 @@ pub fn merge_files_into_magic_config(
     };
     MagicConfig {
         files: new_files,
+        shared_directories,
         extras,
     }
 }
