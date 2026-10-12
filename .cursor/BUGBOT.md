@@ -270,7 +270,11 @@ structurally valid". The engine's rules:
   the same reason the excluded trees are: a directory match that is an ancestor
   of a filtered path would otherwise copy it anyway. A filtered path emits
   `SkipReason::Filtered`, which never counts as a skip, and is tallied in
-  `Summary::filtered`, so it can never turn the summary into a warning.
+  `Summary::filtered`, so it can never turn the summary into a warning. A
+  directory match whose every file was filtered emits no `Copy` event and is
+  not counted as copied – "copied" beside a "left alone" line for each of its
+  files would contradict itself – and the backup pass leaves no empty backup
+  directory for it.
   `apply::run` and `copy_dir_recursive` delegate with an empty filter and must
   keep behaving exactly as before. The forward backup pass
   (`reverse_sync::backup_forward_targets`) takes the SAME filter, at both of its

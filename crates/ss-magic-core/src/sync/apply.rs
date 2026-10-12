@@ -182,6 +182,10 @@ where
 /// filtering only the match list would copy that file anyway. Every filtered
 /// path emits one [`SkipReason::Filtered`] event and bumps `Summary::filtered`;
 /// a filtered directory is reported once, not once per file beneath it.
+///
+/// A directory match whose every file turned out to be filtered is not reported
+/// as copied: nothing was, and "Copied: config/local" next to a "left alone"
+/// line for each file in it would say two opposite things about one directory.
 pub fn run_filtered<F>(
     src: &Path,
     dest: &Path,
@@ -227,7 +231,9 @@ where
                 continue;
             }
         }
-        let outcome: Result<()> = if src_path.is_dir() {
+        // `Ok(true)` – something was copied (or there was nothing to filter);
+        // `Ok(false)` – a directory whose files were all left alone.
+        let outcome: Result<bool> = if src_path.is_dir() {
             let mut filtered_inside = 0;
             let outcome =
                 copy_dir_recursive_filtered(src, &src_path, &dest_path, filter, &mut |inner| {
@@ -238,9 +244,9 @@ where
                     filtered_inside += 1;
                 });
             summary.filtered += filtered_inside;
-            outcome
+            outcome.map(|files_copied| files_copied > 0 || filtered_inside == 0)
         } else if src_path.is_file() {
-            fs::copy(&src_path, &dest_path).map(|_| ()).map_err(|e| {
+            fs::copy(&src_path, &dest_path).map(|_| true).map_err(|e| {
                 anyhow::Error::from(e).context(format!(
                     "copy {} → {}",
                     src_path.display(),
@@ -256,10 +262,11 @@ where
             continue;
         };
         match outcome {
-            Ok(()) => {
+            Ok(true) => {
                 on_event(&Event::Copy { rel: rel.clone() });
                 summary.copied += 1;
             }
+            Ok(false) => {}
             Err(err) => {
                 on_event(&Event::Skip {
                     reason: SkipReason::CopyFailed(format!("{err:#}")),
@@ -443,7 +450,7 @@ fn is_excluded(rel: &Path) -> bool {
 /// yield `.magic/…` and match nothing. Excluded directories are pruned, so the
 /// walk never descends into them.
 pub fn copy_dir_recursive(root: &Path, src: &Path, dst: &Path) -> Result<()> {
-    copy_dir_recursive_filtered(root, src, dst, &PathFilter::empty(), &mut |_| {})
+    copy_dir_recursive_filtered(root, src, dst, &PathFilter::empty(), &mut |_| {}).map(|_| ())
 }
 
 /// [`copy_dir_recursive`], additionally pruning every entry `filter` covers.
@@ -452,13 +459,16 @@ pub fn copy_dir_recursive(root: &Path, src: &Path, dst: &Path) -> Result<()> {
 /// so it is checked against the same `strip_prefix(root)` result. A covered
 /// entry is reported through `on_filtered` with its root-relative path and then
 /// pruned: a covered directory is reported once and never descended into.
+///
+/// Returns how many regular files were copied, so a caller can tell a
+/// directory it copied from one whose every file was filtered.
 pub fn copy_dir_recursive_filtered(
     root: &Path,
     src: &Path,
     dst: &Path,
     filter: &PathFilter,
     on_filtered: &mut dyn FnMut(&Path),
-) -> Result<()> {
+) -> Result<usize> {
     fs::create_dir_all(dst).with_context(|| format!("mkdir -p {}", dst.display()))?;
     let walker = WalkDir::new(src)
         .follow_links(false)
@@ -477,6 +487,7 @@ pub fn copy_dir_recursive_filtered(
             // Outside `root` entirely — keep it; the caller chose this source.
             Err(_) => true,
         });
+    let mut copied = 0;
     for entry in walker {
         let entry = entry?;
         let rel = entry.path().strip_prefix(src)?;
@@ -492,11 +503,12 @@ pub fn copy_dir_recursive_filtered(
             fs::copy(entry.path(), &target).with_context(|| {
                 format!("copy {} → {}", entry.path().display(), target.display())
             })?;
+            copied += 1;
         }
         // Skip symlinks and other special files — matches `cp -R`'s
         // pragmatic posture without leaking outside the source tree.
     }
-    Ok(())
+    Ok(copied)
 }
 
 #[cfg(test)]

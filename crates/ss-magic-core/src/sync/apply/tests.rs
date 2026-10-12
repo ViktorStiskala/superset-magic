@@ -558,6 +558,51 @@ fn filter_entry_naming_a_directory_covers_a_match_beneath_it() {
     assert_eq!(summary.filtered, 2);
 }
 
+/// A directory match whose every file is filtered copies nothing, and says so:
+/// one "left alone" event per file, no "copied" event for the directory.
+#[test]
+fn a_directory_match_with_every_file_filtered_is_not_reported_as_copied() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write(src.path(), "config/local/a.json", "main-a");
+    write(src.path(), "config/local/b.json", "main-b");
+    write(src.path(), "other.txt", "o");
+    write(dest.path(), "config/local/a.json", "dest-a");
+    write(dest.path(), "config/local/b.json", "dest-b");
+
+    let (summary, events) = collect_filtered(
+        src.path(),
+        dest.path(),
+        &["config/local", "other.txt"],
+        &["config/local/a.json", "config/local/b.json"],
+    );
+
+    assert_eq!(copy_events_of(&events), vec![Path::new("other.txt")]);
+    assert_eq!(summary.copied, 1);
+    assert_eq!(summary.filtered, 2);
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(
+        fs::read_to_string(dest.path().join("config/local/a.json")).unwrap(),
+        "dest-a"
+    );
+}
+
+/// An EMPTY matched directory is still reported as copied, as it always was:
+/// nothing was filtered, so the empty directory is the whole result.
+#[test]
+fn an_empty_directory_match_is_still_reported_as_copied() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    fs::create_dir_all(src.path().join("empty")).unwrap();
+
+    let (summary, events) =
+        collect_filtered(src.path(), dest.path(), &["empty"], &["unrelated"]);
+
+    assert_eq!(copy_events_of(&events), vec![Path::new("empty")]);
+    assert_eq!(summary.copied, 1);
+    assert!(dest.path().join("empty").is_dir());
+}
+
 #[test]
 fn empty_filter_behaves_exactly_like_run() {
     let build = || {

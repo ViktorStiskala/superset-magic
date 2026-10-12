@@ -603,7 +603,18 @@ fn backup_if_exists(
     if target.is_dir() {
         // `copy_dir_recursive_filtered`'s first step is `create_dir_all(dest)`,
         // which creates `dest` and its parents.
-        apply::copy_dir_recursive_filtered(root, target, dest, filter, &mut |_| {})?;
+        let mut filtered_any = false;
+        let files = apply::copy_dir_recursive_filtered(root, target, dest, filter, &mut |_| {
+            filtered_any = true;
+        })?;
+        if files == 0 && filtered_any {
+            // Every file in the directory is left alone by the copy, so there
+            // is nothing here to recover. An empty backup directory listed
+            // under "backups of files about to be overwritten" would promise
+            // one. Best-effort removal of the empty tree just created.
+            let _ = fs::remove_dir_all(dest);
+            return Ok(None);
+        }
         Ok(Some(dest.to_path_buf()))
     } else {
         // `backup` does the parent mkdir + `fs::copy` (the file-overwrite site's

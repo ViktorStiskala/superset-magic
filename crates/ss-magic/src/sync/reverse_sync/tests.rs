@@ -2139,3 +2139,35 @@ fn forward_backup_pass_takes_no_backup_of_a_filtered_path() {
         "a filtered file inside a matched directory must not be backed up: {captured:?}"
     );
 }
+
+/// A matched directory whose every file is filtered leaves no backup behind –
+/// not even an empty directory that would be listed as one.
+#[test]
+fn forward_backup_pass_leaves_no_empty_backup_for_a_fully_filtered_directory() {
+    let main = init_main_repo();
+    let (_wt_dir, wt) = make_worktree(main.path());
+    write(main.path(), "config/a.json", "main-a\n");
+    write(main.path(), "config/b.json", "main-b\n");
+    write(&wt, "config/a.json", "wt-a\n");
+    write(&wt, "config/b.json", "wt-b\n");
+
+    let filter = PathFilter::new([PathBuf::from("config/a.json"), PathBuf::from("config/b.json")]);
+    backup_forward_targets(main.path(), &wt, &["config".to_string()], &filter).unwrap();
+
+    let batches = wt.join(".superset/backups");
+    let captured = if batches.exists() {
+        files_under(&batches)
+    } else {
+        Vec::new()
+    };
+    assert!(captured.is_empty(), "nothing is backed up: {captured:?}");
+    let leftover_dirs: Vec<_> = walkdir::WalkDir::new(&batches)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_name() == "config")
+        .collect();
+    assert!(
+        leftover_dirs.is_empty(),
+        "no empty backup directory may be left for the filtered match: {leftover_dirs:?}"
+    );
+}

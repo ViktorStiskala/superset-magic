@@ -350,7 +350,10 @@ The modules, by purpose:
   directory copy (`copy_dir_recursive_filtered`), so a directory match above a
   filtered path still skips it. A filtered path emits `SkipReason::Filtered`,
   which never counts, and is tallied in `Summary::filtered`, apart from
-  `skipped`, so it can never turn the summary into a warning. `run` and
+  `skipped`, so it can never turn the summary into a warning. A directory match
+  whose every file was filtered is not reported as copied (the recursive copy
+  returns how many files it copied), and the backup pass likewise leaves no
+  empty backup directory for one. `run` and
   `copy_dir_recursive` delegate with the empty filter. `DEFAULT_EXCLUDES` is
   public so the Orca snapshot prunes the same names in its own walk.
 - `style.rs` (core; the CLI reaches it as `crate::tui::style`, the plugin crate
