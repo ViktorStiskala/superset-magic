@@ -11,3 +11,6 @@
 #![allow(dead_code)]
 
 pub(crate) mod orca_yaml;
+pub(crate) mod shared_dirs;
+pub(crate) mod snapshot;
+pub(crate) mod worktreeinclude;
