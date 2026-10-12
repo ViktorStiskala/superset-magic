@@ -23,7 +23,7 @@ execution: code
 
 ## Product Contract
 
-Product Contract preservation: changed – R21-R26 added. They record behavior confirmed in the plan-time scoping synthesis (file-only snapshot, Orca-limit warnings, main-checkout exclusion, best-effort background refresh, ownership of `sharedDirectories`, refusal on uneditable `orca.yaml`, refresh never touching `scripts.setup`). R1-R20, F1-F3 and AE1-AE6 are unchanged; AE7-AE9 added. The brainstorm's Outstanding Questions are resolved in place by KTD2-KTD12.
+Product Contract preservation: changed – R21-R26 added, and R25 amended after document review so the explicit refresh writes the setup line into an `orca.yaml` it creates from nothing. They record behavior confirmed in the plan-time scoping synthesis (file-only snapshot, Orca-limit warnings, main-checkout exclusion, best-effort background refresh, ownership of `sharedDirectories`, refusal on uneditable `orca.yaml`, refresh never touching `scripts.setup`). R1-R20, F1-F3 and AE1-AE6 are unchanged; AE7-AE9 added. The brainstorm's Outstanding Questions are resolved in place by KTD2-KTD12.
 
 ### Summary
 
@@ -51,6 +51,7 @@ Neither syncs anything after creation, and neither understands glob patterns.
 - **The automatic refresh rewrites only `.worktreeinclude`.** A background setup script must never leave the main checkout's tracked `orca.yaml` modified. Governs R12, R25. (session-settled: user-approved – chosen over refreshing both files, and over additive-only `orca.yaml` updates.)
 - **Commit `orca.yaml`, gitignore `.worktreeinclude`.** `orca.yaml` carries the team-shared setup script and a stable directory list; the snapshot is per-machine and churns. Governs R5, R11. (session-settled: user-approved – chosen over committing both and over ignoring both.)
 - **Only forward sync skips `.worktreeinclude` paths.** Orca copies them once and never syncs afterwards, so the Sync cockpit and `reverse-sync` still offer them. Governs R14, R17. (session-settled: user-approved – chosen over skipping in every sync operation and over skipping in both non-interactive copies.)
+- **The explicit refresh is the upgrade path for repositories set up before this release, including the setup line.** It writes `scripts.setup` only into an `orca.yaml` it creates, never into an existing one. Governs R13, R25. (session-settled: user-approved – chosen over naming edit-config as the upgrade path: one command makes an older repository fully work in Orca without re-running the pickers.)
 - **Shared-directory detection covers `node_modules`, Python venvs and JS build caches – not Rust `target/`.** Governs R6. (session-settled: user-directed – the user picked these three kinds from four offered and left out `target/`, noting that Orca's APFS clone-copy on macOS makes updates to shared directories safe.)
 - **An Orca worktree is recognized by an ORCA_* path that matches the worktree ss-magic runs in, not by the variables merely existing.** An Orca terminal that changes into another repository's worktree must not trigger Orca behavior. Governs R15, R24.
 
@@ -105,7 +106,7 @@ flowchart TB
 
 - R12. At the end of forward sync in an Orca worktree, ss-magic regenerates the main checkout's `.worktreeinclude` (and only that file), so the next worktree starts from a current list.
 - R13. An explicit refresh, offered both as a main-checkout menu entry and as a subcommand, regenerates `orca.yaml`'s shared directories and `.worktreeinclude` together; this is also how a repository initialized before this release gains the Orca files.
-- R25. Neither refresh touches `scripts.setup`; only init, migrate and edit-config add the `magic.sh sync` line.
+- R25. Neither refresh touches the `scripts.setup` of an existing `orca.yaml`, so a line someone removed comes back only through init, migrate or edit-config; when the explicit refresh creates `orca.yaml` from nothing, it includes the `magic.sh sync` line.
 - R26. The automatic refresh (R12) is best-effort: it writes only when git positively reports main's `.worktreeinclude` as ignored and untracked, otherwise it warns and skips, and it never changes the forward sync's exit status.
 
 **Forward sync inside Orca**
@@ -377,7 +378,7 @@ flowchart TB
 1. A pure function from current text (or none) plus the desired directory list plus a "ensure setup line" switch to either new text or a refusal; no I/O. A refusal carries the reason and the exact managed block (the setup line and the directory list) for the user to add by hand.
 2. Parse with `saphyr` marked spans; apply the KTD3 ladder; splice or append per KTD3/KTD4; emit the directory list as a block sequence at the parent's indentation.
 3. Re-parse the result, compare the two managed values with what was intended, and require every other top-level key to parse to the same value as before; any mismatch is a refusal.
-4. The explicit refresh calls it with the setup switch off (R25).
+4. The explicit refresh calls it with the setup switch on only when no `orca.yaml` exists, and off otherwise (R25).
 
 **Technical design:** Directional: treat the file as text with parser-provided spans; never re-serialize the whole document.
 
@@ -547,7 +548,7 @@ flowchart TB
 
 **Approach:**
 1. Add `Command::Orca`, its dispatch arm and update-gate membership; resolve the main checkout from cwd.
-2. Call the U6 write path with the setup switch off, writing `orca.yaml` shared directories and `.worktreeinclude`; print what changed and remind that `orca.yaml` is to be committed.
+2. Call the U6 write path with the setup switch on only when `orca.yaml` does not exist yet (R25), writing `orca.yaml` shared directories and `.worktreeinclude`; print what changed and remind that `orca.yaml` is to be committed.
 3. Add `MenuOp::RefreshOrca` to the main checkout's normal-branch list and its handler.
 
 **Patterns to follow:** `Command::Pack` (parse, gate, dispatch, "needs magic.json" error); `operations_for` truth table.
@@ -556,6 +557,7 @@ flowchart TB
 - `ss-magic orca` from a worktree → main's files updated, the worktree's files untouched.
 - Refresh after a new `packages/x/node_modules` appears → `orca.yaml` lists it; `scripts.setup` byte-identical, even when the user removed the `magic.sh` line.
 - No `magic.json` in main → error and non-zero exit, nothing written.
+- Old-layout repository with no `orca.yaml` → the refresh creates it with the `magic.sh sync` setup line and the shared directories.
 - Repository with no `.worktreeinclude` ignore rule → the refresh adds it, and a following automatic refresh (U5) succeeds.
 - `magic.json` without a `sharedDirectories` key → `orca.yaml` gets an empty list and the output points to edit-config.
 - Parser: `orca` → `Command::Orca`; `orca --help` → help.
