@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 
 mod cli;
+mod orca;
 mod pack;
 mod sync;
 mod tui;

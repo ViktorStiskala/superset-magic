@@ -18,6 +18,13 @@ fd-lock = "4.0.4"
 globset = "0.4"
 inquire = "0.9"
 ratatui = "0.30.2"
+# YAML 1.2 parser with source spans, used ONLY to locate and re-check the two
+# managed keys of `orca.yaml` (the file itself is edited as text, so comments
+# survive). A CLI-only dependency: the plugin binary links core, not this crate,
+# and must never gain a YAML parser.
+# Default features off: the only one is `encoding` (decoding non-UTF-8 input
+# through `encoding_rs`), and `orca.yaml` is read as UTF-8 text or refused.
+saphyr = { version = "0.2", default-features = false }
 self_update = { version = "0.44.0", default-features = false, features = ["ureq", "rustls", "archive-tar", "compression-flate2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
