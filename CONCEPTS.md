@@ -81,9 +81,10 @@ worktree instead of leaving it to be reinstalled. These are the trees forward
 sync deliberately never copies, so sharing is the only way a new worktree gets
 them. The contract stores glob patterns; each write expands them to the
 literal, gitignored directories they match at that moment, since the set of
-packages changes and Orca accepts literal paths only. A directory nested
-inside another shared one is never listed, and one that is tracked or not
-gitignored is never shared.
+packages changes and Orca accepts literal paths only. Which directories count
+is a fixed list of kinds detected by name; a pattern selects among them and
+cannot add a kind. A `node_modules` nested inside another is never listed, and
+a directory that is tracked or not gitignored is never shared.
 
 ### Orca snapshot
 The literal list of files Orca copies into a new worktree before any setup

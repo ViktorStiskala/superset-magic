@@ -609,16 +609,13 @@ fn ae9_flow_mapping_scripts_is_refused_with_the_block_to_add_by_hand() {
 
 #[test]
 fn each_uneditable_layout_is_refused_with_a_reason_naming_it() {
-    let cases: [(&str, &str); 14] = [
+    let cases: [(&str, &str); 11] = [
         ("scripts:\nworktree:\n  k: v\n", "`scripts` is present but empty"),
         ("scripts: ~\n", "`scripts` is present but empty"),
         ("scripts: just a string\n", "`scripts` is not a mapping"),
         ("scripts: [a, b]\n", "`scripts` is not a mapping"),
         ("base: &b\n  setup: make\nscripts: *b\n", "`scripts` is an alias"),
-        ("scripts: &anchored\n  setup: make\n", "anchor or a tag"),
-        ("scripts: !!map\n  setup: make\n", "anchor or a tag"),
         ("base: &b\n  x: 1\nscripts:\n  <<: *b\n  setup: make\n", "merge key"),
-        ("scripts:\n  setup: &s make\n", "anchor, tag or alias"),
         ("a: 1\n---\nb: 2\n", "more than one YAML document"),
         ("%YAML 1.1\n---\nscripts:\n  setup: make\n", "%YAML 1.1"),
         ("scripts:\n  setup: a\nscripts:\n  setup: b\n", "not valid YAML"),
@@ -643,7 +640,7 @@ fn an_uneditable_worktree_is_refused_when_its_list_must_change() {
         ("worktree: {sharedDirectories: [old]}\n", "`worktree` is a flow mapping"),
         ("worktree:\n", "`worktree` is present but empty"),
         ("base: &w\n  sharedDirectories: [old]\nworktree: *w\n", "`worktree` is an alias"),
-        ("list: &l [old]\nworktree:\n  sharedDirectories: *l\n", "anchor, tag or alias"),
+        ("list: &l [old]\nworktree:\n  sharedDirectories: *l\n", "is an alias"),
     ];
     for (current, expected) in cases {
         let r = refusal(current, &["node_modules"], false);
@@ -655,6 +652,70 @@ fn an_uneditable_worktree_is_refused_when_its_list_must_change() {
         assert!(
             !r.manual_block.contains("scripts"),
             "with the setup switch off the block to add holds only the list"
+        );
+    }
+}
+
+/// KTD3's ladder refuses an alias or a merge key on a managed path – not an
+/// anchor or a tag. Those stay exactly where they are and the edit goes ahead.
+#[test]
+fn anchors_and_tags_on_managed_nodes_are_kept_and_the_edit_applies() {
+    let cases = [
+        (
+            "scripts: &anchored\n  setup: make\n",
+            "scripts: &anchored\n  setup: |-\n    ./.superset/magic.sh sync\n    make\n",
+        ),
+        (
+            "scripts: !!map\n  setup: make\n",
+            "scripts: !!map\n  setup: |-\n    ./.superset/magic.sh sync\n    make\n",
+        ),
+        (
+            "scripts:\n  setup: &s make\n  archive: x\n",
+            "scripts:\n  setup: &s |-\n    ./.superset/magic.sh sync\n    make\n  archive: x\n",
+        ),
+        (
+            "scripts:\n  setup: !!str make # build\n",
+            "scripts:\n  setup: !!str |- # build\n    ./.superset/magic.sh sync\n    make\n",
+        ),
+    ];
+    for (current, expected_start) in cases {
+        let out = edit(Some(current), &[], true).unwrap();
+        assert!(
+            out.starts_with(expected_start),
+            "from {current:?} expected a result starting with {expected_start:?}, got:\n{out}"
+        );
+        assert_eq!(
+            setup_of(&out).as_deref(),
+            Some("./.superset/magic.sh sync\nmake")
+        );
+    }
+
+    let list = "worktree: &w\n  sharedDirectories: &dirs\n    - old\n  other: 1\n";
+    assert_eq!(
+        edit(Some(list), &dirs(&["node_modules"]), false).unwrap(),
+        "worktree: &w\n  sharedDirectories: &dirs\n    - node_modules\n  other: 1\n"
+    );
+    let flow = "worktree:\n  sharedDirectories: &dirs [old] # by hand\n";
+    assert_eq!(
+        edit(Some(flow), &dirs(&["node_modules"]), false).unwrap(),
+        "worktree:\n  sharedDirectories: &dirs\n    - node_modules # by hand\n"
+    );
+}
+
+/// The same anchors, once something else refers to them: the edit would change
+/// that other key too, the re-parse check sees it, and the file is refused.
+#[test]
+fn an_anchor_that_another_key_refers_to_makes_the_edit_a_refusal() {
+    for current in [
+        "scripts: &s\n  setup: make\ncopy: *s\n",
+        "scripts:\n  setup: &cmd make\n  archive: *cmd\n",
+        "worktree:\n  sharedDirectories: &dirs [old]\nelsewhere: *dirs\n",
+    ] {
+        let r = refusal(current, &["node_modules"], true);
+        assert!(
+            r.reason.contains("did not parse back to the intended values"),
+            "for {current:?} got {:?}",
+            r.reason
         );
     }
 }

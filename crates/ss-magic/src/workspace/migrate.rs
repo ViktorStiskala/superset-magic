@@ -32,8 +32,8 @@
 //!
 //! Every operation here also writes Orca's `orca.yaml` and `.worktreeinclude`
 //! at the repository root, derived from the same `magic.json` (see
-//! `crate::orca`). The Orca output is PLANNED before the finishing prompt, so
-//! the "This will:" list names it, and APPLIED after the `.superset` tree has
+//! `crate::orca`). The Orca output is COMPUTED before the finishing prompt, so
+//! the "This will:" list names it, and WRITTEN after the `.superset` tree has
 //! materialized ([`materialize_init`], [`materialize_migration`]). A file that
 //! cannot be edited safely is reported and left alone; it never fails the
 //! operation.
@@ -108,6 +108,25 @@ fn ensure_bootstrap_gitignores(repo_root: &Path) -> Result<()> {
     reverse_sync::ensure_backups_ignored(repo_root)?;
     state_tree::ensure_state_ignored(repo_root)?;
     Ok(())
+}
+
+/// The sync patterns as they will be once `files` is written to `magic.json`:
+/// `files` first, then every pattern of the existing `magic.local.json` overlay
+/// that is not already among them – the same union-and-dedupe
+/// `superset_files::load_overlaid` applies, computed from the list in hand
+/// because `magic.json` is not on disk yet when the Orca output is planned.
+/// A repository with no local overlay yet contributes nothing, which is right:
+/// the one a first init bootstraps is empty.
+fn overlaid_patterns(repo_root: &Path, files: &[String]) -> Result<Vec<String>> {
+    let mut patterns = files.to_vec();
+    if let Some(local) = superset_files::load_magic_local_json(repo_root)? {
+        for pattern in local.files {
+            if !patterns.contains(&pattern) {
+                patterns.push(pattern);
+            }
+        }
+    }
+    Ok(patterns)
 }
 
 /// Path of the pre-marketplace skills-directory copy of the plugin, relative to
@@ -362,8 +381,14 @@ pub fn run_migrate(repo_root: &Path, existing: &Config) -> Result<ExitCode> {
     let stored_shared = superset_files::load_magic_json(repo_root)?
         .and_then(|magic| magic.shared_directories);
     let shared = shared_dirs::stored_or_detected(repo_root, stored_shared.as_deref());
+    // The patterns migration is about to carry into magic.json, read from the
+    // same legacy file `stage_migration` reads them from.
+    let migrated_files = superset_files::load_setup_config(repo_root)?
+        .map(|c| c.files)
+        .unwrap_or_default();
     let orca_plan = orca_write::plan(
         repo_root,
+        &overlaid_patterns(repo_root, &migrated_files)?,
         shared.as_deref().unwrap_or_default(),
         SetupPolicy::Ensure,
     );
@@ -430,8 +455,8 @@ fn materialize_migration(
     ensure_bootstrap_gitignores(repo_root)?;
     clear_legacy_skills_install();
 
-    // The Orca files come last: the snapshot is computed from the magic.json
-    // and the ignore rules that were just put in place.
+    // The Orca files come last, written exactly as they were planned before
+    // the prompt.
     Ok(orca_plan.apply(repo_root))
 }
 
@@ -573,9 +598,14 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
         shared_dirs::picker_preselected(stored_shared.as_deref(), &shared_rows);
     let shared = ui::pick_shared_directories(&shared_rows, &shared_preselected, repo_root)?;
 
-    // ---- Orca output, decided before the prompt so the summary can say
+    // ---- Orca output, computed before the prompt so the summary can say
     // whether orca.yaml is created, updated or cannot be edited. ----
-    let orca_plan = orca_write::plan(repo_root, &shared, SetupPolicy::Ensure);
+    let orca_plan = orca_write::plan(
+        repo_root,
+        &overlaid_patterns(repo_root, &files)?,
+        &shared,
+        SetupPolicy::Ensure,
+    );
 
     println!();
     println!("This will:");
@@ -671,8 +701,8 @@ fn materialize_init(
     ensure_bootstrap_gitignores(repo_root)?;
     clear_legacy_skills_install();
 
-    // The Orca files come last: the snapshot is computed from the magic.json
-    // and the ignore rules that were just put in place.
+    // The Orca files come last, written exactly as they were planned before
+    // the prompt.
     Ok(InitWritten {
         had_local,
         orca_notices: orca_plan.apply(repo_root),
@@ -703,6 +733,7 @@ pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<
     let shared = shared_dirs::stored_or_detected(repo_root, stored_shared.as_deref());
     let orca_plan = orca_write::plan(
         repo_root,
+        &overlaid_patterns(repo_root, &files)?,
         shared.as_deref().unwrap_or_default(),
         SetupPolicy::Ensure,
     );

@@ -85,8 +85,14 @@ pub struct Refusal {
 /// `%YAML` directive other than 1.2, or a top level that is not a block mapping.
 /// A problem with one managed key refuses only when that key actually needs an
 /// edit: a parent (`scripts`, `worktree`) that is a flow mapping, a null, an
-/// alias or otherwise not a block mapping; an anchor, tag, alias or merge key on
-/// the path; or a `scripts.setup` that is not a string.
+/// alias or otherwise not a block mapping; an alias or merge key on the path;
+/// or a `scripts.setup` that is not a string.
+///
+/// An ANCHOR or a TAG on a managed node is not a refusal on its own. It is left
+/// in place and the edit goes ahead; whether that was safe is decided the same
+/// way as everything else, by parsing the result. When some other key refers to
+/// the anchor, that key's value changes with the edit, the check sees it, and
+/// the file is refused then.
 pub fn edit(
     current: Option<&str>,
     shared_dirs: &[String],
@@ -312,6 +318,27 @@ impl Source {
         (self.get(i) == Some(':')).then_some(i + 1)
     }
 
+    /// Index just past any node properties – an `&anchor`, a `!tag` – written
+    /// at `idx`, on the same line. Returns `idx` itself when there are none, so
+    /// a caller that splices text in at the result leaves properties where they
+    /// were and otherwise writes exactly where it would have.
+    fn skip_properties(&self, idx: usize) -> usize {
+        let mut end = idx;
+        let mut i = idx;
+        loop {
+            while matches!(self.get(i), Some(' ' | '\t')) {
+                i += 1;
+            }
+            if !matches!(self.get(i), Some('&' | '!')) {
+                return end;
+            }
+            while self.get(i).is_some_and(|c| !c.is_whitespace()) {
+                i += 1;
+            }
+            end = i;
+        }
+    }
+
     /// Index of the first character at or after `idx` that is neither white
     /// space nor inside a comment – where a value written after `idx` starts.
     fn first_content(&self, idx: usize) -> Option<usize> {
@@ -442,10 +469,12 @@ fn string_value<'a>(node: &'a MarkedYaml<'_>) -> Option<&'a str> {
     key_text(node)
 }
 
-/// The entries of a mapping node, in document order.
+/// The entries of a mapping node, in document order. A tagged mapping
+/// (`!!map`, or a custom tag) is still a mapping, so the tag is looked through.
 fn entries<'a, 'input>(node: &'a MarkedYaml<'input>) -> Option<Vec<Entry<'a, 'input>>> {
     match &node.data {
         YamlData::Mapping(map) => Some(map.iter().collect()),
+        YamlData::Tagged(_, inner) => entries(inner),
         _ => None,
     }
 }
@@ -672,7 +701,9 @@ impl<'p> Plan<'p> {
         if is_null(parent_value) {
             return Err(format!("`{parent}` is present but empty (null)"));
         }
-        let lead = src.first_content(after_parent);
+        // An anchor or tag written after the colon is stepped over: it stays
+        // where it is, and what counts is the node that follows it.
+        let lead = src.first_content(src.skip_properties(after_parent));
         match lead.and_then(|idx| src.get(idx)) {
             Some('{') => {
                 return Err(format!(
@@ -681,9 +712,6 @@ impl<'p> Plan<'p> {
             }
             Some('*') => {
                 return Err(format!("`{parent}` is an alias (`*…`) to another node"));
-            }
-            Some('&' | '!') => {
-                return Err(format!("`{parent}` carries an anchor or a tag"));
             }
             _ => {}
         }
@@ -718,11 +746,14 @@ impl<'p> Plan<'p> {
             });
         };
 
+        // The replaced text starts AFTER any anchor or tag on the value, so
+        // those stay in the file and keep applying to the new value.
         let start = src
             .after_colon(key.span.end.index())
+            .map(|after| src.skip_properties(after))
             .ok_or_else(|| format!("`{parent}.{child}` is not written as a plain `{child}:` key"))?;
         let (end, extent) = Self::value_end(src, start, value)
-            .ok_or_else(|| format!("`{parent}.{child}` uses an anchor, tag or alias"))?;
+            .ok_or_else(|| format!("`{parent}.{child}` is an alias (`*…`) to another node"))?;
         Ok(Slot::ReplaceValue {
             start,
             end,
@@ -732,10 +763,11 @@ impl<'p> Plan<'p> {
         })
     }
 
-    /// Where the value written after the colon at `after_colon` ends, plus what
-    /// else is worth knowing about it ([`Extent`]). `None` when the value carries
-    /// an anchor, a tag or is an alias – all of which tie it to other parts of
-    /// the file.
+    /// Where the value written from `after_colon` on ends, plus what else is
+    /// worth knowing about it ([`Extent`]). `after_colon` is the position just
+    /// past the key's colon and any anchor or tag that follows it. `None` when
+    /// the value is an alias, which is another node's content rather than text
+    /// of its own to replace.
     fn value_end(
         src: &Source,
         after_colon: usize,
@@ -751,7 +783,7 @@ impl<'p> Plan<'p> {
         let span_end = value.span.end.index().min(src.len());
         let plain = |end: usize| Some((end, Extent::default()));
         match src.get(lead)? {
-            '*' | '&' | '!' => None,
+            '*' => None,
             '"' => plain(src.scan_double_quoted(lead)?),
             '\'' => plain(src.scan_single_quoted(lead)?),
             '[' | '{' => plain(src.scan_flow(lead)?),

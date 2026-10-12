@@ -9,13 +9,7 @@ fn strings(items: &[&str]) -> Vec<String> {
 /// The snapshot for an otherwise-empty `.worktreeinclude` and no shared
 /// directories.
 fn snapshot(root: &Path, patterns: &[&str]) -> Snapshot {
-    compute(
-        root,
-        &strings(patterns),
-        &[],
-        &[],
-        Document::empty().budget(),
-    )
+    compute(root, &strings(patterns), &[], Document::empty().budget())
 }
 
 /// AE5. A pattern matching an ignored file and a tracked one lists only the
@@ -131,33 +125,34 @@ fn a_file_under_a_shared_directory_is_left_out() {
     let budget = Document::empty().budget();
     let patterns = strings(&["**/.env", ".env"]);
 
-    let shared = compute(root, &patterns, &strings(&[".cache", "apps/web/.cache"]), &[], budget);
+    let shared = compute(root, &patterns, &strings(&[".cache", "apps/web/.cache"]), budget);
     assert_eq!(shared.entries, strings(&[".env"]));
 
     // A directory the 100-entry cap cut from Orca's list is not shared, so the
     // file under it is listed after all.
-    let one_cut = compute(root, &patterns, &strings(&[".cache"]), &[], budget);
+    let one_cut = compute(root, &patterns, &strings(&[".cache"]), budget);
     assert_eq!(one_cut.entries, strings(&[".env", "apps/web/.cache/.env"]));
 }
 
+/// R9. The snapshot lists every ignored match, whether or not the person also
+/// wrote the path by hand outside the section; their line only costs budget.
 #[test]
-fn a_path_the_person_already_lists_is_not_listed_twice() {
+fn a_path_the_person_also_lists_by_hand_is_still_in_the_snapshot() {
     let main = init_main_repo("main");
     let root = main.path();
     write_file(root, ".gitignore", ".env\n");
     write_file(root, ".env", "S=1\n");
     write_file(root, "apps/web/.env", "S=1\n");
+    let doc = Document::parse(".env\n");
 
-    let snap = compute(
-        root,
-        &strings(&["**/.env", ".env"]),
-        &[],
-        &strings(&[".env"]),
-        Document::empty().budget(),
+    let snap = compute(root, &strings(&["**/.env", ".env"]), &[], doc.budget());
+
+    assert_eq!(snap.entries, strings(&[".env", "apps/web/.env"]));
+    assert_eq!(
+        worktreeinclude::entries(&doc.render(&snap.entries)),
+        strings(&[".env", "apps/web/.env"]),
+        "Orca reads the path once however many times the file names it"
     );
-
-    assert_eq!(snap.entries, strings(&["apps/web/.env"]));
-    assert_eq!(snap.dropped, 0);
 }
 
 /// Outside a git repository nothing is positively ignored: the snapshot is
@@ -228,13 +223,7 @@ fn more_files_than_orcas_limit_are_capped_after_counting_the_hand_lines() {
     all.sort();
     let doc = Document::parse("# mine\nh/one\nh/two\nh/three\nh/four\nh/five\n");
 
-    let snap = compute(
-        root,
-        &strings(&["secrets"]),
-        &[],
-        &doc.hand_entries(),
-        doc.budget(),
-    );
+    let snap = compute(root, &strings(&["secrets"]), &[], doc.budget());
 
     assert_eq!(snap.entries.len(), 995);
     assert_eq!(snap.entries, all[..995], "the first 995 in sorted order");
@@ -262,7 +251,7 @@ fn the_byte_budget_caps_the_snapshot_when_paths_are_long() {
     }
     let doc = Document::empty();
 
-    let snap = compute(root, &strings(&["deep"]), &[], &[], doc.budget());
+    let snap = compute(root, &strings(&["deep"]), &[], doc.budget());
 
     assert!(snap.dropped > 0, "900 paths of ~410 bytes cannot fit in 256 KiB");
     assert_eq!(snap.entries.len() + snap.dropped, 900);

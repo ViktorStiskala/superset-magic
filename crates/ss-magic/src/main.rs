@@ -334,7 +334,12 @@ fn orca_core(cwd: &Path) -> std::result::Result<Vec<orca::write::Notice>, ExitCo
     let cfg = load_magic_or_exit(&main_root)?;
 
     let shared = cfg.shared_directories.clone().unwrap_or_default();
-    let plan = orca::write::plan(&main_root, &shared, SetupPolicy::OnlyWhenCreating);
+    let plan = orca::write::plan(
+        &main_root,
+        &cfg.files,
+        &shared,
+        SetupPolicy::OnlyWhenCreating,
+    );
     let mut notices = plan.apply(&main_root);
     if cfg.shared_directories.is_none() {
         notices.push(Notice {

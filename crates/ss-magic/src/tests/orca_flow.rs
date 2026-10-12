@@ -151,21 +151,28 @@ fn the_summary_line_reports_paths_left_to_orca_apart_from_skips() {
     );
 }
 
-/// A hand-written line is honored like a generated one, and a hand-listed
-/// directory covers the files present under it – but not one Orca did not get
-/// to.
+/// KTD10. A hand-written line is honored like a generated one, and a listed
+/// directory that exists in the worktree covers everything under it: the
+/// directory is left to Orca as a whole.
 #[test]
-fn hand_written_lines_and_listed_directories_are_honored_file_by_file() {
-    let (main, _holder, wt) = orca_repo(&["config/local", "secrets/dev.pem"]);
-    write_file(main.path(), ".gitignore", ".env\n.worktreeinclude\nconfig/local/\nsecrets/\n");
+fn hand_written_lines_are_honored_and_a_listed_directory_covers_everything_under_it() {
+    let (main, _holder, wt) = orca_repo(&["config/local", "secrets/dev.pem", "other/.env"]);
+    write_file(
+        main.path(),
+        ".gitignore",
+        ".env\n.worktreeinclude\nconfig/local/\nsecrets/\n",
+    );
     write_file(main.path(), "config/local/a.json", "main-a\n");
     write_file(main.path(), "config/local/b.json", "main-b\n");
     write_file(main.path(), "secrets/dev.pem", "main-pem\n");
+    write_file(main.path(), "other/.env", "main-other\n");
     fs::write(
         main.path().join(worktreeinclude::FILE_NAME),
-        "# mine\nconfig/local/\nsecrets/dev.pem\n",
+        "# mine\nconfig/local/\nsecrets/dev.pem\nother/\n",
     )
     .unwrap();
+    // What Orca left behind: `config/local/` (with one of its two files) and the
+    // pem. It did not create `other/` at all.
     write_file(&wt, "config/local/a.json", "orca-a\n");
     write_file(&wt, "secrets/dev.pem", "orca-pem\n");
 
@@ -174,14 +181,19 @@ fn hand_written_lines_and_listed_directories_are_honored_file_by_file() {
     assert_eq!(code, 0);
     assert_eq!(read(&wt, "config/local/a.json"), "orca-a\n");
     assert_eq!(read(&wt, "secrets/dev.pem"), "orca-pem\n");
+    assert!(
+        !wt.join("config/local/b.json").exists(),
+        "the listed directory exists, so everything under it is left to Orca"
+    );
     assert_eq!(
-        read(&wt, "config/local/b.json"),
-        "main-b\n",
-        "a file under a listed directory that Orca did not copy is still synced"
+        read(&wt, "other/.env"),
+        "main-other\n",
+        "a listed directory that is NOT in the worktree is still synced"
     );
     let mut left = left_to_orca(&events);
     left.sort();
-    assert_eq!(left, vec!["config/local/a.json", "secrets/dev.pem"]);
+    assert_eq!(left, vec!["config/local", "secrets/dev.pem"]);
+    assert_eq!(copied(&events), vec!["other/.env"]);
 }
 
 /// R17. `--no-orca-skip` copies the listed paths too – and the list is still

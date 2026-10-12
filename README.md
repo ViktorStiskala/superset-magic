@@ -392,9 +392,10 @@ When Orca set the worktree up, forward sync does two more things:
   that already exists in the worktree is left alone, printed as
   `Left to Orca: <path>` and counted apart from skips in the summary. A listed
   path that is *not* in the worktree (Orca's copy budget ran out, or the file is
-  new) is copied as usual. A listed directory counts file by file, so a file
-  Orca did not get to is still synced. Skipped files are not backed up, since
-  nothing overwrites them. `--no-orca-skip` copies the listed paths too.
+  new) is copied as usual. A listed directory that exists in the worktree
+  counts as a whole: everything under it is left to Orca. Skipped paths are not
+  backed up, since nothing overwrites them. `--no-orca-skip` copies the listed
+  paths too.
 - **It refreshes the snapshot afterwards.** Once the copy has succeeded,
   ss-magic regenerates its block of the main checkout's `.worktreeinclude`, so
   the next worktree gets newly added files from Orca directly. This step is
@@ -591,6 +592,11 @@ already stores (an empty list included) or, failing that, every kind detected in
 the checkout. When nothing is stored and nothing is detected – a fresh clone
 before `npm install`, say – the key is left out of `magic.json`, so a later run
 can still detect directories that did not exist yet.
+
+Init works out the Orca files before it writes the contract, so the snapshot
+describes the checkout as it was at that moment. The `magic.local.json` a first
+init creates is therefore not in the first snapshot; it joins with the next
+refresh, which the first Orca worktree's sync performs by itself.
 
 ### `ss-magic update` — force a self-update
 
@@ -1008,12 +1014,14 @@ Derived from `magic.json` and written at the repository root, outside
   [Pattern semantics](#pattern-semantics) apply here exactly as they do to
   forward sync.
 
-`sharedDirectories` can hold any glob that matches gitignored directories. The
-kinds offered by default are `**/node_modules`, `**/.venv`, `**/venv`,
-`**/.cache`, `**/.turbo`, `**/.parcel-cache` and `**/.next/cache`. A
-`node_modules` nested inside another `node_modules` is never listed, nor is any
-directory that sits inside another shared one, and a directory that is tracked
-or not gitignored is never shared.
+ss-magic detects seven kinds of directory by name, and those are the kinds
+offered by default: `**/node_modules`, `**/.venv`, `**/venv`, `**/.cache`,
+`**/.turbo`, `**/.parcel-cache` and `**/.next/cache`. A `sharedDirectories`
+pattern selects among what was detected, so a narrower one such as
+`apps/*/node_modules` shares only some of them; a pattern cannot make a
+directory of another kind shareable (Rust's `target/` is deliberately not
+detected). A `node_modules` nested inside another `node_modules` is never
+listed, and a directory that is tracked or not gitignored is never shared.
 
 ## Pattern semantics
 

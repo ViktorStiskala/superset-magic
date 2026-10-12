@@ -38,9 +38,8 @@ pub struct Snapshot {
 /// `patterns` are the overlaid sync patterns (`magic.json` plus
 /// `magic.local.json`). `shared_dirs` is the directory list that made it into
 /// `orca.yaml`; a file beneath one of them is left out, since Orca links or
-/// clones the whole directory anyway. `hand_entries` are the person's own lines
-/// in `.worktreeinclude`; a path they already list is not listed twice.
-/// `budget` is what remains of Orca's limits for the managed section.
+/// clones the whole directory anyway. `budget` is what remains of Orca's limits
+/// for the managed section once the person's own lines are counted.
 ///
 /// A file enters the snapshot only when git POSITIVELY reports it as ignored
 /// and untracked (R10). Outside a repository, or when git cannot answer, the
@@ -49,18 +48,15 @@ pub fn compute(
     main_root: &Path,
     patterns: &[String],
     shared_dirs: &[String],
-    hand_entries: &[String],
     budget: Budget,
 ) -> Snapshot {
     let candidates = candidate_files(main_root, patterns);
     let ignored = git::ignored_untracked(main_root, &candidates).unwrap_or_default();
 
     let shared = PathFilter::new(shared_dirs.iter().map(PathBuf::from));
-    let already_listed: HashSet<&str> = hand_entries.iter().map(String::as_str).collect();
     let mut entries: Vec<String> = ignored
         .into_iter()
         .filter(|path| !shared.covers(Path::new(path)))
-        .filter(|path| !already_listed.contains(path.as_str()))
         .collect();
     entries.sort();
     entries.dedup();

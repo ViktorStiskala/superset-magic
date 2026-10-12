@@ -499,9 +499,12 @@ The modules, by purpose:
   prompt. `run_init_noninteractive` is the TUI-free init behind
   `ss-magic init` (writes the layout from CLI patterns, no prompt, not
   gated by auto-update). Every write path also writes the Orca files: the
-  Orca output is PLANNED before the finishing prompt (`orca::write::plan`, so
+  Orca output is COMPUTED before the finishing prompt (`orca::write::plan`, so
   the "This will:" list says whether `orca.yaml` is created, updated or cannot
-  be edited) and APPLIED after the tree materializes (`Plan::apply`).
+  be edited, and how many files Orca will copy) and WRITTEN after the tree
+  materializes (`Plan::apply`). `overlaid_patterns` gives the plan the sync
+  patterns as they WILL be – the `files` about to be written plus the local
+  overlay – since `magic.json` is not on disk yet at that point.
   `materialize_init` is the one helper behind everything `run_init` (also the
   edit-config path) and `run_init_noninteractive` do once their decisions are
   made – stage, `copy_into_repo`, bootstrap gitignores, Orca files – and
@@ -871,8 +874,12 @@ The modules, by purpose:
   including duplicate keys, more than one document, a `%YAML` directive other
   than 1.2, a top level that is not a block mapping); a problem with one managed
   key refuses only when that key needs an edit (a parent that is a flow mapping,
-  a null, an alias or not a block mapping; an anchor, tag, alias or merge key on
-  the path; a non-string `scripts.setup`). Line endings follow the file and a
+  a null, an alias or not a block mapping; an alias or merge key on the path; a
+  non-string `scripts.setup`). An ANCHOR or a TAG on a managed node is not a
+  refusal by itself: `Source::skip_properties` steps over it, the replaced text
+  starts after it so it stays in the file, and the re-parse check decides –
+  when another key refers to the anchor, that key changes with the edit and the
+  file is refused then. Line endings follow the file and a
   BOM is preserved. `saphyr`'s span ENDS are not all usable – a quoted scalar's
   can run over a trailing comment, a flow collection's stops before the closing
   bracket, block scalars and block sequences run to the next token – so the
@@ -881,25 +888,24 @@ The modules, by purpose:
   now, and `managed_block` is what a new file consists of and what a refusal
   shows to add by hand.
 - `orca/shared_dirs.rs` – expands the `sharedDirectories` GLOBS stored in
-  `magic.json` to LITERAL directories. `walk_candidates` records a directory
-  that is a known kind (`node_modules`, `.venv`, `venv`, `.cache`, `.turbo`,
-  `.parcel-cache`, and `.next/cache`) or matches a stored pattern. It NEVER
-  descends into a known kind – the only reason a nested `node_modules` never
-  appears – but it does enter a directory recorded only because a pattern
-  matched it: whether that directory is shared depends on git, which is asked
-  later, and a pattern that happens to match a tracked parent (`apps/*`) must
-  not hide the `node_modules` beneath it. It follows no symlink and stays out of
-  the excluded trees, any directory holding a `.git` entry, any directory tagged
-  with `CACHEDIR.TAG` (a Rust `target/`), and `.next` beyond its `cache` child.
-  `expand` keeps only what `git::ignored_untracked` positively reports (queried
-  with a trailing slash), drops a directory that lies inside another kept one
-  (`outermost`), sorts, and caps at `MAX_SHARED_DIRS` (100). `matches_by_pattern`,
-  `picker_patterns` and `picker_preselected` feed the picker;
-  `stored_or_detected` is the choice made when nobody is asked: a stored list
-  as it is (an empty one included), else the detected default kinds, else `None`
-  – the key stays ABSENT when nothing is stored and nothing is detected, so a
-  scripted init run before dependencies exist does not record "chose none" on
-  nobody's behalf.
+  `magic.json` to LITERAL directories. `walk_candidates` walks the checkout BY
+  NAME and records the seven known kinds only (`node_modules`, `.venv`, `venv`,
+  `.cache`, `.turbo`, `.parcel-cache`, and `.next/cache`). It NEVER descends
+  into a directory it recorded – the only reason a nested `node_modules` never
+  appears – follows no symlink, and stays out of the excluded trees and of any
+  directory holding a `.git` entry; it prunes nothing else, so a kind is found
+  at any depth. The stored globs are then matched AGAINST those candidates: a
+  pattern SELECTS among the detected kinds (`apps/*/node_modules` narrows
+  `**/node_modules`) and cannot make a directory of another kind shareable.
+  The kinds are a deliberate, fixed list – Rust's `target/` was considered and
+  left out. `expand` keeps only what `git::ignored_untracked` positively
+  reports (queried with a trailing slash), sorts, and caps at `MAX_SHARED_DIRS`
+  (100). `matches_by_pattern`, `picker_patterns` and `picker_preselected` feed
+  the picker; `stored_or_detected` is the choice made when nobody is asked: a
+  stored list as it is (an empty one included), else the detected default
+  kinds, else `None` – the key stays ABSENT when nothing is stored and nothing
+  is detected, so a scripted init run before dependencies exist does not record
+  "chose none" on nobody's behalf.
 - `orca/snapshot.rs` – `compute` is "what forward sync would copy, filtered to
   what Orca would copy": `apply::match_paths` on main, directory matches walked
   into FILES (the snapshot never lists a directory) with the excluded trees,
@@ -917,17 +923,22 @@ The modules, by purpose:
   Orca's 1000 entries / 256 KiB minus the person's own lines; `read` tells
   `Absent` from `Unreadable`, and an unreadable file is never rewritten by any
   path. `entries` reads the whole file the way Orca does. `copied_by_orca` turns
-  that list into forward sync's skip set, per FILE that exists in the worktree
-  (no symlink followed): a listed directory is expanded to the files actually
-  present under it, so one Orca did not get to is still synced.
-- `orca/write.rs` – the two writers. `plan(main_root, shared_patterns,
-  SetupPolicy)` + `Plan::apply` is the shared path behind init, migrate,
-  edit-config and `ss-magic orca`: the plan edits `orca.yaml` in memory BEFORE
-  the finishing prompt (`Plan::summary_lines` feeds the "This will:" list), and
-  `apply` runs AFTER the `.superset` tree materializes – it writes `orca.yaml`,
-  gitignores `.worktreeinclude` (not when it is tracked), and only then
-  computes and writes the snapshot, so the snapshot sees the `magic.json` and
-  ignore rules just put in place. It returns `Notice`s and never fails the
+  that list into forward sync's skip set: every listed line whose worktree path
+  exists (no symlink followed). A listed directory that exists covers everything
+  under it – the set holds the directory itself – and a listed path that is not
+  in the worktree contributes nothing, so it is still synced.
+- `orca/write.rs` – the two writers. `plan(main_root, patterns,
+  shared_patterns, SetupPolicy)` + `Plan::apply` is the shared path behind
+  init, migrate, edit-config and `ss-magic orca`. The whole Orca output is
+  COMPUTED in `plan`, BEFORE the finishing prompt: `orca.yaml` is read and
+  edited in memory, the snapshot is computed and `.worktreeinclude` is rendered
+  (`Plan::summary_lines` feeds the "This will:" list). `apply` runs AFTER the
+  `.superset` tree materializes and writes exactly what was planned –
+  `orca.yaml`, the `.worktreeinclude` ignore rule (not when the file is
+  tracked), then the planned snapshot. Since the snapshot is taken before the
+  tree is written, a file the same operation creates afterwards (the
+  `magic.local.json` a first init bootstraps) is not in it and joins with the
+  next refresh. `apply` returns `Notice`s and never fails the
   operation. `SetupPolicy::Ensure` is init/migrate/edit-config;
   `OnlyWhenCreating` is the explicit refresh, which never touches the
   `scripts.setup` of an existing file. `refresh_snapshot` is the AUTOMATIC
@@ -1979,11 +1990,12 @@ secret-safety rules above take here.
   main checkout.** Detection compares canonicalized paths; the variables merely
   existing changes nothing. Only forward sync behaves differently in an Orca
   worktree – the Sync cockpit, `reverse-sync` and `pack` do not.
-- **The skip set is read once, before the copy, and counts files that EXIST.**
-  A path the end-of-sync refresh adds was not in the list Orca used, so it is
-  never skipped on the strength of it; a listed directory covers only the files
-  present under it, so one Orca did not get to is still synced. The backup pass
-  runs with the same filter as the copy.
+- **The skip set is read once, before the copy, and holds listed paths that
+  EXIST in the worktree.** A path the end-of-sync refresh adds was not in the
+  list Orca used, so it is never skipped on the strength of it. Existence is
+  checked without following a symlink; a listed directory that exists covers
+  everything under it, and a listed path that is absent is still synced. The
+  backup pass runs with the same filter as the copy.
 - **Lines ss-magic did not write survive.** In `.worktreeinclude` it owns the
   marked section only; in `orca.yaml`, two keys. A file that cannot be read as
   UTF-8 text is never rebuilt from an empty parse.

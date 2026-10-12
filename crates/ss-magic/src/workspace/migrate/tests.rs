@@ -985,12 +985,13 @@ fn noninteractive_init_in_a_git_repo_writes_both_orca_files() {
     );
     assert!(orca_setup_has_the_line(root));
 
+    // KTD13: the Orca output is computed before the tree materializes, so the
+    // snapshot describes the checkout as it stood then. The `magic.local.json`
+    // this same init bootstraps is not in it yet.
     let include = read_text(root, worktreeinclude::FILE_NAME);
     assert_eq!(
         worktreeinclude::entries(&include),
-        strings(&[".env", ".superset/magic.local.json", "apps/web/.env"]),
-        "the snapshot is taken after the tree materializes, so the bootstrapped \
-         overlay is in it"
+        strings(&[".env", "apps/web/.env"])
     );
     let gitignore = read_text(root, ".gitignore");
     assert!(
@@ -1004,6 +1005,13 @@ fn noninteractive_init_in_a_git_repo_writes_both_orca_files() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&status.stdout), "?? orca.yaml\n");
+
+    // The next write of the Orca files sees the overlay and lists it.
+    run_init_noninteractive(root, &strings(&["**/.env", ".env"])).unwrap();
+    assert_eq!(
+        worktreeinclude::entries(&read_text(root, worktreeinclude::FILE_NAME)),
+        strings(&[".env", ".superset/magic.local.json", "apps/web/.env"])
+    );
 }
 
 /// Outside git nothing is positively ignored: init still succeeds, with an
@@ -1058,8 +1066,7 @@ fn ae9_an_uneditable_orca_yaml_is_left_alone_and_everything_else_is_written() {
     let original = "scripts: {setup: make}\n";
     write_file(repo.path(), "orca.yaml", original);
 
-    let plan = orca_write::plan(repo.path(), &[], SetupPolicy::Ensure);
-    let summary = plan.summary_lines();
+    let summary = orca_write::plan(repo.path(), &[], &[], SetupPolicy::Ensure).summary_lines();
     assert!(
         summary[0].starts_with("Cannot edit orca.yaml (`scripts` is a flow mapping"),
         "{summary:?}"
@@ -1073,7 +1080,9 @@ fn ae9_an_uneditable_orca_yaml_is_left_alone_and_everything_else_is_written() {
     assert!(repo.path().join(".superset/config.json").is_file());
     assert!(repo.path().join(worktreeinclude::FILE_NAME).is_file());
 
-    let notices = plan.apply(repo.path());
+    // What the operation tells the person about it.
+    let notices = orca_write::plan(repo.path(), &[], &[], SetupPolicy::Ensure).apply(repo.path());
+    assert_eq!(read_text(repo.path(), "orca.yaml"), original);
     let text: String = notices.iter().map(|n| format!("{}\n", n.text)).collect();
     assert!(text.contains("orca.yaml was not changed"), "{text}");
     assert!(text.contains("flow mapping"), "{text}");
@@ -1094,12 +1103,8 @@ fn an_orca_yaml_symlink_out_of_the_repository_is_never_written_through() {
     let repo = fresh();
     std::os::unix::fs::symlink(&victim, repo.path().join("orca.yaml")).unwrap();
 
-    let plan = orca_write::plan(repo.path(), &[], SetupPolicy::Ensure);
-    assert!(
-        plan.summary_lines()[0].contains("outside the repository"),
-        "{:?}",
-        plan.summary_lines()
-    );
+    let summary = orca_write::plan(repo.path(), &[], &[], SetupPolicy::Ensure).summary_lines();
+    assert!(summary[0].contains("outside the repository"), "{summary:?}");
     run_init_noninteractive(repo.path(), &[]).unwrap();
 
     assert_eq!(fs::read_to_string(&victim).unwrap(), "private: true\n");
@@ -1129,17 +1134,17 @@ fn a_non_utf8_worktreeinclude_is_left_untouched_with_a_notice() {
     let bytes = b"caf\xe9/secret.pem\n";
     fs::write(repo.path().join(worktreeinclude::FILE_NAME), bytes).unwrap();
 
-    let plan = orca_write::plan(repo.path(), &[], SetupPolicy::Ensure);
+    let summary = orca_write::plan(repo.path(), &[], &[], SetupPolicy::Ensure).summary_lines();
     assert!(
-        plan.summary_lines()[1].starts_with("Leave .worktreeinclude untouched"),
-        "{:?}",
-        plan.summary_lines()
+        summary[1].starts_with("Leave .worktreeinclude untouched"),
+        "{summary:?}"
     );
     run_init_noninteractive(repo.path(), &[]).unwrap();
 
     assert_eq!(fs::read(repo.path().join(worktreeinclude::FILE_NAME)).unwrap(), bytes);
     assert!(repo.path().join("orca.yaml").is_file());
-    let notices = plan.apply(repo.path());
+    let notices = orca_write::plan(repo.path(), &[], &[], SetupPolicy::Ensure).apply(repo.path());
+    assert_eq!(fs::read(repo.path().join(worktreeinclude::FILE_NAME)).unwrap(), bytes);
     assert!(
         notices
             .iter()
@@ -1169,30 +1174,31 @@ fn a_stored_empty_shared_list_stays_empty_on_a_later_init() {
     assert!(orca_dirs(root).is_empty());
 }
 
-/// A stored list is used as it is – including a custom pattern – and a kind
-/// that is not stored is not added back just because it matches.
+/// A stored list is used as it is – including a narrower custom pattern – and
+/// a kind that is not stored is not added back just because it matches.
 #[test]
 fn a_stored_shared_list_is_used_as_it_is() {
     let main = init_main_repo("main");
     let root = main.path();
-    write_file(root, ".gitignore", "node_modules/\n.venv/\ndist/\n");
+    write_file(root, ".gitignore", "node_modules/\n.venv/\n");
     write_file(root, "node_modules/a/index.js", "x");
+    write_file(root, "apps/web/node_modules/a/index.js", "x");
     write_file(root, ".venv/pyvenv.cfg", "x");
-    write_file(root, "packages/ui/dist/index.js", "x");
+    let stored = strings(&["**/.venv", "apps/*/node_modules"]);
     superset_files::write_magic_json(
         root,
-        &superset_files::merge_files_into_magic_config(
-            None,
-            Vec::new(),
-            Some(strings(&["**/.venv", "**/dist"])),
-        ),
+        &superset_files::merge_files_into_magic_config(None, Vec::new(), Some(stored.clone())),
     )
     .unwrap();
 
     run_init_noninteractive(root, &[]).unwrap();
 
-    assert_eq!(stored_shared(root), Some(strings(&["**/.venv", "**/dist"])));
-    assert_eq!(orca_dirs(root), strings(&[".venv", "packages/ui/dist"]));
+    assert_eq!(stored_shared(root), Some(stored));
+    assert_eq!(
+        orca_dirs(root),
+        strings(&[".venv", "apps/web/node_modules"]),
+        "the root node_modules belongs to a default kind that was not stored"
+    );
 }
 
 /// A tracked `.worktreeinclude` still gets its section, but no ignore rule –
@@ -1207,7 +1213,6 @@ fn a_tracked_worktreeinclude_gets_its_section_but_no_ignore_rule() {
     git_run(&["add", ".gitignore", worktreeinclude::FILE_NAME], root);
     git_run(&["commit", "-q", "-m", "track the list"], root);
 
-    let plan = orca_write::plan(root, &[], SetupPolicy::Ensure);
     run_init_noninteractive(root, &strings(&[".env"])).unwrap();
 
     let include = read_text(root, worktreeinclude::FILE_NAME);
@@ -1219,7 +1224,14 @@ fn a_tracked_worktreeinclude_gets_its_section_but_no_ignore_rule() {
             .any(|l| l == worktreeinclude::FILE_NAME),
         "no ignore rule may be added for a tracked file"
     );
-    let notices = plan.apply(root);
+    let patterns = overlaid_patterns(root, &strings(&[".env"])).unwrap();
+    let notices = orca_write::plan(root, &patterns, &[], SetupPolicy::Ensure).apply(root);
+    assert!(
+        !read_text(root, ".gitignore")
+            .lines()
+            .any(|l| l == worktreeinclude::FILE_NAME),
+        "still no ignore rule after a second write"
+    );
     assert!(
         notices.iter().any(|n| n.text.contains("tracked by git")),
         "{notices:?}"
@@ -1239,8 +1251,11 @@ fn migration_writes_the_orca_files_alongside_the_new_layout() {
     let existing = superset_files::load_config(root).unwrap().unwrap();
     let shared = shared_dirs::stored_or_detected(root, None);
     assert_eq!(shared, Some(strings(&["**/node_modules"])));
+    let patterns =
+        overlaid_patterns(root, &strings(&["**/.env", "apps/*/.dev.vars"])).unwrap();
     let plan = orca_write::plan(
         root,
+        &patterns,
         shared.as_deref().unwrap_or_default(),
         SetupPolicy::Ensure,
     );
@@ -1248,8 +1263,7 @@ fn migration_writes_the_orca_files_alongside_the_new_layout() {
         plan.summary_lines(),
         vec![
             "Create orca.yaml (Orca setup script, 1 shared directory)".to_string(),
-            "Write .worktreeinclude (files Orca copies into a new worktree) + add it to .gitignore"
-                .to_string(),
+            "Write .worktreeinclude (1 file for Orca to copy) + add it to .gitignore".to_string(),
         ]
     );
 
@@ -1275,7 +1289,9 @@ fn migration_writes_the_orca_files_alongside_the_new_layout() {
 #[test]
 fn the_summary_says_create_update_keep_or_cannot_edit() {
     let repo = fresh();
-    let line = |root: &Path| orca_write::plan(root, &[], SetupPolicy::Ensure).summary_lines()[0].clone();
+    let line = |root: &Path| {
+        orca_write::plan(root, &[], &[], SetupPolicy::Ensure).summary_lines()[0].clone()
+    };
 
     assert_eq!(
         line(repo.path()),
@@ -1296,15 +1312,19 @@ fn the_summary_says_create_update_keep_or_cannot_edit() {
     );
 }
 
-/// Running init twice is quiet the second time: nothing about the Orca files
-/// changes, and the ignore rule is not appended again.
+/// Once the Orca files are in step with the checkout, running init again
+/// changes nothing about them, and the ignore rule is not appended again.
 #[test]
-fn a_second_init_changes_nothing_about_the_orca_files() {
+fn a_repeated_init_changes_nothing_about_the_orca_files() {
     let main = init_main_repo("main");
     let root = main.path();
     write_file(root, ".gitignore", ".env\nnode_modules/\n");
     write_file(root, ".env", "S=1\n");
     write_file(root, "node_modules/a/index.js", "x");
+    // The first run bootstraps `magic.local.json` after its snapshot was taken,
+    // so the second run still has that one file to add. From then on a run
+    // changes nothing.
+    run_init_noninteractive(root, &strings(&[".env"])).unwrap();
     run_init_noninteractive(root, &strings(&[".env"])).unwrap();
     let snapshot = |rel: &str| read_text(root, rel);
     let before = (

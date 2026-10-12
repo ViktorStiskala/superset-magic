@@ -4,13 +4,12 @@
 //!
 //! - [`plan`] and [`Plan::apply`] are the shared Orca write path behind init,
 //!   migrate, edit-config and the explicit `ss-magic orca` refresh (KTD13). The
-//!   plan is computed BEFORE the finishing prompt – the current `orca.yaml` is
-//!   read and edited in memory – so the "This will:" list can say whether the
-//!   file is created, updated or cannot be edited. `apply` runs after the
-//!   Superset tree has materialized: it writes `orca.yaml`, gitignores
-//!   `.worktreeinclude`, and only then computes and writes the snapshot, so the
-//!   snapshot sees the files and ignore rules the operation itself just put in
-//!   place (the bootstrapped `magic.local.json`, for one).
+//!   Orca output is COMPUTED before the finishing prompt and WRITTEN after the
+//!   Superset tree has materialized. `plan` reads the current `orca.yaml` and
+//!   edits it in memory, computes the snapshot and renders `.worktreeinclude`,
+//!   so the "This will:" list can say whether `orca.yaml` is created, updated
+//!   or cannot be edited and how many files Orca will copy. `apply` then writes
+//!   exactly what was planned, and gitignores `.worktreeinclude`.
 //! - [`refresh_snapshot`] is the AUTOMATIC refresh that ends a forward sync in
 //!   an Orca worktree (KTD11). It rewrites only the managed section of main's
 //!   `.worktreeinclude`, only when git positively reports that file as ignored
@@ -169,50 +168,65 @@ enum YamlPlan {
     },
 }
 
-/// What can be said about `.worktreeinclude` before the prompt. The real
-/// decision is taken again in [`Plan::apply`], against the disk as it is then.
+/// What will happen to `.worktreeinclude`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum IncludePreview {
-    Writable,
+enum IncludePlan {
+    /// Write this text, whose managed section lists `listed` files.
+    Write { text: String, listed: usize },
+    /// The file already holds exactly this section.
+    Unchanged { listed: usize },
+    /// Leave the file byte-for-byte untouched, for the reason given.
     Untouched(String),
 }
 
-/// The Orca output of one init / migrate / edit-config / refresh, decided
+/// The Orca output of one init / migrate / edit-config / refresh, computed
 /// before anything is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     yaml: YamlPlan,
-    include: IncludePreview,
+    include: IncludePlan,
     /// The directories `orca.yaml` will share once this plan is applied.
     shared: Expansion,
-    /// The directories Orca shares if `orca.yaml` is NOT rewritten – what the
-    /// file on disk lists now. The snapshot leaves out files under whichever
-    /// list ends up in the file.
-    shared_on_disk: Vec<String>,
+    /// The Orca-limit notice for files the snapshot could not hold, if any.
+    snapshot_warning: Option<String>,
 }
 
-/// Decide what the Orca files of `main_root` should become.
-///
-/// `shared_patterns` are the `sharedDirectories` globs as they will be stored
-/// in `magic.json`; they are expanded against the checkout right now, and the
-/// result replaces `worktree.sharedDirectories` outright (R21). Nothing is
+/// Compute what the Orca files of `main_root` should become. Nothing is
 /// written here.
-pub fn plan(main_root: &Path, shared_patterns: &[String], setup: SetupPolicy) -> Plan {
+///
+/// `patterns` are the overlaid sync patterns as they WILL be once the operation
+/// completes – the `files` it is about to write into `magic.json`, plus the
+/// local overlay. They are passed in rather than read back because the plan is
+/// made before `magic.json` is materialized. `shared_patterns` are the
+/// `sharedDirectories` globs as they will be stored; they are expanded against
+/// the checkout right now, and the result replaces
+/// `worktree.sharedDirectories` outright (R21).
+///
+/// Because the snapshot is taken here, before the `.superset` tree is written,
+/// it describes the main checkout as it stands at that moment. A file the same
+/// operation creates afterwards – the `magic.local.json` a first init
+/// bootstraps – is not in it yet, and enters with the next refresh.
+pub fn plan(
+    main_root: &Path,
+    patterns: &[String],
+    shared_patterns: &[String],
+    setup: SetupPolicy,
+) -> Plan {
     let shared = shared_dirs::expand(main_root, shared_patterns);
     let (yaml, shared_on_disk) = plan_yaml(main_root, &shared.dirs, setup);
-    let include = match landing(main_root, worktreeinclude::FILE_NAME) {
-        Ok(Landing::Outside(target)) => IncludePreview::Untouched(outside_reason(&target)),
-        Err(err) => IncludePreview::Untouched(format!("{err:#}")),
-        Ok(Landing::Inside) => match worktreeinclude::read(main_root) {
-            Existing::Unreadable(why) => IncludePreview::Untouched(why),
-            Existing::Absent | Existing::Text(_) => IncludePreview::Writable,
-        },
+    // The snapshot leaves out files under a directory Orca shares, and "shares"
+    // means whatever list `orca.yaml` will hold: the new one when the file is
+    // written, the one already on disk when it is left untouched.
+    let listed_dirs = match &yaml {
+        YamlPlan::Write { .. } | YamlPlan::Unchanged => &shared.dirs,
+        YamlPlan::Untouched { .. } => &shared_on_disk,
     };
+    let (include, snapshot_warning) = plan_include(main_root, patterns, listed_dirs);
     Plan {
         yaml,
         include,
         shared,
-        shared_on_disk,
+        snapshot_warning,
     }
 }
 
@@ -221,6 +235,41 @@ fn outside_reason(target: &Path) -> String {
         "it is a symlink to {}, outside the repository",
         target.display()
     )
+}
+
+/// The `.worktreeinclude` half of [`plan`]: the rendered file, or why it is
+/// left alone, plus the Orca-limit notice. The containment check comes BEFORE
+/// the read, and a file that cannot be read as UTF-8 text is never rebuilt from
+/// an empty parse – that would drop the person's own lines along with whatever
+/// made it unreadable.
+fn plan_include(
+    main_root: &Path,
+    patterns: &[String],
+    shared_dirs: &[String],
+) -> (IncludePlan, Option<String>) {
+    match landing(main_root, worktreeinclude::FILE_NAME) {
+        Ok(Landing::Inside) => {}
+        Ok(Landing::Outside(target)) => {
+            return (IncludePlan::Untouched(outside_reason(&target)), None);
+        }
+        Err(err) => return (IncludePlan::Untouched(format!("{err:#}")), None),
+    }
+    let existing = worktreeinclude::read(main_root);
+    let document = match &existing {
+        Existing::Absent => Document::empty(),
+        Existing::Text(text) => Document::parse(text),
+        Existing::Unreadable(why) => return (IncludePlan::Untouched(why.clone()), None),
+    };
+    let snap = snapshot::compute(main_root, patterns, shared_dirs, document.budget());
+    let warning = snapshot::overflow_warning(&snap);
+    let text = document.render(&snap.entries);
+    let listed = snap.entries.len();
+    let plan = if matches!(&existing, Existing::Text(current) if *current == text) {
+        IncludePlan::Unchanged { listed }
+    } else {
+        IncludePlan::Write { text, listed }
+    };
+    (plan, warning)
 }
 
 /// The `orca.yaml` half of [`plan`], plus the directory list the file on disk
@@ -285,6 +334,14 @@ fn plan_yaml(main_root: &Path, dirs: &[String], setup: SetupPolicy) -> (YamlPlan
     (plan, on_disk)
 }
 
+/// "N file(s) for Orca to copy".
+fn file_count(listed: usize) -> String {
+    format!(
+        "{listed} {} for Orca to copy",
+        if listed == 1 { "file" } else { "files" }
+    )
+}
+
 impl Plan {
     /// The lines this plan adds to an operation's "This will:" list. Pure, so
     /// the wording is testable without a prompt.
@@ -306,42 +363,43 @@ impl Plan {
                 format!("Cannot edit orca.yaml ({reason}); it is left untouched")
             }
         };
+        let name = worktreeinclude::FILE_NAME;
         let include = match &self.include {
-            IncludePreview::Writable => format!(
-                "Write {} (files Orca copies into a new worktree) + add it to .gitignore",
-                worktreeinclude::FILE_NAME
+            IncludePlan::Write { listed, .. } => {
+                format!("Write {name} ({}) + add it to .gitignore", file_count(*listed))
+            }
+            IncludePlan::Unchanged { listed } => format!(
+                "Keep {name} (already up to date, {}) + add it to .gitignore",
+                file_count(*listed)
             ),
-            IncludePreview::Untouched(why) => format!(
-                "Leave {} untouched ({why})",
-                worktreeinclude::FILE_NAME
-            ),
+            IncludePlan::Untouched(why) => format!("Leave {name} untouched ({why})"),
         };
         vec![yaml, include]
     }
 
-    /// Write the Orca files and report what happened. Never fails: every file
-    /// that cannot be written is left untouched and reported, and the rest is
-    /// still written (R22).
+    /// Write the planned Orca files and report what happened. Never fails:
+    /// every file that cannot be written is left untouched and reported, and
+    /// the rest is still written (R22).
     ///
-    /// Order matters. `orca.yaml` goes first. Then `.worktreeinclude` is
-    /// gitignored – skipped, with a notice, when the file is tracked, since a
-    /// rule cannot ignore a tracked file and would only mislead. Only then is
-    /// the snapshot computed, from the sync patterns as they are on disk NOW:
-    /// the caller has already materialized `magic.json`, so the overlaid list
-    /// is read back rather than passed in.
+    /// Called after the Superset tree has materialized. `orca.yaml` goes first.
+    /// Then `.worktreeinclude` is gitignored – skipped, with a notice, when the
+    /// file is tracked, since a rule cannot ignore a tracked file and would
+    /// only mislead – and the planned text is written.
     pub fn apply(&self, main_root: &Path) -> Vec<Notice> {
         let mut notices = Vec::new();
-        let listed_dirs = self.apply_yaml(main_root, &mut notices);
+        self.apply_yaml(main_root, &mut notices);
         if let Some(warning) = shared_dirs::overflow_warning(&self.shared) {
             notices.push(Notice::warn(warning));
         }
-        self.apply_include(main_root, &listed_dirs, &mut notices);
+        self.apply_include(main_root, &mut notices);
+        if let Some(warning) = &self.snapshot_warning {
+            notices.push(Notice::warn(warning.clone()));
+        }
         notices
     }
 
-    /// Write `orca.yaml` per the plan. Returns the directory list the file
-    /// holds afterwards, which is what the snapshot must leave out.
-    fn apply_yaml(&self, main_root: &Path, notices: &mut Vec<Notice>) -> Vec<String> {
+    /// Write `orca.yaml` per the plan.
+    fn apply_yaml(&self, main_root: &Path, notices: &mut Vec<Notice>) {
         let untouched = |notices: &mut Vec<Notice>, reason: &str, manual: Option<&str>| {
             notices.push(Notice::warn(format!("orca.yaml was not changed: {reason}.")));
             if let Some(block) = manual {
@@ -352,70 +410,39 @@ impl Plan {
             }
         };
         match &self.yaml {
-            YamlPlan::Unchanged => {
-                notices.push(Notice::info("orca.yaml is already up to date"));
-                self.shared.dirs.clone()
-            }
+            YamlPlan::Unchanged => notices.push(Notice::info("orca.yaml is already up to date")),
             YamlPlan::Untouched {
                 reason,
                 manual_block,
-            } => {
-                untouched(notices, reason, manual_block.as_deref());
-                self.shared_on_disk.clone()
-            }
+            } => untouched(notices, reason, manual_block.as_deref()),
             YamlPlan::Write { text, creating } => {
                 match write_contained(main_root, ORCA_YAML, text) {
-                    Ok(Landing::Inside) => {
-                        notices.push(Notice::ok(format!(
-                            "{} orca.yaml (commit it so every Orca worktree gets the setup script)",
-                            if *creating { "Created" } else { "Updated" }
-                        )));
-                        self.shared.dirs.clone()
-                    }
+                    Ok(Landing::Inside) => notices.push(Notice::ok(format!(
+                        "{} orca.yaml (commit it so every Orca worktree gets the setup script)",
+                        if *creating { "Created" } else { "Updated" }
+                    ))),
                     // The target changed between planning and writing.
                     Ok(Landing::Outside(target)) => {
                         untouched(notices, &outside_reason(&target), None);
-                        self.shared_on_disk.clone()
                     }
-                    Err(err) => {
-                        untouched(notices, &format!("writing it failed ({err:#})"), None);
-                        self.shared_on_disk.clone()
-                    }
+                    Err(err) => untouched(notices, &format!("writing it failed ({err:#})"), None),
                 }
             }
         }
     }
 
-    /// Gitignore `.worktreeinclude`, then compute the snapshot and write the
-    /// managed section.
-    fn apply_include(&self, main_root: &Path, shared_dirs: &[String], notices: &mut Vec<Notice>) {
+    /// Gitignore `.worktreeinclude` and write the planned text.
+    fn apply_include(&self, main_root: &Path, notices: &mut Vec<Notice>) {
         let name = worktreeinclude::FILE_NAME;
-        match landing(main_root, name) {
-            Ok(Landing::Inside) => {}
-            Ok(Landing::Outside(target)) => {
-                notices.push(Notice::warn(format!(
-                    "{name} was left untouched because {}.",
-                    outside_reason(&target)
-                )));
-                return;
-            }
-            Err(err) => {
-                notices.push(Notice::warn(format!("{name} was left untouched: {err:#}.")));
-                return;
-            }
-        }
-        let existing = worktreeinclude::read(main_root);
-        let document = match &existing {
-            Existing::Absent => Document::empty(),
-            Existing::Text(text) => Document::parse(text),
-            // Never rebuilt from an empty parse: that would drop the person's
-            // own lines along with whatever made the file unreadable.
-            Existing::Unreadable(why) => {
+        let (text, listed) = match &self.include {
+            IncludePlan::Untouched(why) => {
                 notices.push(Notice::warn(format!(
                     "{name} was left untouched because {why}."
                 )));
                 return;
             }
+            IncludePlan::Write { text, listed } => (Some(text), *listed),
+            IncludePlan::Unchanged { listed } => (None, *listed),
         };
 
         // Positive tracked determination; "git could not be asked" (no
@@ -441,45 +468,18 @@ impl Plan {
             }
         }
 
-        let patterns = match superset_files::load_overlaid(main_root) {
-            Ok(Some(cfg)) => cfg.files,
-            Ok(None) => Vec::new(),
-            Err(err) => {
-                notices.push(Notice::warn(format!(
-                    "{name} was not written: the sync patterns could not be read ({err:#})."
-                )));
-                return;
-            }
-        };
-        let snap = snapshot::compute(
-            main_root,
-            &patterns,
-            shared_dirs,
-            &document.hand_entries(),
-            document.budget(),
-        );
-        let rendered = document.render(&snap.entries);
-        let count = format!(
-            "{} {} for Orca to copy",
-            snap.entries.len(),
-            if snap.entries.len() == 1 { "file" } else { "files" }
-        );
-        if matches!(&existing, Existing::Text(text) if *text == rendered) {
+        let count = file_count(listed);
+        let Some(text) = text else {
             notices.push(Notice::info(format!("{name} is already up to date ({count})")));
-        } else {
-            match write_contained(main_root, name, &rendered) {
-                Ok(Landing::Inside) => notices.push(Notice::ok(format!("Wrote {name} ({count})"))),
-                Ok(Landing::Outside(target)) => notices.push(Notice::warn(format!(
-                    "{name} was left untouched because {}.",
-                    outside_reason(&target)
-                ))),
-                Err(err) => notices.push(Notice::warn(format!(
-                    "{name} was not written: {err:#}."
-                ))),
-            }
-        }
-        if let Some(warning) = snapshot::overflow_warning(&snap) {
-            notices.push(Notice::warn(warning));
+            return;
+        };
+        match write_contained(main_root, name, text) {
+            Ok(Landing::Inside) => notices.push(Notice::ok(format!("Wrote {name} ({count})"))),
+            Ok(Landing::Outside(target)) => notices.push(Notice::warn(format!(
+                "{name} was left untouched because {}.",
+                outside_reason(&target)
+            ))),
+            Err(err) => notices.push(Notice::warn(format!("{name} was not written: {err:#}."))),
         }
     }
 }
@@ -574,13 +574,7 @@ pub fn refresh_snapshot(main_root: &Path, patterns: &[String]) -> SnapshotRefres
     let shared_dirs = fs::read_to_string(main_root.join(ORCA_YAML))
         .map(|text| orca_yaml::shared_directories(&text))
         .unwrap_or_default();
-    let snap = snapshot::compute(
-        main_root,
-        patterns,
-        &shared_dirs,
-        &document.hand_entries(),
-        document.budget(),
-    );
+    let snap = snapshot::compute(main_root, patterns, &shared_dirs, document.budget());
     let warning = snapshot::overflow_warning(&snap);
     let rendered = document.render(&snap.entries);
     if matches!(&existing, Existing::Text(text) if *text == rendered) {

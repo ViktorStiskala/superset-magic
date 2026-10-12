@@ -271,7 +271,10 @@ pub fn pick_patterns(
 /// matches in the checkout today, shown dimmed after the pattern so the choice
 /// is made knowing what it brings in. `preselected` is the set of indices that
 /// start checked. A pattern added inside the loop is validated like a sync
-/// pattern and matched against `repo_root` on the spot.
+/// pattern and matched against `repo_root` on the spot. Such a pattern selects
+/// among the directory kinds ss-magic detects (`apps/*/node_modules` narrows
+/// `**/node_modules`); it cannot make a directory of another kind shareable,
+/// and a row that selects nothing says so.
 pub fn pick_shared_directories(
     rows: &[shared_dirs::PatternMatches],
     preselected: &[usize],
@@ -293,7 +296,7 @@ pub fn pick_shared_directories(
         help: "↑↓ navigate, enter to toggle / add / confirm",
         add_row_label: "+ Add new directory pattern…",
         add_prompt_label: "New directory pattern (Esc to cancel):",
-        add_prompt_help: "e.g. `**/dist` or `vendor/bundle` – must match gitignored directories",
+        add_prompt_help: "e.g. `apps/*/node_modules` – a pattern selects among the detected kinds",
         cancel_context: "shared directory selection cancelled",
         add_cancel_context: "custom directory pattern prompt cancelled",
     };

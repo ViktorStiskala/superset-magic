@@ -87,20 +87,36 @@ fn only_the_stored_patterns_are_expanded() {
     assert!(expand(root, &strings(&["[unclosed"])).dirs.is_empty());
 }
 
-/// A pattern the person added by hand is honored too: the walk records what it
-/// matches, not only the default kinds.
+/// A stored pattern SELECTS among the kinds the walk detects. It can narrow
+/// them (`apps/*/node_modules`), but it cannot make a directory of another kind
+/// shareable: the kinds are a fixed, deliberate list, and Rust's `target/` was
+/// left out of it on purpose.
 #[test]
-fn a_custom_pattern_is_matched_by_the_walk() {
+fn a_pattern_selects_among_the_detected_kinds_and_never_widens_them() {
     let main = init_main_repo("main");
     let root = main.path();
-    write_file(root, ".gitignore", "dist/\nvendor/bundle/\n");
+    write_file(root, ".gitignore", "node_modules/\ndist/\ntarget/\nvendor/bundle/\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    write_file(root, "apps/web/node_modules/a/index.js", "x");
+    write_file(root, "apps/api/node_modules/a/index.js", "x");
     write_file(root, "packages/ui/dist/index.js", "x");
-    write_file(root, "packages/ui/dist/nested/dist/deep.js", "x");
+    write_file(root, "target/debug/build.rs", "x");
     write_file(root, "vendor/bundle/gems/a.rb", "x");
 
-    let expansion = expand(root, &strings(&["**/dist", "vendor/bundle"]));
-
-    assert_eq!(expansion.dirs, strings(&["packages/ui/dist", "vendor/bundle"]));
+    assert_eq!(
+        expand(root, &strings(&["apps/*/node_modules"])).dirs,
+        strings(&["apps/api/node_modules", "apps/web/node_modules"]),
+        "a narrower pattern takes only some of the detected directories"
+    );
+    let all = expand(root, &strings(&["**"])).dirs;
+    assert_eq!(
+        all,
+        strings(&["apps/api/node_modules", "apps/web/node_modules", "node_modules"]),
+        "even a catch-all pattern reaches only the detected kinds"
+    );
+    assert!(expand(root, &strings(&["**/dist", "target", "vendor/bundle"]))
+        .dirs
+        .is_empty());
 }
 
 /// 120 matching directories: the first 100 in sorted order are kept and the
@@ -155,28 +171,39 @@ fn a_submodule_is_not_entered_and_does_not_cost_the_other_answers() {
     write_file(root, "vendor/sub/node_modules/b/index.js", "x");
 
     assert_eq!(
-        rels(walk_candidates(root, &[])),
+        rels(walk_candidates(root)),
         strings(&["node_modules"]),
         "the walk stops at a directory holding a `.git` entry"
     );
     assert_eq!(expand(root, &defaults()).dirs, strings(&["node_modules"]));
 }
 
-/// A directory tagged as a cache (a Rust `target/`) is build output: the walk
-/// stays out of it, and the excluded trees are never entered either.
+/// The walk prunes the excluded trees and nothing else by name: a kind is found
+/// at any depth outside them, including inside build output, and a recorded
+/// directory is never entered.
 #[test]
-fn the_walk_stays_out_of_tagged_cache_directories_and_excluded_trees() {
+fn the_walk_stays_out_of_the_excluded_trees_and_finds_kinds_at_any_depth() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write_file(root, "target/CACHEDIR.TAG", "Signature: 8a477f597d28d172789f06886806bc55\n");
-    write_file(root, "target/debug/node_modules/x.js", "x");
     write_file(root, ".git/node_modules/x.js", "x");
     write_file(root, ".superset/backups/20260101-000000/worktree/node_modules/x.js", "x");
     write_file(root, ".superset/.magic/.cache/x", "x");
     write_file(root, ".scratchpad/node_modules/x.js", "x");
     write_file(root, "src/node_modules/x.js", "x");
+    write_file(root, "a/b/c/d/.venv/pyvenv.cfg", "x");
+    write_file(root, "apps/web/.next/standalone/node_modules/x.js", "x");
+    write_file(root, "apps/web/.next/cache/webpack/x.pack", "x");
+    write_file(root, "apps/web/.next/cache/node_modules/x.js", "x");
 
-    assert_eq!(rels(walk_candidates(root, &[])), strings(&["src/node_modules"]));
+    assert_eq!(
+        rels(walk_candidates(root)),
+        strings(&[
+            "a/b/c/d/.venv",
+            "apps/web/.next/cache",
+            "apps/web/.next/standalone/node_modules",
+            "src/node_modules",
+        ])
+    );
 }
 
 /// Outside a git repository nothing is positively ignored, so nothing is
@@ -186,7 +213,7 @@ fn outside_a_repository_the_list_is_empty() {
     let dir = tempfile::tempdir().unwrap();
     write_file(dir.path(), "node_modules/a/index.js", "x");
 
-    assert_eq!(rels(walk_candidates(dir.path(), &[])), strings(&["node_modules"]));
+    assert_eq!(rels(walk_candidates(dir.path())), strings(&["node_modules"]));
     assert_eq!(expand(dir.path(), &defaults()), Expansion::default());
     assert!(detected_default_patterns(dir.path()).is_empty());
 }
@@ -278,11 +305,10 @@ fn without_a_stored_choice_the_detected_kinds_are_stored() {
     assert_eq!(stored_or_detected(empty.path(), None), None);
 }
 
-/// A stored pattern that happens to match a TRACKED parent directory must not
-/// hide the dependency directories beneath it: the parent is not shared (git
-/// does not ignore it), and the `node_modules` inside it still is.
+/// A pattern that matches a TRACKED parent directory selects nothing – the
+/// parent is not a detected kind – and takes nothing away from other patterns.
 #[test]
-fn a_pattern_matching_a_tracked_parent_does_not_hide_what_is_beneath_it() {
+fn a_pattern_matching_a_tracked_parent_neither_shares_it_nor_hides_what_is_beneath() {
     let main = init_main_repo("main");
     let root = main.path();
     write_file(root, ".gitignore", "node_modules/\n");
@@ -295,26 +321,5 @@ fn a_pattern_matching_a_tracked_parent_does_not_hide_what_is_beneath_it() {
     assert_eq!(
         expansion.dirs,
         strings(&["apps/api/node_modules", "apps/web/node_modules"])
-    );
-}
-
-/// A directory inside another shared directory is not listed: sharing the outer
-/// one already brings it, and each entry spends one of Orca's 100 slots.
-#[test]
-fn a_directory_inside_another_shared_directory_is_not_listed() {
-    let main = init_main_repo("main");
-    let root = main.path();
-    write_file(root, ".gitignore", "build/\n");
-    write_file(root, "build/out/app.js", "x");
-    write_file(root, "build/cache/node_modules/a/index.js", "x");
-    write_file(root, "build-tools/readme.md", "x");
-
-    let expansion = expand(root, &strings(&["build", "**/node_modules"]));
-
-    assert_eq!(expansion.dirs, strings(&["build"]));
-    assert_eq!(
-        outermost(strings(&["a/c", "a", "a-b", "a/c/d", "b/a"])),
-        strings(&["a", "a-b", "b/a"]),
-        "nesting is by whole component, and the outer entry need not be adjacent"
     );
 }

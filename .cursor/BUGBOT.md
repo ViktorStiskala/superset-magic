@@ -654,23 +654,23 @@ hand-written lines are counted. `git::ignored_untracked` builds its own
 helper thread while it reads the answers – flag a rewrite that writes all of
 stdin before reading stdout, which deadlocks past a pipe buffer.
 
-### Shared directories: a walk that never descends into a known kind
+### Shared directories: a name-based walk that never descends into what it records
 
 `orca::shared_dirs` expands the `sharedDirectories` GLOBS stored in `magic.json`
-to LITERAL directories on every write. The walk records a directory that is a
-known kind (`node_modules`, `.venv`, `venv`, `.cache`, `.turbo`,
-`.parcel-cache`, and `.next/cache`) or matches a stored pattern. It NEVER
-descends into a known kind – which is the only reason a `node_modules` nested
+to LITERAL directories on every write. `walk_candidates` walks the checkout BY
+NAME and records the seven known kinds only: `node_modules`, `.venv`, `venv`,
+`.cache`, `.turbo`, `.parcel-cache`, and `.next/cache`. It NEVER descends into
+a directory it recorded – which is the only reason a `node_modules` nested
 inside another can never appear, and what keeps it out of the largest trees.
-A directory recorded only because a stored PATTERN matched it IS entered: a
-pattern that happens to match a tracked parent (`apps/*`) must not hide the
-`node_modules` beneath it. The walk does not follow symlinks and stays out of
-the excluded trees, directories holding a `.git` entry, directories tagged with
-`CACHEDIR.TAG`, and `.next` beyond its `cache` child. Only directories git
-positively reports as ignored are kept (queried WITH a trailing slash); a
-directory inside another kept one is then dropped (`outermost`, compared by
-whole path component), and the list is sorted and capped at Orca's 100. Rust's
-`target/` is deliberately not a default kind.
+It does not follow symlinks and stays out of the excluded trees and of any
+directory holding a `.git` entry; it prunes nothing else, so a kind is found at
+any depth. The stored globs are then MATCHED AGAINST those candidates: a
+pattern selects among the detected kinds (`apps/*/node_modules` narrows
+`**/node_modules`) and cannot make a directory of another kind shareable. The
+kinds are a deliberate, fixed list – Rust's `target/` was considered and left
+out – so a pattern such as `target` or `**/dist` matches nothing. Only
+directories git positively reports as ignored are kept (queried WITH a trailing
+slash), and the list is sorted and capped at Orca's 100.
 
 When nobody is asked (the scripted init, migrate), `stored_or_detected` keeps a
 stored list as it is – an empty one included, since that is a choice – and
@@ -680,10 +680,11 @@ record "chose none" on nobody's behalf and stop every later run from detecting
 directories that did not exist yet. Only the interactive picker's answer is
 stored unconditionally.
 
-Flag a walk that enters a known kind, follows a symlink, shares a tracked or
-unignored directory, lists a directory nested in another listed one, reads
-`sharedDirectories` from `magic.local.json`, or a non-interactive path that
-stores an empty list it did not find in the file.
+Flag a walk that enters a directory it recorded, follows a symlink, records a
+directory because a stored pattern matched it (that widens the kinds), shares a
+tracked or unignored directory, reads `sharedDirectories` from
+`magic.local.json`, or a non-interactive path that stores an empty list it did
+not find in the file.
 
 ### `orca.yaml` is edited as TEXT and verified by re-parsing
 
@@ -709,8 +710,14 @@ unmanaged keys.
   included), more than one document, a `%YAML` directive other than 1.2, a top
   level that is not a block mapping. A problem with one managed key refuses only
   when that key needs an edit: a parent that is a flow mapping, a null, an alias
-  or otherwise not a block mapping; an anchor, tag, alias or merge key on the
-  path; a `scripts.setup` that is not a string.
+  or otherwise not a block mapping; an alias or merge key on the path; a
+  `scripts.setup` that is not a string.
+- An ANCHOR or a TAG on a managed node is NOT a refusal by itself. It stays
+  where it is (the replaced text starts after it) and the edit goes ahead; the
+  re-parse check decides. When another key refers to the anchor, that key's
+  value changes with the edit, the check sees an unmanaged key change, and the
+  file is refused then. Flag a change that strips an anchor or tag from a
+  managed node, or that refuses one outright.
 - A refusal means the file is left BYTE-FOR-BYTE untouched, the reason and the
   block to add by hand are printed, and everything else is still written. It is
   never a failure of init, migrate, edit config or the refresh.
@@ -763,7 +770,7 @@ the function. Flag detection keyed on a variable being set, on a string prefix,
 on an un-canonicalized comparison, or any code path that runs Orca behavior in
 the main checkout.
 
-### Forward sync in an Orca worktree: skip per FILE, read the list ONCE
+### Forward sync in an Orca worktree: skip listed paths that exist, read the list ONCE
 
 In an Orca worktree (and without `--no-orca-skip`), `sync_core` leaves alone
 every path Orca already copied. The list is the main checkout's
@@ -771,15 +778,17 @@ every path Orca already copied. The list is the main checkout's
 read ONCE, right after `magic.json` loads and before anything is copied, so
 before the end-of-sync refresh rewrites it; a path that refresh adds was not in
 the list Orca used and must not be skipped on the strength of it. The skip set
-(`worktreeinclude::copied_by_orca`) is built per file that EXISTS in the
-worktree, checked without following a symlink: a listed directory is expanded to
-the files actually present under it, so a file Orca did not get to (its copy
-budget ran out, or the file is new) is not in the set and is still synced. An
-unreadable list yields an empty set plus a warning. Outside an Orca worktree
-forward sync must behave exactly as before. Flag a skip set that treats a listed
-directory as covering files that are not there, that is read after the refresh,
-that applies in the Sync cockpit, `reverse-sync` or `pack` (only forward sync
-skips), or a change that makes `--no-orca-skip` suppress the refresh.
+(`worktreeinclude::copied_by_orca`) holds every listed line whose WORKTREE PATH
+EXISTS, checked without following a symlink. A listed directory that exists
+covers everything under it: the set holds the directory itself, and a
+`PathFilter` entry covers whatever lies beneath it. A listed path that is not in
+the worktree (Orca's copy budget ran out before it, or the file is new)
+contributes nothing and is still synced. An unreadable list yields an empty set
+plus a warning. Outside an Orca worktree forward sync must behave exactly as
+before. Flag a skip set that includes a listed path absent from the worktree,
+that follows a symlink to decide existence, that is read after the refresh, that
+applies in the Sync cockpit, `reverse-sync` or `pack` (only forward sync skips),
+or a change that makes `--no-orca-skip` suppress the refresh.
 
 ### The automatic refresh writes ONLY `.worktreeinclude`, and only when git says it is safe
 
@@ -802,16 +811,23 @@ Flag a refresh that writes `orca.yaml`, that writes on an unknown tracked or
 ignored status, that turns its own failure into a non-zero exit, or that runs
 before the copy.
 
-### Init, migrate and edit config: plan before the prompt, write after the tree
+### Init, migrate and edit config: compute before the prompt, write after the tree
 
-Every layout-writing operation writes both Orca files through ONE shared path:
-`orca::write::plan(main_root, shared_patterns, SetupPolicy)` before the
-finishing prompt (the current `orca.yaml` is read and edited in memory, so the
-"This will:" list can say create / update / cannot edit), then
-`Plan::apply(main_root)` AFTER `copy_into_repo` and the bootstrap gitignores.
-`apply` writes `orca.yaml`, then gitignores `.worktreeinclude`, and only then
-computes the snapshot from the sync patterns as they are on disk – so it sees
-the `magic.json` and the ignore rules the operation just put in place. It never
+Every layout-writing operation writes both Orca files through ONE shared path.
+`orca::write::plan(main_root, patterns, shared_patterns, SetupPolicy)` runs
+BEFORE the finishing prompt and computes the whole Orca output: the current
+`orca.yaml` is read and edited in memory, the snapshot is computed and
+`.worktreeinclude` is rendered, so the "This will:" list can say create / update
+/ cannot edit and how many files Orca will copy. `patterns` are the overlaid
+sync patterns as they WILL be after the operation, passed in because
+`magic.json` is not on disk yet. `Plan::apply(main_root)` runs AFTER
+`copy_into_repo` and the bootstrap gitignores and writes exactly what was
+planned: `orca.yaml`, the `.worktreeinclude` ignore rule, then the planned
+snapshot. Because the snapshot is taken before the tree materializes, a file
+the same operation creates afterwards (the `magic.local.json` a first init
+bootstraps) is not in it and joins with the next refresh; flag a change that
+recomputes the snapshot inside `apply`, which would make the written file differ
+from what the prompt described. `apply` never
 fails the operation. A committing finishing action stages `.superset`,
 `.gitignore` and `orca.yaml`, and NEVER `.worktreeinclude`. The ignore rule for
 `.worktreeinclude` is NOT added when the file is tracked (a rule cannot ignore a
@@ -1481,8 +1497,8 @@ documentation or a status report that claims `file-changed` is active
 - The Orca files (`orca.yaml`, `.worktreeinclude`) are written at the repository
   root, outside the staged tree, by `orca::write` – each through
   `superset_files::write_atomically` (a staged sibling plus `rename`), never a
-  truncating `fs::write`. They are PLANNED before the finishing prompt and
-  APPLIED after `copy_into_repo`; see the Orca section below.
+  truncating `fs::write`. They are COMPUTED before the finishing prompt and
+  WRITTEN after `copy_into_repo`; see the Orca section below.
 - `pack::write_archive` writes the archive to a `NamedTempFile` in the git root
   and renames it into place atomically only after the tar+bzip2 stream is fully
   finalised (`into_inner()` then `finish()`). Flag an archive path that writes
