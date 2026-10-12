@@ -2069,7 +2069,13 @@ fn forward_backup_pass_skips_excluded_trees_under_a_bare_superset_literal() {
         "RECOVERED=1\n",
     );
 
-    backup_forward_targets(main.path(), &wt, &[".superset".to_string()]).unwrap();
+    backup_forward_targets(
+        main.path(),
+        &wt,
+        &[".superset".to_string()],
+        &PathFilter::empty(),
+    )
+    .unwrap();
 
     let captured = files_under(&wt.join(".superset/backups"));
     assert!(
@@ -2085,5 +2091,51 @@ fn forward_backup_pass_skips_excluded_trees_under_a_bare_superset_literal() {
     assert!(
         !captured.iter().any(|p| p.contains(".superset/backups")),
         "the backups tree must never be copied into itself: {captured:?}"
+    );
+}
+
+/// The forward backup pass runs with the copy's own path filter: a path the
+/// copy will leave alone is not about to be overwritten, so no backup of it is
+/// taken – neither for a filtered match itself, nor for a filtered file inside a
+/// matched directory (the recursive backup is its own enforcement point, like
+/// the recursive copy).
+#[test]
+fn forward_backup_pass_takes_no_backup_of_a_filtered_path() {
+    let main = init_main_repo();
+    let (_wt_dir, wt) = make_worktree(main.path());
+    write(main.path(), ".env", "MAIN=1\n");
+    write(main.path(), "apps/api/.env", "MAIN=1\n");
+    write(main.path(), "config/a.json", "main-a\n");
+    write(main.path(), "config/b.json", "main-b\n");
+    // Every worktree copy differs, so each would be backed up if not filtered.
+    write(&wt, ".env", "WORKTREE=1\n");
+    write(&wt, "apps/api/.env", "WORKTREE=1\n");
+    write(&wt, "config/a.json", "wt-a\n");
+    write(&wt, "config/b.json", "wt-b\n");
+
+    let patterns = vec![
+        ".env".to_string(),
+        "apps/api/.env".to_string(),
+        "config".to_string(),
+    ];
+    let filter = PathFilter::new([PathBuf::from(".env"), PathBuf::from("config/a.json")]);
+    backup_forward_targets(main.path(), &wt, &patterns, &filter).unwrap();
+
+    let captured = files_under(&wt.join(".superset/backups"));
+    assert!(
+        captured.iter().any(|p| p.ends_with("worktree/apps/api/.env")),
+        "an unfiltered file about to be overwritten is backed up: {captured:?}"
+    );
+    assert!(
+        captured.iter().any(|p| p.ends_with("worktree/config/b.json")),
+        "an unfiltered file inside a matched directory is backed up: {captured:?}"
+    );
+    assert!(
+        !captured.iter().any(|p| p.ends_with("worktree/.env")),
+        "a filtered match must not be backed up: {captured:?}"
+    );
+    assert!(
+        !captured.iter().any(|p| p.ends_with("config/a.json")),
+        "a filtered file inside a matched directory must not be backed up: {captured:?}"
     );
 }

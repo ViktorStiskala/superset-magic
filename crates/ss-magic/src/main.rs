@@ -350,7 +350,12 @@ where
     // mistaken forward sync is recoverable. Skipped by `--no-backup`.
     if !no_backup {
         if let Err(err) =
-            sync::reverse_sync::backup_forward_targets(&main_root, &cwd_root, &cfg.files)
+            sync::reverse_sync::backup_forward_targets(
+                &main_root,
+                &cwd_root,
+                &cfg.files,
+                &sync::apply::PathFilter::empty(),
+            )
         {
             eprintln!("{}", tui::style::err(format!("error: {err:#}")));
             return Ok(ExitCode::from(1));
@@ -453,7 +458,12 @@ fn print_event(ev: &Event) {
         }
         Event::Skip { reason, label } => {
             let line = format!("Skipped ({}): {label}", reason.label());
-            if matches!(reason, SkipReason::Excluded) {
+            if matches!(reason, SkipReason::Filtered) {
+                // Not a problem: Orca already put this path in the worktree, so
+                // the copy left it alone. Worded for what happened rather than
+                // with the engine's generic "filtered" label.
+                println!("{}", tui::style::info(format!("Left to Orca: {label}")));
+            } else if matches!(reason, SkipReason::Excluded) {
                 println!("{}", tui::style::info(line));
             } else if matches!(reason, SkipReason::NoMatches) {
                 // Default color, like setup.sh.

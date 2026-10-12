@@ -13,6 +13,12 @@
 //! - De-duplicate matches across patterns by relative path.
 //! - Directories are copied recursively (mirrors `cp -R src/. dst/`).
 //! - Summary line is OK when `skipped == 0`, WARN otherwise.
+//!
+//! [`run_filtered`] is the same engine with a [`PathFilter`]: a set of
+//! repo-relative paths the copy must leave alone because something else already
+//! put them in the destination. It is applied at final enumeration – on the
+//! expanded match list AND inside the recursive directory copy – so a directory
+//! match that is an ancestor of a filtered path still skips it.
 
 use std::collections::HashSet;
 use std::fs;
@@ -25,7 +31,11 @@ use walkdir::WalkDir;
 use crate::sync::pattern::{self, SyntaxError};
 
 /// Directory names that drop matches at any depth, matching `setup.sh`.
-const DEFAULT_EXCLUDES: [&str; 2] = ["node_modules", ".venv"];
+///
+/// Public so a caller that expands a matched directory into its files itself
+/// (the Orca snapshot in the CLI crate) can prune the same names during its own
+/// walk instead of keeping a second copy of the list.
+pub const DEFAULT_EXCLUDES: [&str; 2] = ["node_modules", ".venv"];
 
 /// Result tally returned to the caller after `run`. Mirrors `setup.sh`'s
 /// summary line.
@@ -33,6 +43,64 @@ const DEFAULT_EXCLUDES: [&str; 2] = ["node_modules", ".venv"];
 pub struct Summary {
     pub copied: usize,
     pub skipped: usize,
+    /// Paths a [`PathFilter`] kept out of the copy. Counted apart from
+    /// `skipped` because a filtered path is not a problem – the caller asked for
+    /// it to be left alone – so it must never turn the summary into a warning.
+    pub filtered: usize,
+}
+
+/// A set of repo-relative paths a copy must leave alone.
+///
+/// An entry covers itself and, when it names a directory, everything beneath
+/// it – the same "this path or anything inside it" shape as
+/// `sync::under_excluded_tree`, but over a caller-supplied list instead of the
+/// fixed excluded trees. Matching is by whole path components (`Path`
+/// equality), never by string prefix, so an entry `config` covers
+/// `config/a.json` and not `config.json` or `configs/a.json`.
+///
+/// The empty filter covers nothing, which is what makes [`run`] and
+/// [`copy_dir_recursive`] plain delegations to their filtered forms.
+#[derive(Debug, Default, Clone)]
+pub struct PathFilter {
+    paths: HashSet<PathBuf>,
+}
+
+impl PathFilter {
+    /// The filter that covers nothing.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Build a filter from repo-relative paths. An empty path is dropped: it is
+    /// an ancestor of every relative path, so keeping it would filter the whole
+    /// tree on the strength of a blank line.
+    pub fn new<I>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        Self {
+            paths: paths
+                .into_iter()
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    /// Whether `rel` is one of the filtered paths or lies beneath one.
+    pub fn covers(&self, rel: &Path) -> bool {
+        if self.paths.is_empty() {
+            return false;
+        }
+        rel.ancestors().any(|a| self.paths.contains(a))
+    }
 }
 
 /// Reason a pattern or path was skipped. `counts()` reports whether the
@@ -47,6 +115,10 @@ pub enum SkipReason {
     Excluded,
     NotAFileOrDir,
     CopyFailed(String),
+    /// A [`PathFilter`] covers the path, so the copy left it alone. Not a
+    /// problem and never counted in `Summary::skipped`; it is tallied in
+    /// `Summary::filtered` instead.
+    Filtered,
 }
 
 impl SkipReason {
@@ -72,6 +144,7 @@ impl SkipReason {
             SkipReason::Excluded => "excluded",
             SkipReason::NotAFileOrDir => "not a file or dir",
             SkipReason::CopyFailed(_) => "copy failed",
+            SkipReason::Filtered => "filtered",
         }
     }
 }
@@ -93,7 +166,29 @@ pub enum Event {
 
 /// Apply `patterns` from `src` into `dest`, calling `on_event` for each
 /// copy and skip. Returns the final `Summary`.
-pub fn run<F>(src: &Path, dest: &Path, patterns: &[String], mut on_event: F) -> Result<Summary>
+pub fn run<F>(src: &Path, dest: &Path, patterns: &[String], on_event: F) -> Result<Summary>
+where
+    F: FnMut(&Event),
+{
+    run_filtered(src, dest, patterns, &PathFilter::empty(), on_event)
+}
+
+/// [`run`], leaving every path `filter` covers untouched in `dest`.
+///
+/// The filter is applied where the file set is actually materialized, in two
+/// places: on each expanded match, and on each entry of a matched directory's
+/// recursive copy. The second is what handles a directory match that is an
+/// ANCESTOR of a filtered path (pattern `config`, filter `config/a.json`) –
+/// filtering only the match list would copy that file anyway. Every filtered
+/// path emits one [`SkipReason::Filtered`] event and bumps `Summary::filtered`;
+/// a filtered directory is reported once, not once per file beneath it.
+pub fn run_filtered<F>(
+    src: &Path,
+    dest: &Path,
+    patterns: &[String],
+    filter: &PathFilter,
+    mut on_event: F,
+) -> Result<Summary>
 where
     F: FnMut(&Event),
 {
@@ -112,6 +207,14 @@ where
     };
 
     for rel in &matches {
+        if filter.covers(rel) {
+            on_event(&Event::Skip {
+                reason: SkipReason::Filtered,
+                label: rel.display().to_string(),
+            });
+            summary.filtered += 1;
+            continue;
+        }
         let src_path = src.join(rel);
         let dest_path = dest.join(rel);
         if let Some(parent) = dest_path.parent() {
@@ -125,7 +228,17 @@ where
             }
         }
         let outcome: Result<()> = if src_path.is_dir() {
-            copy_dir_recursive(src, &src_path, &dest_path)
+            let mut filtered_inside = 0;
+            let outcome =
+                copy_dir_recursive_filtered(src, &src_path, &dest_path, filter, &mut |inner| {
+                    on_event(&Event::Skip {
+                        reason: SkipReason::Filtered,
+                        label: inner.display().to_string(),
+                    });
+                    filtered_inside += 1;
+                });
+            summary.filtered += filtered_inside;
+            outcome
         } else if src_path.is_file() {
             fs::copy(&src_path, &dest_path).map(|_| ()).map_err(|e| {
                 anyhow::Error::from(e).context(format!(
@@ -330,12 +443,37 @@ fn is_excluded(rel: &Path) -> bool {
 /// yield `.magic/…` and match nothing. Excluded directories are pruned, so the
 /// walk never descends into them.
 pub fn copy_dir_recursive(root: &Path, src: &Path, dst: &Path) -> Result<()> {
+    copy_dir_recursive_filtered(root, src, dst, &PathFilter::empty(), &mut |_| {})
+}
+
+/// [`copy_dir_recursive`], additionally pruning every entry `filter` covers.
+///
+/// The filter is keyed on root-relative paths, exactly like the excluded trees,
+/// so it is checked against the same `strip_prefix(root)` result. A covered
+/// entry is reported through `on_filtered` with its root-relative path and then
+/// pruned: a covered directory is reported once and never descended into.
+pub fn copy_dir_recursive_filtered(
+    root: &Path,
+    src: &Path,
+    dst: &Path,
+    filter: &PathFilter,
+    on_filtered: &mut dyn FnMut(&Path),
+) -> Result<()> {
     fs::create_dir_all(dst).with_context(|| format!("mkdir -p {}", dst.display()))?;
     let walker = WalkDir::new(src)
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| match e.path().strip_prefix(root) {
-            Ok(rel) => !crate::sync::under_excluded_tree(rel),
+            Ok(rel) => {
+                if crate::sync::under_excluded_tree(rel) {
+                    return false;
+                }
+                if filter.covers(rel) {
+                    on_filtered(rel);
+                    return false;
+                }
+                true
+            }
             // Outside `root` entirely — keep it; the caller chose this source.
             Err(_) => true,
         });
