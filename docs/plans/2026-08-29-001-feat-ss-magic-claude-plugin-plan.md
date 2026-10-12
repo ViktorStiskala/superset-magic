@@ -419,7 +419,7 @@ These were implemented against `ss-magic plugin install` and the sync-time plugi
 
 - [validation-evidence.md](./2026-08-29-001-ss-magic-plugin/validation-evidence.md) — the ruling record: 8 live probes, 86 adversarial refutations, and a final ruling pass, with commands and raw output for every claim.
 - Existing insertion points: the forward-sync path and its pre-copy backup pass in `src/main.rs`, the configuration reader in `src/workspace/superset_files.rs`, the gitignore primitive in `src/git/gitignore.rs`, and the enumeration walk in `src/sync/apply.rs`.
-- The koolman plugin plan and its reference spec, from which the packaging shape, the reserved machine-file directory, and the session-identity discipline port; its operator-checklist domain, Node runtime, and CI renderer do not.
+- The reference repository's plugin plan and its spec, from which the packaging shape, the reserved machine-file directory, and the session-identity discipline port; its operator-checklist domain, Node runtime, and CI renderer do not.
 
 ---
 

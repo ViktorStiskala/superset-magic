@@ -375,7 +375,7 @@ one would mean teaching three separate code paths (forward copy, reverse-sync cl
 handle a primitive they currently drop or sidestep – or accepting that the registry silently
 vanishes from every sync and every archive.
 
-The thing the registry existed for – koolman R15a's "one branch never gets two checklists" – is
+The thing the registry existed for – the reference plan's R15a, "one branch never gets two checklists" – is
 solved by the deterministic slug itself (Q6). What remains is a pointer for humans and for
 `ss-magic plugin status`, and a regular file serves that while being copied, packed and diffed
 correctly by every existing path:
