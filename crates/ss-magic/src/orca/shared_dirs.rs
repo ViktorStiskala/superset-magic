@@ -146,6 +146,48 @@ pub fn detected_default_patterns(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The patterns the shared-directory picker offers, in row order: the default
+/// kinds followed by any stored pattern that is not one of them (a pattern the
+/// person added by hand earlier, which must stay visible to stay stored).
+pub fn picker_patterns(stored: Option<&[String]>) -> Vec<String> {
+    let mut options: Vec<String> = DEFAULT_PATTERNS.iter().map(|p| p.to_string()).collect();
+    for pattern in stored.unwrap_or_default() {
+        if !options.contains(pattern) {
+            options.push(pattern.clone());
+        }
+    }
+    options
+}
+
+/// Which of the picker's `rows` start checked, as indices into `rows`. It
+/// depends on whether a choice was ever stored:
+///
+/// - `stored` is `Some` – exactly the stored patterns, so reopening the picker
+///   shows the previous choice, including a deliberate "none".
+/// - `stored` is `None` (never chosen) – every row that matches at least one
+///   directory, so the first run offers what is actually there, preselected.
+pub fn picker_preselected(stored: Option<&[String]>, rows: &[PatternMatches]) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| match stored {
+            Some(stored) => stored.contains(&row.pattern),
+            None => !row.dirs.is_empty(),
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The patterns to store when nobody is asked: the stored list when
+/// `magic.json` has the key – an empty list included, which is a choice – and
+/// otherwise every default kind that matches something in `root`. Used by the
+/// non-interactive init and by migrate.
+pub fn stored_or_detected(root: &Path, stored: Option<&[String]>) -> Vec<String> {
+    match stored {
+        Some(stored) => stored.to_vec(),
+        None => detected_default_patterns(root),
+    }
+}
+
 /// Compile `patterns` into one matcher, skipping any that is not a valid glob.
 /// `None` when no pattern is usable, which callers read as "matches nothing".
 fn glob_set(patterns: &[String]) -> Option<GlobSet> {

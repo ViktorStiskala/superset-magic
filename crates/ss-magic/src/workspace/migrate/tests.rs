@@ -234,7 +234,7 @@ fn migration_transforms_old_layout_into_new() {
         .unwrap();
 
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
 
     // Staged magic.json carries setup_config.json's files verbatim.
     let staged_magic = superset_files::load_overlaid(stage.path())
@@ -303,7 +303,7 @@ fn migration_preserves_plugin_state_ktd2() {
         .unwrap();
 
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
     superset_files::copy_into_repo(stage.path(), repo.path(), &[SETUP_SH_REL]).unwrap();
     rename_setup_config(repo.path()).unwrap();
 
@@ -326,7 +326,7 @@ fn migration_preserves_existing_magic_local_json() {
     let existing = superset_files::load_config(repo.path()).unwrap().unwrap();
 
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
 
     // The guard kept magic.local.json OUT of the stage.
     assert!(
@@ -366,7 +366,7 @@ fn migration_both_markers_strips_setup_sh_keeps_wrapper() {
         .unwrap();
 
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
 
     let staged_cfg = superset_files::load_config(stage.path())
         .unwrap()
@@ -430,7 +430,7 @@ fn staging_does_not_mutate_repo_until_materialized() {
         .unwrap()
         .unwrap();
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
 
     // Repo is byte-identical: nothing was written, renamed, or deleted.
     assert_eq!(
@@ -635,7 +635,7 @@ fn stage_migration_without_setup_config_yields_empty_files() {
         .unwrap();
 
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
     let staged_magic = superset_files::load_overlaid(stage.path())
         .unwrap()
         .unwrap();
@@ -666,7 +666,7 @@ fn stage_migration_preserves_existing_magic_json_unknown_keys() {
         .unwrap();
 
     let stage = fresh();
-    stage_migration(repo.path(), stage.path(), &existing).unwrap();
+    stage_migration(repo.path(), stage.path(), &existing, &[]).unwrap();
 
     let raw = fs::read_to_string(stage.path().join(".superset/magic.json")).unwrap();
     let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -926,4 +926,419 @@ fn bootstrap_gitignores_cover_local_config_backups_and_state_tree() {
             "ensure_bootstrap_gitignores must write {rule:?}, got: {gi:?}"
         );
     }
+}
+
+// ── Orca files written by init / migrate / edit-config ──────────────────────
+
+use crate::orca::worktreeinclude;
+use ss_magic_core::testutil::{git_run, init_main_repo, write_file};
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
+}
+
+fn read_text(root: &Path, rel: &str) -> String {
+    fs::read_to_string(root.join(rel)).unwrap()
+}
+
+fn stored_shared(root: &Path) -> Option<Vec<String>> {
+    superset_files::load_magic_json(root)
+        .unwrap()
+        .unwrap()
+        .shared_directories
+}
+
+fn orca_dirs(root: &Path) -> Vec<String> {
+    crate::orca::orca_yaml::shared_directories(&read_text(root, "orca.yaml"))
+}
+
+fn orca_setup_has_the_line(root: &Path) -> bool {
+    crate::orca::orca_yaml::has_setup_line(&read_text(root, "orca.yaml"))
+}
+
+/// The wrapper entry Superset runs and the line Orca runs are one and the same
+/// command; the two constants must never drift apart.
+#[test]
+fn the_orca_setup_line_is_the_superset_wrapper_entry() {
+    assert_eq!(MAGIC_WRAPPER_ENTRY, crate::orca::orca_yaml::SETUP_LINE);
+}
+
+/// F1 in a git repository: the shared directories are detected and stored as
+/// patterns, `orca.yaml` lists them beside the setup line, `.worktreeinclude`
+/// holds the snapshot, and the snapshot file is gitignored.
+#[test]
+fn noninteractive_init_in_a_git_repo_writes_both_orca_files() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", ".env\nnode_modules/\n");
+    write_file(root, ".env", "S=1\n");
+    write_file(root, "apps/web/.env", "S=1\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    write_file(root, "apps/web/node_modules/b/index.js", "x");
+
+    run_init_noninteractive(root, &strings(&["**/.env", ".env"])).unwrap();
+
+    assert_eq!(stored_shared(root), Some(strings(&["**/node_modules"])));
+    assert_eq!(
+        orca_dirs(root),
+        strings(&["apps/web/node_modules", "node_modules"])
+    );
+    assert!(orca_setup_has_the_line(root));
+
+    let include = read_text(root, worktreeinclude::FILE_NAME);
+    assert_eq!(
+        worktreeinclude::entries(&include),
+        strings(&[".env", ".superset/magic.local.json", "apps/web/.env"]),
+        "the snapshot is taken after the tree materializes, so the bootstrapped \
+         overlay is in it"
+    );
+    let gitignore = read_text(root, ".gitignore");
+    assert!(
+        gitignore.lines().any(|l| l == worktreeinclude::FILE_NAME),
+        "the snapshot file must be gitignored: {gitignore:?}"
+    );
+    // orca.yaml is an ordinary untracked file for the team to commit.
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--", "orca.yaml", worktreeinclude::FILE_NAME])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "?? orca.yaml\n");
+}
+
+/// Outside git nothing is positively ignored: init still succeeds, with an
+/// empty directory list and an empty section.
+#[test]
+fn noninteractive_init_outside_git_writes_empty_orca_lists() {
+    let repo = fresh();
+    write_file(repo.path(), ".env", "S=1\n");
+    write_file(repo.path(), "node_modules/a/index.js", "x");
+
+    run_init_noninteractive(repo.path(), &strings(&[".env"])).unwrap();
+
+    assert_eq!(
+        read_text(repo.path(), "orca.yaml"),
+        "scripts:\n  setup: |\n    ./.superset/magic.sh sync\nworktree:\n  sharedDirectories: []\n"
+    );
+    assert_eq!(stored_shared(repo.path()), Some(Vec::new()));
+    let include = read_text(repo.path(), worktreeinclude::FILE_NAME);
+    assert!(worktreeinclude::entries(&include).is_empty(), "{include}");
+    assert!(include.contains("ss-magic"), "the section markers are there: {include}");
+}
+
+/// AE4 at the flow level: an existing `orca.yaml` keeps its script and its
+/// other keys; the script gains the sync line.
+#[test]
+fn ae4_init_keeps_an_existing_orca_yaml_and_adds_the_line() {
+    let repo = fresh();
+    let original = "# ours\nscripts:\n  setup: pnpm install\ndefaultTabs:\n  - title: dev\n    command: pnpm dev\n";
+    write_file(repo.path(), "orca.yaml", original);
+
+    run_init_noninteractive(repo.path(), &[]).unwrap();
+
+    let yaml = read_text(repo.path(), "orca.yaml");
+    assert!(yaml.contains("./.superset/magic.sh sync\n    pnpm install\n"), "{yaml}");
+    assert!(
+        yaml.contains("defaultTabs:\n  - title: dev\n    command: pnpm dev\n"),
+        "defaultTabs must be byte-identical: {yaml}"
+    );
+    assert!(yaml.starts_with("# ours\n"));
+}
+
+/// AE9 at the flow level: an `orca.yaml` ss-magic cannot edit is left
+/// byte-identical, the summary and the notices say so and show the block to add
+/// by hand, and every other file is still written.
+#[test]
+fn ae9_an_uneditable_orca_yaml_is_left_alone_and_everything_else_is_written() {
+    let repo = fresh();
+    let original = "scripts: {setup: make}\n";
+    write_file(repo.path(), "orca.yaml", original);
+
+    let plan = orca_write::plan(repo.path(), &[], SetupPolicy::Ensure);
+    let summary = plan.summary_lines();
+    assert!(
+        summary[0].starts_with("Cannot edit orca.yaml (`scripts` is a flow mapping"),
+        "{summary:?}"
+    );
+
+    let code = run_init_noninteractive(repo.path(), &strings(&[".env"])).unwrap();
+
+    assert_eq!(code, ExitCode::SUCCESS, "an uneditable orca.yaml never fails init");
+    assert_eq!(read_text(repo.path(), "orca.yaml"), original);
+    assert!(repo.path().join(".superset/magic.json").is_file());
+    assert!(repo.path().join(".superset/config.json").is_file());
+    assert!(repo.path().join(worktreeinclude::FILE_NAME).is_file());
+
+    let notices = plan.apply(repo.path());
+    let text: String = notices.iter().map(|n| format!("{}\n", n.text)).collect();
+    assert!(text.contains("orca.yaml was not changed"), "{text}");
+    assert!(text.contains("flow mapping"), "{text}");
+    assert!(
+        text.contains("    scripts:\n      setup: |\n        ./.superset/magic.sh sync\n"),
+        "the block to add by hand is shown: {text}"
+    );
+}
+
+/// An `orca.yaml` committed as a link to a file outside the repository is
+/// never written through; a link that stays inside the repository is.
+#[cfg(unix)]
+#[test]
+fn an_orca_yaml_symlink_out_of_the_repository_is_never_written_through() {
+    let outside = fresh();
+    let victim = outside.path().join("someone-elses.yaml");
+    fs::write(&victim, "private: true\n").unwrap();
+    let repo = fresh();
+    std::os::unix::fs::symlink(&victim, repo.path().join("orca.yaml")).unwrap();
+
+    let plan = orca_write::plan(repo.path(), &[], SetupPolicy::Ensure);
+    assert!(
+        plan.summary_lines()[0].contains("outside the repository"),
+        "{:?}",
+        plan.summary_lines()
+    );
+    run_init_noninteractive(repo.path(), &[]).unwrap();
+
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "private: true\n");
+    assert!(repo.path().join(".superset/magic.json").is_file());
+    assert!(repo.path().join(worktreeinclude::FILE_NAME).is_file());
+
+    // In-repo link: written through onto its target, and still a link.
+    let repo = fresh();
+    write_file(repo.path(), "config/orca.yaml", "defaultTabs: []\n");
+    std::os::unix::fs::symlink("config/orca.yaml", repo.path().join("orca.yaml")).unwrap();
+
+    run_init_noninteractive(repo.path(), &[]).unwrap();
+
+    let target = read_text(repo.path(), "config/orca.yaml");
+    assert!(target.starts_with("defaultTabs: []\n") && target.contains("magic.sh sync"), "{target}");
+    assert!(fs::symlink_metadata(repo.path().join("orca.yaml"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+/// A `.worktreeinclude` that is not text is never rebuilt from an empty parse:
+/// its bytes stay, with a notice, and the rest is written.
+#[test]
+fn a_non_utf8_worktreeinclude_is_left_untouched_with_a_notice() {
+    let repo = fresh();
+    let bytes = b"caf\xe9/secret.pem\n";
+    fs::write(repo.path().join(worktreeinclude::FILE_NAME), bytes).unwrap();
+
+    let plan = orca_write::plan(repo.path(), &[], SetupPolicy::Ensure);
+    assert!(
+        plan.summary_lines()[1].starts_with("Leave .worktreeinclude untouched"),
+        "{:?}",
+        plan.summary_lines()
+    );
+    run_init_noninteractive(repo.path(), &[]).unwrap();
+
+    assert_eq!(fs::read(repo.path().join(worktreeinclude::FILE_NAME)).unwrap(), bytes);
+    assert!(repo.path().join("orca.yaml").is_file());
+    let notices = plan.apply(repo.path());
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.level == orca_write::Level::Warn && n.text.contains("UTF-8")),
+        "{notices:?}"
+    );
+}
+
+/// "Chose none" is a stored choice. A later non-interactive init keeps the
+/// list empty instead of detecting the directories again.
+#[test]
+fn a_stored_empty_shared_list_stays_empty_on_a_later_init() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    // What the interactive picker stores when every row is unticked.
+    superset_files::write_magic_json(
+        root,
+        &superset_files::merge_files_into_magic_config(None, Vec::new(), Some(Vec::new())),
+    )
+    .unwrap();
+
+    run_init_noninteractive(root, &[]).unwrap();
+
+    assert_eq!(stored_shared(root), Some(Vec::new()));
+    assert!(orca_dirs(root).is_empty());
+}
+
+/// A stored list is used as it is – including a custom pattern – and a kind
+/// that is not stored is not added back just because it matches.
+#[test]
+fn a_stored_shared_list_is_used_as_it_is() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n.venv/\ndist/\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    write_file(root, ".venv/pyvenv.cfg", "x");
+    write_file(root, "packages/ui/dist/index.js", "x");
+    superset_files::write_magic_json(
+        root,
+        &superset_files::merge_files_into_magic_config(
+            None,
+            Vec::new(),
+            Some(strings(&["**/.venv", "**/dist"])),
+        ),
+    )
+    .unwrap();
+
+    run_init_noninteractive(root, &[]).unwrap();
+
+    assert_eq!(stored_shared(root), Some(strings(&["**/.venv", "**/dist"])));
+    assert_eq!(orca_dirs(root), strings(&[".venv", "packages/ui/dist"]));
+}
+
+/// A tracked `.worktreeinclude` still gets its section, but no ignore rule –
+/// a rule cannot ignore a tracked file – and the notice says so.
+#[test]
+fn a_tracked_worktreeinclude_gets_its_section_but_no_ignore_rule() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", ".env\n");
+    write_file(root, ".env", "S=1\n");
+    write_file(root, worktreeinclude::FILE_NAME, "by/hand.pem\n");
+    git_run(&["add", ".gitignore", worktreeinclude::FILE_NAME], root);
+    git_run(&["commit", "-q", "-m", "track the list"], root);
+
+    let plan = orca_write::plan(root, &[], SetupPolicy::Ensure);
+    run_init_noninteractive(root, &strings(&[".env"])).unwrap();
+
+    let include = read_text(root, worktreeinclude::FILE_NAME);
+    assert!(include.starts_with("by/hand.pem\n"), "{include}");
+    assert!(worktreeinclude::entries(&include).contains(&".env".to_string()));
+    assert!(
+        !read_text(root, ".gitignore")
+            .lines()
+            .any(|l| l == worktreeinclude::FILE_NAME),
+        "no ignore rule may be added for a tracked file"
+    );
+    let notices = plan.apply(root);
+    assert!(
+        notices.iter().any(|n| n.text.contains("tracked by git")),
+        "{notices:?}"
+    );
+}
+
+/// Migration from the legacy `setup.sh` layout writes the Orca files alongside
+/// the migrated tree.
+#[test]
+fn migration_writes_the_orca_files_alongside_the_new_layout() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    seed_old_layout(root);
+    write_file(root, ".gitignore", ".env\nnode_modules/\n");
+    write_file(root, "apps/web/.env", "S=1\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    let existing = superset_files::load_config(root).unwrap().unwrap();
+    let shared = shared_dirs::stored_or_detected(root, None);
+    let plan = orca_write::plan(root, &shared, SetupPolicy::Ensure);
+    assert_eq!(
+        plan.summary_lines(),
+        vec![
+            "Create orca.yaml (Orca setup script, 1 shared directory)".to_string(),
+            "Write .worktreeinclude (files Orca copies into a new worktree) + add it to .gitignore"
+                .to_string(),
+        ]
+    );
+
+    materialize_migration(root, &existing, &shared, &plan).unwrap();
+
+    // The migrated Superset tree ...
+    assert!(!root.join(".superset/setup.sh").exists());
+    assert!(!root.join(".superset/setup_config.json").exists());
+    let magic = superset_files::load_magic_json(root).unwrap().unwrap();
+    assert_eq!(magic.files, strings(&["**/.env", "apps/*/.dev.vars"]));
+    assert_eq!(magic.shared_directories, Some(strings(&["**/node_modules"])));
+    // ... and the Orca files beside it.
+    assert_eq!(orca_dirs(root), strings(&["node_modules"]));
+    assert!(orca_setup_has_the_line(root));
+    assert_eq!(
+        worktreeinclude::entries(&read_text(root, worktreeinclude::FILE_NAME)),
+        strings(&["apps/web/.env"])
+    );
+}
+
+/// The summary names what will happen to `orca.yaml`: created, updated, kept
+/// or impossible to edit.
+#[test]
+fn the_summary_says_create_update_keep_or_cannot_edit() {
+    let repo = fresh();
+    let line = |root: &Path| orca_write::plan(root, &[], SetupPolicy::Ensure).summary_lines()[0].clone();
+
+    assert_eq!(
+        line(repo.path()),
+        "Create orca.yaml (Orca setup script, 0 shared directories)"
+    );
+    write_file(repo.path(), "orca.yaml", "defaultTabs: []\n");
+    assert_eq!(
+        line(repo.path()),
+        "Update orca.yaml (Orca setup script, 0 shared directories)"
+    );
+    run_init_noninteractive(repo.path(), &[]).unwrap();
+    assert_eq!(line(repo.path()), "Keep orca.yaml (already up to date)");
+    write_file(repo.path(), "orca.yaml", "scripts: [oops\n");
+    assert!(
+        line(repo.path()).starts_with("Cannot edit orca.yaml (it is not valid YAML"),
+        "{}",
+        line(repo.path())
+    );
+}
+
+/// Running init twice is quiet the second time: nothing about the Orca files
+/// changes, and the ignore rule is not appended again.
+#[test]
+fn a_second_init_changes_nothing_about_the_orca_files() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", ".env\nnode_modules/\n");
+    write_file(root, ".env", "S=1\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    run_init_noninteractive(root, &strings(&[".env"])).unwrap();
+    let snapshot = |rel: &str| read_text(root, rel);
+    let before = (
+        snapshot("orca.yaml"),
+        snapshot(worktreeinclude::FILE_NAME),
+        snapshot(".gitignore"),
+        snapshot(".superset/magic.json"),
+    );
+
+    run_init_noninteractive(root, &strings(&[".env"])).unwrap();
+
+    assert_eq!(
+        (
+            snapshot("orca.yaml"),
+            snapshot(worktreeinclude::FILE_NAME),
+            snapshot(".gitignore"),
+            snapshot(".superset/magic.json"),
+        ),
+        before
+    );
+}
+
+/// A committing finishing action stages `orca.yaml` with the `.superset` tree
+/// and never the per-machine snapshot.
+#[test]
+fn the_finishing_action_stages_orca_yaml_and_never_the_snapshot() {
+    assert!(FINAL_ACTION_PATHS.contains(&"orca.yaml"));
+    assert!(!FINAL_ACTION_PATHS.contains(&worktreeinclude::FILE_NAME));
+
+    let main = init_main_repo("main");
+    let root = main.path();
+    run_init_noninteractive(root, &[]).unwrap();
+    git::stage_paths(root, &FINAL_ACTION_PATHS).unwrap();
+
+    let staged = std::process::Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let staged = String::from_utf8_lossy(&staged.stdout);
+    assert!(staged.lines().any(|l| l == "orca.yaml"), "{staged}");
+    assert!(
+        !staged.lines().any(|l| l == worktreeinclude::FILE_NAME),
+        "the snapshot is gitignored and must not be staged: {staged}"
+    );
 }

@@ -216,3 +216,60 @@ fn matches_are_reported_per_pattern_for_the_picker() {
         "only kinds that match something, in the picker's order"
     );
 }
+
+// --- the picker's options ------------------------------------------------------
+
+fn row(pattern: &str, dirs: &[&str]) -> PatternMatches {
+    PatternMatches {
+        pattern: pattern.to_string(),
+        dirs: strings(dirs),
+    }
+}
+
+#[test]
+fn the_picker_offers_the_default_kinds_then_stored_custom_patterns() {
+    assert_eq!(picker_patterns(None), defaults());
+
+    let stored = strings(&["**/dist", "**/node_modules", "vendor/bundle"]);
+    let mut expected = defaults();
+    expected.extend(strings(&["**/dist", "vendor/bundle"]));
+    assert_eq!(picker_patterns(Some(&stored)), expected);
+}
+
+/// Never chosen: what matches something starts checked. Chosen before: exactly
+/// the stored choice starts checked, whatever matches – including "none".
+#[test]
+fn the_picker_preselects_matches_at_first_and_the_stored_choice_afterwards() {
+    let rows = vec![
+        row("**/node_modules", &["node_modules"]),
+        row("**/.venv", &[]),
+        row("**/.turbo", &[".turbo"]),
+        row("**/dist", &[]),
+    ];
+
+    assert_eq!(picker_preselected(None, &rows), vec![0, 2]);
+
+    let stored = strings(&["**/.venv", "**/dist"]);
+    assert_eq!(picker_preselected(Some(&stored), &rows), vec![1, 3]);
+
+    assert!(picker_preselected(Some(&[]), &rows).is_empty());
+}
+
+#[test]
+fn without_a_stored_choice_the_detected_kinds_are_stored() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n.venv/\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    write_file(root, ".venv/pyvenv.cfg", "x");
+
+    assert_eq!(
+        stored_or_detected(root, None),
+        strings(&["**/node_modules", "**/.venv"])
+    );
+    assert_eq!(stored_or_detected(root, Some(&[])), Vec::<String>::new());
+    assert_eq!(
+        stored_or_detected(root, Some(&strings(&["**/dist"]))),
+        strings(&["**/dist"])
+    );
+}

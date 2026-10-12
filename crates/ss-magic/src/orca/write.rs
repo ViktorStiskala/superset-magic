@@ -1,13 +1,26 @@
 //! Writing the Orca files into the main checkout.
 //!
-//! Two files, two writers that share one rule about where a write may land:
+//! Two writers that share one rule about where a write may land:
 //!
+//! - [`plan`] and [`Plan::apply`] are the shared Orca write path behind init,
+//!   migrate, edit-config and the explicit `ss-magic orca` refresh (KTD13). The
+//!   plan is computed BEFORE the finishing prompt – the current `orca.yaml` is
+//!   read and edited in memory – so the "This will:" list can say whether the
+//!   file is created, updated or cannot be edited. `apply` runs after the
+//!   Superset tree has materialized: it writes `orca.yaml`, gitignores
+//!   `.worktreeinclude`, and only then computes and writes the snapshot, so the
+//!   snapshot sees the files and ignore rules the operation itself just put in
+//!   place (the bootstrapped `magic.local.json`, for one).
 //! - [`refresh_snapshot`] is the AUTOMATIC refresh that ends a forward sync in
 //!   an Orca worktree (KTD11). It rewrites only the managed section of main's
 //!   `.worktreeinclude`, only when git positively reports that file as ignored
 //!   and untracked, and it reports rather than fails: a background setup script
 //!   must never leave the shared main checkout with a modified tracked file, and
 //!   must never turn a successful sync into a failed one.
+//!
+//! Neither writer ever fails the operation it belongs to. A file that cannot be
+//! edited safely is left byte-for-byte untouched and reported, and everything
+//! else is still written (R22).
 //!
 //! Every write goes through [`write_contained`], which refuses a target that
 //! resolves outside the repository through a symlink (KTD13). The hazard is a
@@ -21,8 +34,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::git;
+use crate::git::gitignore::{self, Ignored, PathKind};
+use crate::orca::shared_dirs::{self, Expansion};
 use crate::orca::worktreeinclude::{self, Document, Existing};
 use crate::orca::{orca_yaml, snapshot};
+use crate::tui::style;
 use crate::workspace::superset_files;
 
 /// The name of Orca's configuration file, at the root of the main checkout.
@@ -69,6 +85,418 @@ pub fn write_contained(root: &Path, rel: &str, text: &str) -> Result<Landing> {
         superset_files::write_atomically(&root.join(rel), text)?;
     }
     Ok(landing)
+}
+
+/// Whether an operation may touch `scripts.setup` in `orca.yaml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupPolicy {
+    /// Make sure the script contains the `magic.sh sync` line. Init, migrate
+    /// and edit-config: the person is setting the repository up, so a line that
+    /// went missing comes back.
+    Ensure,
+    /// Write the line only into an `orca.yaml` this operation creates; leave
+    /// the script of an existing file exactly as it is (R25). The explicit
+    /// refresh: it must not undo someone's deliberate removal of the line, yet
+    /// it is also how a repository set up before Orca support gets a working
+    /// file in one step.
+    OnlyWhenCreating,
+}
+
+/// How loudly a [`Notice`] is printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// Something was written.
+    Ok,
+    /// Something worth knowing that needs no action.
+    Info,
+    /// Something was NOT done, or the person should act.
+    Warn,
+}
+
+/// One line of what the Orca write path did, for the caller to print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub level: Level,
+    pub text: String,
+}
+
+impl Notice {
+    fn ok(text: impl Into<String>) -> Self {
+        Self {
+            level: Level::Ok,
+            text: text.into(),
+        }
+    }
+
+    fn info(text: impl Into<String>) -> Self {
+        Self {
+            level: Level::Info,
+            text: text.into(),
+        }
+    }
+
+    fn warn(text: impl Into<String>) -> Self {
+        Self {
+            level: Level::Warn,
+            text: text.into(),
+        }
+    }
+}
+
+/// Print notices in order: warnings to stderr, everything else to stdout.
+pub fn print_notices(notices: &[Notice]) {
+    for notice in notices {
+        match notice.level {
+            Level::Ok => println!("{}", style::ok(&notice.text)),
+            Level::Info => println!("{}", style::info(&notice.text)),
+            Level::Warn => eprintln!("{}", style::warn(&notice.text)),
+        }
+    }
+}
+
+/// What will happen to `orca.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum YamlPlan {
+    /// Write this text. `creating` says the file does not exist yet.
+    Write { text: String, creating: bool },
+    /// The file already holds the intended values.
+    Unchanged,
+    /// Leave the file byte-for-byte untouched, for `reason`. `manual_block` is
+    /// what the person can add by hand to get the same effect.
+    Untouched {
+        reason: String,
+        manual_block: Option<String>,
+    },
+}
+
+/// What can be said about `.worktreeinclude` before the prompt. The real
+/// decision is taken again in [`Plan::apply`], against the disk as it is then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IncludePreview {
+    Writable,
+    Untouched(String),
+}
+
+/// The Orca output of one init / migrate / edit-config / refresh, decided
+/// before anything is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    yaml: YamlPlan,
+    include: IncludePreview,
+    /// The directories `orca.yaml` will share once this plan is applied.
+    shared: Expansion,
+    /// The directories Orca shares if `orca.yaml` is NOT rewritten – what the
+    /// file on disk lists now. The snapshot leaves out files under whichever
+    /// list ends up in the file.
+    shared_on_disk: Vec<String>,
+}
+
+/// Decide what the Orca files of `main_root` should become.
+///
+/// `shared_patterns` are the `sharedDirectories` globs as they will be stored
+/// in `magic.json`; they are expanded against the checkout right now, and the
+/// result replaces `worktree.sharedDirectories` outright (R21). Nothing is
+/// written here.
+pub fn plan(main_root: &Path, shared_patterns: &[String], setup: SetupPolicy) -> Plan {
+    let shared = shared_dirs::expand(main_root, shared_patterns);
+    let (yaml, shared_on_disk) = plan_yaml(main_root, &shared.dirs, setup);
+    let include = match landing(main_root, worktreeinclude::FILE_NAME) {
+        Ok(Landing::Outside(target)) => IncludePreview::Untouched(outside_reason(&target)),
+        Err(err) => IncludePreview::Untouched(format!("{err:#}")),
+        Ok(Landing::Inside) => match worktreeinclude::read(main_root) {
+            Existing::Unreadable(why) => IncludePreview::Untouched(why),
+            Existing::Absent | Existing::Text(_) => IncludePreview::Writable,
+        },
+    };
+    Plan {
+        yaml,
+        include,
+        shared,
+        shared_on_disk,
+    }
+}
+
+fn outside_reason(target: &Path) -> String {
+    format!(
+        "it is a symlink to {}, outside the repository",
+        target.display()
+    )
+}
+
+/// The `orca.yaml` half of [`plan`], plus the directory list the file on disk
+/// holds now. The containment check comes BEFORE the read: a link out of the
+/// repository is not even opened.
+fn plan_yaml(main_root: &Path, dirs: &[String], setup: SetupPolicy) -> (YamlPlan, Vec<String>) {
+    let untouched = |reason: String, manual: bool, ensure_setup: bool| YamlPlan::Untouched {
+        reason,
+        manual_block: manual.then(|| orca_yaml::managed_block(dirs, ensure_setup)),
+    };
+    match landing(main_root, ORCA_YAML) {
+        Ok(Landing::Inside) => {}
+        Ok(Landing::Outside(target)) => {
+            return (
+                untouched(outside_reason(&target), true, setup == SetupPolicy::Ensure),
+                Vec::new(),
+            );
+        }
+        Err(err) => return (untouched(format!("{err:#}"), false, false), Vec::new()),
+    }
+    let current = match fs::read(main_root.join(ORCA_YAML)) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => Some(text),
+            Err(_) => {
+                return (
+                    untouched(
+                        "it is not valid UTF-8 text".to_string(),
+                        true,
+                        setup == SetupPolicy::Ensure,
+                    ),
+                    Vec::new(),
+                );
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return (
+                untouched(format!("it could not be read ({err})"), false, false),
+                Vec::new(),
+            );
+        }
+    };
+    let on_disk = current
+        .as_deref()
+        .map(orca_yaml::shared_directories)
+        .unwrap_or_default();
+    let ensure_setup = match setup {
+        SetupPolicy::Ensure => true,
+        SetupPolicy::OnlyWhenCreating => current.is_none(),
+    };
+    let plan = match orca_yaml::edit(current.as_deref(), dirs, ensure_setup) {
+        Ok(text) if current.as_deref() == Some(text.as_str()) => YamlPlan::Unchanged,
+        Ok(text) => YamlPlan::Write {
+            text,
+            creating: current.is_none(),
+        },
+        Err(refusal) => YamlPlan::Untouched {
+            reason: refusal.reason,
+            manual_block: Some(refusal.manual_block),
+        },
+    };
+    (plan, on_disk)
+}
+
+impl Plan {
+    /// The lines this plan adds to an operation's "This will:" list. Pure, so
+    /// the wording is testable without a prompt.
+    pub fn summary_lines(&self) -> Vec<String> {
+        let count = self.shared.dirs.len();
+        let shared = format!(
+            "{count} shared {}",
+            if count == 1 { "directory" } else { "directories" }
+        );
+        let yaml = match &self.yaml {
+            YamlPlan::Write { creating: true, .. } => {
+                format!("Create orca.yaml (Orca setup script, {shared})")
+            }
+            YamlPlan::Write {
+                creating: false, ..
+            } => format!("Update orca.yaml (Orca setup script, {shared})"),
+            YamlPlan::Unchanged => "Keep orca.yaml (already up to date)".to_string(),
+            YamlPlan::Untouched { reason, .. } => {
+                format!("Cannot edit orca.yaml ({reason}); it is left untouched")
+            }
+        };
+        let include = match &self.include {
+            IncludePreview::Writable => format!(
+                "Write {} (files Orca copies into a new worktree) + add it to .gitignore",
+                worktreeinclude::FILE_NAME
+            ),
+            IncludePreview::Untouched(why) => format!(
+                "Leave {} untouched ({why})",
+                worktreeinclude::FILE_NAME
+            ),
+        };
+        vec![yaml, include]
+    }
+
+    /// Whether this plan writes `orca.yaml`. A caller that commits the result
+    /// stages the file either way; this is for what it tells the person.
+    pub fn writes_yaml(&self) -> bool {
+        matches!(self.yaml, YamlPlan::Write { .. })
+    }
+
+    /// Write the Orca files and report what happened. Never fails: every file
+    /// that cannot be written is left untouched and reported, and the rest is
+    /// still written (R22).
+    ///
+    /// Order matters. `orca.yaml` goes first. Then `.worktreeinclude` is
+    /// gitignored – skipped, with a notice, when the file is tracked, since a
+    /// rule cannot ignore a tracked file and would only mislead. Only then is
+    /// the snapshot computed, from the sync patterns as they are on disk NOW:
+    /// the caller has already materialized `magic.json`, so the overlaid list
+    /// is read back rather than passed in.
+    pub fn apply(&self, main_root: &Path) -> Vec<Notice> {
+        let mut notices = Vec::new();
+        let listed_dirs = self.apply_yaml(main_root, &mut notices);
+        if let Some(warning) = shared_dirs::overflow_warning(&self.shared) {
+            notices.push(Notice::warn(warning));
+        }
+        self.apply_include(main_root, &listed_dirs, &mut notices);
+        notices
+    }
+
+    /// Write `orca.yaml` per the plan. Returns the directory list the file
+    /// holds afterwards, which is what the snapshot must leave out.
+    fn apply_yaml(&self, main_root: &Path, notices: &mut Vec<Notice>) -> Vec<String> {
+        let untouched = |notices: &mut Vec<Notice>, reason: &str, manual: Option<&str>| {
+            notices.push(Notice::warn(format!("orca.yaml was not changed: {reason}.")));
+            if let Some(block) = manual {
+                notices.push(Notice::info(format!(
+                    "To set it up by hand, add this to orca.yaml:\n{}",
+                    indent(block)
+                )));
+            }
+        };
+        match &self.yaml {
+            YamlPlan::Unchanged => {
+                notices.push(Notice::info("orca.yaml is already up to date"));
+                self.shared.dirs.clone()
+            }
+            YamlPlan::Untouched {
+                reason,
+                manual_block,
+            } => {
+                untouched(notices, reason, manual_block.as_deref());
+                self.shared_on_disk.clone()
+            }
+            YamlPlan::Write { text, creating } => {
+                match write_contained(main_root, ORCA_YAML, text) {
+                    Ok(Landing::Inside) => {
+                        notices.push(Notice::ok(format!(
+                            "{} orca.yaml (commit it so every Orca worktree gets the setup script)",
+                            if *creating { "Created" } else { "Updated" }
+                        )));
+                        self.shared.dirs.clone()
+                    }
+                    // The target changed between planning and writing.
+                    Ok(Landing::Outside(target)) => {
+                        untouched(notices, &outside_reason(&target), None);
+                        self.shared_on_disk.clone()
+                    }
+                    Err(err) => {
+                        untouched(notices, &format!("writing it failed ({err:#})"), None);
+                        self.shared_on_disk.clone()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gitignore `.worktreeinclude`, then compute the snapshot and write the
+    /// managed section.
+    fn apply_include(&self, main_root: &Path, shared_dirs: &[String], notices: &mut Vec<Notice>) {
+        let name = worktreeinclude::FILE_NAME;
+        match landing(main_root, name) {
+            Ok(Landing::Inside) => {}
+            Ok(Landing::Outside(target)) => {
+                notices.push(Notice::warn(format!(
+                    "{name} was left untouched because {}.",
+                    outside_reason(&target)
+                )));
+                return;
+            }
+            Err(err) => {
+                notices.push(Notice::warn(format!("{name} was left untouched: {err:#}.")));
+                return;
+            }
+        }
+        let existing = worktreeinclude::read(main_root);
+        let document = match &existing {
+            Existing::Absent => Document::empty(),
+            Existing::Text(text) => Document::parse(text),
+            // Never rebuilt from an empty parse: that would drop the person's
+            // own lines along with whatever made the file unreadable.
+            Existing::Unreadable(why) => {
+                notices.push(Notice::warn(format!(
+                    "{name} was left untouched because {why}."
+                )));
+                return;
+            }
+        };
+
+        // Positive tracked determination; "git could not be asked" (no
+        // repository) reads as untracked, and the rule is then written.
+        let tracked = git::tracked_files(main_root, &[name]).is_ok_and(|list| !list.is_empty());
+        if tracked {
+            notices.push(Notice::info(format!(
+                "{name} is tracked by git, so no ignore rule was added. Its contents are a \
+                 per-machine snapshot; consider `git rm --cached {name}`."
+            )));
+        } else {
+            match gitignore::ensure_path_ignored(
+                main_root,
+                main_root,
+                Path::new(name),
+                PathKind::File,
+            ) {
+                Ok(Ignored::Appended) => notices.push(Notice::ok(format!("Gitignored {name}"))),
+                Ok(Ignored::Already) => {}
+                Err(err) => notices.push(Notice::warn(format!(
+                    "Could not add {name} to .gitignore: {err:#}"
+                ))),
+            }
+        }
+
+        let patterns = match superset_files::load_overlaid(main_root) {
+            Ok(Some(cfg)) => cfg.files,
+            Ok(None) => Vec::new(),
+            Err(err) => {
+                notices.push(Notice::warn(format!(
+                    "{name} was not written: the sync patterns could not be read ({err:#})."
+                )));
+                return;
+            }
+        };
+        let snap = snapshot::compute(
+            main_root,
+            &patterns,
+            shared_dirs,
+            &document.hand_entries(),
+            document.budget(),
+        );
+        let rendered = document.render(&snap.entries);
+        let count = format!(
+            "{} {} for Orca to copy",
+            snap.entries.len(),
+            if snap.entries.len() == 1 { "file" } else { "files" }
+        );
+        if matches!(&existing, Existing::Text(text) if *text == rendered) {
+            notices.push(Notice::info(format!("{name} is already up to date ({count})")));
+        } else {
+            match write_contained(main_root, name, &rendered) {
+                Ok(Landing::Inside) => notices.push(Notice::ok(format!("Wrote {name} ({count})"))),
+                Ok(Landing::Outside(target)) => notices.push(Notice::warn(format!(
+                    "{name} was left untouched because {}.",
+                    outside_reason(&target)
+                ))),
+                Err(err) => notices.push(Notice::warn(format!(
+                    "{name} was not written: {err:#}."
+                ))),
+            }
+        }
+        if let Some(warning) = snapshot::overflow_warning(&snap) {
+            notices.push(Notice::warn(warning));
+        }
+    }
+}
+
+/// Indent every line of `block` by four spaces, for showing it under a notice.
+fn indent(block: &str) -> String {
+    block
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// What the automatic snapshot refresh did.
