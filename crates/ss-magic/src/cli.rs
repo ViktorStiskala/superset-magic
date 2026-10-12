@@ -2,8 +2,8 @@
 //!
 //! A handful of entry points don't justify pulling in `clap`, so this is a tiny
 //! parser over `std::env::args`: the first non-flag token selects `sync`,
-//! `pack`, `update`, or `init`; its absence falls through to the
-//! interactive (bare) mode. `--version`/`-V` and `--help`/`-h` short-circuit to
+//! `reverse-sync`, `pack`, `orca`, `update`, or `init`; its absence falls
+//! through to the interactive (bare) mode. `--version`/`-V` and `--help`/`-h` short-circuit to
 //! terminal signals, and any unrecognized subcommand is an error carrying the
 //! same usage text the help path prints.
 //!
@@ -36,6 +36,9 @@ pub enum Command {
     /// Non-interactive pack: archive the configured files into a tar.bz2 at the
     /// git root.
     Pack,
+    /// Explicit Orca refresh: regenerate `orca.yaml`'s shared directories and
+    /// `.worktreeinclude` in the main checkout from `magic.json`.
+    Orca,
     /// Force a self-update.
     Update,
 }
@@ -72,6 +75,9 @@ Commands:
                  git-untracked files matching the configured patterns
   pack           Archive the configured files into ss-magic-<repo>.tar.bz2 at
                  the git root (name derived from the origin remote)
+  orca           Regenerate the Orca files in the main checkout from
+                 magic.json: orca.yaml's shared directories and
+                 .worktreeinclude (runs from any directory of the repository)
   update         Force a self-update to the latest release
   init           Initialize .superset (magic.json layout) non-interactively;
                  optional file-pattern args become magic.json `files`
@@ -83,7 +89,8 @@ Options:
       --no-orca-skip
                     On `sync` in an Orca worktree: also copy the paths Orca
                     already copied from `.worktreeinclude` (default: skip them).
-  -h, --help        Print this help (recognized before the subcommand)
+  -h, --help        Print this help (recognized before the subcommand, and
+                    after `orca`)
   -V, --version     Print the version and exit (recognized anywhere in argv)";
 
 /// Render the usage text. Kept as a function (not just the `const`) so the
@@ -122,6 +129,12 @@ pub fn parse(args: &[String]) -> Parsed {
                 no_backup: has_no_backup(args),
             }),
             "pack" => Parsed::Command(Command::Pack),
+            // `orca` rewrites files in the shared main checkout. A `--help`
+            // typed AFTER it is someone asking what the command does, and
+            // answering by running it would be the wrong surprise – so here,
+            // unlike for the other subcommands, a trailing help flag wins.
+            "orca" if args[i + 1..].iter().any(|a| a == "-h" || a == "--help") => Parsed::Help,
+            "orca" => Parsed::Command(Command::Orca),
             "update" => Parsed::Command(Command::Update),
             // Positional args after `init` become magic.json file patterns.
             "init" => Parsed::Init(

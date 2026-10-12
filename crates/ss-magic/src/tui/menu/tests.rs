@@ -44,11 +44,44 @@ fn init_branch_offers_init_op() {
     assert_eq!(ops, vec![MenuOp::Init]);
 }
 
-/// Branch::Normal → [EditConfig, Pack].
+/// Branch::Normal → [EditConfig, Pack, RefreshOrca].
 #[test]
-fn normal_branch_offers_edit_config_and_pack() {
+fn normal_branch_offers_edit_config_pack_and_refresh_orca() {
     let ops = operations_for(Location::Main, Branch::Normal);
-    assert_eq!(ops, vec![MenuOp::EditConfig, MenuOp::Pack]);
+    assert_eq!(
+        ops,
+        vec![MenuOp::EditConfig, MenuOp::Pack, MenuOp::RefreshOrca]
+    );
+}
+
+/// The Orca refresh needs an initialized `magic.json` in the main checkout:
+/// it is offered there on the Normal branch and nowhere else. Init and migrate
+/// write the Orca files themselves, and the worktree list is unchanged.
+#[test]
+fn refresh_orca_is_offered_only_on_the_main_checkouts_normal_branch() {
+    assert!(operations_for(Location::Main, Branch::Normal).contains(&MenuOp::RefreshOrca));
+    assert!(!operations_for(Location::Main, Branch::Init).contains(&MenuOp::RefreshOrca));
+    assert!(!operations_for(Location::Main, Branch::Migrate).contains(&MenuOp::RefreshOrca));
+    for branch in [Branch::Init, Branch::Migrate, Branch::Normal] {
+        assert!(!operations_for(Location::Worktree, branch).contains(&MenuOp::RefreshOrca));
+    }
+}
+
+#[test]
+fn every_menu_entry_has_its_own_label() {
+    let labels: std::collections::HashSet<String> = [
+        MenuOp::Migrate,
+        MenuOp::Init,
+        MenuOp::EditConfig,
+        MenuOp::Sync,
+        MenuOp::Pack,
+        MenuOp::RefreshOrca,
+    ]
+    .iter()
+    .map(|op| op.to_string())
+    .collect();
+    assert_eq!(labels.len(), 6);
+    assert!(MenuOp::RefreshOrca.to_string().contains("Orca"));
 }
 
 /// Pack is offered where magic.json exists: any worktree, and Main+Normal.

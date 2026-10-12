@@ -20,7 +20,8 @@ use crate::orca::detect::{WORKTREE_ID_VAR, WORKTREE_PATH_VAR};
 use crate::orca::worktreeinclude::{self, Document};
 use crate::orca::write::ORCA_YAML;
 use crate::sync::apply::{Event, SkipReason};
-use crate::{run_sync_flow, sync_core, sync_summary_line, SyncOptions};
+use crate::orca::write::{Level, Notice};
+use crate::{orca_core, run_sync_flow, sync_core, sync_summary_line, SyncOptions};
 
 /// A main checkout set up the way this release leaves one – `.env` files and
 /// `.worktreeinclude` gitignored – plus a linked worktree of it.
@@ -423,6 +424,216 @@ fn ae8_sync_in_the_main_checkout_never_runs_in_orca_mode() {
         read(main.path(), worktreeinclude::FILE_NAME),
         before,
         "no refresh runs in the main checkout"
+    );
+}
+
+// ── The explicit refresh: `ss-magic orca` ──────────────────────────────────
+
+/// Store `shared` as `magic.json`'s `sharedDirectories`, keeping its `files`.
+fn store_shared(main: &Path, shared: &[&str]) {
+    use ss_magic_core::superset_files as files;
+    let existing = files::load_magic_json(main).unwrap();
+    let patterns = existing.as_ref().map(|m| m.files.clone()).unwrap_or_default();
+    let shared = shared.iter().map(|s| s.to_string()).collect();
+    files::write_magic_json(
+        main,
+        &files::merge_files_into_magic_config(existing.as_ref(), patterns, Some(shared)),
+    )
+    .unwrap();
+}
+
+fn refresh(cwd: &Path) -> Vec<Notice> {
+    orca_core(cwd).unwrap_or_else(|_| panic!("the refresh must not be a hard error"))
+}
+
+fn shared_in(main: &Path) -> Vec<String> {
+    crate::orca::orca_yaml::shared_directories(&read(main, ORCA_YAML))
+}
+
+/// F3. From a worktree, the refresh writes the MAIN checkout's files and
+/// leaves the worktree's alone.
+#[test]
+fn the_refresh_run_from_a_worktree_writes_the_main_checkouts_files() {
+    let (main, _holder, wt) = orca_repo(&["**/.env", ".env"]);
+    store_shared(main.path(), &["**/node_modules"]);
+    write_file(main.path(), ".env", "MAIN=1\n");
+    write_file(main.path(), "node_modules/a/index.js", "x");
+    // The worktree has its own, different state.
+    write_file(&wt, "packages/only-here/node_modules/b/index.js", "x");
+    write_file(&wt, "only-in-worktree/.env", "WT=1\n");
+
+    refresh(&wt);
+
+    assert_eq!(shared_in(main.path()), vec!["node_modules"]);
+    assert_eq!(listed_in_main(main.path()), vec![".env"]);
+    assert!(!wt.join(ORCA_YAML).exists(), "nothing is written in the worktree");
+    assert!(!wt.join(worktreeinclude::FILE_NAME).exists());
+}
+
+/// R13 + R25. A directory that appeared since `orca.yaml` was written is added
+/// by the refresh, while `scripts.setup` stays byte-identical – even though
+/// someone removed the `magic.sh` line from it.
+#[test]
+fn the_refresh_adds_a_new_directory_and_never_touches_an_existing_setup_script() {
+    let (main, _holder, _wt) = orca_repo(&[".env"]);
+    store_shared(main.path(), &["**/node_modules"]);
+    write_file(main.path(), "node_modules/a/index.js", "x");
+    let yaml = "# ours\nscripts:\n  setup: |\n    pnpm install   # the magic.sh line was removed on purpose\nworktree:\n  sharedDirectories:\n    - node_modules\n";
+    write_file(main.path(), ORCA_YAML, yaml);
+    write_file(main.path(), "packages/x/node_modules/b/index.js", "x");
+
+    refresh(main.path());
+
+    let after = read(main.path(), ORCA_YAML);
+    assert_eq!(
+        shared_in(main.path()),
+        vec!["node_modules", "packages/x/node_modules"]
+    );
+    let script = "scripts:\n  setup: |\n    pnpm install   # the magic.sh line was removed on purpose\n";
+    assert!(after.contains(script), "scripts.setup must be byte-identical:\n{after}");
+    assert!(
+        !crate::orca::orca_yaml::has_setup_line(&after),
+        "a line removed on purpose is not added back by a refresh"
+    );
+}
+
+/// The upgrade path. A repository set up before Orca support has a
+/// `magic.json` and nothing else: one refresh creates `orca.yaml` WITH the
+/// setup line, writes the snapshot and gitignores it.
+#[test]
+fn the_refresh_sets_up_a_repository_initialized_before_orca_support() {
+    let main = init_main_repo("main");
+    write_file(main.path(), ".gitignore", ".env\nnode_modules/\n");
+    git_run(&["add", ".gitignore"], main.path());
+    git_run(&["commit", "-q", "-m", "ignore"], main.path());
+    write_magic(main.path(), &[".env"]);
+    write_file(main.path(), ".env", "MAIN=1\n");
+    write_file(main.path(), "node_modules/a/index.js", "x");
+
+    let notices = refresh(main.path());
+
+    assert_eq!(
+        read(main.path(), ORCA_YAML),
+        "scripts:\n  setup: |\n    ./.superset/magic.sh sync\nworktree:\n  sharedDirectories: []\n"
+    );
+    assert_eq!(listed_in_main(main.path()), vec![".env"]);
+    assert!(read(main.path(), ".gitignore")
+        .lines()
+        .any(|l| l == worktreeinclude::FILE_NAME));
+    // Nobody chose shared directories yet: the list is empty, magic.json is
+    // not changed, and the output says where to choose.
+    let magic = ss_magic_core::superset_files::load_magic_json(main.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(magic.shared_directories, None);
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.level == Level::Info && n.text.contains("Edit synced files")),
+        "{notices:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.level == Level::Ok && n.text.starts_with("Created orca.yaml")),
+        "{notices:?}"
+    );
+}
+
+/// With stored patterns the same first refresh lists the directories too.
+#[test]
+fn a_first_refresh_with_stored_patterns_creates_the_file_with_its_directories() {
+    let (main, _holder, _wt) = orca_repo(&[".env"]);
+    store_shared(main.path(), &["**/node_modules"]);
+    write_file(main.path(), "node_modules/a/index.js", "x");
+    write_file(main.path(), "apps/web/node_modules/b/index.js", "x");
+
+    refresh(main.path());
+
+    let yaml = read(main.path(), ORCA_YAML);
+    assert!(crate::orca::orca_yaml::has_setup_line(&yaml), "{yaml}");
+    assert_eq!(
+        shared_in(main.path()),
+        vec!["apps/web/node_modules", "node_modules"]
+    );
+}
+
+/// The refresh adds the ignore rule a repository never had, which is exactly
+/// what the automatic end-of-sync refresh was waiting for.
+#[test]
+fn the_refresh_adds_the_ignore_rule_so_the_automatic_refresh_can_run() {
+    let main = init_main_repo("main");
+    write_file(main.path(), ".gitignore", ".env\n");
+    git_run(&["add", ".gitignore"], main.path());
+    git_run(&["commit", "-q", "-m", "ignore .env only"], main.path());
+    write_magic(main.path(), &["**/.env", ".env"]);
+    write_file(main.path(), ".env", "MAIN=1\n");
+    let (_holder, wt) = make_worktree(main.path());
+
+    // Before: the automatic refresh has nowhere safe to write.
+    sync(&wt, SyncOptions::default(), &setup_env(&wt));
+    assert!(!main.path().join(worktreeinclude::FILE_NAME).exists());
+
+    refresh(main.path());
+    assert_eq!(listed_in_main(main.path()), vec![".env"]);
+
+    // After: a file that appears in main reaches the list through the sync.
+    write_file(main.path(), "apps/api/.env", "API=1\n");
+    let (code, _) = sync(&wt, SyncOptions::default(), &setup_env(&wt));
+    assert_eq!(code, 0);
+    assert_eq!(listed_in_main(main.path()), vec![".env", "apps/api/.env"]);
+}
+
+/// Without a `magic.json` in the main checkout the refresh is a hard error and
+/// writes nothing.
+#[test]
+fn the_refresh_without_magic_json_is_an_error_and_writes_nothing() {
+    let main = init_main_repo("main");
+    let (_holder, wt) = make_worktree(main.path());
+
+    let code = orca_core(&wt).unwrap_err();
+
+    assert_eq!(exit_code_to_u8(code), 1);
+    assert!(!main.path().join(ORCA_YAML).exists());
+    assert!(!main.path().join(worktreeinclude::FILE_NAME).exists());
+    assert!(!main.path().join(".gitignore").exists());
+}
+
+#[test]
+fn the_refresh_outside_a_repository_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(exit_code_to_u8(orca_core(dir.path()).unwrap_err()), 1);
+}
+
+/// An `orca.yaml` that cannot be edited is a notice, not a failure, and the
+/// snapshot is still written.
+#[test]
+fn the_refresh_reports_an_uneditable_orca_yaml_and_still_writes_the_snapshot() {
+    let (main, _holder, _wt) = orca_repo(&[".env"]);
+    store_shared(main.path(), &["**/node_modules"]);
+    write_file(main.path(), ".env", "MAIN=1\n");
+    write_file(main.path(), "node_modules/a/index.js", "x");
+    let yaml = "worktree: {sharedDirectories: [old]}\n";
+    write_file(main.path(), ORCA_YAML, yaml);
+
+    let notices = refresh(main.path());
+
+    assert_eq!(read(main.path(), ORCA_YAML), yaml);
+    assert_eq!(listed_in_main(main.path()), vec![".env"]);
+    let warning = notices
+        .iter()
+        .find(|n| n.level == Level::Warn)
+        .expect("a warning about orca.yaml");
+    assert!(warning.text.contains("flow mapping"), "{}", warning.text);
+    let by_hand = notices
+        .iter()
+        .find(|n| n.text.contains("add this to orca.yaml"))
+        .expect("the block to add by hand");
+    assert!(by_hand.text.contains("- node_modules"), "{}", by_hand.text);
+    assert!(
+        !by_hand.text.contains("magic.sh"),
+        "the refresh does not manage the setup script of an existing file: {}",
+        by_hand.text
     );
 }
 

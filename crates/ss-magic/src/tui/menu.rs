@@ -53,6 +53,10 @@ pub enum MenuOp {
     /// wherever an initialized `magic.json` exists (any worktree, or the main
     /// checkout on a Normal branch).
     Pack,
+    /// Main-checkout, Branch::Normal: regenerate the Orca files (`orca.yaml`'s
+    /// shared directories and `.worktreeinclude`) from `magic.json` – the same
+    /// operation as `ss-magic orca`.
+    RefreshOrca,
 }
 
 impl fmt::Display for MenuOp {
@@ -63,6 +67,7 @@ impl fmt::Display for MenuOp {
             MenuOp::EditConfig => "Edit synced files (magic.json)",
             MenuOp::Sync => "Sync with main (interactive — push, pull, merge, or delete per file)",
             MenuOp::Pack => "Pack configured files into a tar.bz2 archive",
+            MenuOp::RefreshOrca => "Refresh Orca files (orca.yaml, .worktreeinclude)",
         };
         f.write_str(label)
     }
@@ -86,6 +91,12 @@ pub enum Location {
 /// and the main checkout on a `Normal` branch. `Init`/`Migrate` branches have no
 /// `magic.json` yet, so `Pack` would have nothing to archive there.
 ///
+/// `RefreshOrca` is offered on the main checkout's `Normal` branch only. It
+/// writes the main checkout's Orca files from `magic.json`, so it needs that
+/// file to exist, and `Init`/`Migrate` write the Orca files themselves. A
+/// worktree is not offered it in the menu (the `ss-magic orca` command works
+/// from one, for whoever wants it there).
+///
 /// Truth table:
 ///
 /// | Location  | Branch            | Ops                                    |
@@ -93,14 +104,14 @@ pub enum Location {
 /// | Worktree  | (any)             | `[Sync, Pack]`                         |
 /// | Main      | `Branch::Migrate` | `[Migrate]`                            |
 /// | Main      | `Branch::Init`    | `[Init]`                               |
-/// | Main      | `Branch::Normal`  | `[EditConfig, Pack]`                   |
+/// | Main      | `Branch::Normal`  | `[EditConfig, Pack, RefreshOrca]`      |
 pub fn operations_for(location: Location, branch: Branch) -> Vec<MenuOp> {
     match location {
         Location::Worktree => vec![MenuOp::Sync, MenuOp::Pack],
         Location::Main => match branch {
             Branch::Migrate => vec![MenuOp::Migrate],
             Branch::Init => vec![MenuOp::Init],
-            Branch::Normal => vec![MenuOp::EditConfig, MenuOp::Pack],
+            Branch::Normal => vec![MenuOp::EditConfig, MenuOp::Pack, MenuOp::RefreshOrca],
         },
     }
 }
@@ -172,7 +183,8 @@ pub fn run(cwd: &Path) -> Result<ExitCode> {
             MenuOp::Init => migrate::run_init(&repo_root, config.as_ref()),
             MenuOp::EditConfig => edit_config(&repo_root, config.as_ref()),
             MenuOp::Pack => crate::run_pack_flow(&repo_root),
-            _ => unreachable!("main checkout only offers Migrate/Init/EditConfig/Pack"),
+            MenuOp::RefreshOrca => crate::run_orca_flow(&repo_root),
+            _ => unreachable!("main checkout only offers Migrate/Init/EditConfig/Pack/RefreshOrca"),
         })
     }
 }
@@ -203,8 +215,8 @@ where
 /// Edit-config flow for `Branch::Normal` (already migrated).
 ///
 /// Reuses `migrate::run_init` as the idempotent edit-config path: it opens the
-/// pattern picker, lets the user adjust the `magic.json` files list, then runs
-/// the finishing-action prompt. When called against an already-initialized repo,
+/// pattern picker and the shared-directory picker, lets the user adjust both
+/// `magic.json` lists, then runs the finishing-action prompt. When called against an already-initialized repo,
 /// `run_init` writes a new `magic.json` with the chosen patterns, which is
 /// exactly the "edit synced files" semantic needed here. No separate function
 /// is needed because `run_init` is already idempotent for the Normal case.

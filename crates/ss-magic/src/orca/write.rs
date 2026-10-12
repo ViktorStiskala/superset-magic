@@ -319,12 +319,6 @@ impl Plan {
         vec![yaml, include]
     }
 
-    /// Whether this plan writes `orca.yaml`. A caller that commits the result
-    /// stages the file either way; this is for what it tells the person.
-    pub fn writes_yaml(&self) -> bool {
-        matches!(self.yaml, YamlPlan::Write { .. })
-    }
-
     /// Write the Orca files and report what happened. Never fails: every file
     /// that cannot be written is left untouched and reported, and the rest is
     /// still written (R22).

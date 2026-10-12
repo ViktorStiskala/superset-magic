@@ -303,3 +303,31 @@ fn usage_lists_the_no_orca_skip_flag() {
         "usage should mention --no-orca-skip"
     );
 }
+
+// ── `orca` ───────────────────────────────────────────────────────────────
+
+#[test]
+fn orca_token_dispatches_to_orca() {
+    assert_eq!(parse(&argv(&["orca"])), Parsed::Command(Command::Orca));
+    assert_eq!(
+        parse(&argv(&["--verbose", "orca"])),
+        Parsed::Command(Command::Orca)
+    );
+}
+
+/// `orca` writes into the shared main checkout, so a help flag typed after it
+/// answers with help instead of running the refresh.
+#[test]
+fn a_help_flag_after_orca_prints_help_instead_of_refreshing() {
+    assert_eq!(parse(&argv(&["orca", "--help"])), Parsed::Help);
+    assert_eq!(parse(&argv(&["orca", "-h"])), Parsed::Help);
+    assert_eq!(parse(&argv(&["--help", "orca"])), Parsed::Help);
+    assert_eq!(parse(&argv(&["orca", "--version"])), Parsed::Version);
+}
+
+#[test]
+fn usage_lists_the_orca_command() {
+    let text = usage();
+    assert!(text.contains("\n  orca "), "usage should list orca: {text:?}");
+    assert!(text.contains(".worktreeinclude"), "{text:?}");
+}

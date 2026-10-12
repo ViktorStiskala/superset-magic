@@ -7,9 +7,6 @@
 //! ignored-path probe, a public atomic writer and the `sharedDirectories` field
 //! – because the plugin binary links core and must never gain a YAML parser.
 
-// Wired into the commands unit by unit; lifted once every item has a caller.
-#![allow(dead_code)]
-
 pub(crate) mod detect;
 pub(crate) mod orca_yaml;
 pub(crate) mod shared_dirs;

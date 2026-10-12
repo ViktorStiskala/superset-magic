@@ -34,8 +34,9 @@ use crate::orca::detect::EnvLookup;
 /// | `Sync`                       | false        | true   |
 /// | `ReverseSync`                | false        | true   |
 /// | `Pack`                       | false        | true   |
+/// | `Orca`                       | false        | true   |
 /// | `Update`                     | false        | false  |
-/// | `Bare`/`Sync`/`ReverseSync`/`Pack` | true   | false  |
+/// | `Bare`/`Sync`/`ReverseSync`/`Pack`/`Orca` | true | false |
 /// | `Update`                     | true         | false  |
 ///
 /// `Command::Update` always bypasses the gate — it routes to the force path
@@ -43,9 +44,9 @@ use crate::orca::detect::EnvLookup;
 /// guard is active (`SS_MAGIC_UPDATED` or `SS_MAGIC_NO_UPDATE` is set) the
 /// gate never fires regardless of command, preventing re-exec loops (AE4).
 ///
-/// `Command::Pack` and `Command::ReverseSync` are gated alongside `Bare`/`Sync`:
-/// each is a non-interactive "do work" command, so gating keeps their users
-/// self-updating.
+/// `Command::Pack`, `Command::ReverseSync` and `Command::Orca` are gated
+/// alongside `Bare`/`Sync`: each is a non-interactive "do work" command, so
+/// gating keeps their users self-updating.
 ///
 /// Keep this an INCLUSION list. Inverting it to exclusions would mean every
 /// future command self-updates unless someone remembers to opt it out, and the
@@ -60,7 +61,11 @@ pub fn should_run_update_gate(cmd: Command, guard_active: bool) -> bool {
     }
     matches!(
         cmd,
-        Command::Bare | Command::Sync { .. } | Command::ReverseSync { .. } | Command::Pack
+        Command::Bare
+            | Command::Sync { .. }
+            | Command::ReverseSync { .. }
+            | Command::Pack
+            | Command::Orca
     )
 }
 
@@ -201,6 +206,7 @@ fn dispatch(cmd: Command) -> Result<ExitCode> {
         ),
         Command::ReverseSync { no_backup } => run_reverse_sync_flow(&cwd, no_backup),
         Command::Pack => run_pack_flow(&cwd),
+        Command::Orca => run_orca_flow(&cwd),
         Command::Update => update_flow(),
     }
 }
@@ -279,6 +285,65 @@ fn print_pack_event(ev: &pack::PackEvent) {
             }
         }
     }
+}
+
+/// Explicit Orca refresh: regenerate the main checkout's `orca.yaml` shared
+/// directories and `.worktreeinclude` from `magic.json`. Handler for
+/// `ss-magic orca` and the main-checkout menu's "Refresh Orca files" entry.
+///
+/// Runs from any directory of the repository – a worktree included – and always
+/// writes into the MAIN checkout, since that is where Orca reads both files
+/// from. This is also how a repository set up before Orca support gains the
+/// files in one step.
+pub fn run_orca_flow(cwd: &Path) -> Result<ExitCode> {
+    tui::style::print_section("Refresh Orca files");
+    match orca_core(cwd) {
+        Ok(notices) => {
+            orca::write::print_notices(&notices);
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(code) => Ok(code),
+    }
+}
+
+/// Core of [`run_orca_flow`], returning the notices instead of printing them
+/// so tests can read what happened. `Err` carries the exit code of a hard
+/// error, already reported on stderr: the repository roots cannot be resolved,
+/// or the main checkout has no (or a malformed) `.superset/magic.json` – in
+/// which case nothing is written.
+///
+/// What the refresh does and does not touch:
+///
+/// - `worktree.sharedDirectories` is replaced by the expansion of the patterns
+///   stored under `sharedDirectories` in the committed `magic.json`. When that
+///   key is absent nobody has chosen yet, so the list is written empty and a
+///   notice points at edit-config; `magic.json` itself is not changed here.
+/// - `scripts.setup` of an EXISTING `orca.yaml` is left exactly as it is, so a
+///   line someone removed on purpose stays removed (R25). Only when the refresh
+///   creates the file does it include the `magic.sh sync` line.
+/// - `.worktreeinclude` gets a fresh snapshot and, unless it is tracked, its
+///   ignore rule – which is what lets the automatic end-of-sync refresh run in
+///   a repository that never had the rule.
+///
+/// An `orca.yaml` that cannot be edited safely is reported and left alone; that
+/// is a notice, not a failure.
+fn orca_core(cwd: &Path) -> std::result::Result<Vec<orca::write::Notice>, ExitCode> {
+    use orca::write::{Level, Notice, SetupPolicy};
+
+    let (_cwd_root, main_root) = resolve_sync_roots(cwd)?;
+    let cfg = load_magic_or_exit(&main_root)?;
+
+    let shared = cfg.shared_directories.clone().unwrap_or_default();
+    let plan = orca::write::plan(&main_root, &shared, SetupPolicy::OnlyWhenCreating);
+    let mut notices = plan.apply(&main_root);
+    if cfg.shared_directories.is_none() {
+        notices.push(Notice {
+            level: Level::Info,
+            text: "magic.json has no `sharedDirectories` yet, so no directories are shared                    with Orca worktrees. Run `ss-magic` in the main checkout and pick                    \"Edit synced files\" to choose them."
+                .to_string(),
+        });
+    }
+    Ok(notices)
 }
 
 /// Non-interactive forward file copy: main checkout → current working tree.
