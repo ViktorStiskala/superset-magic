@@ -25,7 +25,8 @@
 # when present and skipped when absent.
 #
 #   retired subcommand spelling    no current-state document spells the old
-#                                  `ss-magic` + `plugin` + `<verb>` form
+#                                  `ss-magic` + `plugin` + `<verb>` form, with
+#                                  any whitespace or a line wrap between words
 #   skills name no CLAUDE_PLUGIN_DATA
 #                                  no skill body names the data-dir variable
 #   README pins the installer      README names no releases/latest/download/ URL
@@ -109,8 +110,46 @@ require_scope() { # root path...
 # PATH -- the update gate and the TUI included -- instead of the pinned plugin
 # binary the wrapper resolves.
 #
-# The trailing space is load-bearing: it matches the verb form only, so prose
-# about "the ss-magic plugin" as a thing still reads naturally.
+# What counts as the retired form: `ss-magic`, whitespace, `plugin`, then more
+# whitespace. That trailing whitespace is load-bearing: `ss-magic plugin.` or
+# `ss-magic plugin,` (the thing named in a sentence) and `ss-magic-plugin <verb>`
+# (the real binary, a hyphen not a space) never match. Text such as
+# "the ss-magic plugin is installed" DOES match, as it always has: a trailing
+# space cannot tell a verb from any other word, so prose must say "the
+# ss-magic-plugin binary" or reword.
+#
+# The whitespace may be any run of spaces and tabs, and the words may also be
+# split by a line wrap, because a Markdown paragraph is wrapped by hand and the
+# old spelling survives there unmatched by a single-line, single-space search:
+#   - `ss-magic` ends a line and the next line starts with `plugin` plus
+#     whitespace (or `plugin` is that whole line and a third line follows);
+#   - `ss-magic plugin` ends a line and the next line starts with a word.
+# A wrapped hit is reported on the line holding `ss-magic`.
+#
+# A wrap counts only when the second line CARRIES ON THE SENTENCE of the first:
+# two lines that merely sit next to each other in the file are not the retired
+# form, and reading them as one would refuse text that names the plugin and
+# then starts something else. The second line carries on when, after its
+# indentation and blockquote `>` markers, it starts with a letter, and none of
+# these block boundaries lies between the two:
+#   - a list marker, a heading, a table row, a rule, a fence or a blank line
+#     on the second line (none starts with a letter, so `- ss-magic` followed
+#     by `- plugin runtime` is two list items, not one command);
+#   - a heading or a table row on the FIRST line: a heading is one line long,
+#     and the line after a table row is the next row;
+#   - a blockquote that starts on the second line (more `>` markers than the
+#     first carries). Fewer is fine: Markdown lets a quoted paragraph continue
+#     on a line without its marker;
+#   - inside a fenced code block, every line is its own statement, so only a
+#     shell `\` at the end of the first line joins the two;
+#   - a second line shaped like a `key:` entry (one token, a colon, then a
+#     blank or the end of the line). That is how the next entry of YAML
+#     frontmatter, or of a YAML file shipped beside a skill, begins, while the
+#     indented continuation of a long `description:` value still joins.
+# An indented (unfenced) code block is read as paragraph text, because telling
+# one from a wrapped list item needs a full Markdown parser. A fence that never
+# closes keeps the fence rule to the end of its file; the link check reports
+# such a fence in every Markdown file it covers.
 #
 # docs/solutions/, CLAUDE.md and the .claude/rules/ files it indexes are in
 # scope too: all are read by agents working in this repo, so a retired command
@@ -124,6 +163,103 @@ require_scope() { # root path...
 # --------------------------------------------------------------------------
 SPELLING_SCOPE="plugin/skills docs/solutions .claude/rules README.md CONTRIBUTING.md CONCEPTS.md CLAUDE.md .cursor/BUGBOT.md"
 
+# Prints `file:line:text` for every line holding the retired spelling, in the
+# shape `grep -nH` prints, so the findings read like the other checks'. The
+# regexes avoid interval expressions and `\b` so BSD awk, mawk and gawk agree.
+SPELLING_AWK='
+    # The text of a line after Markdown block framing: indentation and
+    # blockquote markers. A list marker is left in place on purpose, so a line
+    # that opens a new list item never reads as the rest of a sentence.
+    function body(s) {
+        while (1) {
+            if (s ~ /^[ \t]+/) sub(/^[ \t]+/, "", s)
+            else if (s ~ /^>/) sub(/^>/, "", s)
+            else break
+        }
+        return s
+    }
+    # How many blockquote markers open the line.
+    function qdepth(s,   n) {
+        n = 0
+        while (1) {
+            if (s ~ /^[ \t]+/) sub(/^[ \t]+/, "", s)
+            else if (s ~ /^>/) { sub(/^>/, "", s); n++ }
+            else break
+        }
+        return n
+    }
+    # Whether the line closes the open fence: a run of the opening character at
+    # least as long as the opener, and nothing else (the link check uses the
+    # same rule, so a shorter fence shown inside a longer one is content).
+    function is_closer(s,   n) {
+        sub(/^[ \t]*/, "", s)
+        n = 0
+        while (substr(s, n + 1, 1) == fchar) n++
+        if (n < flen) return 0
+        return substr(s, n + 1) ~ /^[ \t]*$/
+    }
+    # Whether the line (b is its body) carries on the sentence of the line
+    # before it. The p* variables describe that previous line.
+    function continues(line, b) {
+        if (b !~ /^[A-Za-z]/) return 0
+        if (infence) return pbackslash
+        if (phead || prow) return 0
+        if (b ~ /^[A-Za-z0-9_.-]+:([ \t]|$)/) return 0
+        return qdepth(line) <= pquote
+    }
+    FNR == 1 { pend = 0; infence = 0 }
+    {
+        line = $0
+        sub(/\r$/, "", line)
+
+        # A fence line belongs to neither side of a wrap, and changes what
+        # the lines after it are.
+        delim = 0
+        if (infence) {
+            if (is_closer(line)) { infence = 0; delim = 1 }
+        } else {
+            t = line
+            sub(/^[ \t]*/, "", t)
+            c = substr(t, 1, 1)
+            if (c == "`" || c == "~") {
+                n = 0
+                while (substr(t, n + 1, 1) == c) n++
+                if (n >= 3 && !(c == "`" && index(substr(t, n + 1), "`") > 0)) {
+                    infence = 1; fchar = c; flen = n; delim = 1
+                }
+            }
+        }
+
+        # The whole form on one line.
+        hit = 0
+        if (line ~ /ss-magic[ \t]+plugin[ \t]/) {
+            print FILENAME ":" FNR ":" line
+            hit = 1
+        }
+
+        # The form split across lines. pend says how much of it the lines so
+        # far end with: 1 for `ss-magic`, 2 for `ss-magic` + `plugin`. After
+        # `ss-magic plugin` the line wrap is itself the trailing whitespace, so
+        # any word that carries on the sentence completes the form.
+        b = body(line)
+        carry = 0
+        if (pend && !delim && continues(line, b)) {
+            if (pend == 2 || b ~ /^plugin[ \t]/) print FILENAME ":" pendn ":" pendtext " | " b
+            else if (b ~ /^plugin[ \t]*\\?[ \t]*$/) carry = 1
+        }
+
+        if (delim) pend = 0
+        else if (carry) { pend = 2; pendtext = pendtext " | " b }
+        else if (line ~ /ss-magic[ \t]*\\?[ \t]*$/) { pend = 1; pendn = FNR; pendtext = line }
+        else if (!hit && line ~ /ss-magic[ \t]+plugin[ \t]*\\?[ \t]*$/) { pend = 2; pendn = FNR; pendtext = line }
+        else pend = 0
+        pquote = qdepth(line)
+        phead = (b ~ /^#+([ \t]|$)/)
+        prow = (b ~ /^\|/)
+        pbackslash = (line ~ /\\[ \t]*$/)
+    }
+'
+
 check_spelling() { # root
     local root=$1 p existing=""
     require_scope "$root" CLAUDE.md README.md .cursor/BUGBOT.md .claude/rules/ plugin/skills/
@@ -133,7 +269,7 @@ check_spelling() { # root
     [ -n "$existing" ] || return 0
     # Word splitting of $existing is intended: the scope names contain no spaces.
     # shellcheck disable=SC2086
-    (cd "$root" && find -L $existing -type f -exec grep -nHF -- 'ss-magic plugin ' {} +) |
+    (cd "$root" && find -L $existing -type f -exec awk "$SPELLING_AWK" {} +) |
         sed 's/$/ (spell it ss-magic-plugin <verb>)/'
     return 0
 }
@@ -300,7 +436,72 @@ extract_links() { # file
             }
             return out
         }
-        function flush(   s, k, n, parts, line, t) {
+        function skip_blanks(s, i) {
+            while (substr(s, i, 1) == " " || substr(s, i, 1) == "\t") i++
+            return i
+        }
+        # The index of the ")" that closes an inline link whose destination
+        # starts at p (just after the "]("), or 0 when the text there is not a
+        # well-formed inline link. CommonMark lets a destination hold balanced,
+        # unescaped parentheses, so `./docs/a_(b).md` is one destination, and a
+        # `<...>` destination holds anything but `>`.
+        #
+        # What may follow the destination is deliberately STRICT: blanks, then
+        # the closing ")", or blanks, exactly one title (in double quotes, in
+        # single quotes, or in parentheses), blanks and the closing ")". A
+        # looser scan that took the next ")" anywhere on the line would, for a
+        # destination whose own closing parenthesis is missing, run on to the
+        # ")" of a LATER link and swallow that link whole, so a broken link
+        # after `[w](https://example.org/Foo_(bar) and` would go unchecked.
+        # Returning 0 instead hands the text to the caller, which then ends it
+        # at the first ")" and goes on to the links after it.
+        function link_end(s, p,   L, i, j, c, d, depth, closer) {
+            L = length(s)
+            i = skip_blanks(s, p)
+            if (substr(s, i, 1) == "<") {
+                i++
+                while (i <= L && substr(s, i, 1) != ">") {
+                    if (substr(s, i, 1) == "\\") i++
+                    i++
+                }
+                if (i > L) return 0
+                i++
+            } else {
+                depth = 0
+                while (i <= L) {
+                    c = substr(s, i, 1)
+                    if (c == "\\") { i += 2; continue }
+                    if (c == " " || c == "\t") break
+                    if (c == "(") depth++
+                    else if (c == ")") { if (depth == 0) return i; depth-- }
+                    i++
+                }
+                if (depth != 0) return 0
+            }
+            j = skip_blanks(s, i)
+            if (substr(s, j, 1) == ")") return j
+            # A title needs at least one blank between it and the destination.
+            if (j == i) return 0
+            c = substr(s, j, 1)
+            # "\047" is the single quote, which this shell-quoted program
+            # cannot hold literally.
+            if (c == "\"" || c == "\047") closer = c
+            else if (c == "(") closer = ")"
+            else return 0
+            i = j + 1
+            while (i <= L) {
+                d = substr(s, i, 1)
+                if (d == "\\") { i += 2; continue }
+                if (d == closer) break
+                if (c == "(" && d == "(") return 0
+                i++
+            }
+            if (i > L) return 0
+            i = skip_blanks(s, i + 1)
+            if (substr(s, i, 1) == ")") return i
+            return 0
+        }
+        function flush(   s, k, n, parts, line, t, q, e) {
             if (nb == 0) return
             s = buf[1]
             for (k = 2; k <= nb; k++) s = s "\n" buf[k]
@@ -313,9 +514,22 @@ extract_links() { # file
                     print "L\t" bl[k] "\t" t
                     continue
                 }
-                while (match(line, /\]\([^)]*\)/)) {
-                    print "L\t" bl[k] "\t" substr(line, RSTART + 2, RLENGTH - 3)
-                    line = substr(line, RSTART + RLENGTH)
+                while ((q = index(line, "](")) > 0) {
+                    e = link_end(line, q + 2)
+                    if (e > 0) {
+                        print "L\t" bl[k] "\t" substr(line, q + 2, e - q - 2)
+                        line = substr(line, e + 1)
+                    } else if (match(substr(line, q), /^\]\([^)]*\)/)) {
+                        # Not a well-formed link (an unbalanced destination,
+                        # or stray text after it): CommonMark would not make
+                        # this a link, but dropping it would hide a typo from
+                        # the check. It ends at the first ")", the rule this
+                        # check applied to every link before it understood
+                        # parentheses, and the scan resumes right after that
+                        # ")" so the links later on the line are still seen.
+                        print "L\t" bl[k] "\t" substr(line, q + 2, RLENGTH - 3)
+                        line = substr(line, q + RLENGTH)
+                    } else break
                 }
             }
             nb = 0
@@ -673,6 +887,114 @@ MD
     run_guard "$F"
     assert_contains_fixed "$OUT" "FAIL retired subcommand spelling" "a scoped, nested rule is scanned too"
 
+    # The widened spelling: the same retired form with a different gap between
+    # the words. Each variant is appended on its own to a fresh fixture, so a
+    # variant the guard misses cannot hide behind another that it catches.
+    spelling_variant() { # case-name printf-format
+        current_case="retired spelling: $1"
+        fixture spelling-variant
+        # shellcheck disable=SC2059
+        printf -- "$2" >>"$F/.claude/rules/hard.md"
+        run_guard "$F"
+        assert_eq 1 "$CODE" "exits 1"
+        assert_contains_fixed "$OUT" "FAIL retired subcommand spelling" "the spelling guard fails"
+        assert_contains_fixed "$ERR" ".claude/rules/hard.md:" "the detail names the file"
+    }
+    spelling_variant "two spaces" 'Run ss-magic  plugin status now.\n'
+    spelling_variant "a tab" 'Run ss-magic\tplugin\tstatus now.\n'
+    spelling_variant "mixed spaces and a tab" 'Run ss-magic \t plugin  status now.\n'
+    spelling_variant "wrapped after ss-magic" 'Run ss-magic\nplugin status now.\n'
+    spelling_variant "wrapped, indented" 'Run ss-magic\n    plugin status now.\n'
+    spelling_variant "wrapped inside a blockquote" '> Run ss-magic\n> plugin status now.\n'
+    spelling_variant "wrapped inside a list item" '- Run ss-magic\n  plugin status now.\n'
+    spelling_variant "wrapped after a shell continuation" '    ss-magic \\\n      plugin status\n'
+    spelling_variant "wrapped after plugin" 'Run ss-magic plugin\nstatus now.\n'
+    spelling_variant "wrapped after plugin, with a trailing space" 'Run ss-magic plugin \nstatus now.\n'
+    spelling_variant "wrapped after plugin inside a list item" '- Run ss-magic plugin\n  status now.\n'
+    spelling_variant "one word per line" 'Run ss-magic\nplugin\nstatus now.\n'
+    # Markdown lets a quoted paragraph continue on a line without its marker.
+    spelling_variant "a blockquote continued without its marker" '> Run ss-magic\nplugin status now.\n'
+    # Inside a fence a shell continuation is what joins two lines.
+    spelling_variant "a shell continuation inside a fence" '\n```sh\nss-magic \\\n  plugin status\n```\n'
+    spelling_variant "three continued lines inside a fence" '\n```sh\nss-magic\\\nplugin\\\nstatus\n```\n'
+    # BASE's hard.md is three lines long, so the appended `one` is line 4, the
+    # line holding ss-magic is line 5 and its continuation is line 6.
+    spelling_variant "the wrapped detail names the line holding ss-magic" 'one\nRun ss-magic\nplugin status now.\n'
+    assert_contains_fixed "$ERR" ".claude/rules/hard.md:5:Run ss-magic" "the hit is reported on the line holding ss-magic"
+    assert_lacks_fixed "$ERR" ".claude/rules/hard.md:6:" "and not on the continuation line"
+    spelling_variant "the detail for a wrap after plugin names that line too" 'one\nRun ss-magic plugin\nstatus now.\n'
+    assert_contains_fixed "$ERR" ".claude/rules/hard.md:5:Run ss-magic plugin" "the hit is reported on the line holding ss-magic"
+    assert_lacks_fixed "$ERR" ".claude/rules/hard.md:6:" "and not on the continuation line"
+    # CRLF line endings must not hide a wrapped hit.
+    spelling_variant "wrapped with CRLF endings" 'Run ss-magic\r\nplugin status now.\r\n'
+
+    current_case="retired spelling: variants that must stay clean"
+    fixture spelling-controls
+    {
+        printf 'Run ss-magic-plugin status, or ss-magic-plugin  status, or ss-magic-plugin\tstatus.\n'
+        printf 'Wrapped: ss-magic-plugin\nstatus is fine, and so is ss-magic\n-plugin status.\n\n'
+        printf 'The thing named in a sentence: the ss-magic plugin.\n'
+        printf 'Or with a comma: the ss-magic plugin, which ships separately.\n\n'
+        printf 'A paragraph ending in ss-magic\n\nplugin status after a blank line is a new paragraph.\n\n'
+        printf 'A line ending in ss-magic plugin\n\nand a blank line after it.\n\n'
+        printf 'A heading follows the name ss-magic plugin\n# Heading\n\n'
+        printf 'A list follows the name ss-magic plugin\n- status item\n\n'
+        printf 'ss-magic\n- plugin-like item without a verb\n\n'
+        # Two lines that sit next to each other without being one sentence: a
+        # block boundary lies between them, so none of these is the retired
+        # form, and each passed before the guard learned about line wraps.
+        printf 'Two list items:\n\n- ss-magic\n- plugin runtime binary\n\n'
+        printf '1. ss-magic plugin\n2. status of the other binary\n\n'
+        printf '## Installing the ss-magic plugin\nRun the installer first.\n\n'
+        printf '## About ss-magic\nplugin tree layout is described below.\n\n'
+        printf 'This is the ss-magic plugin\n> Note that it ships separately.\n\n'
+        printf 'This is ss-magic\n> plugin tree is quoted here.\n\n'
+        printf '> Quoted: the ss-magic plugin\n> > Nested quote starts here.\n\n'
+        printf '| binary | the ss-magic plugin\nnext | row |\n\n'
+        printf 'A setext heading names the ss-magic plugin\n==========================================\n\n'
+        # Lines of a fenced block are separate statements unless a shell
+        # continuation joins them, including inside a longer fence.
+        printf '```plaintext\nss-magic plugin\nss-magic-plugin status\nss-magic\nplugin tree\n```\n\n'
+        printf '````md\n```sh\nss-magic plugin\n```\nstatus\n````\n\n'
+        # A fence line is on neither side of a wrap, whatever its info string.
+        printf '~~~ ss-magic \\\nplugin status is the first line of this block\n~~~\n\n'
+        # YAML entries outside frontmatter, as a YAML file in scope holds them.
+        printf 'description: Scratchpad for the ss-magic plugin\nallowed-tools: Bash\n\n'
+        printf 'Only ss-magic at the end of this file\n'
+    } >>"$F/.claude/rules/hard.md"
+    # YAML frontmatter: each `key:` line is its own entry, nested or not, and
+    # the closing `---` ends the last one.
+    {
+        printf -- '---\ndescription: Scratchpad for the ss-magic plugin\nallowed-tools: Bash\n'
+        printf 'metadata:\n  summary: the ss-magic plugin\n  version: 1\n  tool: ss-magic\n  plugin: true\n'
+        printf 'name: the ss-magic plugin\n---\nBody text starts here.\n'
+    } >"$F/plugin/skills/demo/reference.md"
+    run_guard "$F"
+    assert_eq 0 "$CODE" "exits 0"
+    assert_contains_fixed "$OUT" "ok   retired subcommand spelling" "none of them is the retired verb form"
+    assert_empty_file "$ERR" "nothing on stderr"
+
+    current_case="retired spelling: wrapped inside a frontmatter value"
+    fixture spelling-frontmatter
+    printf -- '---\nname: demo\ndescription: Use it to run ss-magic\n  plugin status before anything else.\n---\nBody.\n' \
+        >"$F/plugin/skills/demo/reference.md"
+    run_guard "$F"
+    assert_eq 1 "$CODE" "exits 1"
+    assert_contains_fixed "$OUT" "FAIL retired subcommand spelling" "an indented continuation of a value still joins"
+    assert_contains_fixed "$ERR" "plugin/skills/demo/reference.md:3:description: Use it to run ss-magic" "the detail names the line holding ss-magic"
+
+    current_case="retired spelling: a fence that has closed no longer separates lines"
+    fixture spelling-after-fence
+    printf '\n```sh\ntrue\n```\n\nRun ss-magic\nplugin status now.\n' >>"$F/.claude/rules/hard.md"
+    run_guard "$F"
+    assert_contains_fixed "$OUT" "FAIL retired subcommand spelling" "paragraph wraps after a closed fence are joined again"
+
+    current_case="retired spelling: the prose the check has always refused"
+    fixture spelling-prose
+    printf 'The ss-magic plugin is installed.\n' >>"$F/.claude/rules/hard.md"
+    run_guard "$F"
+    assert_contains_fixed "$OUT" "FAIL retired subcommand spelling" "a space after plugin is the trigger, whatever follows"
+
     # ======================================================================
     current_case="CLAUDE_PLUGIN_DATA in a skill body"
     fixture plugin-data
@@ -737,6 +1059,67 @@ MD
     run_guard "$F"
     assert_eq 0 "$CODE" "exits 0"
     assert_contains_fixed "$OUT" "ok   relative links resolve" "the anchor is stripped before resolving"
+
+    current_case="a destination with balanced parentheses that exists"
+    fixture link-parens-ok
+    printf '# Notes\n' >"$F/docs/a_(b).md"
+    printf '# Nested\n' >"$F/docs/c_(d_(e)).md"
+    {
+        printf 'See [notes](./docs/a_(b).md), [more](./docs/a_(b).md#top "title (x)") and [deep](./docs/c_(d_(e)).md) (an aside).\n'
+        printf 'Angle form [spaced](<./docs/a_(b).md>) and an image ![alt](./docs/a_(b).md).\n'
+        printf 'Prose in parentheses after a link: [r](./README.md) (see above), and [s](./README.md)(no gap).\n'
+    } >>"$F/CONTRIBUTING.md"
+    run_guard "$F"
+    assert_eq 0 "$CODE" "exits 0"
+    assert_contains_fixed "$OUT" "ok   relative links resolve" "the whole parenthesised destination is resolved"
+
+    current_case="a destination with balanced parentheses that is missing"
+    fixture link-parens-missing
+    printf 'See [notes](./docs/nope_(b).md) and [ok](./README.md) (an aside) and [g](./gone.md) (aside).\n' >>"$F/CONTRIBUTING.md"
+    run_guard "$F"
+    assert_eq 1 "$CODE" "exits 1"
+    assert_contains_fixed "$OUT" "FAIL relative links resolve" "the link guard fails"
+    assert_contains_fixed "$ERR" "CONTRIBUTING.md:4: ./docs/nope_(b).md (no such file)" "the target is reported whole, parentheses included"
+    assert_contains_fixed "$ERR" "CONTRIBUTING.md:4: ./gone.md (no such file)" "a link before prose in parentheses stops at its own paren"
+    assert_lacks_fixed "$ERR" "README.md (no such file)" "the existing link on the same line is fine"
+
+    current_case="a destination with an unbalanced parenthesis"
+    fixture link-parens-unbalanced
+    printf 'See [x](./docs/odd_(b.md) here.\n' >>"$F/CONTRIBUTING.md"
+    run_guard "$F"
+    assert_contains_fixed "$OUT" "FAIL relative links resolve" "it is still checked rather than silently skipped"
+    assert_contains_fixed "$ERR" "./docs/odd_(b.md (no such file)" "up to the first closing parenthesis, as before"
+
+    # A destination that opens a parenthesis and never closes its own link
+    # must not run on to the ")" of the next link and swallow it. With an
+    # absolute URL in front the swallowed text is skipped as a URL, so the
+    # broken link behind it would pass without a word.
+    current_case="an unclosed destination before a later link"
+    fixture link-parens-swallow
+    {
+        printf 'See [w](https://en.wikipedia.org/wiki/Foo_(bar) and [b](./gone8.md).\n'
+        printf 'See [x](./docs/odd_(b.md) and [y](./gone9.md) here.\n'
+        printf 'See [z](./README.md "title" stray) and [v](./gone10.md).\n'
+    } >>"$F/CONTRIBUTING.md"
+    run_guard "$F"
+    assert_eq 1 "$CODE" "exits 1"
+    assert_contains_fixed "$OUT" "FAIL relative links resolve" "the link guard fails"
+    assert_contains_fixed "$ERR" "CONTRIBUTING.md:4: ./gone8.md (no such file)" "the link after an unclosed URL is still checked"
+    assert_contains_fixed "$ERR" "CONTRIBUTING.md:5: ./docs/odd_(b.md (no such file)" "the unclosed destination ends at the first closing parenthesis"
+    assert_contains_fixed "$ERR" "CONTRIBUTING.md:5: ./gone9.md (no such file)" "and the link after it is still checked"
+    assert_contains_fixed "$ERR" "CONTRIBUTING.md:6: ./gone10.md (no such file)" "stray text after a title does not swallow the next link"
+    assert_lacks_fixed "$ERR" "README.md" "the existing target before the stray text is fine"
+
+    current_case="every title form after a destination"
+    fixture link-titles
+    printf '# Notes\n' >"$F/docs/a_(b).md"
+    {
+        printf 'Titles: [d](./README.md "double (x)"), [s](./docs/a_(b).md '"'"'single (y)'"'"') and [p](./docs/a_(b).md (in parentheses)).\n'
+        printf 'Escapes: [e](./README.md "a \\" quote )") then [m](./gone11.md '"'"'t (z)'"'"').\n'
+    } >>"$F/CONTRIBUTING.md"
+    run_guard "$F"
+    assert_contains_fixed "$ERR" "CONTRIBUTING.md:5: ./gone11.md (no such file)" "a link after titles holding parentheses is checked"
+    assert_eq 1 "$(grep -c 'relative links resolve:' "$ERR")" "and it is the only finding"
 
     current_case="a broken link in a plan"
     # BASE's plan already links ./gone.md; this case documents that it is
