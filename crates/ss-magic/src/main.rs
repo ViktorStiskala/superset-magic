@@ -344,7 +344,9 @@ fn orca_core(cwd: &Path) -> std::result::Result<Vec<orca::write::Notice>, ExitCo
     if cfg.shared_directories.is_none() {
         notices.push(Notice {
             level: Level::Info,
-            text: "magic.json has no `sharedDirectories` yet, so no directories are shared                    with Orca worktrees. Run `ss-magic` in the main checkout and pick                    \"Edit synced files\" to choose them."
+            text: "magic.json has no `sharedDirectories` yet, so no directories are shared \
+                   with Orca worktrees. Run `ss-magic` in the main checkout and pick \
+                   \"Edit synced files\" to choose them."
                 .to_string(),
         });
     }
@@ -537,7 +539,8 @@ fn orca_skip_filter(main_root: &Path, cwd_root: &Path) -> PathFilter {
             eprintln!(
                 "{}",
                 tui::style::warn(format!(
-                    "Orca: the main checkout's `.worktreeinclude` was not used because {why};                      nothing is skipped."
+                    "Orca: the main checkout's `.worktreeinclude` was not used because {why}; \
+                     nothing is skipped."
                 ))
             );
             PathFilter::empty()

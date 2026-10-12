@@ -231,6 +231,7 @@ fn more_files_than_orcas_limit_are_capped_after_counting_the_hand_lines() {
     let warning = overflow_warning(&snap).unwrap();
     assert!(warning.contains("105 matching files were left out"), "{warning}");
     assert!(warning.contains("ss-magic's own sync"), "{warning}");
+    assert!(!warning.contains("  "), "one tidy sentence: {warning:?}");
 
     // The rendered file stays inside both of Orca's limits.
     let rendered = doc.render(&snap.entries);

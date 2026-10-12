@@ -129,6 +129,7 @@ fn the_refresh_is_skipped_when_the_file_is_not_gitignored() {
         panic!("expected a skip, got {outcome:?}");
     };
     assert!(why.contains("does not gitignore"), "{why}");
+    assert!(!why.contains("  "), "one tidy sentence: {why:?}");
     assert!(why.contains("ss-magic orca"), "the notice says how to set it up: {why}");
     assert!(!main.path().join(worktreeinclude::FILE_NAME).exists());
 }
@@ -149,6 +150,7 @@ fn the_refresh_is_skipped_when_the_file_is_tracked() {
         panic!("expected a skip, got {outcome:?}");
     };
     assert!(why.contains("tracked by git"), "{why}");
+    assert!(!why.contains("  "), "one tidy sentence: {why:?}");
     assert_eq!(include_text(main.path()), "committed/by-hand\n");
 }
 
@@ -176,6 +178,7 @@ fn the_refresh_never_rewrites_a_file_it_cannot_read() {
     let outcome = refresh_snapshot(main.path(), &strings(&[".env"]));
 
     assert!(matches!(&outcome, SnapshotRefresh::Skipped(why) if why.contains("UTF-8")));
+    assert!(matches!(&outcome, SnapshotRefresh::Skipped(why) if !why.contains("  ")));
     assert_eq!(fs::read(main.path().join(worktreeinclude::FILE_NAME)).unwrap(), bytes);
 }
 

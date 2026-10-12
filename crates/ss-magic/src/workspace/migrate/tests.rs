@@ -952,6 +952,21 @@ fn orca_dirs(root: &Path) -> Vec<String> {
     crate::orca::orca_yaml::shared_directories(&read_text(root, "orca.yaml"))
 }
 
+/// Every notice the Orca write path returns is one tidy sentence. A run of
+/// spaces means a string literal lost its line continuation and swallowed its
+/// own indentation; only the block shown to add by hand is indented on purpose.
+fn assert_tidy(notices: &[Notice]) {
+    for notice in notices {
+        if !notice.text.contains("add this to orca.yaml") {
+            assert!(
+                !notice.text.contains("  "),
+                "a notice carries a run of spaces: {:?}",
+                notice.text
+            );
+        }
+    }
+}
+
 fn orca_setup_has_the_line(root: &Path) -> bool {
     crate::orca::orca_yaml::has_setup_line(&read_text(root, "orca.yaml"))
 }
@@ -1083,6 +1098,7 @@ fn ae9_an_uneditable_orca_yaml_is_left_alone_and_everything_else_is_written() {
     // What the operation tells the person about it.
     let notices = orca_write::plan(repo.path(), &[], &[], SetupPolicy::Ensure).apply(repo.path());
     assert_eq!(read_text(repo.path(), "orca.yaml"), original);
+    assert_tidy(&notices);
     let text: String = notices.iter().map(|n| format!("{}\n", n.text)).collect();
     assert!(text.contains("orca.yaml was not changed"), "{text}");
     assert!(text.contains("flow mapping"), "{text}");
@@ -1145,6 +1161,7 @@ fn a_non_utf8_worktreeinclude_is_left_untouched_with_a_notice() {
     assert!(repo.path().join("orca.yaml").is_file());
     let notices = orca_write::plan(repo.path(), &[], &[], SetupPolicy::Ensure).apply(repo.path());
     assert_eq!(fs::read(repo.path().join(worktreeinclude::FILE_NAME)).unwrap(), bytes);
+    assert_tidy(&notices);
     assert!(
         notices
             .iter()
@@ -1232,6 +1249,7 @@ fn a_tracked_worktreeinclude_gets_its_section_but_no_ignore_rule() {
             .any(|l| l == worktreeinclude::FILE_NAME),
         "still no ignore rule after a second write"
     );
+    assert_tidy(&notices);
     assert!(
         notices.iter().any(|n| n.text.contains("tracked by git")),
         "{notices:?}"

@@ -455,7 +455,21 @@ fn store_shared(main: &Path, shared: &[&str]) {
 }
 
 fn refresh(cwd: &Path) -> Vec<Notice> {
-    orca_core(cwd).unwrap_or_else(|_| panic!("the refresh must not be a hard error"))
+    let notices =
+        orca_core(cwd).unwrap_or_else(|_| panic!("the refresh must not be a hard error"));
+    // Every notice is one tidy sentence. A run of spaces means a string literal
+    // lost its line continuation and swallowed its own indentation; the only
+    // text allowed to be indented is the block shown to add by hand.
+    for notice in &notices {
+        if !notice.text.contains("add this to orca.yaml") {
+            assert!(
+                !notice.text.contains("  "),
+                "a notice carries a run of spaces: {:?}",
+                notice.text
+            );
+        }
+    }
+    notices
 }
 
 fn shared_in(main: &Path) -> Vec<String> {

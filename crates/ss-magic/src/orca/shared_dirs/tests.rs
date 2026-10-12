@@ -144,6 +144,7 @@ fn more_than_orcas_limit_keeps_the_first_hundred_sorted_and_warns() {
         warning.contains("20 matching directories will not be shared"),
         "{warning}"
     );
+    assert!(!warning.contains("  "), "one tidy sentence: {warning:?}");
 }
 
 /// A submodule's directories belong to another repository, and a path inside
