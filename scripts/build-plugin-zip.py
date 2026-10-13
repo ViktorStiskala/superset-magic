@@ -650,7 +650,7 @@ def _declared_dependency_names(text: str) -> set[str]:
 
     Line-oriented rather than a TOML parse (`tomllib` is 3.11+). Comments are
     skipped -- which matters here, because the plugin manifest's own comment names
-    every forbidden crate in prose. Renames (`foo = { package = "bar" }`) are
+    forbidden crates in prose. Renames (`foo = { package = "bar" }`) are
     resolved to the real crate name, since the whole point is that the crate is
     not linked in, whatever it is called locally. Hyphens are folded to
     underscores so `self-update` and `self_update` are one name.

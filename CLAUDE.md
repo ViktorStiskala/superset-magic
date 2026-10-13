@@ -536,13 +536,17 @@ The modules, by purpose:
   `.gitignore` and `orca.yaml`, NEVER the per-machine `.worktreeinclude`. All
   three write paths (`run_migrate`, `run_init`,
   `run_init_noninteractive`) call `ensure_bootstrap_gitignores`, which gitignores
-  BOTH `magic.local.json` (a `gitignore::ensure_path_ignored` `File` rule) AND
-  the tool's `.superset/backups/` tree (via `reverse_sync::ensure_backups_ignored`,
-  the same `Dir` rule the first sync would otherwise add lazily) at the closest
-  existing `.gitignore` (or the git-root file) – git-tolerant, so each degrades to
-  a literal append in the non-git test tempdirs. Ignoring backups up front means
-  a fresh `ss-magic init` protects the backup tree before any secret bytes are
-  ever backed up.
+  THREE things: `magic.local.json` (a `gitignore::ensure_path_ignored` `File`
+  rule), the tool's `.superset/backups/` tree (via
+  `reverse_sync::ensure_backups_ignored`, the same `Dir` rule the first sync
+  would otherwise add lazily) and the plugin's `.superset/.magic/` state tree
+  (via core's `state_tree::ensure_state_ignored`, that rule's one owner) – each
+  at the closest existing `.gitignore` (or the git-root file), and git-tolerant,
+  so each degrades to a literal append in the non-git test tempdirs. Ignoring
+  backups up front means a fresh `ss-magic init` protects the backup tree before
+  any secret bytes are ever backed up. A fourth rule, for `.worktreeinclude`, is
+  NOT written by this helper: `orca::write::Plan::apply` adds it afterwards, and
+  only when the plan found that file untracked.
 - `sync/reverse_sync.rs` — the sync engine: reconcile the configured files
   between a worktree and main, safely, in BOTH directions. Three entry points.
   `run` is the interactive unified Sync cockpit (the worktree menu's single

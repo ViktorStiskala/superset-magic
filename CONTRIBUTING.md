@@ -204,7 +204,7 @@ A few boundaries to preserve:
 - The Orca snapshot lists a file only when git positively reports it ignored
   and untracked, and never lists a directory. The end-of-sync refresh writes
   only `.worktreeinclude`, only when git reports that file untracked and
-  ignored, and never changes the sync's exit status.
+  ignored, never through a symlink, and never changes the sync's exit status.
 - Do not reintroduce a `plugin` subcommand on the `ss-magic` CLI, in any form.
   It was removed outright; a compatibility alias would put the plugin's verbs
   back inside the binary that self-updates and opens a menu.

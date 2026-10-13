@@ -911,8 +911,9 @@ link to a file the person owns elsewhere. Writing through an in-repo link is
 what THIS path does, because a person ran the command; the automatic refresh
 above writes through no symlink at all, and the two must not be made alike in
 either direction. Flag an Orca write that skips the containment check, that
-stages `.worktreeinclude`, that computes the snapshot before the tree
-materializes, or a fourth inline copy of the write sequence instead of
+stages `.worktreeinclude`, that recomputes the snapshot inside `apply` (after
+the tree materializes, so the written file can differ from what the prompt
+described), or a fourth inline copy of the write sequence instead of
 `plan`/`apply`.
 
 ## The Claude Code Plugin (`crates/ss-magic-plugin/`, `plugin/`, `scripts/`)
@@ -1607,7 +1608,21 @@ documentation or a status report that claims `file-changed` is active
   code that writes `setup_config.json`.
 - Malformed `magic.json` / `magic.local.json` / `config.json` must be a HARD
   error with a non-zero exit that names the offending path — never a silent
-  fallback to empty/default. Flag a config read that swallows a parse error.
+  fallback to empty/default. That holds wherever the overlaid config decides
+  what is copied or archived: `sync`, `reverse-sync`, `pack`, `ss-magic orca`
+  and the Sync cockpit all load it through `load_overlaid` and stop on a parse
+  error. There is ONE exception, and it is never silent:
+  `migrate::overlaid_patterns`, which init, edit config and migrate call only
+  to plan the list of files handed to Orca. A `magic.local.json` that cannot be
+  read or parsed contributes no patterns there and yields a warning that every
+  call site prints to stderr (`warn_overlay`); the command carries on with its
+  usual exit status and never rewrites the overlay. Those commands did not
+  parse the per-machine overlay before the Orca output existed, so a broken one
+  must not stop them, and leaving its patterns out of `.worktreeinclude` is
+  safe because forward sync still copies those files. Flag a config read that
+  swallows a parse error anywhere else, an `overlaid_patterns` that drops the
+  warning or fails the command again, and a call site that does not print the
+  warning.
 
 ## `magic.sh` Source of Truth
 

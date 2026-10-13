@@ -140,7 +140,7 @@ fn overlaid_patterns(repo_root: &Path, files: &[String]) -> (Vec<String>, Option
         Err(e) => {
             let warning = format!(
                 ".superset/magic.local.json could not be read ({e:#}); its patterns are \
-left out of the files listed for Orca until it is fixed."
+                 left out of the files listed for Orca until it is fixed."
             );
             (patterns, Some(warning))
         }
