@@ -363,3 +363,354 @@ fn the_refresh_reads_orca_yaml_for_shared_directories_and_never_writes_it() {
     );
     assert_eq!(fs::read_to_string(main.path().join(ORCA_YAML)).unwrap(), yaml);
 }
+
+// --- the plan made before the prompt, and its apply after it ---------------
+
+/// A main checkout that ignores `.env` but has no rule for `.worktreeinclude`
+/// yet, with one ignored secret for the snapshot to list – a repository as it
+/// is before its first init.
+fn main_without_rule() -> tempfile::TempDir {
+    let main = init_main_repo("main");
+    write_file(main.path(), ".gitignore", ".env\n");
+    git_run(&["add", ".gitignore"], main.path());
+    git_run(&["commit", "-q", "-m", "ignore"], main.path());
+    write_file(main.path(), ".env", "S=1\n");
+    main
+}
+
+fn yaml_text(root: &Path) -> String {
+    fs::read_to_string(root.join(ORCA_YAML)).unwrap()
+}
+
+/// Whether `.gitignore` carries a rule naming `.worktreeinclude`.
+fn include_is_gitignored(root: &Path) -> bool {
+    fs::read_to_string(root.join(".gitignore"))
+        .unwrap()
+        .lines()
+        .any(|line| line == worktreeinclude::FILE_NAME)
+}
+
+/// Whether some warning holds `needle`.
+fn warns(notices: &[Notice], needle: &str) -> bool {
+    notices
+        .iter()
+        .any(|notice| notice.level == Level::Warn && notice.text.contains(needle))
+}
+
+/// Every notice is one tidy sentence: a run of spaces means a string literal
+/// lost its line continuation and swallowed its own indentation.
+fn assert_tidy(notices: &[Notice]) {
+    for notice in notices {
+        assert!(
+            !notice.text.contains("  "),
+            "a notice carries a run of spaces: {:?}",
+            notice.text
+        );
+    }
+}
+
+/// With nothing changed between the plan and its apply, both files are written
+/// exactly as planned, around the lines that were already there, and nothing
+/// is reported as left alone.
+#[test]
+fn apply_writes_both_files_when_nothing_changed_since_the_plan() {
+    let main = main_with_rule();
+    write_file(main.path(), ".env", "S=1\n");
+    write_file(main.path(), ORCA_YAML, "# ours\ndefaultTabs: []\n");
+    write_file(main.path(), worktreeinclude::FILE_NAME, "# mine\nsecrets/local.pem\n");
+    let patterns = strings(&[".env"]);
+
+    let planned = plan(main.path(), &patterns, &[], SetupPolicy::Ensure);
+    let notices = planned.apply(main.path());
+
+    assert!(
+        notices.iter().all(|notice| notice.level != Level::Warn),
+        "{notices:?}"
+    );
+    let yaml = yaml_text(main.path());
+    assert!(yaml.starts_with("# ours\ndefaultTabs: []\n"), "{yaml}");
+    assert!(orca_yaml::has_setup_line(&yaml), "{yaml}");
+    let include = include_text(main.path());
+    assert!(include.starts_with("# mine\nsecrets/local.pem\n"), "{include}");
+    assert_eq!(
+        worktreeinclude::entries(&include),
+        strings(&["secrets/local.pem", ".env"])
+    );
+    // A second plan finds both files in step with the checkout.
+    assert_eq!(
+        plan(main.path(), &patterns, &[], SetupPolicy::Ensure).summary_lines(),
+        vec![
+            "Keep orca.yaml (already up to date)".to_string(),
+            "Keep .worktreeinclude (already up to date, 1 file for Orca to copy) + add it to \
+             .gitignore"
+                .to_string(),
+        ]
+    );
+}
+
+/// The planned `orca.yaml` text was computed from the file as it was BEFORE the
+/// finishing prompt. A key and a comment someone adds while the prompt is open
+/// are not in it, so writing it would silently drop them. `apply` reads the
+/// file again, sees it is no longer what the plan started from, and leaves it
+/// byte for byte as the edit left it.
+#[test]
+fn apply_leaves_an_orca_yaml_edited_after_the_plan_untouched() {
+    let main = main_with_rule();
+    write_file(main.path(), ORCA_YAML, "# ours\nscripts:\n  setup: pnpm install\n");
+    let planned = plan(main.path(), &[], &[], SetupPolicy::Ensure);
+    assert!(
+        planned.summary_lines()[0].starts_with("Update orca.yaml"),
+        "{:?}",
+        planned.summary_lines()
+    );
+
+    // The prompt is open, and the file is edited in another window.
+    let edited = "# ours\nscripts:\n  setup: pnpm install\n# added while the prompt was open\n\
+                  defaultTabs:\n  - title: dev\n    command: pnpm dev\n";
+    write_file(main.path(), ORCA_YAML, edited);
+
+    let notices = planned.apply(main.path());
+
+    assert_eq!(
+        yaml_text(main.path()),
+        edited,
+        "the key and the comment added during the prompt must survive"
+    );
+    assert!(
+        warns(&notices, "orca.yaml was not changed: it changed on disk"),
+        "{notices:?}"
+    );
+    assert!(warns(&notices, "would discard that change"), "{notices:?}");
+    assert!(warns(&notices, "Run the command again"), "{notices:?}");
+    assert!(
+        !notices.iter().any(|notice| notice.text.contains("Updated orca.yaml")),
+        "nothing may claim the file was written: {notices:?}"
+    );
+    assert_tidy(&notices);
+}
+
+/// The plan found no `orca.yaml` and meant to create one. A file written by
+/// hand while the prompt is open is somebody's work, not a blank to fill in.
+#[test]
+fn apply_leaves_an_orca_yaml_created_after_the_plan_alone() {
+    let main = main_with_rule();
+    let planned = plan(main.path(), &[], &[], SetupPolicy::Ensure);
+    assert!(
+        planned.summary_lines()[0].starts_with("Create orca.yaml"),
+        "{:?}",
+        planned.summary_lines()
+    );
+
+    let by_hand = "# written by hand while the prompt was open\ndefaultTabs: []\n";
+    write_file(main.path(), ORCA_YAML, by_hand);
+
+    let notices = planned.apply(main.path());
+
+    assert_eq!(yaml_text(main.path()), by_hand);
+    assert!(
+        warns(&notices, "orca.yaml was not changed: it was created on disk"),
+        "{notices:?}"
+    );
+    assert!(
+        !notices.iter().any(|notice| notice.text.contains("Created orca.yaml")),
+        "{notices:?}"
+    );
+    assert_tidy(&notices);
+}
+
+/// The mirror case: a file the plan read and that was deleted while the prompt
+/// was open is not brought back.
+#[test]
+fn apply_does_not_bring_back_an_orca_yaml_removed_after_the_plan() {
+    let main = main_with_rule();
+    write_file(main.path(), ORCA_YAML, "defaultTabs: []\n");
+    let planned = plan(main.path(), &[], &[], SetupPolicy::Ensure);
+
+    fs::remove_file(main.path().join(ORCA_YAML)).unwrap();
+
+    let notices = planned.apply(main.path());
+
+    assert!(!main.path().join(ORCA_YAML).exists());
+    assert!(
+        warns(&notices, "orca.yaml was not changed: it was removed from disk"),
+        "{notices:?}"
+    );
+    assert_tidy(&notices);
+}
+
+/// The unknown answer is the refusing one. When the file cannot be read again
+/// nobody can say it is still what the plan started from, so that counts as
+/// changed. A directory where the file should be makes the read fail with
+/// something other than "not found".
+#[test]
+fn apply_treats_an_orca_yaml_it_cannot_read_again_as_changed() {
+    let main = main_with_rule();
+    let planned = plan(main.path(), &[], &[], SetupPolicy::Ensure);
+
+    fs::create_dir(main.path().join(ORCA_YAML)).unwrap();
+
+    let notices = planned.apply(main.path());
+
+    assert!(main.path().join(ORCA_YAML).is_dir());
+    assert!(
+        warns(&notices, "orca.yaml was not changed: it could not be read again"),
+        "{notices:?}"
+    );
+    assert_tidy(&notices);
+}
+
+/// The planned `.worktreeinclude` was rendered around the hand-written lines
+/// as they were before the prompt. A line added while it is open survives:
+/// the file is left untouched and a warning says so and names what refreshes
+/// it. The ignore rule is still added, and `orca.yaml` – which did not change
+/// – is still written.
+#[test]
+fn apply_leaves_a_worktreeinclude_edited_after_the_plan_untouched() {
+    let main = main_without_rule();
+    let name = worktreeinclude::FILE_NAME;
+    write_file(main.path(), name, "# mine\nsecrets/local.pem\n");
+    let planned = plan(main.path(), &strings(&[".env"]), &[], SetupPolicy::Ensure);
+    assert_eq!(
+        planned.summary_lines()[1],
+        "Write .worktreeinclude (1 file for Orca to copy) + add it to .gitignore"
+    );
+
+    let edited = "# mine\nsecrets/local.pem\ncerts/dev.key\n";
+    write_file(main.path(), name, edited);
+
+    let notices = planned.apply(main.path());
+
+    assert_eq!(
+        include_text(main.path()),
+        edited,
+        "the line added during the prompt must survive"
+    );
+    assert!(
+        warns(&notices, ".worktreeinclude was left untouched because it changed on disk"),
+        "{notices:?}"
+    );
+    assert!(
+        warns(&notices, "`ss-magic orca`"),
+        "the notice names what refreshes the file: {notices:?}"
+    );
+    assert!(
+        !notices.iter().any(|notice| notice.text.contains("Wrote .worktreeinclude")),
+        "nothing may claim the file was written: {notices:?}"
+    );
+    assert!(
+        include_is_gitignored(main.path()),
+        "the ignore rule is added even though the write was skipped"
+    );
+    assert!(
+        orca_yaml::has_setup_line(&yaml_text(main.path())),
+        "orca.yaml did not change during the prompt, so it is written as planned"
+    );
+    assert_tidy(&notices);
+}
+
+/// The plan found no `.worktreeinclude`. One written by hand while the prompt
+/// is open holds lines the planned text knows nothing about.
+#[test]
+fn apply_leaves_a_worktreeinclude_created_after_the_plan_alone() {
+    let main = main_without_rule();
+    let planned = plan(main.path(), &strings(&[".env"]), &[], SetupPolicy::Ensure);
+
+    let by_hand = "# mine\nsecrets/local.pem\n";
+    write_file(main.path(), worktreeinclude::FILE_NAME, by_hand);
+
+    let notices = planned.apply(main.path());
+
+    assert_eq!(include_text(main.path()), by_hand);
+    assert!(
+        warns(&notices, ".worktreeinclude was left untouched because it was created on disk"),
+        "{notices:?}"
+    );
+    assert!(include_is_gitignored(main.path()));
+    assert_tidy(&notices);
+}
+
+/// The "This will:" list is what the person confirms, so it may promise the
+/// ignore rule only when the rule will be added. A rule cannot ignore a file
+/// git tracks, so for a tracked `.worktreeinclude` the list says that in place
+/// of the promise, and `apply` adds none.
+#[test]
+fn the_summary_promises_an_ignore_rule_only_for_an_untracked_worktreeinclude() {
+    let main = main_without_rule();
+    let root = main.path();
+    let name = worktreeinclude::FILE_NAME;
+    let patterns = strings(&[".env"]);
+    let include_line =
+        |root: &Path| plan(root, &patterns, &[], SetupPolicy::Ensure).summary_lines()[1].clone();
+
+    // Untracked: the wording is the one the list always had.
+    write_file(root, name, "by/hand.pem\n");
+    assert_eq!(
+        include_line(root),
+        "Write .worktreeinclude (1 file for Orca to copy) + add it to .gitignore"
+    );
+
+    // Tracked: no promise of a rule, and the reason in its place.
+    git_run(&["add", name], root);
+    git_run(&["commit", "-q", "-m", "track the list"], root);
+    let planned = plan(root, &patterns, &[], SetupPolicy::Ensure);
+    assert_eq!(
+        planned.summary_lines()[1],
+        "Write .worktreeinclude (1 file for Orca to copy); it is tracked by git, so no ignore \
+         rule is added"
+    );
+
+    let notices = planned.apply(root);
+
+    assert!(!include_is_gitignored(root), "no rule may be added for a tracked file");
+    assert_eq!(
+        worktreeinclude::entries(&include_text(root)),
+        strings(&["by/hand.pem", ".env"]),
+        "the section is still written"
+    );
+    assert!(
+        notices.iter().any(|notice| notice.text.contains("tracked by git")),
+        "{notices:?}"
+    );
+    assert_tidy(&notices);
+
+    // The same holds once the file is in step and is only kept.
+    assert_eq!(
+        include_line(root),
+        "Keep .worktreeinclude (already up to date, 1 file for Orca to copy); it is tracked by \
+         git, so no ignore rule is added"
+    );
+}
+
+/// `apply` acts on the tracked status the plan recorded and does not ask git a
+/// second time. The step the person confirmed is therefore the step that
+/// happens, even when the answer would be different by now: here the list is
+/// staged while the prompt is open, and the rule the summary promised is still
+/// added.
+#[test]
+fn apply_follows_the_tracked_status_the_plan_recorded() {
+    let main = main_without_rule();
+    let root = main.path();
+    let name = worktreeinclude::FILE_NAME;
+    write_file(root, name, "by/hand.pem\n");
+    let planned = plan(root, &strings(&[".env"]), &[], SetupPolicy::Ensure);
+    assert!(
+        planned.summary_lines()[1].ends_with("+ add it to .gitignore"),
+        "{:?}",
+        planned.summary_lines()
+    );
+
+    // Staging the file changes what git would answer, and not one of its bytes.
+    git_run(&["add", name], root);
+
+    let notices = planned.apply(root);
+
+    assert!(include_is_gitignored(root), "the summary promised the rule");
+    assert!(
+        !notices.iter().any(|notice| notice.text.contains("tracked by git")),
+        "{notices:?}"
+    );
+    assert_eq!(
+        worktreeinclude::entries(&include_text(root)),
+        strings(&["by/hand.pem", ".env"])
+    );
+}

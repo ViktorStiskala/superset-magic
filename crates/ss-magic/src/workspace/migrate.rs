@@ -455,8 +455,9 @@ fn materialize_migration(
     ensure_bootstrap_gitignores(repo_root)?;
     clear_legacy_skills_install();
 
-    // The Orca files come last, written exactly as they were planned before
-    // the prompt.
+    // The Orca files come last, written as they were planned before the
+    // prompt. A file that changed on disk since the plan read it is left alone
+    // with a warning, since the planned text would discard that change.
     Ok(orca_plan.apply(repo_root))
 }
 
@@ -701,8 +702,9 @@ fn materialize_init(
     ensure_bootstrap_gitignores(repo_root)?;
     clear_legacy_skills_install();
 
-    // The Orca files come last, written exactly as they were planned before
-    // the prompt.
+    // The Orca files come last, written as they were planned before the
+    // prompt. A file that changed on disk since the plan read it is left alone
+    // with a warning, since the planned text would discard that change.
     Ok(InitWritten {
         had_local,
         orca_notices: orca_plan.apply(repo_root),

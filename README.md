@@ -338,13 +338,24 @@ the repository root. Interactive init and edit config ask which dependency
 directories Orca should share, with each pattern's current matches shown next
 to it; migration and the scripted init keep a stored choice and otherwise take
 every kind they detect. The summary shown before the finishing action says
-whether `orca.yaml` will be created, updated, or cannot be edited.
+whether `orca.yaml` will be created, updated, or cannot be edited, how many
+files `.worktreeinclude` will list, and whether that file is added to
+`.gitignore` – a file git already tracks gets no rule, and the summary says so
+instead of promising one.
+
+The Orca files are worked out before that prompt and written after it. If
+`orca.yaml` or `.worktreeinclude` changes on disk while the prompt is open –
+you add a key, a comment or a line of your own, or create or delete the file –
+ss-magic does not write its prepared version over yours. It leaves that file
+exactly as it is, says so in a warning, and still writes everything else. Run
+the command again to update `orca.yaml`, or `ss-magic orca` to refresh
+`.worktreeinclude`.
 
 Init and migration both gitignore three things up front: the per-machine
 `magic.local.json` overlay, the tool's `.superset/backups/` tree (where a
 sync stores the bytes it overwrites, which can include recovered secrets), so
 the backup tree is protected before the first sync ever writes to it, and the
-per-machine `.worktreeinclude` snapshot. Both flows
+per-machine `.worktreeinclude` snapshot (unless git tracks that file). Both flows
 preserve `config.json`'s `teardown` and `run` arrays verbatim. All
 changes are staged into a tempdir and materialized only after the
 finishing-action prompt returns a non-cancel choice, so picking "done" or

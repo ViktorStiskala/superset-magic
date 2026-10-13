@@ -508,8 +508,11 @@ The modules, by purpose:
   gated by auto-update). Every write path also writes the Orca files: the
   Orca output is COMPUTED before the finishing prompt (`orca::write::plan`, so
   the "This will:" list says whether `orca.yaml` is created, updated or cannot
-  be edited, and how many files Orca will copy) and WRITTEN after the tree
-  materializes (`Plan::apply`). `overlaid_patterns` gives the plan the sync
+  be edited, how many files Orca will copy, and whether `.worktreeinclude`
+  gains an ignore rule or is tracked and gets none) and WRITTEN after the tree
+  materializes (`Plan::apply`). The prompt sits between the two, so the plan
+  remembers what it read and `apply` leaves alone, with a warning, a file that
+  changed on disk in the meantime. `overlaid_patterns` gives the plan the sync
   patterns as they WILL be – the `files` about to be written plus the local
   overlay – since `magic.json` is not on disk yet at that point.
   `materialize_init` is the one helper behind everything `run_init` (also the
@@ -957,13 +960,30 @@ The modules, by purpose:
   COMPUTED in `plan`, BEFORE the finishing prompt: `orca.yaml` is read and
   edited in memory, the snapshot is computed and `.worktreeinclude` is rendered
   (`Plan::summary_lines` feeds the "This will:" list). `apply` runs AFTER the
-  `.superset` tree materializes and writes exactly what was planned –
+  `.superset` tree materializes and writes what was planned and nothing else –
   `orca.yaml`, the `.worktreeinclude` ignore rule (not when the file is
   tracked), then the planned snapshot. Since the snapshot is taken before the
   tree is written, a file the same operation creates afterwards (the
   `magic.local.json` a first init bootstraps) is not in it and joins with the
-  next refresh. `apply` returns `Notice`s and never fails the
-  operation. `SetupPolicy::Ensure` is init/migrate/edit-config;
+  next refresh. The plan carries two things from the moment it was made to the
+  write. First, each planned write keeps its `Baseline` – the exact text `plan`
+  read, or the fact that the file was absent – because the planned text is that
+  reading with ss-magic's parts replaced, and a prompt may stay open for
+  minutes. `write_planned` re-reads the file right before writing and `drift`
+  compares: other bytes, a file where there was none, no file where there was
+  one, or a file that cannot be read again (the unknown answer is the refusing
+  one) all leave it byte-for-byte untouched with a `Warn` notice saying that
+  running the command again updates it (`ss-magic orca` for
+  `.worktreeinclude`, whose ignore rule is still added). Nothing is recomputed
+  at apply time – the plan is what the person confirmed – and the window is
+  NARROWED to the instant between that re-read and the rename, not closed.
+  Second, `plan_include` asks git ONCE whether `.worktreeinclude` is tracked
+  (positive determination; "could not be asked" reads as untracked) and records
+  the answer: `summary_lines` ends the line in "+ add it to .gitignore" or in
+  "it is tracked by git, so no ignore rule is added", and `apply_include` acts
+  on the recorded value instead of probing again, so the list the person
+  confirmed and the step that runs cannot disagree. `apply` returns `Notice`s
+  and never fails the operation. `SetupPolicy::Ensure` is init/migrate/edit-config;
   `OnlyWhenCreating` is the explicit refresh, which never touches the
   `scripts.setup` of an existing file. `refresh_snapshot` is the AUTOMATIC
   end-of-sync refresh: it rewrites only the managed section of main's
@@ -2037,7 +2057,16 @@ secret-safety rules above take here.
   backup pass runs with the same filter as the copy.
 - **Lines ss-magic did not write survive.** In `.worktreeinclude` it owns the
   marked section only; in `orca.yaml`, two keys. A file that cannot be read as
-  UTF-8 text is never rebuilt from an empty parse.
+  UTF-8 text is never rebuilt from an empty parse. The rule holds ACROSS THE
+  FINISHING PROMPT too: a text planned before the prompt knows only the lines
+  the file had then, so it is written only when the file is still exactly what
+  the plan read (`orca::write::drift`, checked right before the write). A file
+  that was edited, created or removed while the prompt was open, or that cannot
+  be read again, is left untouched with a warning – never overwritten with the
+  planned text, and never silently re-planned. Do not move the computation to
+  after the prompt to "fix" this (the summary must describe the plan), and do
+  not describe the window as closed: an edit landing between the re-read and
+  the rename is still lost.
 
 ## Plugin constraints (hard rules)
 

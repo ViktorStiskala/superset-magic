@@ -770,7 +770,12 @@ file with no section gains one at the end; a begin marker with no end marker
 does NOT extend the section to the end of the file – only the stray marker is
 dropped and the following lines are kept as theirs. An existing file that cannot
 be read as UTF-8 text is NEVER rewritten by any path: rebuilding it from an empty
-parse would drop the person's lines. `worktreeinclude::entries` reads the file
+parse would drop the person's lines. The same promise holds across the finishing
+prompt of init, migrate and edit config, for `orca.yaml` as well: a text
+prepared before the prompt is written only when the file is still exactly what
+was read then, and a file that gained a line, a key or a comment while the
+prompt was open is left untouched with a warning (the baseline check in the
+"compute before the prompt" section below). `worktreeinclude::entries` reads the file
 the way Orca does (trim, skip blank and `#` lines, `\` to `/`, strip one leading
 `./` and trailing `/`, reject globs, `!`, absolute paths, `..`, empty segments
 and `.git`); flag a reader that diverges from that, since it decides what
@@ -851,11 +856,12 @@ Every layout-writing operation writes both Orca files through ONE shared path.
 BEFORE the finishing prompt and computes the whole Orca output: the current
 `orca.yaml` is read and edited in memory, the snapshot is computed and
 `.worktreeinclude` is rendered, so the "This will:" list can say create / update
-/ cannot edit and how many files Orca will copy. `patterns` are the overlaid
+/ cannot edit, how many files Orca will copy, and whether `.worktreeinclude`
+gains an ignore rule. `patterns` are the overlaid
 sync patterns as they WILL be after the operation, passed in because
 `magic.json` is not on disk yet. `Plan::apply(main_root)` runs AFTER
-`copy_into_repo` and the bootstrap gitignores and writes exactly what was
-planned: `orca.yaml`, the `.worktreeinclude` ignore rule, then the planned
+`copy_into_repo` and the bootstrap gitignores and writes what was planned and
+nothing else: `orca.yaml`, the `.worktreeinclude` ignore rule, then the planned
 snapshot. Because the snapshot is taken before the tree materializes, a file
 the same operation creates afterwards (the `magic.local.json` a first init
 bootstraps) is not in it and joins with the next refresh; flag a change that
@@ -865,6 +871,37 @@ fails the operation. A committing finishing action stages `.superset`,
 `.gitignore` and `orca.yaml`, and NEVER `.worktreeinclude`. The ignore rule for
 `.worktreeinclude` is NOT added when the file is tracked (a rule cannot ignore a
 tracked file); the section is still written and the notice says so.
+
+A prompt sits between `plan` and `apply` and can stay open for minutes, so two
+facts are RECORDED in the plan and carried across it:
+
+- **The baseline of each planned write.** A planned text is the file as `plan`
+  read it with ss-magic's parts replaced, so it keeps the person's other lines
+  only while the file is still that reading. Each `Write` plan therefore holds
+  its `Baseline` – the exact text read, or `Absent` – and `write_planned` reads
+  the file again right before writing; `drift` compares. Different bytes, a file
+  where there was none, no file where there was one, or a file that cannot be
+  read again all mean the file is left BYTE-FOR-BYTE untouched and a `Warn`
+  notice says it changed on disk after ss-magic read it, that writing would
+  discard the change, and what updates it (running the command again; for
+  `.worktreeinclude`, `ss-magic orca`). The unknown answer is the refusing one:
+  an unreadable file counts as changed. The `.worktreeinclude` ignore rule is
+  still added when its write is skipped this way, and the other file is still
+  written. `Unchanged` and `Untouched` plans write nothing and need no check.
+  This NARROWS the window to the instant between the re-read and the rename; it
+  does not close it. Flag a planned write that skips the re-read, that compares
+  anything looser than the exact bytes, that treats a failed re-read as
+  "unchanged", that overwrites or re-plans a changed file instead of leaving it
+  alone, that moves the computation to after the prompt, or a comment or doc
+  that calls the window closed.
+- **Whether git tracks `.worktreeinclude`.** `plan_include` asks once
+  (`git::tracked_files`, positive determination – "git could not be asked" reads
+  as untracked) and stores the answer in the plan. `summary_lines` ends the line
+  in `+ add it to .gitignore` for an untracked file and in `it is tracked by
+  git, so no ignore rule is added` for a tracked one, and `apply_include` acts
+  on the STORED answer. Flag a summary line that promises the rule
+  unconditionally, or an `apply` that probes git again – either lets the list
+  the person confirmed disagree with the step that runs.
 
 Before either file is read, the write path checks containment
 (`orca::write::landing`): a target that resolves OUTSIDE the repository through
@@ -1534,7 +1571,8 @@ documentation or a status report that claims `file-changed` is active
   root, outside the staged tree, by `orca::write` – each through
   `superset_files::write_atomically` (a staged sibling plus `rename`), never a
   truncating `fs::write`. They are COMPUTED before the finishing prompt and
-  WRITTEN after `copy_into_repo`; see the Orca section below.
+  WRITTEN after `copy_into_repo` – each only if the file is still what was read
+  before the prompt; see the Orca section below.
 - `pack::write_archive` writes the archive to a `NamedTempFile` in the git root
   and renames it into place atomically only after the tar+bzip2 stream is fully
   finalised (`into_inner()` then `finish()`). Flag an archive path that writes
