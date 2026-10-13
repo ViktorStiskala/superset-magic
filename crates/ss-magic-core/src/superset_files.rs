@@ -3,7 +3,8 @@
 //!   .superset/config.json         { setup, teardown, run }  (Superset-owned)
 //!   .superset/magic.sh            executable wrapper (embedded asset)
 //!   .superset/setup_config.json   { files: [pattern, ...] }  (legacy; read-only)
-//!   .superset/magic.json          { files: [pattern, ...] }  (committed)
+//!   .superset/magic.json          { files: [pattern, ...],
+//!                                   sharedDirectories: [pattern, ...] }  (committed)
 //!   .superset/magic.local.json    { files: [pattern, ...] }  (gitignored overlay)
 //!
 //! The embedded `magic.sh` (under `assets/`) is the single source of truth
@@ -58,7 +59,7 @@ pub struct SetupConfig {
 /// (gitignored local overlay).
 ///
 /// Named fields hold the keys this version of ss-magic actually understands
-/// (currently just `files`); everything else lands in `extras` (KTD8) via
+/// (`files` and `sharedDirectories`); everything else lands in `extras` (KTD8) via
 /// `#[serde(flatten)]` instead of being dropped. That matters because a
 /// `magic.json` written by a NEWER ss-magic can carry keys this build has
 /// never heard of (e.g. a future `plugin` block) — every writer must
@@ -72,6 +73,24 @@ pub struct MagicConfig {
     /// Glob patterns for files to sync from main into worktrees.
     #[serde(default)]
     pub files: Vec<String>,
+    /// Glob patterns naming the dependency directories Orca should share with
+    /// a new worktree (`**/node_modules`, `**/.venv`, ...). ss-magic expands
+    /// them to literal directories for `orca.yaml`'s `worktree.sharedDirectories`.
+    ///
+    /// `None` and an empty list mean different things, and both must survive a
+    /// rewrite: `None` is "never chosen" (the key is absent, and stays absent
+    /// on write), while `Some(vec![])` is "chose none" and is written as `[]`
+    /// so a later non-interactive run does not fill the list back in.
+    ///
+    /// Read from the committed `magic.json` ONLY – [`load_overlaid`] never
+    /// takes it from `magic.local.json`. The list ends up in the committed
+    /// `orca.yaml`, so a per-machine overlay must not be able to reach it.
+    #[serde(
+        default,
+        rename = "sharedDirectories",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub shared_directories: Option<Vec<String>>,
     /// Every top-level key this build of ss-magic has no named field for.
     /// Serialized back out verbatim alongside `files` on every write.
     #[serde(flatten)]
@@ -84,6 +103,10 @@ pub struct MagicConfig {
 /// - `files`: UNION + DEDUPE — magic.json order is preserved first; local
 ///   entries not already present are appended in local order. A local entry
 ///   that duplicates a base entry is silently dropped (base position kept).
+/// - `sharedDirectories`: the BASE value only. A `sharedDirectories` key in
+///   `magic.local.json` is ignored, because the list is expanded into the
+///   committed `orca.yaml` and a per-machine file must not decide what the
+///   whole team's Orca worktrees share.
 /// - Scalar / object keys (future): local value wins.
 /// - Missing base `magic.json` → `Ok(None)`.
 /// - Malformed `magic.json` OR malformed `magic.local.json` → hard error
@@ -126,6 +149,7 @@ pub fn load_overlaid(root: &Path) -> Result<Option<MagicConfig>> {
 
     Ok(Some(MagicConfig {
         files: merged_files,
+        shared_directories: base.shared_directories.clone(),
         extras: merged_extras,
     }))
 }
@@ -177,7 +201,10 @@ pub fn write_magic_local_json(root: &Path, cfg: &MagicConfig) -> Result<()> {
 /// process id and a per-process counter so concurrent writers stage
 /// different files; whichever renames last wins whole, which is the same
 /// outcome a sequential pair of writes has.
-fn write_atomically(path: &Path, body: &str) -> Result<()> {
+///
+/// Public so the CLI's Orca writers (`orca.yaml`, `.worktreeinclude`) replace
+/// their files the same way instead of hand-rolling a second staged write.
+pub fn write_atomically(path: &Path, body: &str) -> Result<()> {
     // Write THROUGH a symlink, as `fs::write` did: rename onto the link's
     // resolved target, not onto the link itself, which would silently turn
     // the link into a plain file and leave its target stale. The plugin's
@@ -185,7 +212,36 @@ fn write_atomically(path: &Path, body: &str) -> Result<()> {
     // one that leaves the repository); a target that does not exist yet
     // resolves to the path as given.
     let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let path = target.as_path();
+    replace_entry(&target, body)
+}
+
+/// Replace the directory entry `path` ITSELF with `body` in one step, following
+/// no symlink at that name.
+///
+/// The mirror of [`write_atomically`], for a writer nobody has vouched a link's
+/// target to. `rename` replaces the entry it is given, so when `path` is a
+/// symlink the LINK is replaced by a regular file, and the file it pointed at
+/// is never opened and keeps its bytes. Symlinks among the PARENT directories
+/// are followed as usual; only the last component is not.
+///
+/// The CLI's automatic Orca refresh is the caller this exists for. It runs from
+/// a background setup script and may only ever change the one name git answered
+/// for (`.worktreeinclude`, untracked and ignored). A write through a link at
+/// that name could land on a tracked file, and checking for a link first only
+/// narrows that: the name can become a link between the check and the write.
+/// Replacing the entry closes it, because no check about links has to stay
+/// true. The staging file is created exclusively ([`create_staging`]), so a
+/// link planted at ITS name is not followed either.
+pub fn write_atomically_no_follow(path: &Path, body: &str) -> Result<()> {
+    replace_entry(path, body)
+}
+
+/// The staged write behind both atomic writers: write a private sibling of
+/// `path`, then rename it over `path` exactly as given. Whether a symlink at
+/// that name is followed is the caller's decision, made before this is called –
+/// [`write_atomically`] resolves the link first, [`write_atomically_no_follow`]
+/// does not.
+fn replace_entry(path: &Path, body: &str) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
@@ -198,7 +254,11 @@ fn write_atomically(path: &Path, body: &str) -> Result<()> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let staged = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
-    let write = fs::write(&staged, body)
+    let write = create_staging(&staged)
+        .and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(body.as_bytes())
+        })
         .with_context(|| format!("writing {}", staged.display()))
         .and_then(|()| {
             fs::rename(&staged, path)
@@ -212,16 +272,51 @@ fn write_atomically(path: &Path, body: &str) -> Result<()> {
     write
 }
 
-/// Build a fresh `MagicConfig` with `new_files`, carrying forward the
-/// unknown top-level keys (KTD8) from `existing`, if any. Mirrors
-/// `merge_setup_into_config`'s preservation discipline for `config.json`:
-/// every write path (init, migrate, edit-config) loads the current on-disk
-/// `magic.json`, calls this to change just `files`, then writes the result —
-/// never rebuilding a `MagicConfig` from parts alone, which would silently
-/// drop any key this build doesn't have a named field for.
+/// Create the private staging file of [`replace_entry`], refusing to reuse
+/// whatever already sits at that name.
+///
+/// A plain `fs::write` opens an existing entry and FOLLOWS it when it is a
+/// symlink. A link planted at the staging name would then have the new text
+/// written into its target, and the link itself would be renamed over the real
+/// file – a write through a symlink by another door, which the no-follow writer
+/// in particular must not have. `create_new` (`O_EXCL`) fails on any existing
+/// entry, a symlink included, without following it. The one honest reason for
+/// an entry to exist is a leftover from a crashed run that had this process id,
+/// so it is removed – `remove_file` unlinks a link itself, never its target –
+/// and the creation is tried once more.
+fn create_staging(staged: &Path) -> std::io::Result<fs::File> {
+    let create = || {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(staged)
+    };
+    match create() {
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(staged)?;
+            create()
+        }
+        other => other,
+    }
+}
+
+/// Build a fresh `MagicConfig` with `new_files` and `shared_directories`,
+/// carrying forward the unknown top-level keys (KTD8) from `existing`, if any.
+/// Mirrors `merge_setup_into_config`'s preservation discipline for
+/// `config.json`: every write path (init, migrate, edit-config) loads the
+/// current on-disk `magic.json`, calls this to change the keys it owns, then
+/// writes the result — never rebuilding a `MagicConfig` from parts alone, which
+/// would silently drop any key this build doesn't have a named field for.
+///
+/// `shared_directories` REPLACES the field, exactly as `new_files` replaces
+/// `files`: the caller passes the list it decided on (a pattern the person
+/// unticked must disappear from the file), or `None` to leave the key absent.
+/// It is never merged with what `existing` held – a caller that wants to keep
+/// the stored list passes `existing.shared_directories.clone()` itself.
 pub fn merge_files_into_magic_config(
     existing: Option<&MagicConfig>,
     new_files: Vec<String>,
+    shared_directories: Option<Vec<String>>,
 ) -> MagicConfig {
     let extras = match existing {
         Some(cfg) => cfg.extras.clone(),
@@ -229,6 +324,7 @@ pub fn merge_files_into_magic_config(
     };
     MagicConfig {
         files: new_files,
+        shared_directories,
         extras,
     }
 }

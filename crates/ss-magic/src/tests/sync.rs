@@ -5,6 +5,13 @@ use ss_magic_core::testutil::{
     exit_code_to_u8, init_main_repo, make_worktree, write_file, write_magic,
 };
 
+/// An environment with no Orca variables in it. Every test here runs the sync
+/// as it behaves outside Orca, whatever terminal the suite itself was started
+/// from – including an Orca terminal, whose variables must not leak in.
+fn no_orca_env(_: &str) -> Option<std::ffi::OsString> {
+    None
+}
+
 // ── Test: patterns from overlaid config copy into the worktree ─────────
 
 /// Literal file pattern copies from main into the worktree.
@@ -15,7 +22,7 @@ fn sync_literal_file_copies_into_worktree() {
     write_file(main.path(), ".env", "FOO=1\n");
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    let code = sync_core(&wt_root, SyncOptions::default(), &no_orca_env, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0, "sync_core must succeed");
     assert!(
         wt_root.join(".env").is_file(),
@@ -34,7 +41,7 @@ fn sync_glob_pattern_copies_at_depth() {
     write_file(main.path(), "apps/web/.dev.vars", "OTHER=y\n");
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    let code = sync_core(&wt_root, SyncOptions::default(), &no_orca_env, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0);
     assert!(wt_root.join("apps/api/.dev.vars").is_file());
     assert!(wt_root.join("apps/web/.dev.vars").is_file());
@@ -48,7 +55,7 @@ fn sync_double_glob_matches_deep_paths() {
     write_file(main.path(), "a/b/c/.env", "DEEP=1\n");
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    let code = sync_core(&wt_root, SyncOptions::default(), &no_orca_env, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0);
     assert!(wt_root.join("a/b/c/.env").is_file(), "deep path must copy");
 }
@@ -63,7 +70,7 @@ fn sync_excludes_node_modules_and_venv() {
     write_file(main.path(), ".venv/lib/.env", "drop\n");
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    let code = sync_core(&wt_root, SyncOptions::default(), &no_orca_env, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0);
     assert!(wt_root.join("apps/api/.env").is_file());
     assert!(!wt_root.join("node_modules/pkg/.env").exists());
@@ -86,7 +93,7 @@ fn sync_uses_overlaid_config() {
     write_file(main.path(), "apps/api/.dev.vars", "VARS=2\n");
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    let code = sync_core(&wt_root, SyncOptions::default(), &no_orca_env, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0);
     assert!(wt_root.join("apps/api/.env").is_file());
     assert!(wt_root.join("apps/api/.dev.vars").is_file());
@@ -100,7 +107,7 @@ fn sync_empty_files_succeeds_with_nothing_copied() {
 
     let (_wt, wt_root) = make_worktree(main.path());
     let mut events: Vec<sync::apply::Event> = Vec::new();
-    let code = sync_core(&wt_root, false, |e| events.push(e.clone())).unwrap();
+    let code = sync_core(&wt_root, SyncOptions::default(), &no_orca_env, |e| events.push(e.clone())).unwrap();
     assert_eq!(exit_code_to_u8(code), 0);
     assert!(events.is_empty(), "no events when files is empty");
 }
@@ -114,7 +121,7 @@ fn sync_no_magic_json_is_hard_error() {
     // Deliberately do NOT write magic.json.
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    let code = sync_core(&wt_root, SyncOptions::default(), &no_orca_env, |_| {}).unwrap();
     assert_ne!(exit_code_to_u8(code), 0, "must exit non-zero when magic.json absent");
 }
 
@@ -126,7 +133,7 @@ fn sync_malformed_magic_json_is_hard_error() {
     fs::write(main.path().join(".superset/magic.json"), "{bad json").unwrap();
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    let code = sync_core(&wt_root, SyncOptions::default(), &no_orca_env, |_| {}).unwrap();
     assert_ne!(
         exit_code_to_u8(code),
         0,
@@ -146,7 +153,7 @@ fn sync_malformed_magic_local_json_is_hard_error() {
     .unwrap();
 
     let (_wt, wt_root) = make_worktree(main.path());
-    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    let code = sync_core(&wt_root, SyncOptions::default(), &no_orca_env, |_| {}).unwrap();
     assert_ne!(
         exit_code_to_u8(code),
         0,
@@ -159,7 +166,7 @@ fn sync_malformed_magic_local_json_is_hard_error() {
 fn sync_outside_git_repo_is_hard_error() {
     let dir = tempfile::tempdir().unwrap();
     // No git init — not a repo.
-    let code = sync_core(dir.path(), false, |_| {}).unwrap();
+    let code = sync_core(dir.path(), SyncOptions::default(), &no_orca_env, |_| {}).unwrap();
     assert_ne!(
         exit_code_to_u8(code),
         0,
@@ -181,7 +188,7 @@ fn sync_backs_up_overwritten_worktree_file_by_default() {
     let (_wt, wt_root) = make_worktree(main.path());
     write_file(&wt_root, ".env", "OLD=0\n");
 
-    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    let code = sync_core(&wt_root, SyncOptions::default(), &no_orca_env, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0, "sync_core must succeed");
     assert_eq!(
         fs::read_to_string(wt_root.join(".env")).unwrap(),
@@ -215,7 +222,16 @@ fn sync_no_backup_flag_skips_backup() {
     let (_wt, wt_root) = make_worktree(main.path());
     write_file(&wt_root, ".env", "OLD=0\n");
 
-    let code = sync_core(&wt_root, true, |_| {}).unwrap();
+    let code = sync_core(
+        &wt_root,
+        SyncOptions {
+            no_backup: true,
+            ..SyncOptions::default()
+        },
+        &no_orca_env,
+        |_| {},
+    )
+    .unwrap();
     assert_eq!(exit_code_to_u8(code), 0, "sync_core must succeed");
     assert_eq!(
         fs::read_to_string(wt_root.join(".env")).unwrap(),
@@ -239,7 +255,7 @@ fn sync_new_file_creates_no_backup() {
     let (_wt, wt_root) = make_worktree(main.path());
     // Worktree deliberately has no `.env` yet.
 
-    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    let code = sync_core(&wt_root, SyncOptions::default(), &no_orca_env, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0, "sync_core must succeed");
     assert!(
         wt_root.join(".env").is_file(),
@@ -262,7 +278,7 @@ fn sync_backup_dir_is_gitignored_in_worktree() {
     let (_wt, wt_root) = make_worktree(main.path());
     write_file(&wt_root, ".env", "OLD=0\n");
 
-    let code = sync_core(&wt_root, false, |_| {}).unwrap();
+    let code = sync_core(&wt_root, SyncOptions::default(), &no_orca_env, |_| {}).unwrap();
     assert_eq!(exit_code_to_u8(code), 0, "sync_core must succeed");
     assert!(
         git::is_ignored(&wt_root, Path::new(".superset/backups")).unwrap(),

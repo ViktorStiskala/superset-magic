@@ -2,8 +2,8 @@
 
 Keep gitignored files — `.env` secrets, local overrides, machine-specific
 config — in sync across git worktrees: automatically when a
-[Superset](https://superset.sh) workspace is created, on demand from the
-command line anywhere else.
+[Superset](https://superset.sh) workspace or an [Orca](https://www.onorca.dev)
+worktree is created, on demand from the command line anywhere else.
 
 ## The problem
 
@@ -27,9 +27,10 @@ file set:
 
 - **Forward sync** (`ss-magic sync`) – copy every matching file from the
   repo's main checkout into the current worktree, backing up every file it's
-  about to overwrite first (skip with `-n`/`--no-backup`). Under Superset this
-  runs automatically the moment a workspace is created, via the setup-script
-  hook; without Superset it's one command to run in a fresh worktree.
+  about to overwrite first (skip with `-n`/`--no-backup`). Under Superset and
+  under Orca this runs automatically the moment a workspace or worktree is
+  created, via each app's setup-script hook; without either it's one command to
+  run in a fresh worktree.
 - **Sync** (interactive, worktree menu) – reconcile every configured file
   against the main checkout in either direction, through a full-screen merge
   cockpit: a file list beside a live side-by-side diff, where you set each
@@ -66,9 +67,9 @@ repository, and is described in [its own section](#the-claude-code-plugin)
 below.
 
 If you work with git worktrees and carry per-developer gitignored files, this
-tool is for you. It is built for Superset's workspace lifecycle, but forward
-sync, reverse sync, pack, and init are ordinary CLI commands that work in any
-worktree setup.
+tool is for you. It is built for Superset's workspace lifecycle and Orca's
+worktree lifecycle, but forward sync, reverse sync, pack, and init are ordinary
+CLI commands that work in any worktree setup.
 
 ## How it works with Superset
 
@@ -90,6 +91,82 @@ binary, and if the binary isn't installed it prints an install hint and exits
 in the hook is the file copy only; dependency installation, migrations, and
 dev servers stay in Superset's own `config.json` commands. The result: every
 new workspace starts with your secrets and local config already in place.
+
+## How it works with Orca
+
+Orca creates git worktrees too, but reads its own two files from the repository
+root. ss-magic generates both from the same `magic.json`, so one maintained list
+serves both apps and nobody hand-writes or hand-syncs Orca's configuration.
+
+| File | Committed? | What it holds |
+| --- | --- | --- |
+| `orca.yaml` | yes | `scripts.setup`, which runs `./.superset/magic.sh sync` in a new worktree, and `worktree.sharedDirectories`, the dependency directories Orca links or clone-copies |
+| `.worktreeinclude` | no (gitignored) | a per-machine snapshot: the literal, gitignored files your sync patterns match in the main checkout right now |
+
+```mermaid
+flowchart TB
+  subgraph src["Source of truth (committed)"]
+    mj[".superset/magic.json<br/>sync patterns + shared-directory patterns"]
+  end
+  subgraph superset["Superset layout"]
+    cj[".superset/config.json<br/>setup: magic.sh sync"]
+  end
+  subgraph orca["Orca layout (repository root)"]
+    oy["orca.yaml (committed)<br/>scripts.setup + worktree.sharedDirectories"]
+    wi[".worktreeinclude (gitignored)<br/>snapshot of matched gitignored files"]
+  end
+  mj --> cj
+  mj -->|init / migrate / edit config / ss-magic orca| oy
+  mj -->|the same, plus the end of every sync in an Orca worktree| wi
+```
+
+Orca's native mechanisms only partly overlap with ss-magic's, so each does what
+it is good at:
+
+- **Shared directories.** `node_modules`, Python virtualenvs and JS build
+  caches are trees ss-magic's own sync deliberately never copies. Orca links or
+  clone-copies them, so a new worktree starts with dependencies already there.
+- **`.worktreeinclude`.** Orca copies these files itself, before the setup
+  script runs. It takes literal paths only (no globs) and copies once, at
+  creation.
+- **The setup script.** `magic.sh sync` then fills the gaps: files added since
+  the snapshot was written, tracked files your patterns match, anything Orca's
+  copy budget left out. It skips the files Orca already copied.
+
+When a worktree is created, the order is fixed:
+
+```mermaid
+sequenceDiagram
+  participant O as Orca
+  participant S as ss-magic sync (new worktree)
+  participant M as main checkout
+  O->>M: read orca.yaml sharedDirectories and .worktreeinclude
+  O->>O: link shared directories, copy the listed files
+  O->>S: run scripts.setup (magic.sh sync)
+  S->>M: load magic.json, read .worktreeinclude once
+  S->>S: copy everything Orca did not already copy
+  S->>M: refresh the .worktreeinclude snapshot for the next worktree
+```
+
+Three things to know:
+
+- **Commit `orca.yaml`.** Orca reads the setup script from the new worktree's
+  own copy of the file, so an uncommitted `orca.yaml` never runs it. The
+  snapshot is the opposite: it describes one machine's files, is gitignored by
+  ss-magic, and is never committed.
+- **Your own lines are safe.** ss-magic owns only the block between its two
+  marker comments in `.worktreeinclude`, and only two keys of `orca.yaml`
+  (`scripts.setup` gains a line, `worktree.sharedDirectories` is replaced).
+  Every other key, comment and hand-written line is left as it is. An
+  `orca.yaml` laid out in a way ss-magic cannot edit safely is left untouched,
+  with the lines to add by hand printed instead.
+- **A shared Python virtualenv still points at the main checkout.** A venv
+  records absolute interpreter paths, so its scripts run the main checkout's
+  interpreter even when Orca clone-copies the directory. Leave `**/.venv`
+  unticked in the picker if that matters to you.
+
+A teammate without ss-magic installed still gets Orca's own copies and links;
+`magic.sh` exits 0 with an install hint, so only the gaps go unfilled.
 
 ## Install
 
@@ -173,7 +250,10 @@ ss-magic
 and pick **init** from the menu. It walks you through selecting the file
 patterns to sync and writes the [`.superset/` contract](#the-superset-contract)
 — `config.json` with the setup hook, the `magic.sh` wrapper, `magic.json` with
-your patterns, and a gitignored `magic.local.json` overlay. You then choose a
+your patterns, and a gitignored `magic.local.json` overlay. A second picker
+offers the dependency directories it found (`node_modules`, virtualenvs, build
+caches) for Orca to share, and init writes the two
+[Orca files](#how-it-works-with-orca) next to the contract. You then choose a
 finishing action: commit and push, open a PR, or leave the changes on disk.
 
 For scripted provisioning there's a non-interactive form:
@@ -185,9 +265,9 @@ ss-magic init '.env' '**/.dev.vars' 'config/local/*'
 Quote glob patterns so your shell doesn't expand them before ss-magic sees
 them. The non-interactive init leaves the generated files uncommitted on disk.
 
-Once the contract is committed, every worktree created through Superset.sh app
-gets the matching files copied in automatically. In a worktree created any
-other way, run `ss-magic sync` yourself.
+Once the contract is committed, every worktree created through the Superset
+app or through Orca gets the matching files copied in automatically. In a
+worktree created any other way, run `ss-magic sync` yourself.
 
 ## Commands
 
@@ -198,6 +278,8 @@ ss-magic reverse-sync # non-interactive bulk copy: current worktree → main,
                        # for git-untracked files matching the configured
                        # patterns
 ss-magic pack         # archive the configured files into ss-magic-<repo>.tar.bz2
+ss-magic orca         # regenerate the Orca files (orca.yaml shared directories,
+                       # .worktreeinclude) in the main checkout from magic.json
 ss-magic update       # force a self-update to the newest CLI release
 ss-magic init [PATTERN...]   # non-interactively seed .superset (magic.json
                              # layout); extra args become magic.json `files`
@@ -213,6 +295,10 @@ reconciles files in both directions through the merge cockpit; there's no
 separate forward/reverse choice there. `SS_MAGIC_NO_UPDATE=1` disables the
 auto-update gate (the explicit `ss-magic update` ignores it and always checks).
 
+`sync` also takes `--no-orca-skip`. In an Orca worktree, forward sync leaves
+alone the files Orca already copied from `.worktreeinclude`; the flag copies
+them too. It has no effect anywhere else.
+
 There is no `plugin` subcommand: the [Claude Code plugin](#the-claude-code-plugin)
 is a separate binary, `ss-magic-plugin`, delivered by the marketplace and reached
 from inside a Claude Code session. The old `plugin` token was removed outright
@@ -225,7 +311,8 @@ The bare invocation opens a menu whose options depend on where you run it:
 
 - **Main checkout** — one lifecycle operation, chosen from the detected state:
   init the contract, migrate an old `setup.sh` layout, or edit the
-  synced-files config.
+  synced-files config. Once the contract exists, **Refresh Orca files** is
+  offered as well – the menu form of [`ss-magic orca`](#ss-magic-orca--refresh-the-orca-files).
 - **Worktree** – a single **Sync** entry: the interactive merge cockpit,
   reconciling every configured file against main in both directions.
 - **Pack** is offered wherever an initialized `magic.json` exists (any
@@ -245,11 +332,33 @@ From the main-checkout menu, ss-magic branches on `config.json`'s `setup`:
 - A `magic.sh` / `ss-magic` marker only → **edit config**.
 - Neither marker (or absent `config.json`) → **init** the contract.
 
-Init and migration both gitignore two things up front: the per-machine
-`magic.local.json` overlay and the tool's `.superset/backups/` tree (where a
-sync stores the bytes it overwrites, which can include recovered secrets), so
-the backup tree is protected before the first sync ever writes to it. Both flows
-preserve `config.json`'s `teardown` and `run` arrays verbatim. All
+Init, migration and edit config also write the
+[Orca files](#how-it-works-with-orca): `orca.yaml` and `.worktreeinclude` at
+the repository root. Interactive init and edit config ask which dependency
+directories Orca should share, with each pattern's current matches shown next
+to it; migration and the scripted init keep a stored choice and otherwise take
+every kind they detect. The summary shown before the finishing action says
+whether `orca.yaml` will be created, updated, or cannot be edited, how many
+files `.worktreeinclude` will list, and whether that file is added to
+`.gitignore` – a file git already tracks gets no rule, and the summary says so
+instead of promising one.
+
+The Orca files are worked out before that prompt and written after it. If
+`orca.yaml` or `.worktreeinclude` changes on disk while the prompt is open –
+you add a key, a comment or a line of your own, or create or delete the file –
+ss-magic does not write its prepared version over yours. It leaves that file
+exactly as it is, says so in a warning, and still writes everything else. Run
+the command again to update `orca.yaml`, or `ss-magic orca` to refresh
+`.worktreeinclude`.
+
+Init, migration and edit config gitignore three things up front: the
+per-machine `magic.local.json` overlay, the tool's `.superset/backups/` tree
+(where a sync stores the bytes it overwrites, which can include recovered
+secrets), so the backup tree is protected before the first sync ever writes to
+it, and the Claude plugin's per-worktree state tree `.superset/.magic/`. A
+fourth rule, for the per-machine `.worktreeinclude` snapshot, is added
+afterwards by the Orca step of the same run, and only when git does not track
+that file. Both flows preserve `config.json`'s `teardown` and `run` arrays verbatim. All
 changes are staged into a tempdir and materialized only after the
 finishing-action prompt returns a non-cancel choice, so picking "done" or
 aborting leaves the old layout intact — never a half-migrated tree. Migration
@@ -262,7 +371,9 @@ After files are staged you pick a finishing action:
 2. Create a feature branch, commit, push, then `gh pr create --fill`.
 3. Done for now (no git operations).
 
-If nothing on disk changed, the commit step is skipped automatically.
+A committing action stages `.superset/`, `.gitignore` and `orca.yaml`, never
+`.worktreeinclude`. If nothing on disk changed, the commit step is skipped
+automatically.
 
 ### `ss-magic sync` — forward sync (main → worktree)
 
@@ -284,6 +395,41 @@ By default every worktree file this is about to overwrite is backed up first,
 under a gitignored `<worktree>/.superset/backups/<YYYYmmdd-HHMMSS>/…`; pass
 `-n`/`--no-backup` to skip it. Forward sync is not offered from the worktree
 menu – the menu's single **Sync** entry (below) covers pulling from main too.
+
+#### Inside an Orca worktree
+
+When Orca set the worktree up, forward sync does two more things:
+
+- **It skips what Orca already copied.** Every path listed in the main
+  checkout's `.worktreeinclude` – ss-magic's block and your own lines alike –
+  that already exists in the worktree is left alone, printed as
+  `Left to Orca: <path>` and counted apart from skips in the summary. A listed
+  path that is *not* in the worktree (Orca's copy budget ran out, or the file is
+  new) is copied as usual. A listed directory that exists in the worktree
+  counts as a whole: everything under it is left to Orca. Skipped paths are not
+  backed up, since nothing overwrites them. `--no-orca-skip` copies the listed
+  paths too.
+- **It refreshes the snapshot afterwards.** Once the copy has succeeded,
+  ss-magic regenerates its block of the main checkout's `.worktreeinclude`, so
+  the next worktree gets newly added files from Orca directly. This step is
+  best-effort: it writes only when git reports that file as both gitignored and
+  untracked, it never writes through a symlink, it never touches `orca.yaml`,
+  and whatever it reports, the sync's exit status stands. If the main checkout
+  has no ignore rule for the file yet, the sync says so; run `ss-magic orca`
+  there once. If `.worktreeinclude` is a symlink there – wherever it points –
+  the sync says so and leaves it alone, since the file behind the link could be
+  a tracked one. `ss-magic orca` run in that checkout is what updates it: that
+  command writes through a link that stays inside the repository, and reports
+  one that leaves it without touching the file.
+
+An Orca worktree is recognized by `ORCA_WORKTREE_PATH` (set for setup scripts)
+or the path inside `ORCA_WORKTREE_ID` (set in Orca's terminals) naming the
+worktree ss-magic runs in. The variables merely existing is not enough: an Orca
+terminal that changes into another repository's worktree behaves exactly as a
+plain terminal does there. The main checkout never counts as an Orca worktree.
+A later `ss-magic sync` in an Orca worktree still skips any listed file that
+exists, so to pull an updated secret from main use the **Sync** menu or
+`--no-orca-skip`.
 
 ### `ss-magic reverse-sync` – bulk push (worktree → main)
 
@@ -422,13 +568,53 @@ outside the repo. An empty config, no matches, or a match set that contains
 nothing packable is a success with no archive written — and an existing
 archive is left untouched rather than replaced by an empty one.
 
+### `ss-magic orca` – refresh the Orca files
+
+Regenerates the main checkout's Orca files from `magic.json`. Run it after
+adding a package, a virtualenv or a new secret file that you want Orca to
+handle natively – and once in a repository that was set up with ss-magic before
+it knew about Orca. It works from any directory of the repository, a worktree
+included, and always writes into the main checkout, because that is where Orca
+reads both files from. It needs `.superset/magic.json` there (hard error,
+non-zero exit, nothing written, if absent or malformed).
+
+- **`orca.yaml`** – `worktree.sharedDirectories` is replaced by what the
+  `sharedDirectories` patterns in `magic.json` match now. ss-magic owns that
+  list, so add a directory through `magic.json` (edit config), not by hand. With
+  no `sharedDirectories` key stored yet the list is written empty and the output
+  points you at edit config.
+- **`scripts.setup` is not touched** in an existing `orca.yaml`. A
+  `magic.sh sync` line someone removed comes back only through init, migrate or
+  edit config. When the refresh *creates* `orca.yaml`, it does include the line,
+  so one command makes an older repository work in Orca.
+- **`.worktreeinclude`** – ss-magic's block gets a fresh snapshot, and the file
+  is added to `.gitignore` unless it is tracked.
+
+Any change to `orca.yaml` shows up as an ordinary diff to commit.
+
+Orca's limits are respected, with a warning when something is left out:
+`sharedDirectories` keeps the first 100 directories in sorted order (the rest
+are not shared – forward sync never copies dependency trees), and
+`.worktreeinclude` holds at most 1000 entries in 256 KiB, counting your own
+lines first (the rest are copied by ss-magic's own sync).
+
 ### `ss-magic init [PATTERN...]` — scripted init
 
 The scriptable form of the interactive init: it writes the `.superset/`
 contract without prompts (for CI / automated provisioning) and leaves the
 changes uncommitted on disk. Extra arguments become the `files` patterns in
 `magic.json`. It preserves an existing `magic.local.json`, performs no git/gh
-operations, and skips the auto-update gate.
+operations, and skips the auto-update gate. The Orca files are written too:
+with nobody to ask, the shared-directory patterns are the ones `magic.json`
+already stores (an empty list included) or, failing that, every kind detected in
+the checkout. When nothing is stored and nothing is detected – a fresh clone
+before `npm install`, say – the key is left out of `magic.json`, so a later run
+can still detect directories that did not exist yet.
+
+Init works out the Orca files before it writes the contract, so the snapshot
+describes the checkout as it was at that moment. The `magic.local.json` a first
+init creates is therefore not in the first snapshot; it joins with the next
+refresh, which the first Orca worktree's sync performs by itself.
 
 ### `ss-magic update` — force a self-update
 
@@ -778,8 +964,12 @@ A repo using ss-magic carries:
   `command -v ss-magic` then `exec ss-magic "$@"` (propagating the binary's
   real exit code); if the binary is absent it prints a bold-red install hint
   and exits 0, so Superset's setup pipeline is never blocked.
-- `.superset/magic.json` — committed `{ files: [pattern, ...] }`. The glob
-  patterns of files to sync from main into each worktree.
+- `.superset/magic.json` — committed `{ files: [pattern, ...],
+  sharedDirectories: [pattern, ...] }`. `files` are the glob patterns of files
+  to sync from main into each worktree. `sharedDirectories` are the glob
+  patterns of dependency directories Orca shares with a new worktree; ss-magic
+  expands them into `orca.yaml`. It is read from this committed file only,
+  never from the local overlay.
 - `.superset/magic.local.json` — gitignored local overlay of the same shape.
   Patterns here are unioned with `magic.json` (de-duped, `magic.json` order
   first) at sync time, so a developer can add machine-specific patterns
@@ -801,6 +991,69 @@ A typical `magic.json`:
 ignored (ss-magic bootstraps it and adds the `.gitignore` entry).
 `.superset/magic.local.json` is a default `magic.json` pattern, so the local
 overlay is itself copied into each worktree.
+
+### The Orca files
+
+Derived from `magic.json` and written at the repository root, outside
+`.superset/`:
+
+- `orca.yaml` – committed. ss-magic manages two keys and leaves the rest of the
+  file, comments and formatting included, exactly as it found it:
+
+  ```yaml
+  scripts:
+    setup: |
+      ./.superset/magic.sh sync
+  worktree:
+    sharedDirectories:
+      - node_modules
+      - apps/web/node_modules
+  ```
+
+  An existing `scripts.setup` keeps its commands and gains the `magic.sh sync`
+  line in front of them, so secrets are in place before a `pnpm install` in the
+  same script.
+
+  Some layouts ss-magic does not edit at all. It leaves the file untouched and
+  prints the lines to add by hand when `orca.yaml`:
+
+  - does not parse, holds more than one document, or declares `%YAML 1.1`;
+  - uses an alias (`*name`) or a merge key (`<<`) on the way to either key;
+  - writes `scripts` or `worktree` as a flow mapping (`{ … }`), as an empty
+    value, or as anything that is not a mapping.
+
+  This holds even when both keys already say the right thing, and for the
+  `ss-magic orca` refresh as well. A file without a `scripts` or `worktree`
+  key is fine: the block is added at the end.
+- `.worktreeinclude` – gitignored. ss-magic's entries sit between two marker
+  comments; lines outside them are yours:
+
+  ```plaintext
+  # >>> ss-magic: generated from .superset/magic.json - do not edit this section; lines outside it are kept >>>
+  .env
+  .superset/magic.local.json
+  apps/api/.env
+  # <<< ss-magic <<<
+  ```
+
+  The block lists individual files, never a directory, and only files git
+  reports as ignored and untracked. A tracked file your patterns match stays
+  out of it and is still copied by ss-magic's own sync. A file under a
+  directory Orca shares is left out as well, since Orca brings the whole
+  directory. A matched symlink that points at a regular file is listed like a
+  file, because Orca copies what it points at, just as forward sync does; a
+  link to a directory is not listed. The exclusions described under
+  [Pattern semantics](#pattern-semantics) apply here exactly as they do to
+  forward sync.
+
+ss-magic detects seven kinds of directory by name, and those are the kinds
+offered by default: `**/node_modules`, `**/.venv`, `**/venv`, `**/.cache`,
+`**/.turbo`, `**/.parcel-cache` and `**/.next/cache`. A `sharedDirectories`
+pattern selects among what was detected, so a narrower one such as
+`apps/*/node_modules` shares only some of them; a pattern cannot make a
+directory of another kind shareable (Rust's `target/` is deliberately not
+detected). A `node_modules` nested inside another `node_modules` is never
+listed, and a directory that is tracked or not gitignored is never shared.
 
 ## Pattern semantics
 
@@ -897,6 +1150,8 @@ Escape hatches:
 | `NO_COLOR` | Disable ANSI color output. Stdout is also checked for TTY support and color is auto-disabled when piping. |
 | `SS_MAGIC_NO_UPDATE` | Disable the self-update gate. |
 | `SS_MAGIC_UPDATED` | Internal re-exec guard preventing update loops — not meant to be set by hand. |
+| `ORCA_WORKTREE_PATH` | Set by Orca for setup-script runs; read (not set) by `ss-magic sync`. When it names the worktree ss-magic runs in, that worktree is treated as an Orca worktree. |
+| `ORCA_WORKTREE_ID` | Set by Orca in its terminals as `<repo id>::<worktree path>`; read the same way, by the path after the first `::`. |
 | `CLAUDE_CONFIG_DIR` | Read (not set) by `ss-magic-plugin` to locate Claude Code's own state when it is not at `~/.claude`. |
 | `CLAUDE_PLUGIN_ROOT` | Set by Claude Code for a running plugin; read to find the version pin (`ss-magic-plugin.version`). Not meant to be set by hand. |
 | `CLAUDE_PLUGIN_DATA` | Set by Claude Code for hook processes; where the bootstrap installs `bin/ss-magic-plugin`. It is *not* exported to the Bash tool, which is why skills reach the binary through the `ss-magic-plugin` wrapper. |

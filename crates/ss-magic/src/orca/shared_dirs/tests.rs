@@ -1,0 +1,352 @@
+use super::*;
+use ss_magic_core::testutil::{git_run, init_main_repo, write_file};
+use std::fs;
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
+}
+
+fn defaults() -> Vec<String> {
+    DEFAULT_PATTERNS.iter().map(|p| p.to_string()).collect()
+}
+
+fn rels(paths: Vec<PathBuf>) -> Vec<String> {
+    let mut out: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    out.sort();
+    out
+}
+
+/// The R6 fixture: root and per-package `node_modules`, one nested inside
+/// another, a virtualenv, a JS build cache and a symlinked `node_modules`.
+#[cfg(unix)]
+#[test]
+fn detects_dependency_directories_but_never_a_nested_or_symlinked_one() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n.venv/\n.next/\n");
+    write_file(root, "node_modules/left-pad/index.js", "x");
+    write_file(root, "apps/web/node_modules/react/index.js", "x");
+    write_file(root, "apps/web/node_modules/x/node_modules/y/index.js", "x");
+    write_file(root, ".venv/bin/python", "x");
+    write_file(root, "apps/web/.next/cache/webpack/a.pack", "x");
+    write_file(root, "apps/web/.next/server/page.js", "x");
+    write_file(root, "apps/web/src/index.ts", "x");
+    fs::create_dir_all(root.join("apps/linked")).unwrap();
+    std::os::unix::fs::symlink(root.join("node_modules"), root.join("apps/linked/node_modules"))
+        .unwrap();
+
+    let expansion = expand(root, &defaults());
+
+    assert_eq!(
+        expansion.dirs,
+        strings(&[
+            ".venv",
+            "apps/web/.next/cache",
+            "apps/web/node_modules",
+            "node_modules",
+        ])
+    );
+    assert_eq!(expansion.dropped, 0);
+    assert_eq!(overflow_warning(&expansion), None);
+}
+
+#[test]
+fn a_directory_that_is_not_gitignored_is_not_shared() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    // A `venv/` nobody ignored, and one that is committed: both are source to
+    // git, so neither may be handed to Orca as a shareable cache.
+    write_file(root, "venv/pyvenv.cfg", "x");
+    write_file(root, "tools/.cache/kept.txt", "x");
+    git_run(&["add", "-f", "tools/.cache/kept.txt"], root);
+    git_run(&["commit", "-q", "-m", "tracked cache"], root);
+
+    assert_eq!(expand(root, &defaults()).dirs, strings(&["node_modules"]));
+}
+
+/// A directory that IS ignored but holds a tracked file is source to git, so it
+/// must not be shared either. The fixture proves both halves hold: git reports
+/// the directory ignored by rule and the file inside it tracked.
+#[test]
+fn an_ignored_directory_holding_a_tracked_file_is_not_shared() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n.cache/\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    write_file(root, "tools/.cache/kept.txt", "x");
+    git_run(&["add", "-f", "tools/.cache/kept.txt"], root);
+    git_run(&["commit", "-q", "-m", "tracked cache"], root);
+
+    // Precondition: the rule covers the directory, and the file is tracked.
+    git_run(&["check-ignore", "-q", "--no-index", "tools/.cache/"], root);
+    let listed = std::process::Command::new("git")
+        .args(["ls-files", "tools/.cache"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let tracked = String::from_utf8_lossy(&listed.stdout);
+    assert!(tracked.contains("tools/.cache/kept.txt"), "{tracked:?}");
+
+    assert_eq!(expand(root, &defaults()).dirs, strings(&["node_modules"]));
+}
+
+#[test]
+fn only_the_stored_patterns_are_expanded() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n.venv/\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    write_file(root, "apps/api/node_modules/a/index.js", "x");
+    write_file(root, ".venv/pyvenv.cfg", "x");
+
+    assert_eq!(
+        expand(root, &strings(&["**/node_modules"])).dirs,
+        strings(&["apps/api/node_modules", "node_modules"])
+    );
+    assert_eq!(expand(root, &strings(&["**/.venv"])).dirs, strings(&[".venv"]));
+    assert!(expand(root, &[]).dirs.is_empty(), "no patterns, no directories");
+    assert!(expand(root, &strings(&["[unclosed"])).dirs.is_empty());
+}
+
+/// A stored pattern SELECTS among the kinds the walk detects. It can narrow
+/// them (`apps/*/node_modules`), but it cannot make a directory of another kind
+/// shareable: the kinds are a fixed, deliberate list, and Rust's `target/` was
+/// left out of it on purpose.
+#[test]
+fn a_pattern_selects_among_the_detected_kinds_and_never_widens_them() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\ndist/\ntarget/\nvendor/bundle/\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    write_file(root, "apps/web/node_modules/a/index.js", "x");
+    write_file(root, "apps/api/node_modules/a/index.js", "x");
+    write_file(root, "packages/ui/dist/index.js", "x");
+    write_file(root, "target/debug/build.rs", "x");
+    write_file(root, "vendor/bundle/gems/a.rb", "x");
+
+    assert_eq!(
+        expand(root, &strings(&["apps/*/node_modules"])).dirs,
+        strings(&["apps/api/node_modules", "apps/web/node_modules"]),
+        "a narrower pattern takes only some of the detected directories"
+    );
+    let all = expand(root, &strings(&["**"])).dirs;
+    assert_eq!(
+        all,
+        strings(&["apps/api/node_modules", "apps/web/node_modules", "node_modules"]),
+        "even a catch-all pattern reaches only the detected kinds"
+    );
+    assert!(expand(root, &strings(&["**/dist", "target", "vendor/bundle"]))
+        .dirs
+        .is_empty());
+}
+
+/// 120 matching directories: the first 100 in sorted order are kept and the
+/// warning says how many will not be shared.
+#[test]
+fn more_than_orcas_limit_keeps_the_first_hundred_sorted_and_warns() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n");
+    let mut all = Vec::new();
+    for i in 0..120 {
+        let dir = format!("packages/p{i:03}/node_modules");
+        write_file(root, &format!("{dir}/a.js"), "x");
+        all.push(dir);
+    }
+    all.sort();
+
+    let expansion = expand(root, &strings(&["**/node_modules"]));
+
+    assert_eq!(expansion.dirs.len(), MAX_SHARED_DIRS);
+    assert_eq!(expansion.dirs, all[..100]);
+    assert_eq!(expansion.dropped, 20);
+    let warning = overflow_warning(&expansion).unwrap();
+    assert!(
+        warning.contains("20 matching directories will not be shared"),
+        "{warning}"
+    );
+    assert!(!warning.contains("  "), "one tidy sentence: {warning:?}");
+}
+
+/// A submodule's directories belong to another repository, and a path inside
+/// one would make git abort the whole ignore query – losing the answer for
+/// every other directory as well.
+#[test]
+fn a_submodule_is_not_entered_and_does_not_cost_the_other_answers() {
+    let sub = init_main_repo("main");
+    let main = init_main_repo("main");
+    let root = main.path();
+    git_run(
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub.path().to_str().unwrap(),
+            "vendor/sub",
+        ],
+        root,
+    );
+    write_file(root, ".gitignore", "node_modules/\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    write_file(root, "vendor/sub/node_modules/b/index.js", "x");
+
+    assert_eq!(
+        rels(walk_candidates(root)),
+        strings(&["node_modules"]),
+        "the walk stops at a directory holding a `.git` entry"
+    );
+    assert_eq!(expand(root, &defaults()).dirs, strings(&["node_modules"]));
+}
+
+/// The walk prunes the excluded trees and nothing else by name: a kind is found
+/// at any depth outside them, including inside build output, and a recorded
+/// directory is never entered.
+#[test]
+fn the_walk_stays_out_of_the_excluded_trees_and_finds_kinds_at_any_depth() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, ".git/node_modules/x.js", "x");
+    write_file(root, ".superset/backups/20260101-000000/worktree/node_modules/x.js", "x");
+    write_file(root, ".superset/.magic/.cache/x", "x");
+    write_file(root, ".scratchpad/node_modules/x.js", "x");
+    write_file(root, "src/node_modules/x.js", "x");
+    write_file(root, "a/b/c/d/.venv/pyvenv.cfg", "x");
+    write_file(root, "apps/web/.next/standalone/node_modules/x.js", "x");
+    write_file(root, "apps/web/.next/cache/webpack/x.pack", "x");
+    write_file(root, "apps/web/.next/cache/node_modules/x.js", "x");
+
+    assert_eq!(
+        rels(walk_candidates(root)),
+        strings(&[
+            "a/b/c/d/.venv",
+            "apps/web/.next/cache",
+            "apps/web/.next/standalone/node_modules",
+            "src/node_modules",
+        ])
+    );
+}
+
+/// Outside a git repository nothing is positively ignored, so nothing is
+/// shared – the candidates exist, the answer is still empty.
+#[test]
+fn outside_a_repository_the_list_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    write_file(dir.path(), "node_modules/a/index.js", "x");
+
+    assert_eq!(rels(walk_candidates(dir.path())), strings(&["node_modules"]));
+    assert_eq!(expand(dir.path(), &defaults()), Expansion::default());
+    assert!(detected_default_patterns(dir.path()).is_empty());
+}
+
+#[test]
+fn matches_are_reported_per_pattern_for_the_picker() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n.turbo/\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    write_file(root, "apps/web/node_modules/a/index.js", "x");
+    write_file(root, ".turbo/cache/a", "x");
+
+    let rows = matches_by_pattern(root, &defaults());
+
+    assert_eq!(rows.len(), DEFAULT_PATTERNS.len());
+    assert_eq!(rows[0].pattern, "**/node_modules");
+    assert_eq!(rows[0].dirs, strings(&["apps/web/node_modules", "node_modules"]));
+    let turbo = rows.iter().find(|row| row.pattern == "**/.turbo").unwrap();
+    assert_eq!(turbo.dirs, strings(&[".turbo"]));
+    let venv = rows.iter().find(|row| row.pattern == "**/.venv").unwrap();
+    assert!(venv.dirs.is_empty());
+
+    assert_eq!(
+        detected_default_patterns(root),
+        strings(&["**/node_modules", "**/.turbo"]),
+        "only kinds that match something, in the picker's order"
+    );
+}
+
+// --- the picker's options ------------------------------------------------------
+
+fn row(pattern: &str, dirs: &[&str]) -> PatternMatches {
+    PatternMatches {
+        pattern: pattern.to_string(),
+        dirs: strings(dirs),
+    }
+}
+
+#[test]
+fn the_picker_offers_the_default_kinds_then_stored_custom_patterns() {
+    assert_eq!(picker_patterns(None), defaults());
+
+    let stored = strings(&["**/dist", "**/node_modules", "vendor/bundle"]);
+    let mut expected = defaults();
+    expected.extend(strings(&["**/dist", "vendor/bundle"]));
+    assert_eq!(picker_patterns(Some(&stored)), expected);
+}
+
+/// Never chosen: what matches something starts checked. Chosen before: exactly
+/// the stored choice starts checked, whatever matches – including "none".
+#[test]
+fn the_picker_preselects_matches_at_first_and_the_stored_choice_afterwards() {
+    let rows = vec![
+        row("**/node_modules", &["node_modules"]),
+        row("**/.venv", &[]),
+        row("**/.turbo", &[".turbo"]),
+        row("**/dist", &[]),
+    ];
+
+    assert_eq!(picker_preselected(None, &rows), vec![0, 2]);
+
+    let stored = strings(&["**/.venv", "**/dist"]);
+    assert_eq!(picker_preselected(Some(&stored), &rows), vec![1, 3]);
+
+    assert!(picker_preselected(Some(&[]), &rows).is_empty());
+}
+
+#[test]
+fn without_a_stored_choice_the_detected_kinds_are_stored() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n.venv/\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    write_file(root, ".venv/pyvenv.cfg", "x");
+
+    assert_eq!(
+        stored_or_detected(root, None),
+        Some(strings(&["**/node_modules", "**/.venv"]))
+    );
+    // A stored choice wins, and a stored "none" is a choice.
+    assert_eq!(stored_or_detected(root, Some(&[])), Some(Vec::new()));
+    assert_eq!(
+        stored_or_detected(root, Some(&strings(&["**/dist"]))),
+        Some(strings(&["**/dist"]))
+    );
+    // No stored choice and nothing to detect: the key stays absent.
+    let empty = init_main_repo("main");
+    assert_eq!(stored_or_detected(empty.path(), None), None);
+}
+
+/// A pattern that matches a TRACKED parent directory selects nothing – the
+/// parent is not a detected kind – and takes nothing away from other patterns.
+#[test]
+fn a_pattern_matching_a_tracked_parent_neither_shares_it_nor_hides_what_is_beneath() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n");
+    write_file(root, "apps/web/src/index.ts", "x");
+    write_file(root, "apps/web/node_modules/a/index.js", "x");
+    write_file(root, "apps/api/node_modules/b/index.js", "x");
+
+    let expansion = expand(root, &strings(&["apps/*", "**/node_modules"]));
+
+    assert_eq!(
+        expansion.dirs,
+        strings(&["apps/api/node_modules", "apps/web/node_modules"])
+    );
+}

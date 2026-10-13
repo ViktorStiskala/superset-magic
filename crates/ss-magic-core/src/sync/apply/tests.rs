@@ -398,3 +398,237 @@ fn excluded_trees_match_exact_components_not_prefixes() {
         assert!(dest.path().join(want).is_file(), "{want} must be copied");
     }
 }
+
+// --- PathFilter / run_filtered --------------------------------------------
+
+fn collect_filtered(
+    src: &Path,
+    dest: &Path,
+    patterns: &[&str],
+    filter: &[&str],
+) -> (Summary, Vec<Event>) {
+    let pats: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
+    let filter = PathFilter::new(filter.iter().map(PathBuf::from));
+    let mut events = Vec::new();
+    let summary = run_filtered(src, dest, &pats, &filter, |e| events.push(e.clone())).unwrap();
+    (summary, events)
+}
+
+fn filtered_labels(events: &[Event]) -> Vec<&str> {
+    skip_events_of(events)
+        .into_iter()
+        .filter(|(r, _)| matches!(r, SkipReason::Filtered))
+        .map(|(_, label)| label)
+        .collect()
+}
+
+#[test]
+fn path_filter_covers_an_entry_and_everything_beneath_it_by_component() {
+    let filter = PathFilter::new([PathBuf::from("config"), PathBuf::from("apps/api/.env")]);
+    assert!(filter.covers(Path::new("config")));
+    assert!(filter.covers(Path::new("config/a.json")));
+    assert!(filter.covers(Path::new("config/deep/er/a.json")));
+    assert!(filter.covers(Path::new("apps/api/.env")));
+    // Whole components only – never a string prefix.
+    assert!(!filter.covers(Path::new("config.json")));
+    assert!(!filter.covers(Path::new("configs/a.json")));
+    assert!(!filter.covers(Path::new("apps/api/.env.local")));
+    assert!(!filter.covers(Path::new("apps/api")));
+    assert!(!filter.covers(Path::new("apps")));
+}
+
+#[test]
+fn path_filter_drops_an_empty_path_instead_of_covering_the_whole_tree() {
+    let filter = PathFilter::new([PathBuf::new()]);
+    assert!(filter.is_empty());
+    assert!(!filter.covers(Path::new(".env")));
+    assert!(!PathFilter::empty().covers(Path::new(".env")));
+}
+
+#[test]
+fn filtered_match_is_not_copied_and_not_counted_as_skipped() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write(src.path(), ".env", "MAIN=1\n");
+    write(src.path(), "apps/api/.env", "API=1\n");
+    // The destination already holds its own copy of the filtered path.
+    write(dest.path(), ".env", "ALREADY-THERE=1\n");
+
+    let (summary, events) =
+        collect_filtered(src.path(), dest.path(), &[".env", "apps/api/.env"], &[".env"]);
+
+    assert_eq!(summary.copied, 1);
+    assert_eq!(summary.skipped, 0, "a filtered path is not a skip");
+    assert_eq!(summary.filtered, 1);
+    assert_eq!(copy_events_of(&events), vec![Path::new("apps/api/.env")]);
+    assert_eq!(filtered_labels(&events), vec![".env"]);
+    assert_eq!(
+        fs::read_to_string(dest.path().join(".env")).unwrap(),
+        "ALREADY-THERE=1\n",
+        "the filtered destination file must be left byte-for-byte alone"
+    );
+    assert!(dest.path().join("apps/api/.env").is_file());
+}
+
+#[test]
+fn filtered_file_inside_a_matched_directory_is_left_alone() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write(src.path(), "config/a.json", "main-a");
+    write(src.path(), "config/b.json", "main-b");
+    write(dest.path(), "config/a.json", "dest-a");
+
+    // The trailing slash is how a directory literal is often written.
+    let (summary, events) =
+        collect_filtered(src.path(), dest.path(), &["config/"], &["config/a.json"]);
+
+    assert_eq!(summary.copied, 1, "the directory match itself still copies");
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(summary.filtered, 1);
+    assert_eq!(filtered_labels(&events), vec!["config/a.json"]);
+    assert_eq!(
+        fs::read_to_string(dest.path().join("config/a.json")).unwrap(),
+        "dest-a",
+        "a filtered file under a matched directory must not be overwritten"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("config/b.json")).unwrap(),
+        "main-b"
+    );
+}
+
+#[test]
+fn filtered_file_absent_from_the_destination_is_not_created() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write(src.path(), "config/a.json", "main-a");
+    write(src.path(), "config/b.json", "main-b");
+
+    collect_filtered(src.path(), dest.path(), &["config"], &["config/a.json"]);
+
+    assert!(!dest.path().join("config/a.json").exists());
+    assert!(dest.path().join("config/b.json").is_file());
+}
+
+#[test]
+fn filter_entry_naming_a_directory_covers_the_whole_match() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write(src.path(), "config/a.json", "a");
+    write(src.path(), "config/nested/b.json", "b");
+    write(src.path(), "other.txt", "o");
+
+    let (summary, events) =
+        collect_filtered(src.path(), dest.path(), &["config", "other.txt"], &["config"]);
+
+    assert!(!dest.path().join("config").exists(), "nothing under config/ is copied");
+    assert!(dest.path().join("other.txt").is_file());
+    assert_eq!(summary.copied, 1);
+    assert_eq!(summary.filtered, 1, "a filtered directory is reported once");
+    assert_eq!(filtered_labels(&events), vec!["config"]);
+}
+
+#[test]
+fn filter_entry_naming_a_directory_covers_a_match_beneath_it() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write(src.path(), "config/local/a.json", "a");
+    // `.txt`, not `.json`: globset's `*` crosses path separators here, so a
+    // `.json` file in `sub/` would be a second glob match of its own.
+    write(src.path(), "config/local/sub/b.txt", "b");
+    write(src.path(), "config/shared.json", "s");
+
+    // A glob match beneath the filtered directory, and a directory match that
+    // is an ancestor of it: both enforcement points in one run.
+    let (summary, events) = collect_filtered(
+        src.path(),
+        dest.path(),
+        &["config/local/*.json", "config"],
+        &["config/local"],
+    );
+
+    assert!(!dest.path().join("config/local").exists());
+    assert!(dest.path().join("config/shared.json").is_file());
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(
+        filtered_labels(&events),
+        vec!["config/local/a.json", "config/local"],
+        "one event for the filtered glob match, one for the pruned directory"
+    );
+    assert_eq!(summary.filtered, 2);
+}
+
+/// A directory match whose every file is filtered copies nothing, and says so:
+/// one "left alone" event per file, no "copied" event for the directory.
+#[test]
+fn a_directory_match_with_every_file_filtered_is_not_reported_as_copied() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write(src.path(), "config/local/a.json", "main-a");
+    write(src.path(), "config/local/b.json", "main-b");
+    write(src.path(), "other.txt", "o");
+    write(dest.path(), "config/local/a.json", "dest-a");
+    write(dest.path(), "config/local/b.json", "dest-b");
+
+    let (summary, events) = collect_filtered(
+        src.path(),
+        dest.path(),
+        &["config/local", "other.txt"],
+        &["config/local/a.json", "config/local/b.json"],
+    );
+
+    assert_eq!(copy_events_of(&events), vec![Path::new("other.txt")]);
+    assert_eq!(summary.copied, 1);
+    assert_eq!(summary.filtered, 2);
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(
+        fs::read_to_string(dest.path().join("config/local/a.json")).unwrap(),
+        "dest-a"
+    );
+}
+
+/// An EMPTY matched directory is still reported as copied, as it always was:
+/// nothing was filtered, so the empty directory is the whole result.
+#[test]
+fn an_empty_directory_match_is_still_reported_as_copied() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    fs::create_dir_all(src.path().join("empty")).unwrap();
+
+    let (summary, events) =
+        collect_filtered(src.path(), dest.path(), &["empty"], &["unrelated"]);
+
+    assert_eq!(copy_events_of(&events), vec![Path::new("empty")]);
+    assert_eq!(summary.copied, 1);
+    assert!(dest.path().join("empty").is_dir());
+}
+
+#[test]
+fn empty_filter_behaves_exactly_like_run() {
+    let build = || {
+        let src = tempfile::tempdir().unwrap();
+        write(src.path(), ".env", "E");
+        write(src.path(), "config/a.json", "a");
+        write(src.path(), "node_modules/x/.env", "drop");
+        src
+    };
+    let patterns = [".env", "config", "**/.env", "missing.txt", "/abs"];
+
+    let src = build();
+    let dest_plain = tempfile::tempdir().unwrap();
+    let (plain, plain_events) = collect(src.path(), dest_plain.path(), &patterns);
+    let dest_filtered = tempfile::tempdir().unwrap();
+    let (filtered, filtered_events) =
+        collect_filtered(src.path(), dest_filtered.path(), &patterns, &[]);
+
+    assert_eq!(plain.copied, filtered.copied);
+    assert_eq!(plain.skipped, filtered.skipped);
+    assert_eq!(plain.filtered, 0);
+    assert_eq!(filtered.filtered, 0);
+    assert_eq!(format!("{plain_events:?}"), format!("{filtered_events:?}"));
+}
+
+#[test]
+fn filtered_skip_reason_never_counts() {
+    assert!(!SkipReason::Filtered.counts());
+}

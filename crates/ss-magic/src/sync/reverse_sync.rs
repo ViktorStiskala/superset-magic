@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 
 use crate::hashing;
-use crate::sync::apply;
+use crate::sync::apply::{self, PathFilter};
 use crate::sync::merge::{backup_rel_path, BackupSide, Decision};
 use crate::git;
 use crate::git::gitignore::{self, Ignored, PathKind};
@@ -588,15 +588,33 @@ pub fn run_bulk(worktree_root: &Path, main_root: &Path, no_backup: bool) -> Resu
 /// returning the backup path (`Ok(None)` when `target` is absent — a fresh
 /// create has nothing to lose). A directory is copied recursively, with `root`
 /// (the tree `target` sits under) passed through so the recursive copy can key
-/// its excluded-tree pruning on root-relative paths.
-fn backup_if_exists(root: &Path, target: &Path, dest: &Path) -> Result<Option<PathBuf>> {
+/// its excluded-tree pruning on root-relative paths. `filter` is the forward
+/// copy's own path filter: an entry it covers will not be overwritten, so the
+/// recursive copy leaves it out of the backup as well.
+fn backup_if_exists(
+    root: &Path,
+    target: &Path,
+    dest: &Path,
+    filter: &PathFilter,
+) -> Result<Option<PathBuf>> {
     if !target.exists() {
         return Ok(None);
     }
     if target.is_dir() {
-        // `copy_dir_recursive`'s first step is `create_dir_all(dest)`, which
-        // creates `dest` and its parents.
-        apply::copy_dir_recursive(root, target, dest)?;
+        // `copy_dir_recursive_filtered`'s first step is `create_dir_all(dest)`,
+        // which creates `dest` and its parents.
+        let mut filtered_any = false;
+        let files = apply::copy_dir_recursive_filtered(root, target, dest, filter, &mut |_| {
+            filtered_any = true;
+        })?;
+        if files == 0 && filtered_any {
+            // Every file in the directory is left alone by the copy, so there
+            // is nothing here to recover. An empty backup directory listed
+            // under "backups of files about to be overwritten" would promise
+            // one. Best-effort removal of the empty tree just created.
+            let _ = fs::remove_dir_all(dest);
+            return Ok(None);
+        }
         Ok(Some(dest.to_path_buf()))
     } else {
         // `backup` does the parent mkdir + `fs::copy` (the file-overwrite site's
@@ -612,7 +630,18 @@ fn backup_if_exists(root: &Path, target: &Path, dest: &Path) -> Result<Option<Pa
 /// stays untouched — this is a deliberate pre-pass with a narrow, documented
 /// same-process TOCTOU window (nothing else writes the worktree between this
 /// pass and the copy). Best-effort pruning keeps the backups dir bounded.
-pub fn backup_forward_targets(main_root: &Path, cwd_root: &Path, patterns: &[String]) -> Result<()> {
+///
+/// `filter` must be the SAME [`PathFilter`] the copy runs with
+/// (`apply::run_filtered`): a path the copy leaves alone is not about to be
+/// overwritten, so backing it up would only store another copy of a secret for
+/// no recovery value. It is applied both to each match and inside a matched
+/// directory's recursive backup, mirroring the copy's two enforcement points.
+pub fn backup_forward_targets(
+    main_root: &Path,
+    cwd_root: &Path,
+    patterns: &[String],
+    filter: &PathFilter,
+) -> Result<()> {
     let matches = apply::match_paths(main_root, patterns)
         .context("expanding sync patterns for the pre-copy backup pass")?;
     if matches.is_empty() {
@@ -628,12 +657,16 @@ pub fn backup_forward_targets(main_root: &Path, cwd_root: &Path, patterns: &[Str
         if crate::sync::under_excluded_tree(rel) {
             continue;
         }
+        // The copy will not touch a filtered path, so there is nothing to lose.
+        if filter.covers(rel) {
+            continue;
+        }
         // Forward sync overwrites the WORKTREE side, so back up under the shared
         // `<ts>/worktree/<rel>` namespace (`backup_rel_path`) that the cockpit and
         // reverse-sync bulk path use — one consistent layout, and no collision if
         // a forward and an interactive/bulk run ever share a timestamp directory.
         let dest = backups_root.join(backup_rel_path(&ts, BackupSide::Worktree, rel));
-        if let Some(p) = backup_if_exists(cwd_root, &cwd_root.join(rel), &dest)? {
+        if let Some(p) = backup_if_exists(cwd_root, &cwd_root.join(rel), &dest, filter)? {
             backed_up.push(p);
         }
     }

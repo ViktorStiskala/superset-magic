@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use inquire::validator::Validation;
 use inquire::{CustomUserError, Select, Text};
 
+use crate::orca::shared_dirs;
 use crate::sync::pattern;
 use crate::sync::repo_scan;
 use crate::tui::style;
@@ -40,15 +41,29 @@ impl fmt::Display for FinalAction {
 /// toggle the checkbox (re-renders, keeps the cursor on the row), or tap
 /// one of the trailing sentinels (`+ Add new …` / `✔ Done`).
 ///
-/// `dim_suffix` is rendered after the row label in [`style::warn`] when
-/// set. Pickers use this to flag rows that didn't trip their detection
-/// signal (`(no matches)` for the patterns picker, `(not detected)` for
-/// the setup-commands picker).
+/// `suffix` is rendered after the row label when set. Pickers use it to flag
+/// a row that didn't trip its detection signal (`(no matches)`), or to show
+/// what a row would bring in (the directories a shared-directory pattern
+/// matches).
 #[derive(Debug, Clone)]
 struct Row {
     raw: String,
     checked: bool,
-    dim_suffix: Option<&'static str>,
+    suffix: Option<RowSuffix>,
+}
+
+/// The note after a picker row's label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowSuffix {
+    /// Something to notice, in the warning color: the row matches nothing.
+    Warn(String),
+    /// Plain detail, dimmed: what the row matches.
+    Dim(String),
+}
+
+/// The suffix every pattern picker puts on a row that matches nothing.
+fn no_matches() -> RowSuffix {
+    RowSuffix::Warn("(no matches)".to_string())
 }
 
 /// One row in the bootstrap action prompt. Every row is an action: tap
@@ -73,8 +88,9 @@ impl fmt::Display for Action {
 
 fn render_row(row: &Row) -> String {
     let mark = if row.checked { "[x]" } else { "[ ]" };
-    match row.dim_suffix {
-        Some(suffix) => format!("{} {}  {}", mark, row.raw, style::warn(suffix)),
+    match &row.suffix {
+        Some(RowSuffix::Warn(suffix)) => format!("{} {}  {}", mark, row.raw, style::warn(suffix)),
+        Some(RowSuffix::Dim(suffix)) => format!("{} {}  {}", mark, row.raw, style::info(suffix)),
         None => format!("{} {}", mark, row.raw),
     }
 }
@@ -96,8 +112,8 @@ struct PickerStrings {
 /// sub-prompt, tap `✔ Done` to commit.
 ///
 /// Callers supply the validator (`(trimmed, taken) -> Result<(), String>`)
-/// and a closure that decides whether a newly added row carries a dim
-/// suffix and what label it uses. Function pointers satisfy the
+/// and a closure that decides which suffix, if any, a newly added row
+/// carries. Function pointers satisfy the
 /// `Clone + 'static` bound on the validator for free, which is what both
 /// in-tree call sites use.
 ///
@@ -108,11 +124,11 @@ fn pick_with_actions<V, D>(
     strings: &PickerStrings,
     mut rows: Vec<Row>,
     validator: V,
-    dim_for_new_row: D,
+    suffix_for_new_row: D,
 ) -> Result<Vec<String>>
 where
     V: Fn(&str, &[String]) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
-    D: Fn(&str) -> Result<Option<&'static str>>,
+    D: Fn(&str) -> Result<Option<RowSuffix>>,
 {
     // Cursor starts on the first unchecked row; if everything is already
     // checked, fall through to "Done" (one index past the AddNew sentinel).
@@ -155,11 +171,11 @@ where
                     &taken,
                     validator.clone(),
                 )? {
-                    let dim_suffix = dim_for_new_row(&new_value)?;
+                    let suffix = suffix_for_new_row(&new_value)?;
                     rows.push(Row {
                         raw: new_value,
                         checked: true,
-                        dim_suffix,
+                        suffix,
                     });
                     cursor = rows.len() - 1;
                 } else {
@@ -228,11 +244,7 @@ pub fn pick_patterns(
         .map(|(i, raw)| Row {
             raw: raw.clone(),
             checked: preselected.contains(&i),
-            dim_suffix: if initial_match[i] {
-                None
-            } else {
-                Some("(no matches)")
-            },
+            suffix: (!initial_match[i]).then(no_matches),
         })
         .collect();
 
@@ -248,12 +260,81 @@ pub fn pick_patterns(
     };
     pick_with_actions(&STRINGS, rows, validate_pattern, move |s| {
         let matched = repo_scan::pattern_matches_any(&repo_root, s)?;
-        Ok(if matched { None } else { Some("(no matches)") })
+        Ok((!matched).then(no_matches))
+    })
+}
+
+/// Pick the directory patterns Orca should share with a new worktree
+/// (`sharedDirectories` in `magic.json`).
+///
+/// `rows` pairs each offered pattern with the gitignored directories it
+/// matches in the checkout today, shown dimmed after the pattern so the choice
+/// is made knowing what it brings in. `preselected` is the set of indices that
+/// start checked. A pattern added inside the loop is validated like a sync
+/// pattern and matched against `repo_root` on the spot. Such a pattern selects
+/// among the directory kinds ss-magic detects (`apps/*/node_modules` narrows
+/// `**/node_modules`); it cannot make a directory of another kind shareable,
+/// and a row that selects nothing says so.
+pub fn pick_shared_directories(
+    rows: &[shared_dirs::PatternMatches],
+    preselected: &[usize],
+    repo_root: &Path,
+) -> Result<Vec<String>> {
+    let picker_rows: Vec<Row> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| Row {
+            raw: row.pattern.clone(),
+            checked: preselected.contains(&i),
+            suffix: Some(shared_suffix(&row.dirs)),
+        })
+        .collect();
+
+    let repo_root = repo_root.to_path_buf();
+    const STRINGS: PickerStrings = PickerStrings {
+        prompt: "Directories Orca shares with new worktrees:",
+        help: "↑↓ navigate, enter to toggle / add / confirm",
+        add_row_label: "+ Add new directory pattern…",
+        add_prompt_label: "New directory pattern (Esc to cancel):",
+        add_prompt_help: "e.g. `apps/*/node_modules` – a pattern selects among the detected kinds",
+        cancel_context: "shared directory selection cancelled",
+        add_cancel_context: "custom directory pattern prompt cancelled",
+    };
+    pick_with_actions(&STRINGS, picker_rows, validate_pattern, move |s| {
+        let matched = shared_dirs::matches_by_pattern(&repo_root, &[s.to_string()]);
+        let dirs = matched.into_iter().next().map(|m| m.dirs).unwrap_or_default();
+        Ok(Some(shared_suffix(&dirs)))
+    })
+}
+
+/// How many matched directories a shared-directory row names before it
+/// summarizes the rest as a count.
+const SHARED_SUFFIX_NAMED: usize = 3;
+
+/// The suffix of a shared-directory row: the directories the pattern matches,
+/// the first few by name, or the usual no-match warning.
+fn shared_suffix(dirs: &[String]) -> RowSuffix {
+    if dirs.is_empty() {
+        return no_matches();
+    }
+    let named = dirs
+        .iter()
+        .take(SHARED_SUFFIX_NAMED)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = dirs.len().saturating_sub(SHARED_SUFFIX_NAMED);
+    RowSuffix::Dim(if rest == 0 {
+        format!("({named})")
+    } else {
+        format!("({named}, +{rest} more)")
     })
 }
 
 /// Validate a single user-entered pattern. Wraps `pattern::check_syntax`
-/// and layers on the duplicate-of-already-taken check.
+/// and layers on the duplicate-of-already-taken check. Shared by the sync
+/// pattern picker and the shared-directory picker, so both reject an absolute
+/// path, a `..` segment and an uncompilable glob the same way.
 fn validate_pattern(pattern_str: &str, taken: &[String]) -> std::result::Result<(), String> {
     pattern::check_syntax(pattern_str).map_err(|e| e.label())?;
     if taken.iter().any(|p| p == pattern_str) {

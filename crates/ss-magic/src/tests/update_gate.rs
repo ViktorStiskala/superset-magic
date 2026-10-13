@@ -9,6 +9,12 @@
 use crate::cli::{self, Command, Parsed};
 use crate::{menu_blocked_reason, should_run_update_gate, version_line};
 
+/// `ss-magic sync` with no flags.
+const PLAIN_SYNC: Command = Command::Sync {
+    no_backup: false,
+    no_orca_skip: false,
+};
+
 // ── Gate fires for Bare / Sync when guard is inactive ───────────────────
 
 /// AE3 (wiring): Bare command + no guard → gate fires.
@@ -24,7 +30,7 @@ fn ae3_bare_no_guard_gate_fires() {
 #[test]
 fn sync_no_guard_gate_fires() {
     assert!(
-        should_run_update_gate(Command::Sync { no_backup: false }, false),
+        should_run_update_gate(PLAIN_SYNC, false),
         "Sync + guard inactive → gate must fire"
     );
 }
@@ -92,7 +98,7 @@ fn ae4_bare_guard_active_gate_does_not_fire() {
 #[test]
 fn sync_guard_active_gate_does_not_fire() {
     assert!(
-        !should_run_update_gate(Command::Sync { no_backup: false }, true),
+        !should_run_update_gate(PLAIN_SYNC, true),
         "Sync + guard active (SS_MAGIC_NO_UPDATE) → gate must not fire"
     );
 }
@@ -154,12 +160,13 @@ fn version_line_carries_the_crate_version() {
 /// so adding a variant fails to compile until someone decides whether it is
 /// gated, rather than silently inheriting `false`.
 #[test]
-fn gate_inclusion_list_is_exactly_the_four_work_commands() {
+fn gate_inclusion_list_is_exactly_the_five_work_commands() {
     let all = [
         Command::Bare,
-        Command::Sync { no_backup: false },
+        PLAIN_SYNC,
         Command::ReverseSync { no_backup: false },
         Command::Pack,
+        Command::Orca,
         Command::Update,
     ];
     for cmd in all {
@@ -167,7 +174,8 @@ fn gate_inclusion_list_is_exactly_the_four_work_commands() {
             Command::Bare
             | Command::Sync { .. }
             | Command::ReverseSync { .. }
-            | Command::Pack => true,
+            | Command::Pack
+            | Command::Orca => true,
             Command::Update => false,
         };
         assert_eq!(
@@ -213,4 +221,13 @@ fn every_menu_refusal_names_a_terminal() {
             "reason {reason:?} should name the terminal requirement"
         );
     }
+}
+
+/// `ss-magic orca` is a non-interactive "do work" command like `pack`, so it
+/// passes through the update gate – and, like every command, not when the
+/// loop guard is active.
+#[test]
+fn orca_is_gated_like_pack() {
+    assert!(should_run_update_gate(Command::Orca, false));
+    assert!(!should_run_update_gate(Command::Orca, true));
 }

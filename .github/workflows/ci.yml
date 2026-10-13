@@ -163,13 +163,17 @@ jobs:
       # it). The message is matched explicitly so an unrelated cargo failure --
       # a missing lockfile, a resolve error -- is reported rather than read as
       # proof of absence.
-      - name: The plugin links no updater and no TUI (R2)
+      #
+      # `saphyr` is the YAML parser of the CLI's `orca.yaml` editor. The plugin
+      # has no Orca behaviour, so the parser showing up here would mean Orca
+      # code reached core.
+      - name: The plugin links no updater, no TUI and no YAML parser (R2)
         run: |
           set -euo pipefail
-          for crate in self_update inquire ratatui; do
+          for crate in self_update inquire ratatui saphyr; do
             if out=$(cargo tree --locked -p ss-magic-plugin -i "$crate" 2>&1); then
               printf '%s\n' "$out"
-              echo "ss-magic-plugin links $crate; it must link neither an updater nor a TUI." >&2
+              echo "ss-magic-plugin links $crate; it must link no updater, no TUI and no YAML parser." >&2
               exit 1
             fi
             case "$out" in

@@ -320,6 +320,112 @@ fn check_ignore(repo_root: &Path, rel_str: &str, no_index: bool) -> Result<bool>
     }
 }
 
+/// Which of `candidates` git reports as IGNORED AND UNTRACKED, answered for the
+/// whole list by ONE `git check-ignore --stdin -z` process.
+///
+/// `check-ignore` consults the index by default and never reports a tracked
+/// path, whatever the ignore rules say, so a single call yields the positive
+/// "ignored and untracked" set – the question the Orca snapshot asks about every
+/// file it would list, where a per-path `is_ignored` plus a `tracked_files`
+/// lookup would cost a process per path. The returned strings are the matching
+/// candidates byte-for-byte, in git's output order; with `-z` git echoes each
+/// pathname exactly as it was given, so a name in a decomposed (NFD) Unicode
+/// form comes back in that same form.
+///
+/// A candidate naming a DIRECTORY must carry a trailing slash (`node_modules/`):
+/// that forces git's directory-only match, so a `node_modules/` rule answers
+/// correctly, and the slash comes back with the path.
+///
+/// Git reads every line of the batch as a PATHSPEC, so a candidate that is empty
+/// or starts with `:` is dropped before the question is asked and is never
+/// reported as ignored. A root-level file literally named `:(top)a.env` would
+/// otherwise be answered as if it were `a.env` (git echoes the original string
+/// back, so it would pass the `asked` filter below and wrongly enter the list
+/// handed to Orca), and a name such as `:(icase)z` or `:!x` makes git exit 128
+/// and throws away the answers for the whole batch. Only a name at the
+/// repository root can begin with `:` once paths are repo-relative (below a
+/// directory it starts with the directory's name), so dropping such names costs
+/// nothing else. Leaving a file out is the safe side: forward sync still copies
+/// it.
+///
+/// The answer fails closed in both directions a caller cares about. An empty
+/// `candidates`, or one with nothing left after the drop above, returns an empty
+/// list without spawning anything. Exit 1 (nothing
+/// ignored) is an empty list. ANY other failure – not a git repository, an
+/// unreadable index – is an `Err`, which a caller must read as "nothing is
+/// positively ignored" rather than retry path by path.
+///
+/// One git behavior shapes how callers build the list: git aborts the WHOLE
+/// batch with a fatal error (exit 128) when a single pathspec lies inside a
+/// submodule or beneath a symlinked directory, even though it has already
+/// printed answers for the earlier entries. Those partial answers are discarded
+/// here (the call is an `Err`), so a caller must drop such candidates BEFORE the
+/// call or lose the answer for every other path.
+///
+/// Builds its own `Command` instead of going through [`git_raw`], which nulls
+/// stdin. The candidate list is written from a helper thread while this thread
+/// drains stdout: git answers as it reads, so writing a list larger than the
+/// pipe buffer from the same thread that later reads the output would deadlock.
+pub fn ignored_untracked(repo_root: &Path, candidates: &[String]) -> Result<Vec<String>> {
+    let candidates: Vec<&String> = candidates
+        .iter()
+        .filter(|candidate| !candidate.is_empty() && !candidate.starts_with(':'))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut payload: Vec<u8> = Vec::new();
+    for candidate in &candidates {
+        payload.extend_from_slice(candidate.as_bytes());
+        payload.push(0);
+    }
+
+    let mut child = Command::new("git")
+        .current_dir(repo_root)
+        .args(["check-ignore", "--stdin", "-z"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn `git check-ignore --stdin -z`")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("`git check-ignore` was spawned without a stdin pipe")?;
+    // A write error here (EPIPE once git has already died) is not reported on
+    // its own: the exit status below is what says whether the answer is usable.
+    let writer = std::thread::spawn(move || {
+        use std::io::Write;
+        let _ = stdin.write_all(&payload);
+        // `stdin` drops here, closing the pipe so git sees end-of-input.
+    });
+    let out = child
+        .wait_with_output()
+        .context("waiting for `git check-ignore --stdin -z`")?;
+    let _ = writer.join();
+
+    match out.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(Vec::new()),
+        _ => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            bail!("`git check-ignore --stdin -z` failed: {stderr}");
+        }
+    }
+    let asked: std::collections::HashSet<&str> = candidates.iter().map(|c| c.as_str()).collect();
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|raw| !raw.is_empty())
+        .filter_map(|raw| std::str::from_utf8(raw).ok())
+        // Git only ever echoes what it was asked about; keeping to the asked set
+        // means nothing this function returns can be a path the caller did not
+        // itself choose to query.
+        .filter(|path| asked.contains(path))
+        .map(str::to_string)
+        .collect())
+}
+
 /// Git-TRACKED files among `pathspecs`, via `git ls-files --cached -z --`. The
 /// mirror of [`untracked_files`], used for POSITIVE tracked determination in the
 /// reverse-sync secret gate — a path NOT in this set is treated as untracked (a

@@ -11,24 +11,37 @@ learnings; direct edits are fine. Glossary only, not a spec or catch-all.
 A linked git checkout that shares its repository's history with the main
 checkout but has its own working tree, so anything that never enters git –
 secrets, local overlays, generated state – is absent from it until something
-copies it there. Superset creates one per workspace; forward sync, reverse
-sync and the merge cockpit exist to move exactly those non-git files between
-a worktree and the main checkout, and which side is source or target is
-decided by where the command is run.
+copies it there. Superset creates one per workspace, and Orca creates them
+too; forward sync, reverse sync and the merge cockpit exist to move exactly
+those non-git files between a worktree and the main checkout, and which side
+is source or target is decided by where the command is run.
 
 ### Workspace contract
-The directory a repository commits so Superset can create and tear down
-workspaces for it: the workspace lifecycle configuration, the wrapper script
-that runs ss-magic when a workspace is set up, the shared sync-pattern list,
-and beside them the optional per-checkout local pattern list. It is the one
-tree ss-magic owns inside a repository and is never itself excluded from
-sync or pack – only the backup and plugin-state subtrees inside it are.
+What a repository carries so a worktree manager can set up a new worktree
+with ss-magic's files in it. It has two parts.
 
-ss-magic writes it in two ways. Initialization lays it out fresh; migration
-converts a repository that predates the current layout, carrying the
-previously configured file list forward. Both stage the whole tree and
+The `.superset/` directory is the part Superset reads, and the source of
+truth: the workspace lifecycle configuration, the wrapper script that runs
+ss-magic when a workspace is set up, the shared list of sync patterns and
+shared-directory patterns, and beside them the optional per-checkout local
+pattern list. It is the one tree ss-magic owns inside a repository and is
+never itself excluded from sync or pack – only the backup and plugin-state
+subtrees inside it are.
+
+The Orca files at the repository root are the part Orca reads, and are derived
+output: a committed configuration file whose setup script runs the same
+wrapper and which lists the shared directories, and a gitignored snapshot of
+the files Orca should copy. ss-magic generates both from the `.superset/`
+lists, so there is one maintained list for both apps. It owns only its two
+keys of the configuration file and its marked section of the snapshot;
+everything else in either file belongs to whoever wrote it.
+
+ss-magic writes the contract in two ways. Initialization lays it out fresh;
+migration converts a repository that predates the current layout, carrying the
+previously configured file list forward. Both stage the `.superset/` tree and
 materialize it in one step behind a finishing prompt, so an aborted run
-leaves the previous contract intact.
+leaves the previous contract intact; the Orca files are planned before that
+prompt and written right after the tree is in place.
 
 ### Main checkout
 The primary git checkout that linked worktrees branch from and share a common
@@ -48,7 +61,42 @@ checkout's copy.
 ### Forward sync
 Copying the files matching the sync patterns from the main checkout into a
 worktree, so a freshly created worktree gains the local/untracked files (secrets,
-local overlays) that never travel through git.
+local overlays) that never travel through git. In an Orca worktree it leaves
+alone the files Orca already copied and, once the copy has succeeded,
+refreshes the Orca snapshot.
+
+### Orca worktree
+A worktree that Orca set up, as far as ss-magic can tell: one of Orca's
+environment variables names the very worktree root ss-magic is running in.
+The variables existing is not the test – a terminal Orca opened keeps them
+when it moves into another repository's worktree, and running there must
+behave as it does outside Orca. The main checkout is never an Orca worktree,
+whatever a variable names. Only forward sync behaves differently in one;
+reverse sync, the merge cockpit and pack do not.
+
+### Shared directory
+A dependency directory of the main checkout – `node_modules`, a Python
+virtualenv, a JS build cache – that Orca links or clone-copies into a new
+worktree instead of leaving it to be reinstalled. These are the trees forward
+sync deliberately never copies, so sharing is the only way a new worktree gets
+them. The contract stores glob patterns; each write expands them to the
+literal, gitignored directories they match at that moment, since the set of
+packages changes and Orca accepts literal paths only. Which directories count
+is a fixed list of kinds detected by name; a pattern selects among them and
+cannot add a kind. A `node_modules` nested inside another is never listed, and
+a directory that is tracked or not gitignored is never shared.
+
+### Orca snapshot
+The literal list of files Orca copies into a new worktree before any setup
+script runs: what forward sync would copy, narrowed to what Orca would copy.
+The sync patterns are expanded against the main checkout as it is right now,
+directories are listed file by file, and a file enters only when git
+positively reports it as ignored and untracked. It is per-machine and goes
+stale as files come and go, which is why it is never committed and why it is
+refreshed in three ways: by every operation that writes the contract, by the
+explicit refresh, and automatically at the end of a forward sync in an Orca
+worktree. Leaving a file out is always safe, because forward sync still
+copies whatever the snapshot does not list.
 
 ### Reverse sync
 Pushing a worktree's files that match the sync patterns back into the main

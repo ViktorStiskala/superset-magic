@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 
 mod cli;
+mod orca;
 mod pack;
 mod sync;
 mod tui;
@@ -18,8 +19,9 @@ mod tests;
 // and `crate::hashing::…` path still resolves.
 pub(crate) use ss_magic_core::{git, hashing};
 
-use crate::sync::apply::{Event, SkipReason};
+use crate::sync::apply::{Event, PathFilter, SkipReason, Summary};
 use crate::cli::{Command, Parsed};
+use crate::orca::detect::EnvLookup;
 
 /// Pure gate-decision helper (U8, AE3). Returns `true` when the auto-update
 /// daily-cache gate should fire for the given command and guard state.
@@ -32,8 +34,9 @@ use crate::cli::{Command, Parsed};
 /// | `Sync`                       | false        | true   |
 /// | `ReverseSync`                | false        | true   |
 /// | `Pack`                       | false        | true   |
+/// | `Orca`                       | false        | true   |
 /// | `Update`                     | false        | false  |
-/// | `Bare`/`Sync`/`ReverseSync`/`Pack` | true   | false  |
+/// | `Bare`/`Sync`/`ReverseSync`/`Pack`/`Orca` | true | false |
 /// | `Update`                     | true         | false  |
 ///
 /// `Command::Update` always bypasses the gate — it routes to the force path
@@ -41,9 +44,9 @@ use crate::cli::{Command, Parsed};
 /// guard is active (`SS_MAGIC_UPDATED` or `SS_MAGIC_NO_UPDATE` is set) the
 /// gate never fires regardless of command, preventing re-exec loops (AE4).
 ///
-/// `Command::Pack` and `Command::ReverseSync` are gated alongside `Bare`/`Sync`:
-/// each is a non-interactive "do work" command, so gating keeps their users
-/// self-updating.
+/// `Command::Pack`, `Command::ReverseSync` and `Command::Orca` are gated
+/// alongside `Bare`/`Sync`: each is a non-interactive "do work" command, so
+/// gating keeps their users self-updating.
 ///
 /// Keep this an INCLUSION list. Inverting it to exclusions would mean every
 /// future command self-updates unless someone remembers to opt it out, and the
@@ -58,7 +61,11 @@ pub fn should_run_update_gate(cmd: Command, guard_active: bool) -> bool {
     }
     matches!(
         cmd,
-        Command::Bare | Command::Sync { .. } | Command::ReverseSync { .. } | Command::Pack
+        Command::Bare
+            | Command::Sync { .. }
+            | Command::ReverseSync { .. }
+            | Command::Pack
+            | Command::Orca
     )
 }
 
@@ -187,9 +194,19 @@ fn dispatch(cmd: Command) -> Result<ExitCode> {
             }
             tui::menu::run(&cwd)
         }
-        Command::Sync { no_backup } => run_sync_flow(&cwd, no_backup),
+        Command::Sync {
+            no_backup,
+            no_orca_skip,
+        } => run_sync_flow(
+            &cwd,
+            SyncOptions {
+                no_backup,
+                no_orca_skip,
+            },
+        ),
         Command::ReverseSync { no_backup } => run_reverse_sync_flow(&cwd, no_backup),
         Command::Pack => run_pack_flow(&cwd),
+        Command::Orca => run_orca_flow(&cwd),
         Command::Update => update_flow(),
     }
 }
@@ -270,6 +287,72 @@ fn print_pack_event(ev: &pack::PackEvent) {
     }
 }
 
+/// Explicit Orca refresh: regenerate the main checkout's `orca.yaml` shared
+/// directories and `.worktreeinclude` from `magic.json`. Handler for
+/// `ss-magic orca` and the main-checkout menu's "Refresh Orca files" entry.
+///
+/// Runs from any directory of the repository – a worktree included – and always
+/// writes into the MAIN checkout, since that is where Orca reads both files
+/// from. This is also how a repository set up before Orca support gains the
+/// files in one step.
+pub fn run_orca_flow(cwd: &Path) -> Result<ExitCode> {
+    tui::style::print_section("Refresh Orca files");
+    match orca_core(cwd) {
+        Ok(notices) => {
+            orca::write::print_notices(&notices);
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(code) => Ok(code),
+    }
+}
+
+/// Core of [`run_orca_flow`], returning the notices instead of printing them
+/// so tests can read what happened. `Err` carries the exit code of a hard
+/// error, already reported on stderr: the repository roots cannot be resolved,
+/// or the main checkout has no (or a malformed) `.superset/magic.json` – in
+/// which case nothing is written.
+///
+/// What the refresh does and does not touch:
+///
+/// - `worktree.sharedDirectories` is replaced by the expansion of the patterns
+///   stored under `sharedDirectories` in the committed `magic.json`. When that
+///   key is absent nobody has chosen yet, so the list is written empty and a
+///   notice points at edit-config; `magic.json` itself is not changed here.
+/// - `scripts.setup` of an EXISTING `orca.yaml` is left exactly as it is, so a
+///   line someone removed on purpose stays removed (R25). Only when the refresh
+///   creates the file does it include the `magic.sh sync` line.
+/// - `.worktreeinclude` gets a fresh snapshot and, unless it is tracked, its
+///   ignore rule – which is what lets the automatic end-of-sync refresh run in
+///   a repository that never had the rule.
+///
+/// An `orca.yaml` that cannot be edited safely is reported and left alone; that
+/// is a notice, not a failure.
+fn orca_core(cwd: &Path) -> std::result::Result<Vec<orca::write::Notice>, ExitCode> {
+    use orca::write::{Level, Notice, SetupPolicy};
+
+    let (_cwd_root, main_root) = resolve_sync_roots(cwd)?;
+    let cfg = load_magic_or_exit(&main_root)?;
+
+    let shared = cfg.shared_directories.clone().unwrap_or_default();
+    let plan = orca::write::plan(
+        &main_root,
+        &cfg.files,
+        &shared,
+        SetupPolicy::OnlyWhenCreating,
+    );
+    let mut notices = plan.apply(&main_root);
+    if cfg.shared_directories.is_none() {
+        notices.push(Notice {
+            level: Level::Info,
+            text: "magic.json has no `sharedDirectories` yet, so no directories are shared \
+                   with Orca worktrees. Run `ss-magic` in the main checkout and pick \
+                   \"Edit synced files\" to choose them."
+                .to_string(),
+        });
+    }
+    Ok(notices)
+}
+
 /// Non-interactive forward file copy: main checkout → current working tree.
 /// Handler for `ss-magic sync` (the worktree menu now routes to the interactive
 /// unified cockpit instead).
@@ -284,8 +367,23 @@ fn print_pack_event(ev: &pack::PackEvent) {
 /// - Cannot resolve the main checkout root (not in a git repo, or git fails).
 /// - `.superset/magic.json` absent in the resolved main root.
 /// - Malformed `magic.json` or `magic.local.json` in the main root.
-pub fn run_sync_flow(cwd: &Path, no_backup: bool) -> Result<ExitCode> {
-    sync_core(cwd, no_backup, print_event)
+///
+/// In an Orca worktree (see `orca::detect`) the copy leaves alone the paths
+/// Orca already copied from the main checkout's `.worktreeinclude`, and a
+/// successful copy is followed by a best-effort refresh of that file's managed
+/// section. Outside an Orca worktree none of that happens.
+pub fn run_sync_flow(cwd: &Path, opts: SyncOptions) -> Result<ExitCode> {
+    sync_core(cwd, opts, &|name| env::var_os(name), print_event)
+}
+
+/// What `ss-magic sync` was asked to do besides the copy itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncOptions {
+    /// `--no-backup`: skip the pre-overwrite backup pass.
+    pub no_backup: bool,
+    /// `--no-orca-skip`: in an Orca worktree, copy the `.worktreeinclude`
+    /// paths as well instead of leaving them to Orca.
+    pub no_orca_skip: bool,
 }
 
 /// Resolve the current repo root and the main checkout root for the sync flows,
@@ -320,7 +418,12 @@ fn resolve_sync_roots(cwd: &Path) -> std::result::Result<(PathBuf, PathBuf), Exi
 
 /// Extracted core of `sync_flow` so tests can inject a no-op event handler
 /// without side-effects on stdout/stderr.
-fn sync_core<F>(cwd: &Path, no_backup: bool, on_event: F) -> Result<ExitCode>
+///
+/// `env` is how the Orca variables are read. Production passes the process
+/// environment; tests pass a closure, so a test neither depends on the
+/// variables of the terminal it happens to run in (which may itself be an Orca
+/// terminal) nor has to set process-wide ones that parallel tests would see.
+fn sync_core<F>(cwd: &Path, opts: SyncOptions, env: EnvLookup<'_>, on_event: F) -> Result<ExitCode>
 where
     F: FnMut(&Event),
 {
@@ -345,31 +448,46 @@ where
         return Ok(ExitCode::SUCCESS);
     }
 
+    // 5a. Orca: in an Orca worktree, the paths Orca already copied from the
+    // main checkout's `.worktreeinclude` are left alone. The list is read HERE,
+    // once, before anything is copied – and so before the refresh at the end
+    // rewrites it. A path that refresh adds was not in the list Orca used, so
+    // it must not be skipped on the strength of it (R16).
+    let in_orca = orca::detect::is_orca_worktree(&cwd_root, &main_root, env);
+    let filter = if in_orca && !opts.no_orca_skip {
+        orca_skip_filter(&main_root, &cwd_root)
+    } else {
+        PathFilter::empty()
+    };
+
     // 5b. Pre-copy backup pass: back up every worktree file the copy will
     // overwrite (under `<cwd>/.superset/backups/`, gitignored there) so a
-    // mistaken forward sync is recoverable. Skipped by `--no-backup`.
-    if !no_backup {
-        if let Err(err) =
-            sync::reverse_sync::backup_forward_targets(&main_root, &cwd_root, &cfg.files)
-        {
+    // mistaken forward sync is recoverable. Skipped by `--no-backup`. It runs
+    // with the copy's own filter: a path left to Orca is not overwritten, so it
+    // is not backed up either.
+    if !opts.no_backup {
+        if let Err(err) = sync::reverse_sync::backup_forward_targets(
+            &main_root,
+            &cwd_root,
+            &cfg.files,
+            &filter,
+        ) {
             eprintln!("{}", tui::style::err(format!("error: {err:#}")));
             return Ok(ExitCode::from(1));
         }
     }
 
     // 6. Run the apply engine: main_root → cwd_root.
-    let summary = match sync::apply::run(&main_root, &cwd_root, &cfg.files, on_event) {
-        Ok(s) => s,
-        Err(err) => {
-            eprintln!("{}", tui::style::err(format!("error: {err:#}")));
-            return Ok(ExitCode::from(1));
-        }
-    };
+    let summary =
+        match sync::apply::run_filtered(&main_root, &cwd_root, &cfg.files, &filter, on_event) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("{}", tui::style::err(format!("error: {err:#}")));
+                return Ok(ExitCode::from(1));
+            }
+        };
 
-    let line = format!(
-        "Sync done: copied {} files, skipped {} files",
-        summary.copied, summary.skipped
-    );
+    let line = sync_summary_line(&summary);
     println!();
     if summary.skipped == 0 {
         println!("{}", tui::style::ok(line));
@@ -377,7 +495,86 @@ where
         println!("{}", tui::style::warn(line));
     }
 
+    // 7. Orca: the copy succeeded, so bring the main checkout's snapshot up to
+    // date for the NEXT worktree. Best-effort – whatever it reports, the exit
+    // status of the sync stands (R26). It runs with `--no-orca-skip` too: that
+    // flag is about what this run copies, not about keeping the list current.
+    if in_orca {
+        report_snapshot_refresh(&orca::write::refresh_snapshot(&main_root, &cfg.files));
+    }
+
     Ok(ExitCode::SUCCESS)
+}
+
+/// The one-line result of a forward sync. Paths left to Orca are reported apart
+/// from skips: they are not a problem and never turn the line into a warning.
+fn sync_summary_line(summary: &Summary) -> String {
+    let mut line = format!(
+        "Sync done: copied {} files, skipped {} files",
+        summary.copied, summary.skipped
+    );
+    if summary.filtered > 0 {
+        line.push_str(&format!(
+            ", left {} {} to Orca",
+            summary.filtered,
+            if summary.filtered == 1 { "path" } else { "paths" }
+        ));
+    }
+    line
+}
+
+/// The paths this Orca worktree already has from Orca: every entry of the main
+/// checkout's `.worktreeinclude` – the managed section and the hand-written
+/// lines alike – that exists here. A file that cannot be read yields an empty
+/// set plus a warning, so the sync copies everything itself rather than trust a
+/// list it could not see.
+fn orca_skip_filter(main_root: &Path, cwd_root: &Path) -> PathFilter {
+    use orca::worktreeinclude::{self, Existing};
+    match worktreeinclude::read(main_root) {
+        Existing::Absent => PathFilter::empty(),
+        Existing::Text(text) => {
+            worktreeinclude::copied_by_orca(cwd_root, &worktreeinclude::entries(&text))
+        }
+        Existing::Unreadable(why) => {
+            eprintln!(
+                "{}",
+                tui::style::warn(format!(
+                    "Orca: the main checkout's `.worktreeinclude` was not used because {why}; \
+                     nothing is skipped."
+                ))
+            );
+            PathFilter::empty()
+        }
+    }
+}
+
+/// Print what the end-of-sync snapshot refresh did. Never an error: a refresh
+/// that could not run is a warning, and the sync has already succeeded.
+fn report_snapshot_refresh(outcome: &orca::write::SnapshotRefresh) {
+    use orca::write::SnapshotRefresh;
+    let warning = match outcome {
+        SnapshotRefresh::Written { listed, warning } => {
+            println!(
+                "{}",
+                tui::style::info(format!(
+                    "Orca: refreshed `.worktreeinclude` in the main checkout ({listed} {} listed).",
+                    if *listed == 1 { "file" } else { "files" }
+                ))
+            );
+            warning
+        }
+        SnapshotRefresh::Unchanged { warning } => warning,
+        SnapshotRefresh::Skipped(why) => {
+            eprintln!(
+                "{}",
+                tui::style::warn(format!("Orca: `.worktreeinclude` was not refreshed: {why}"))
+            );
+            &None
+        }
+    };
+    if let Some(warning) = warning {
+        eprintln!("{}", tui::style::warn(warning));
+    }
 }
 
 /// Non-interactive reverse copy (current worktree → main). Handler for
@@ -453,7 +650,12 @@ fn print_event(ev: &Event) {
         }
         Event::Skip { reason, label } => {
             let line = format!("Skipped ({}): {label}", reason.label());
-            if matches!(reason, SkipReason::Excluded) {
+            if matches!(reason, SkipReason::Filtered) {
+                // Not a problem: Orca already put this path in the worktree, so
+                // the copy left it alone. Worded for what happened rather than
+                // with the engine's generic "filtered" label.
+                println!("{}", tui::style::info(format!("Left to Orca: {label}")));
+            } else if matches!(reason, SkipReason::Excluded) {
                 println!("{}", tui::style::info(line));
             } else if matches!(reason, SkipReason::NoMatches) {
                 // Default color, like setup.sh.

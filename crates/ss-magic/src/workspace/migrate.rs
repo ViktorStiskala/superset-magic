@@ -27,6 +27,16 @@
 //! The destructive file transforms (rename/marker-replace/delete) are kept in
 //! pure, UI-free helpers ([`migrated_setup`], [`stage_migration`]) so they are
 //! unit-testable without driving the interactive prompt.
+//!
+//! ## Orca files
+//!
+//! Every operation here also writes Orca's `orca.yaml` and `.worktreeinclude`
+//! at the repository root, derived from the same `magic.json` (see
+//! `crate::orca`). The Orca output is COMPUTED before the finishing prompt, so
+//! the "This will:" list names it, and WRITTEN after the `.superset` tree has
+//! materialized ([`materialize_init`], [`materialize_migration`]). A file that
+//! cannot be edited safely is reported and left alone; it never fails the
+//! operation.
 
 use std::fs;
 use std::path::Path;
@@ -36,8 +46,10 @@ use anyhow::{Context, Result};
 
 use crate::git;
 use crate::git::gitignore;
+use crate::orca::shared_dirs;
+use crate::orca::write::{self as orca_write, Notice, SetupPolicy};
 use crate::sync::reverse_sync;
-use crate::workspace::superset_files::{self, Config};
+use crate::workspace::superset_files::{self, Config, MagicConfig};
 use crate::tui::style;
 use crate::tui::ui::{self, FinalAction};
 use ss_magic_core::state_tree;
@@ -96,6 +108,50 @@ fn ensure_bootstrap_gitignores(repo_root: &Path) -> Result<()> {
     reverse_sync::ensure_backups_ignored(repo_root)?;
     state_tree::ensure_state_ignored(repo_root)?;
     Ok(())
+}
+
+/// The sync patterns as they will be once `files` is written to `magic.json`:
+/// `files` first, then every pattern of the existing `magic.local.json` overlay
+/// that is not already among them – the same union-and-dedupe
+/// `superset_files::load_overlaid` applies, computed from the list in hand
+/// because `magic.json` is not on disk yet when the Orca output is planned.
+/// A repository with no local overlay yet contributes nothing, which is right:
+/// the one a first init bootstraps is empty.
+///
+/// An overlay that cannot be read or parsed (a merge conflict, a hand edit
+/// gone wrong) contributes no patterns, and the second element of the result is
+/// a warning for the caller to print. Init, edit config and migrate never
+/// parsed that file before the Orca output existed, so a broken per-machine
+/// file must not stop them now; leaving its patterns out of the list handed to
+/// Orca is always safe, because forward sync still copies those files. The
+/// function prints nothing itself so the warning text can be tested.
+fn overlaid_patterns(repo_root: &Path, files: &[String]) -> (Vec<String>, Option<String>) {
+    let mut patterns = files.to_vec();
+    match superset_files::load_magic_local_json(repo_root) {
+        Ok(Some(local)) => {
+            for pattern in local.files {
+                if !patterns.contains(&pattern) {
+                    patterns.push(pattern);
+                }
+            }
+            (patterns, None)
+        }
+        Ok(None) => (patterns, None),
+        Err(e) => {
+            let warning = format!(
+                ".superset/magic.local.json could not be read ({e:#}); its patterns are \
+                 left out of the files listed for Orca until it is fixed."
+            );
+            (patterns, Some(warning))
+        }
+    }
+}
+
+/// Prints the warning `overlaid_patterns` produced, if any, to stderr.
+fn warn_overlay(warning: Option<String>) {
+    if let Some(warning) = warning {
+        eprintln!("{}", style::warn(warning));
+    }
 }
 
 /// Path of the pre-marketplace skills-directory copy of the plugin, relative to
@@ -272,7 +328,16 @@ fn migration_summary(existing: &Config) -> Vec<String> {
 /// The retired `setup.sh` is NOT staged; the caller passes
 /// [`SETUP_SH_REL`] to `copy_into_repo`'s delete set to remove it from the
 /// repo.
-fn stage_migration(repo_root: &Path, stage_root: &Path, existing: &Config) -> Result<()> {
+///
+/// `shared` becomes `magic.json`'s `sharedDirectories` – the patterns naming
+/// the dependency directories Orca shares with a new worktree – and `None`
+/// leaves that key out of the file.
+fn stage_migration(
+    repo_root: &Path,
+    stage_root: &Path,
+    existing: &Config,
+    shared: Option<&[String]>,
+) -> Result<()> {
     // setup_config.json `files` carry across to magic.json. Absent → empty.
     let files = superset_files::load_setup_config(repo_root)?
         .map(|c| c.files)
@@ -280,8 +345,15 @@ fn stage_migration(repo_root: &Path, stage_root: &Path, existing: &Config) -> Re
     // Preserve any unknown top-level keys (KTD8) already sitting in
     // magic.json — a repo mid-migration (both the old setup.sh marker and
     // the new magic.sh marker present in `setup`) can already have one.
+    // `shared` is the Orca shared-directory pattern list the caller settled on
+    // (the stored one, or the detected defaults); it is stored as given, and
+    // `None` leaves the key absent.
     let existing_magic = superset_files::load_magic_json(repo_root)?;
-    let magic_cfg = superset_files::merge_files_into_magic_config(existing_magic.as_ref(), files);
+    let magic_cfg = superset_files::merge_files_into_magic_config(
+        existing_magic.as_ref(),
+        files,
+        shared.map(<[String]>::to_vec),
+    );
     superset_files::write_magic_json(stage_root, &magic_cfg)?;
 
     // magic.sh wrapper.
@@ -328,10 +400,32 @@ pub fn run_migrate(repo_root: &Path, existing: &Config) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // ---- Orca output, decided before the prompt so the summary can name it.
+    // Migration asks nothing about shared directories: it keeps a stored list
+    // and otherwise takes every default kind that matches something. ----
+    let stored_shared = superset_files::load_magic_json(repo_root)?
+        .and_then(|magic| magic.shared_directories);
+    let shared = shared_dirs::stored_or_detected(repo_root, stored_shared.as_deref());
+    // The patterns migration is about to carry into magic.json, read from the
+    // same legacy file `stage_migration` reads them from.
+    let migrated_files = superset_files::load_setup_config(repo_root)?
+        .map(|c| c.files)
+        .unwrap_or_default();
+    let (orca_patterns, overlay_warning) = overlaid_patterns(repo_root, &migrated_files);
+    warn_overlay(overlay_warning);
+    let orca_plan = orca_write::plan(
+        repo_root,
+        &orca_patterns,
+        shared.as_deref().unwrap_or_default(),
+        SetupPolicy::Ensure,
+    );
+
     // ---- Change summary (printed BEFORE the prompt). ----
     println!();
     println!("This will:");
-    ui::print_pattern_list(&migration_summary(existing));
+    let mut summary = migration_summary(existing);
+    summary.extend(orca_plan.summary_lines());
+    ui::print_pattern_list(&summary);
     println!();
 
     // ---- Stale-worktree advisory (bold orange, R/System-Wide Impact). ----
@@ -348,18 +442,8 @@ and must be recreated."
     // ---- staged or materialized: the old layout stays intact on disk. ----
     let action = ui::pick_final_action()?;
 
-    // ---- Stage into a tempdir. Drop on early return cleans up. ----
-    let staging = tempfile::Builder::new()
-        .prefix("ss-magic-migrate-")
-        .tempdir()
-        .context("creating migration staging tempdir")?;
-    stage_migration(repo_root, staging.path(), existing)?;
-
-    // ---- Materialize: copy staged files in, delete the retired setup.sh. ----
-    superset_files::copy_into_repo(staging.path(), repo_root, &[SETUP_SH_REL])?;
-    rename_setup_config(repo_root)?;
-    ensure_bootstrap_gitignores(repo_root)?;
-    clear_legacy_skills_install();
+    let orca_notices =
+        materialize_migration(repo_root, existing, shared.as_deref(), &orca_plan)?;
 
     println!();
     println!("{}", style::ok("Wrote .superset/magic.json"));
@@ -369,8 +453,39 @@ and must be recreated."
     println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
     println!("{}", style::ok("Gitignored .superset/backups/"));
     println!("{}", style::ok("Gitignored .superset/.magic/"));
+    orca_write::print_notices(&orca_notices);
 
     execute_final_action(repo_root, action, MIGRATE_COMMIT_MESSAGE, "chore/ss-magic-migrate-")
+}
+
+/// Everything migration does once the finishing action is chosen: stage the
+/// new tree in a tempdir, copy it in, delete the retired `setup.sh` and
+/// `setup_config.json`, add the bootstrap gitignore rules, and write the Orca
+/// files per `orca_plan`. Returns the Orca notices for the caller to print.
+/// Split from [`run_migrate`] so the whole write is testable without a prompt.
+fn materialize_migration(
+    repo_root: &Path,
+    existing: &Config,
+    shared: Option<&[String]>,
+    orca_plan: &orca_write::Plan,
+) -> Result<Vec<Notice>> {
+    // Stage into a tempdir. Drop on early return cleans up.
+    let staging = tempfile::Builder::new()
+        .prefix("ss-magic-migrate-")
+        .tempdir()
+        .context("creating migration staging tempdir")?;
+    stage_migration(repo_root, staging.path(), existing, shared)?;
+
+    // Materialize: copy staged files in, delete the retired setup.sh.
+    superset_files::copy_into_repo(staging.path(), repo_root, &[SETUP_SH_REL])?;
+    rename_setup_config(repo_root)?;
+    ensure_bootstrap_gitignores(repo_root)?;
+    clear_legacy_skills_install();
+
+    // The Orca files come last, written as they were planned before the
+    // prompt. A file that changed on disk since the plan read it is left alone
+    // with a warning, since the planned text would discard that change.
+    Ok(orca_plan.apply(repo_root))
 }
 
 /// Remove the retired `setup_config.json` from the repo after `magic.json`
@@ -457,9 +572,15 @@ pub fn build_pattern_options(
 /// `magic.local.json` + gitignore. Stage → prompt → materialize, same as
 /// migration.
 ///
+/// A second picker (`ui::pick_shared_directories`) then asks which dependency
+/// directories Orca should share with a new worktree; the chosen patterns are
+/// stored as `magic.json`'s `sharedDirectories`, and `orca.yaml` and
+/// `.worktreeinclude` are written from them once the `.superset` tree is in
+/// place.
+///
 /// When an existing `magic.json` is present (edit-config path, `Branch::Normal`),
-/// custom patterns are preserved in the picker and preselected so they survive
-/// a rewrite.
+/// custom patterns are preserved in both pickers and preselected so they
+/// survive a rewrite.
 pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode> {
     style::print_section("Initialize .superset (magic layout)");
     println!(
@@ -490,29 +611,113 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
     // magic.json files = default_magic_files() + chosen (deduped, defaults first).
     let files = init_magic_files(&chosen);
 
+    // ---- Shared directories for Orca: the default kinds plus any stored
+    // custom pattern, each shown with the gitignored directories it matches
+    // today. A stored choice is what starts checked; with none stored, every
+    // kind that matches something does. ----
+    let stored_shared = existing_magic
+        .as_ref()
+        .and_then(|magic| magic.shared_directories.clone());
+    let shared_rows = shared_dirs::matches_by_pattern(
+        repo_root,
+        &shared_dirs::picker_patterns(stored_shared.as_deref()),
+    );
+    let shared_preselected =
+        shared_dirs::picker_preselected(stored_shared.as_deref(), &shared_rows);
+    let shared = ui::pick_shared_directories(&shared_rows, &shared_preselected, repo_root)?;
+
+    // ---- Orca output, computed before the prompt so the summary can say
+    // whether orca.yaml is created, updated or cannot be edited. ----
+    let (orca_patterns, overlay_warning) = overlaid_patterns(repo_root, &files);
+    warn_overlay(overlay_warning);
+    let orca_plan = orca_write::plan(
+        repo_root,
+        &orca_patterns,
+        &shared,
+        SetupPolicy::Ensure,
+    );
+
     println!();
     println!("This will:");
-    ui::print_pattern_list(&[
+    let mut summary = vec![
         "Write .superset/magic.json (synced patterns)".to_string(),
         "Write .superset/magic.sh (executable wrapper)".to_string(),
         format!("Write .superset/config.json setup → [{MAGIC_WRAPPER_ENTRY}]"),
         "Bootstrap .superset/magic.local.json + add it to .gitignore".to_string(),
-    ]);
+    ];
+    summary.extend(orca_plan.summary_lines());
+    ui::print_pattern_list(&summary);
     println!();
 
     let action = ui::pick_final_action()?;
 
-    // ---- Stage. ----
+    // The picker's answer is always stored, an empty one included: here
+    // someone did choose.
+    let written = materialize_init(
+        repo_root,
+        existing,
+        existing_magic.as_ref(),
+        files,
+        Some(shared),
+        &orca_plan,
+    )?;
+
+    println!();
+    println!("{}", style::ok("Wrote .superset/magic.json"));
+    println!("{}", style::ok("Wrote .superset/magic.sh"));
+    println!("{}", style::ok("Wrote .superset/config.json"));
+    if written.had_local {
+        println!("{}", style::info("Kept existing .superset/magic.local.json"));
+    } else {
+        println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
+    }
+    println!("{}", style::ok("Gitignored .superset/backups/"));
+    println!("{}", style::ok("Gitignored .superset/.magic/"));
+    orca_write::print_notices(&written.orca_notices);
+
+    execute_final_action(repo_root, action, INIT_COMMIT_MESSAGE, "chore/ss-magic-init-")
+}
+
+/// What [`materialize_init`] did, for the caller's report.
+struct InitWritten {
+    /// The repository already had a `magic.local.json`, which was kept.
+    had_local: bool,
+    /// What happened to the Orca files.
+    orca_notices: Vec<Notice>,
+}
+
+/// Everything init does once its decisions are made – shared by the
+/// interactive [`run_init`] (also the edit-config path) and
+/// [`run_init_noninteractive`], so the two cannot drift apart.
+///
+/// Stages `magic.json` (with `files` and `shared` as its two lists – `shared`
+/// being `None` leaves `sharedDirectories` out of the file – and every unknown
+/// key of `existing_magic` carried over), `magic.sh`, `config.json`
+/// (the wrapper entry as `setup`, `teardown`/`run` of `existing_config`
+/// preserved) and, when the repository has none, a fresh `magic.local.json`;
+/// copies the stage in; adds the bootstrap gitignore rules; then writes the
+/// Orca files per `orca_plan`. Nothing in the repository is touched before the
+/// stage is complete.
+fn materialize_init(
+    repo_root: &Path,
+    existing_config: Option<&Config>,
+    existing_magic: Option<&MagicConfig>,
+    files: Vec<String>,
+    shared: Option<Vec<String>>,
+    orca_plan: &orca_write::Plan,
+) -> Result<InitWritten> {
     let staging = tempfile::Builder::new()
         .prefix("ss-magic-init-")
         .tempdir()
         .context("creating init staging tempdir")?;
     let stage_root = staging.path();
-    let magic_cfg = superset_files::merge_files_into_magic_config(existing_magic.as_ref(), files);
+    let magic_cfg = superset_files::merge_files_into_magic_config(existing_magic, files, shared);
     superset_files::write_magic_json(stage_root, &magic_cfg)?;
     superset_files::write_magic_sh(stage_root)?;
-    let merged =
-        superset_files::merge_setup_into_config(existing, vec![MAGIC_WRAPPER_ENTRY.to_string()]);
+    let merged = superset_files::merge_setup_into_config(
+        existing_config,
+        vec![MAGIC_WRAPPER_ENTRY.to_string()],
+    );
     superset_files::write_config_json(stage_root, &merged)?;
     // Only seed magic.local.json when the repo doesn't already have one — it's
     // gitignored (unrecoverable), so staging the empty template would clobber a
@@ -522,24 +727,17 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
         superset_files::bootstrap_magic_local_json(stage_root)?;
     }
 
-    // ---- Materialize. ----
     superset_files::copy_into_repo(stage_root, repo_root, &[])?;
     ensure_bootstrap_gitignores(repo_root)?;
     clear_legacy_skills_install();
 
-    println!();
-    println!("{}", style::ok("Wrote .superset/magic.json"));
-    println!("{}", style::ok("Wrote .superset/magic.sh"));
-    println!("{}", style::ok("Wrote .superset/config.json"));
-    if had_local {
-        println!("{}", style::info("Kept existing .superset/magic.local.json"));
-    } else {
-        println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
-    }
-    println!("{}", style::ok("Gitignored .superset/backups/"));
-    println!("{}", style::ok("Gitignored .superset/.magic/"));
-
-    execute_final_action(repo_root, action, INIT_COMMIT_MESSAGE, "chore/ss-magic-init-")
+    // The Orca files come last, written as they were planned before the
+    // prompt. A file that changed on disk since the plan read it is left alone
+    // with a warning, since the planned text would discard that change.
+    Ok(InitWritten {
+        had_local,
+        orca_notices: orca_plan.apply(repo_root),
+    })
 }
 
 /// Non-interactive init for automation (`ss-magic init [PATTERN...]`, AN1):
@@ -549,41 +747,48 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
 /// `magic.json` `files` alongside the defaults (`.superset/magic.local.json`),
 /// deduped. An existing `magic.local.json` is preserved, not clobbered. Any
 /// unknown top-level keys (KTD8) already in `magic.json` survive the rewrite.
+///
+/// The Orca files are written too. With nobody to ask, the shared-directory
+/// patterns are the ones `magic.json` already stores – an empty list included,
+/// since that is a choice someone made – and otherwise every default kind that
+/// matches a gitignored directory in the checkout. When nothing is stored and
+/// nothing is detected the key is left out of `magic.json`, so a later run can
+/// still detect directories that did not exist yet.
 pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<ExitCode> {
     let files = init_magic_files(patterns);
-
-    let staging = tempfile::Builder::new()
-        .prefix("ss-magic-init-")
-        .tempdir()
-        .context("creating init staging tempdir")?;
-    let stage_root = staging.path();
     let existing_magic = superset_files::load_magic_json(repo_root)?;
-    let magic_cfg = superset_files::merge_files_into_magic_config(existing_magic.as_ref(), files);
-    superset_files::write_magic_json(stage_root, &magic_cfg)?;
-    superset_files::write_magic_sh(stage_root)?;
     let existing = superset_files::load_config(repo_root)?;
-    let merged = superset_files::merge_setup_into_config(
-        existing.as_ref(),
-        vec![MAGIC_WRAPPER_ENTRY.to_string()],
+    let stored_shared = existing_magic
+        .as_ref()
+        .and_then(|magic| magic.shared_directories.clone());
+    let shared = shared_dirs::stored_or_detected(repo_root, stored_shared.as_deref());
+    let (orca_patterns, overlay_warning) = overlaid_patterns(repo_root, &files);
+    warn_overlay(overlay_warning);
+    let orca_plan = orca_write::plan(
+        repo_root,
+        &orca_patterns,
+        shared.as_deref().unwrap_or_default(),
+        SetupPolicy::Ensure,
     );
-    superset_files::write_config_json(stage_root, &merged)?;
-    let had_local = repo_root.join(".superset/magic.local.json").exists();
-    if !had_local {
-        superset_files::bootstrap_magic_local_json(stage_root)?;
-    }
 
-    superset_files::copy_into_repo(stage_root, repo_root, &[])?;
-    ensure_bootstrap_gitignores(repo_root)?;
-    clear_legacy_skills_install();
+    let written = materialize_init(
+        repo_root,
+        existing.as_ref(),
+        existing_magic.as_ref(),
+        files,
+        shared,
+        &orca_plan,
+    )?;
 
     println!("{}", style::ok("Wrote .superset/magic.json"));
     println!("{}", style::ok("Wrote .superset/magic.sh"));
     println!("{}", style::ok("Wrote .superset/config.json"));
-    if !had_local {
+    if !written.had_local {
         println!("{}", style::ok("Bootstrapped .superset/magic.local.json"));
     }
     println!("{}", style::ok("Gitignored .superset/backups/"));
     println!("{}", style::ok("Gitignored .superset/.magic/"));
+    orca_write::print_notices(&written.orca_notices);
     println!(
         "{}",
         style::info("Done. Changes are on disk; run `git status` to review.")
@@ -610,7 +815,7 @@ fn execute_final_action(
             Ok(ExitCode::SUCCESS)
         }
         FinalAction::CommitPushMain => {
-            git::stage_paths(repo_root, &[".superset", ".gitignore"])?;
+            git::stage_paths(repo_root, &FINAL_ACTION_PATHS)?;
             if git::nothing_to_commit(repo_root)? {
                 println!(
                     "{}",
@@ -625,7 +830,7 @@ fn execute_final_action(
             Ok(ExitCode::SUCCESS)
         }
         FinalAction::FeatureBranchPR => {
-            git::stage_paths(repo_root, &[".superset", ".gitignore"])?;
+            git::stage_paths(repo_root, &FINAL_ACTION_PATHS)?;
             if git::nothing_to_commit(repo_root)? {
                 println!(
                     "{}",
@@ -663,6 +868,12 @@ fn execute_final_action(
         }
     }
 }
+
+/// What a committing finishing action stages: the `.superset` contract, the
+/// `.gitignore` rules, and `orca.yaml`, which is committed so the whole team's
+/// Orca worktrees run the setup script. `.worktreeinclude` is deliberately NOT
+/// here – it is a per-machine snapshot, gitignored by the same operation.
+const FINAL_ACTION_PATHS: [&str; 3] = [".superset", ".gitignore", orca_write::ORCA_YAML];
 
 const MIGRATE_COMMIT_MESSAGE: &str = "chore(superset): migrate to ss-magic layout";
 const INIT_COMMIT_MESSAGE: &str = "chore(superset): initialize ss-magic layout";
