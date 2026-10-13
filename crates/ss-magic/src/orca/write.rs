@@ -34,18 +34,21 @@
 //! edited safely is left byte-for-byte untouched and reported, and everything
 //! else is still written (R22).
 //!
-//! Every write goes through [`write_contained`], which refuses a target that
-//! resolves outside the repository through a symlink (KTD13). The hazard is a
-//! repository that commits `orca.yaml` or `.worktreeinclude` as a link to a file
-//! the person owns elsewhere; a command run in that checkout would otherwise
-//! follow the link and rewrite THAT file.
+//! Every write of the explicit path goes through [`write_contained`], which
+//! refuses a target that resolves outside the repository through a symlink
+//! (KTD13). The hazard is a repository that commits `orca.yaml` or
+//! `.worktreeinclude` as a link to a file the person owns elsewhere; a command
+//! run in that checkout would otherwise follow the link and rewrite THAT file.
 //!
 //! A link that STAYS inside the repository is where the two writers part. The
 //! explicit path writes through it onto its target: a person ran that command
 //! and reads what it did. The automatic refresh writes through no symlink at
 //! all. Git can only vouch for the link's own name, and the file behind an
 //! untracked, ignored link may be a tracked one, which a background script
-//! would then leave modified in the main checkout.
+//! would then leave modified in the main checkout. It therefore turns a link
+//! away twice (see [`symlink_refusal`]) and writes through
+//! [`replace_refreshed`], which replaces the directory entry itself, so even a
+//! link that appears after the last check is never written through.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -744,16 +747,23 @@ pub enum SnapshotRefresh {
 ///   that stays inside the repository is left to the explicit path ([`plan`]
 ///   and [`Plan::apply`]).
 /// - git positively reports `.worktreeinclude` as untracked (an empty
-///   `ls-files` answer for it) AND as ignored. A tracked file would show up as
-///   modified in the shared main checkout; an unignored one would show up as
-///   untracked. Either would be a surprise left behind by a background script,
-///   and "git could not be asked" counts as a no.
+///   `ls-files` answer for it, asked case-insensitively so a file committed as
+///   `.WorktreeInclude` counts on a volume that treats the two as one) AND as
+///   ignored. A tracked file would show up as modified in the shared main
+///   checkout; an unignored one would show up as untracked. Either would be a
+///   surprise left behind by a background script, and "git could not be asked"
+///   counts as a no.
 /// - the existing file, if any, can be read as UTF-8 text. Rebuilding an
 ///   unreadable file from an empty parse would drop the person's lines.
 ///
-/// The write itself still goes through [`write_contained`], which refuses a
-/// target outside the repository – a second line of defence for a name that
-/// turned into such a link after the first condition was checked.
+/// The first condition is checked a second time right before the write,
+/// because computing the snapshot takes a while and the name can become a link
+/// in the meantime. And the write itself follows no link: it replaces the
+/// directory entry (`superset_files::write_atomically_no_follow`), so a link
+/// that appears even after that second look is replaced by a regular file and
+/// the file it pointed at keeps its bytes. The rule about links therefore does
+/// not depend on any check staying true. (The two git answers above are a
+/// different matter: they are asked once, before the snapshot is computed.)
 ///
 /// The files under a directory Orca already shares are left out of the
 /// snapshot. "Already shares" is read from `orca.yaml` as it is on disk, since
@@ -761,33 +771,28 @@ pub enum SnapshotRefresh {
 /// until someone runs the explicit refresh.
 pub fn refresh_snapshot(main_root: &Path, patterns: &[String]) -> SnapshotRefresh {
     let name = worktreeinclude::FILE_NAME;
-    // `symlink_metadata` reads the entry itself and follows nothing, so a link
-    // is recognized here without its target ever being opened. Where the link
-    // leads is deliberately not asked: git can vouch for the link's name only,
-    // so no target makes a write through it safe for a background script.
-    match fs::symlink_metadata(main_root.join(name)) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return SnapshotRefresh::Skipped(format!(
-                "the main checkout's `{name}` is a symlink, and the automatic refresh never \
-                 writes through one. Run `ss-magic orca` there to update it."
-            ));
-        }
-        // Not a link, or no file yet: the conditions below decide.
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        // Any other failure leaves "is it a link?" unanswered, and the unknown
-        // answer has to be the refusing one.
-        Err(err) => {
-            return SnapshotRefresh::Skipped(format!(
-                "the main checkout's `{name}` could not be inspected ({err})"
-            ));
-        }
+    if let Some(why) = symlink_refusal(main_root, name) {
+        return SnapshotRefresh::Skipped(why);
     }
-    match git::tracked_files(main_root, &[name]) {
+    // Asked about every spelling of the name, not only this one. A
+    // case-insensitive volume (the macOS default) resolves `.worktreeinclude`
+    // to an entry committed as `.WorktreeInclude`, while git matches a pathspec
+    // case-sensitively: asked about the exact name it answers "not tracked" for
+    // the very file the write would land on. The `:(icase)` pathspec makes git
+    // report a tracked file under any spelling. On a case-sensitive volume that
+    // also refuses for what is a separate file there, which is the safe side.
+    let any_spelling = format!(":(icase){name}");
+    match git::tracked_files(main_root, &[any_spelling.as_str()]) {
         Ok(tracked) if tracked.is_empty() => {}
-        Ok(_) => {
+        Ok(tracked) => {
+            let spelled = tracked[0].to_string_lossy();
+            let which = if spelled == name {
+                format!("`{name}`")
+            } else {
+                format!("`{name}` (committed as `{spelled}`)")
+            };
             return SnapshotRefresh::Skipped(format!(
-                "the main checkout's `{name}` is tracked by git, and the automatic refresh never \
+                "the main checkout's {which} is tracked by git, and the automatic refresh never \
                  rewrites a tracked file. Run `ss-magic orca` there to update it."
             ));
         }
@@ -833,21 +838,69 @@ pub fn refresh_snapshot(main_root: &Path, patterns: &[String]) -> SnapshotRefres
         return SnapshotRefresh::Unchanged { warning };
     }
 
-    match write_contained(main_root, name, &rendered) {
-        Ok(Landing::Inside) => SnapshotRefresh::Written {
+    match write_refreshed(main_root, name, &rendered) {
+        Ok(()) => SnapshotRefresh::Written {
             listed: snap.entries.len(),
             warning,
         },
-        // A second line of defence. Every symlink that existed when this
-        // function started was turned away at the top, so this arm is reached
-        // only when the name became a link out of the repository while the
-        // snapshot was being computed.
-        Ok(Landing::Outside(target)) => SnapshotRefresh::Skipped(format!(
-            "the main checkout's `{name}` is a symlink to {}, outside the repository",
-            target.display()
-        )),
-        Err(err) => SnapshotRefresh::Skipped(format!("writing `{name}` failed ({err:#})")),
+        Err(why) => SnapshotRefresh::Skipped(why),
     }
+}
+
+/// Why the automatic refresh must leave `<main_root>/<name>` alone because of
+/// what kind of directory entry it is, or `None` when it is an ordinary entry
+/// or does not exist yet.
+///
+/// `symlink_metadata` reads the entry itself and follows nothing, so a link is
+/// recognized without its target ever being opened. Where the link leads is
+/// deliberately not asked: git can vouch for the link's name only, so no target
+/// makes a write through it safe for a background script. An entry that cannot
+/// be inspected leaves "is it a link?" unanswered, and the unknown answer has
+/// to be the refusing one.
+fn symlink_refusal(main_root: &Path, name: &str) -> Option<String> {
+    match fs::symlink_metadata(main_root.join(name)) {
+        Ok(meta) if meta.file_type().is_symlink() => Some(format!(
+            "the main checkout's `{name}` is a symlink, and the automatic refresh never \
+             writes through one. Run `ss-magic orca` there to update it."
+        )),
+        Ok(_) => None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => Some(format!(
+            "the main checkout's `{name}` could not be inspected ({err})"
+        )),
+    }
+}
+
+/// The automatic refresh's write: put `text` at `<main_root>/<name>` without
+/// ever writing through a symlink. `Err` carries the reason nothing was
+/// written, worded for [`SnapshotRefresh::Skipped`].
+///
+/// Two things happen, and each covers what the other cannot. The entry is
+/// inspected once more, because the first look in [`refresh_snapshot`] was
+/// taken before the snapshot was computed: a name that became a link since then
+/// is turned away with the same notice, and the link is left as the person made
+/// it. Then [`replace_refreshed`] writes the text.
+fn write_refreshed(main_root: &Path, name: &str, text: &str) -> std::result::Result<(), String> {
+    if let Some(why) = symlink_refusal(main_root, name) {
+        return Err(why);
+    }
+    replace_refreshed(main_root, name, text)
+}
+
+/// The one place the automatic refresh writes from: replace the directory entry
+/// `<main_root>/<name>` with `text`, following no symlink at that name.
+///
+/// It uses core's `write_atomically_no_follow`, which renames onto the entry
+/// itself. That is what makes the no-link rule hold without a race: a link
+/// created in the instant after [`write_refreshed`] looked is replaced by a
+/// regular file, and whatever it pointed at – possibly a tracked file – is not
+/// opened. The explicit path's [`write_contained`] and core's following
+/// `write_atomically` must never be used here, since both resolve a link first.
+/// It is a function of its own so a test can call it with a link already in
+/// place, which no test can arrange between the look and the write.
+fn replace_refreshed(main_root: &Path, name: &str, text: &str) -> std::result::Result<(), String> {
+    superset_files::write_atomically_no_follow(&main_root.join(name), text)
+        .map_err(|err| format!("writing `{name}` failed ({err:#})"))
 }
 
 #[cfg(test)]

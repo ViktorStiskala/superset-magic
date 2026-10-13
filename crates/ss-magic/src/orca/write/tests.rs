@@ -217,6 +217,38 @@ fn the_refresh_never_writes_a_tracked_file_through_a_symlink() {
     );
 }
 
+/// Git matches a pathspec case-sensitively, but the default macOS volume does
+/// not tell `.worktreeinclude` from a file committed as `.WorktreeInclude`: a
+/// write to the first lands on the second. So "is it tracked?" is asked for
+/// every spelling, and a tracked file under another one stops the refresh. On a
+/// case-sensitive volume the two are separate files and the refresh refuses all
+/// the same, which is the safe side.
+#[test]
+fn the_refresh_is_skipped_when_the_file_is_tracked_under_another_spelling() {
+    let main = main_with_rule();
+    write_file(main.path(), ".WorktreeInclude", "# committed\n");
+    git_run(&["add", "-f", ".WorktreeInclude"], main.path());
+    git_run(&["commit", "-q", "-m", "a list under another spelling"], main.path());
+    write_file(main.path(), ".env", "S=1\n");
+
+    let outcome = refresh_snapshot(main.path(), &strings(&[".env"]));
+
+    let SnapshotRefresh::Skipped(why) = outcome else {
+        panic!("expected a skip, got {outcome:?}");
+    };
+    assert!(why.contains("tracked by git"), "{why}");
+    assert!(why.contains(".WorktreeInclude"), "the notice names the committed spelling: {why}");
+    assert_eq!(
+        fs::read_to_string(main.path().join(".WorktreeInclude")).unwrap(),
+        "# committed\n"
+    );
+    assert_eq!(
+        git::status_porcelain(main.path(), &["."]).unwrap(),
+        Vec::new(),
+        "git must see nothing modified and nothing new in the main checkout"
+    );
+}
+
 /// The refresh does not judge where a link leads: one that points at an
 /// untracked, ignored file inside the repository is not written through
 /// either, so the person's own file behind it keeps its bytes.
@@ -312,6 +344,85 @@ fn the_refresh_is_skipped_when_the_entry_cannot_be_inspected() {
         matches!(&outcome, SnapshotRefresh::Skipped(why) if why.contains("could not be inspected")),
         "{outcome:?}"
     );
+}
+
+/// Computing the snapshot takes time, and the name can become a link after the
+/// refresh's first look at it. The write step looks again: a link that is there
+/// by then is turned away with the same notice, and both the link and the
+/// tracked file behind it are left exactly as they were.
+#[cfg(unix)]
+#[test]
+fn the_refresh_write_turns_away_a_link_that_appeared_after_the_first_look() {
+    let main = main_with_rule();
+    let committed = "# shared by the team\nvendor/licence.key\n";
+    write_file(main.path(), "shared.include", committed);
+    git_run(&["add", "shared.include"], main.path());
+    git_run(&["commit", "-q", "-m", "a tracked list"], main.path());
+    let name = worktreeinclude::FILE_NAME;
+    // The first look saw no link ...
+    assert_eq!(symlink_refusal(main.path(), name), None);
+    // ... and the link is made while the snapshot is being computed.
+    link_include_to(main.path(), "shared.include");
+
+    let why = write_refreshed(main.path(), name, "rendered\n").unwrap_err();
+
+    assert!(why.contains("is a symlink"), "{why}");
+    assert_eq!(
+        fs::read_to_string(main.path().join("shared.include")).unwrap(),
+        committed
+    );
+    assert_eq!(
+        include_link_target(main.path()),
+        Some(PathBuf::from("shared.include")),
+        "the link is left as the person made it"
+    );
+    assert_eq!(git::status_porcelain(main.path(), &["."]).unwrap(), Vec::new());
+}
+
+/// The guarantee that needs no check to stay true. A link can still appear in
+/// the instant between the write step's look and its rename, which no test can
+/// time. So this calls the refresh's own writing step with such a link already
+/// in place: the link is replaced by a regular file, the tracked file it
+/// pointed at is byte-identical, and git reports nothing modified in the main
+/// checkout. It fails if that step ever goes back to a writer that follows.
+#[cfg(unix)]
+#[test]
+fn the_refresh_writer_replaces_a_link_and_never_writes_the_tracked_file_behind_it() {
+    let main = main_with_rule();
+    let committed = "# shared by the team\nvendor/licence.key\n";
+    write_file(main.path(), "shared.include", committed);
+    git_run(&["add", "shared.include"], main.path());
+    git_run(&["commit", "-q", "-m", "a tracked list"], main.path());
+    link_include_to(main.path(), "shared.include");
+    let name = worktreeinclude::FILE_NAME;
+
+    replace_refreshed(main.path(), name, "rendered\n").unwrap();
+
+    assert_eq!(
+        fs::read_to_string(main.path().join("shared.include")).unwrap(),
+        committed,
+        "the tracked file the link pointed at must be byte-identical"
+    );
+    assert_eq!(include_link_target(main.path()), None, "the link was replaced");
+    assert_eq!(include_text(main.path()), "rendered\n");
+    assert_eq!(
+        git::status_porcelain(main.path(), &["."]).unwrap(),
+        Vec::new(),
+        "the new file is ignored and no tracked file is modified"
+    );
+}
+
+/// Without a link in the way the write step is an ordinary atomic write: it
+/// creates the file, and replaces it on the next run.
+#[test]
+fn the_refresh_write_creates_and_replaces_a_plain_file() {
+    let main = main_with_rule();
+    let name = worktreeinclude::FILE_NAME;
+
+    write_refreshed(main.path(), name, "first\n").unwrap();
+    assert_eq!(include_text(main.path()), "first\n");
+    write_refreshed(main.path(), name, "second\n").unwrap();
+    assert_eq!(include_text(main.path()), "second\n");
 }
 
 /// Outside a repository git cannot vouch for anything, so nothing is written.

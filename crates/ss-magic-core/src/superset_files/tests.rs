@@ -1124,3 +1124,88 @@ fn write_atomically_replaces_the_file_and_leaves_no_staging_file() {
         .collect();
     assert_eq!(names, vec!["orca.yaml".to_string()], "no stray staging file");
 }
+
+/// The two atomic writers differ in exactly one thing: what happens when the
+/// name is a symlink. The following one lands on the link's target and keeps
+/// the link; the no-follow one replaces the link itself and never touches the
+/// file it pointed at.
+#[cfg(unix)]
+#[test]
+fn the_no_follow_writer_replaces_a_symlink_and_leaves_its_target_alone() {
+    let dir = fresh();
+    let target = dir.path().join("tracked.txt");
+    let link = dir.path().join(".worktreeinclude");
+
+    // The following writer, for contrast: the target changes, the link stays.
+    fs::write(&target, "original\n").unwrap();
+    std::os::unix::fs::symlink("tracked.txt", &link).unwrap();
+    write_atomically(&link, "through the link\n").unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "through the link\n");
+    assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+
+    // The no-follow writer: the link becomes a regular file holding the new
+    // text, and the file it pointed at is byte-identical.
+    fs::write(&target, "original\n").unwrap();
+    write_atomically_no_follow(&link, "replaced the link\n").unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
+    let meta = fs::symlink_metadata(&link).unwrap();
+    assert!(meta.file_type().is_file(), "the link itself was replaced");
+    assert_eq!(fs::read_to_string(&link).unwrap(), "replaced the link\n");
+
+    // A link to nothing and a link to a directory are replaced the same way:
+    // the writer never asks where the link leads.
+    for dest in ["nowhere", "."] {
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(dest, &link).unwrap();
+        write_atomically_no_follow(&link, "again\n").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_file());
+        assert_eq!(fs::read_to_string(&link).unwrap(), "again\n");
+    }
+}
+
+/// The staging file is the other name a writer opens. A symlink planted there
+/// must not be followed: the file it points at keeps its bytes, and the link is
+/// replaced by a fresh regular file. A stale regular leftover is replaced too.
+#[cfg(unix)]
+#[test]
+fn the_staging_file_is_created_fresh_and_never_through_a_planted_symlink() {
+    use std::io::Write;
+    let dir = fresh();
+    let victim = dir.path().join("tracked.txt");
+    fs::write(&victim, "original\n").unwrap();
+    let staged = dir.path().join(".worktreeinclude.1.0.tmp");
+    std::os::unix::fs::symlink("tracked.txt", &staged).unwrap();
+
+    let mut file = create_staging(&staged).unwrap();
+    file.write_all(b"new\n").unwrap();
+    drop(file);
+
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "original\n");
+    assert!(fs::symlink_metadata(&staged).unwrap().file_type().is_file());
+    assert_eq!(fs::read_to_string(&staged).unwrap(), "new\n");
+
+    // A leftover regular file from a crashed run is not appended to or reused.
+    let mut again = create_staging(&staged).unwrap();
+    again.write_all(b"x\n").unwrap();
+    drop(again);
+    assert_eq!(fs::read_to_string(&staged).unwrap(), "x\n");
+}
+
+/// On an ordinary file, or no file at all, the no-follow writer behaves like
+/// the following one: the text lands whole and no staging file is left.
+#[test]
+fn the_no_follow_writer_creates_and_replaces_a_plain_file() {
+    let dir = fresh();
+    let target = dir.path().join(".worktreeinclude");
+
+    write_atomically_no_follow(&target, "first\n").unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "first\n");
+    write_atomically_no_follow(&target, "second\n").unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "second\n");
+
+    let names: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec![".worktreeinclude".to_string()], "no stray staging file");
+}

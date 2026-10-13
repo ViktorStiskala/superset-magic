@@ -296,7 +296,16 @@ The modules, by purpose:
   Orca writers replace `orca.yaml` and `.worktreeinclude` the same way), never a truncating
   `fs::write`: `magic.json` is a tracked file with an unattended writer now
   (the plugin's `seed-config` runs from every session start), so a write that
-  dies half-way must leave the previous file, not a prefix;
+  dies half-way must leave the previous file, not a prefix.
+  `write_atomically_no_follow` is its mirror: the same staged write (both share
+  the private `replace_entry`), renamed onto the path AS GIVEN, so a symlink at
+  that name is replaced by a regular file and the file it pointed at is never
+  opened. It exists for the CLI's automatic Orca refresh, an unattended writer
+  that may only ever change the one name git answered for. Both writers create
+  their staging file through `create_staging`, which opens it with `create_new`
+  (`O_EXCL`): a plain `fs::write` would follow a symlink planted at the staging
+  name and write the new text into its target, so an existing entry there is
+  unlinked – the link itself, never its target – and created afresh;
   `merge_files_into_magic_config(existing, files, shared_directories)` folds
   a new `files` list and a new `sharedDirectories` list into an existing
   config for the same reason – both REPLACE what was stored, never merge. `write_magic_sh`,
@@ -1005,11 +1014,22 @@ The modules, by purpose:
   leads: git answers for the link's NAME, so an untracked, ignored link to a
   tracked file would pass both git questions while the write landed on the
   tracked target. An entry that cannot be inspected is a skip too, and an
-  absent file is created as before. Every write goes through `write_contained`,
-  which refuses a target that resolves OUTSIDE the repository through a symlink
-  (`landing`) while writing through an in-repo link. Since the automatic refresh
-  has already turned every link away, only the `plan` / `Plan::apply` path ever
-  writes through one.
+  absent file is created as before. The tracked question is asked with the
+  pathspec `:(icase).worktreeinclude`: git matches a pathspec case-sensitively
+  while the default macOS volume resolves `.worktreeinclude` to a file
+  committed as `.WorktreeInclude`, so the exact name would answer "not tracked"
+  for the very file the write lands on. Computing the snapshot takes time, so
+  the link inspection (`symlink_refusal`) runs a SECOND time in
+  `write_refreshed`, right before the write, and the write itself –
+  `replace_refreshed`, the one place the refresh writes from – is core's
+  `write_atomically_no_follow`: it renames onto the directory entry, so a link
+  that appears even after that second look is replaced by a regular file and
+  its target keeps its bytes. The no-link rule therefore depends on no check
+  staying true (the two git answers are still asked once, before the snapshot
+  is computed). The explicit path is different on purpose: every write of
+  `plan` / `Plan::apply` goes through `write_contained`, which refuses a target
+  that resolves OUTSIDE the repository through a symlink (`landing`) while
+  writing through an in-repo link. Only that path ever writes through a link.
 
 ## The Claude Code plugin (`crates/ss-magic-plugin/src/`)
 
@@ -2049,7 +2069,16 @@ secret-safety rules above take here.
   changes the sync's exit status. Git answers for the NAME `.worktreeinclude`,
   so an untracked, ignored link to a tracked file passes both questions while
   a write through it lands on the tracked target; that is why the link check
-  comes first and never asks where the link leads. "Git could not be asked" is
+  comes first and never asks where the link leads. A check alone only narrows
+  the hazard, since the name can become a link while the snapshot is computed:
+  the check is repeated right before the write, and the write replaces the
+  directory entry instead of following it (`write_atomically_no_follow`), so
+  the no-link rule holds without any check having to stay true. Never route
+  this write through `write_contained` or `write_atomically`. "Tracked" is
+  asked for every spelling of the name (`:(icase)`), because a case-insensitive
+  volume resolves `.worktreeinclude` to a file committed under another
+  spelling, which git, asked about the exact name, calls untracked. "Git could
+  not be asked" is
   a no, and so is an entry that could not be inspected. Writing through a link
   that stays inside the repository belongs to the explicit path alone (init,
   migrate, edit-config, `ss-magic orca`).

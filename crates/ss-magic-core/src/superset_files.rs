@@ -212,7 +212,36 @@ pub fn write_atomically(path: &Path, body: &str) -> Result<()> {
     // one that leaves the repository); a target that does not exist yet
     // resolves to the path as given.
     let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let path = target.as_path();
+    replace_entry(&target, body)
+}
+
+/// Replace the directory entry `path` ITSELF with `body` in one step, following
+/// no symlink at that name.
+///
+/// The mirror of [`write_atomically`], for a writer nobody has vouched a link's
+/// target to. `rename` replaces the entry it is given, so when `path` is a
+/// symlink the LINK is replaced by a regular file, and the file it pointed at
+/// is never opened and keeps its bytes. Symlinks among the PARENT directories
+/// are followed as usual; only the last component is not.
+///
+/// The CLI's automatic Orca refresh is the caller this exists for. It runs from
+/// a background setup script and may only ever change the one name git answered
+/// for (`.worktreeinclude`, untracked and ignored). A write through a link at
+/// that name could land on a tracked file, and checking for a link first only
+/// narrows that: the name can become a link between the check and the write.
+/// Replacing the entry closes it, because no check about links has to stay
+/// true. The staging file is created exclusively ([`create_staging`]), so a
+/// link planted at ITS name is not followed either.
+pub fn write_atomically_no_follow(path: &Path, body: &str) -> Result<()> {
+    replace_entry(path, body)
+}
+
+/// The staged write behind both atomic writers: write a private sibling of
+/// `path`, then rename it over `path` exactly as given. Whether a symlink at
+/// that name is followed is the caller's decision, made before this is called –
+/// [`write_atomically`] resolves the link first, [`write_atomically_no_follow`]
+/// does not.
+fn replace_entry(path: &Path, body: &str) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
@@ -225,7 +254,11 @@ pub fn write_atomically(path: &Path, body: &str) -> Result<()> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let staged = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
-    let write = fs::write(&staged, body)
+    let write = create_staging(&staged)
+        .and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(body.as_bytes())
+        })
         .with_context(|| format!("writing {}", staged.display()))
         .and_then(|()| {
             fs::rename(&staged, path)
@@ -237,6 +270,34 @@ pub fn write_atomically(path: &Path, body: &str) -> Result<()> {
         let _ = fs::remove_file(&staged);
     }
     write
+}
+
+/// Create the private staging file of [`replace_entry`], refusing to reuse
+/// whatever already sits at that name.
+///
+/// A plain `fs::write` opens an existing entry and FOLLOWS it when it is a
+/// symlink. A link planted at the staging name would then have the new text
+/// written into its target, and the link itself would be renamed over the real
+/// file – a write through a symlink by another door, which the no-follow writer
+/// in particular must not have. `create_new` (`O_EXCL`) fails on any existing
+/// entry, a symlink included, without following it. The one honest reason for
+/// an entry to exist is a leftover from a crashed run that had this process id,
+/// so it is removed – `remove_file` unlinks a link itself, never its target –
+/// and the creation is tried once more.
+fn create_staging(staged: &Path) -> std::io::Result<fs::File> {
+    let create = || {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(staged)
+    };
+    match create() {
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(staged)?;
+            create()
+        }
+        other => other,
+    }
 }
 
 /// Build a fresh `MagicConfig` with `new_files` and `shared_directories`,

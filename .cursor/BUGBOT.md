@@ -833,21 +833,42 @@ setup script writing into the shared main checkout, so:
   cannot be inspected is a skip as well; a file that does not exist yet is not a
   link and is created;
 - it writes only when git POSITIVELY reports the file as untracked (an empty
-  `ls-files` answer for it) AND as ignored; "git could not be asked" is a no;
+  `ls-files` answer for it) AND as ignored; "git could not be asked" is a no.
+  The tracked question uses the pathspec `:(icase).worktreeinclude`, so a file
+  committed under another spelling (`.WorktreeInclude`) counts: git matches a
+  pathspec case-sensitively, while a case-insensitive volume (the macOS
+  default) resolves the lowercase name to that committed file, and a write
+  would land on it;
 - it never rewrites a file it cannot read;
 - it runs on neither the empty-`files` early return nor any error path;
 - every reason not to write is reported as a warning and NEVER changes the
   sync's exit status.
 
-The write still goes through the containment check described in the next
-section, as a second line of defence for a name that became a link out of the
-repository after the first check.
+A check made before the snapshot is computed only narrows the hazard, because
+the name can become a link while that computation runs. So the write step
+(`write_refreshed`) does two more things. It inspects the entry a SECOND time
+with the same helper (`symlink_refusal`) and skips when a link is there by then,
+leaving the link as the person made it. And it writes through
+`replace_refreshed`, the one place the refresh writes from, which calls
+`superset_files::write_atomically_no_follow`: that stages a sibling file and
+renames it onto the directory entry itself, so a link that appears even after
+the second look is replaced by a regular file, and the file it pointed at is
+never opened. The no-link rule therefore depends on no check staying true. The
+following writer (`superset_files::write_atomically`) and the explicit path's
+`write_contained` both resolve a link first and must NOT be used for this write.
+Both atomic writers create their staging file exclusively (`create_staging`,
+`create_new`): a plain `fs::write` there would follow a symlink planted at the
+staging name and write into its target.
 
 Flag a refresh that writes `orca.yaml`, that writes on an unknown tracked or
-ignored status, that writes through a symlink, that decides from where a link
+ignored status, that asks the tracked question for the exact name only, that
+writes through a symlink, that writes with a function which follows a link at
+the target name (`write_atomically`, `write_contained`, `fs::write`), that
+drops the second inspection before the write, that decides from where a link
 resolves instead of from the link itself, that treats a failed inspection as
 "not a link", that turns its own failure into a non-zero exit, or that runs
-before the copy.
+before the copy. Flag a staging file opened without `create_new` in either
+atomic writer.
 
 ### Init, migrate and edit config: compute before the prompt, write after the tree
 
@@ -1571,7 +1592,9 @@ documentation or a status report that claims `file-changed` is active
 - The Orca files (`orca.yaml`, `.worktreeinclude`) are written at the repository
   root, outside the staged tree, by `orca::write` – each through
   `superset_files::write_atomically` (a staged sibling plus `rename`), never a
-  truncating `fs::write`. They are COMPUTED before the finishing prompt and
+  truncating `fs::write`. (The automatic end-of-sync refresh, which is not part
+  of init or migration, uses the no-follow twin `write_atomically_no_follow`;
+  see the Orca section below.) They are COMPUTED before the finishing prompt and
   WRITTEN after `copy_into_repo` – each only if the file is still what was read
   before the prompt; see the Orca section below.
 - `pack::write_archive` writes the archive to a `NamedTempFile` in the git root
