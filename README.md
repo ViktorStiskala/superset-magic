@@ -173,7 +173,7 @@ A teammate without ss-magic installed still gets Orca's own copies and links;
 ### One-line installer (recommended — macOS & Linux)
 
 ```sh
-curl -sSfL https://github.com/ViktorStiskala/superset-magic/releases/download/v0.11.2/ss-magic-installer.sh | sh
+curl -sSfL https://github.com/ViktorStiskala/superset-magic/releases/download/v0.12.0/ss-magic-installer.sh | sh
 ```
 
 It fetches the right prebuilt binary for your platform and puts `ss-magic` on
@@ -206,7 +206,7 @@ binary updates itself to the newest release within a day (or immediately with
 ### Manual download
 
 Grab the archive for your platform plus its `.sha256` from the
-[v0.11.2 release](https://github.com/ViktorStiskala/superset-magic/releases/tag/v0.11.2),
+[v0.12.0 release](https://github.com/ViktorStiskala/superset-magic/releases/tag/v0.12.0),
 verify the checksum, extract, and move `ss-magic` onto your `PATH`. The CLI's
 archives are named `ss-magic-<target>.tar.gz`. The plugin's own
 `ss-magic-plugin-<target>.tar.gz` archives sit on the plugin's releases and are
