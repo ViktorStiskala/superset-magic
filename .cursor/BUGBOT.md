@@ -657,6 +657,12 @@ hand-written lines are counted. `git::ignored_untracked` builds its own
 `Command` because `git_raw` nulls stdin, and writes the candidate list from a
 helper thread while it reads the answers – flag a rewrite that writes all of
 stdin before reading stdout, which deadlocks past a pipe buffer.
+Git reads each candidate as a PATHSPEC, so the probe drops any candidate that
+is empty or starts with `:` before asking: a root-level file named
+`:(top)a.env` would be answered as `a.env` and falsely reported ignored, and
+`:(icase)z` or `:!x` makes git exit 128 and lose the whole batch. Flag a change
+that sends such a name to git, or that makes the drop report the name as
+ignored; a list left empty must return without spawning git.
 
 ### Shared directories: a name-based walk that never descends into what it records
 

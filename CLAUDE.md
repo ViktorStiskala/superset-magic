@@ -210,7 +210,12 @@ The modules, by purpose:
   own `Command` because `git_raw` nulls stdin, and writes the list from a helper
   thread while it drains stdout, so a list larger than a pipe buffer cannot
   deadlock. Git aborts the whole batch on a pathspec inside a submodule or
-  beneath a symlinked directory, so callers drop those candidates first),
+  beneath a symlinked directory, so callers drop those candidates first. Git
+  also reads every candidate as a PATHSPEC, so the probe itself drops any
+  candidate that is empty or starts with `:` before asking (a root-level file
+  named `:(top)a.env` would be answered as `a.env` and falsely reported ignored,
+  and `:(icase)z` or `:!x` would abort the batch); such a name is never reported
+  as ignored, and a list left empty returns without spawning git),
   `status_porcelain` (parsed `(status, path)` pairs behind the checklist commit
   nudge – built on `git_raw`, NEVER the trimming `git` helper, because porcelain's
   leading column is a literal space for a worktree-only modification and a blanket

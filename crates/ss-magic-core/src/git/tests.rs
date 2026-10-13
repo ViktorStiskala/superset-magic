@@ -319,6 +319,64 @@ fn ignored_untracked_returns_a_decomposed_unicode_name_byte_exact() {
     assert_eq!(got[0].as_bytes(), nfd.as_bytes());
 }
 
+/// Git parses every line of the batch as a PATHSPEC, so a root-level file
+/// literally named `:(top)a.env` would be answered as if it were `a.env` and
+/// echoed back under its own name – reporting a file git does NOT ignore as
+/// ignored. A candidate starting with `:` is therefore never asked about.
+#[test]
+fn ignored_untracked_never_reports_a_name_that_reads_as_pathspec_magic() {
+    let dir = init_repo("main");
+    let root = dir.path();
+    write(root, ".gitignore", "a.env\n");
+    write(root, "a.env", "SECRET=1\n");
+    write(root, ":(top)a.env", "not ignored, merely named oddly\n");
+
+    let got = ignored_untracked(root, &strings(&["a.env", ":(top)a.env"])).unwrap();
+
+    assert_eq!(got, strings(&["a.env"]));
+}
+
+/// Other magic names make git exit 128 for the whole batch (`:(icase)z` is an
+/// unsupported magic combination, `:!x` an exclusion), and an empty line is a
+/// pathspec error too. Dropping them keeps the answer for the other candidates.
+#[test]
+fn ignored_untracked_keeps_the_batch_alive_past_unaskable_names() {
+    let dir = init_repo("main");
+    let root = dir.path();
+    write(root, ".gitignore", "a.env\n");
+    write(root, "a.env", "SECRET=1\n");
+
+    let got = ignored_untracked(root, &strings(&["a.env", ":(icase)z", ":!x", ""])).unwrap();
+
+    assert_eq!(got, strings(&["a.env"]));
+}
+
+/// Only a name at the repository root can begin a pathspec with `:`; the same
+/// name below a directory starts with the directory's name and is an ordinary
+/// path, so it is still answered (and still dropped from nothing).
+#[test]
+fn ignored_untracked_still_answers_a_colon_name_below_the_root() {
+    let dir = init_repo("main");
+    let root = dir.path();
+    write(root, ".gitignore", ":x\n");
+    write(root, "dir/:x", "S=1\n");
+
+    let got = ignored_untracked(root, &strings(&["dir/:x"])).unwrap();
+
+    assert_eq!(got, strings(&["dir/:x"]));
+}
+
+/// A list made only of unaskable candidates is an empty answer without asking
+/// git at all: outside a repository the probe would otherwise be an error.
+#[test]
+fn ignored_untracked_with_only_unaskable_candidates_spawns_nothing() {
+    let plain = tempfile::tempdir().unwrap();
+
+    let got = ignored_untracked(plain.path(), &strings(&[":(top)a.env", ":!x", ""])).unwrap();
+
+    assert!(got.is_empty());
+}
+
 /// A list far larger than a pipe buffer is still answered by ONE process: the
 /// candidates are written from a helper thread while the answers are read, so
 /// the call neither deadlocks nor falls back to asking path by path.

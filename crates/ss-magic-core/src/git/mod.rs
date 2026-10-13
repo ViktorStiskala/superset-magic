@@ -336,8 +336,21 @@ fn check_ignore(repo_root: &Path, rel_str: &str, no_index: bool) -> Result<bool>
 /// that forces git's directory-only match, so a `node_modules/` rule answers
 /// correctly, and the slash comes back with the path.
 ///
+/// Git reads every line of the batch as a PATHSPEC, so a candidate that is empty
+/// or starts with `:` is dropped before the question is asked and is never
+/// reported as ignored. A root-level file literally named `:(top)a.env` would
+/// otherwise be answered as if it were `a.env` (git echoes the original string
+/// back, so it would pass the `asked` filter below and wrongly enter the list
+/// handed to Orca), and a name such as `:(icase)z` or `:!x` makes git exit 128
+/// and throws away the answers for the whole batch. Only a name at the
+/// repository root can begin with `:` once paths are repo-relative (below a
+/// directory it starts with the directory's name), so dropping such names costs
+/// nothing else. Leaving a file out is the safe side: forward sync still copies
+/// it.
+///
 /// The answer fails closed in both directions a caller cares about. An empty
-/// `candidates` returns an empty list without spawning anything. Exit 1 (nothing
+/// `candidates`, or one with nothing left after the drop above, returns an empty
+/// list without spawning anything. Exit 1 (nothing
 /// ignored) is an empty list. ANY other failure – not a git repository, an
 /// unreadable index – is an `Err`, which a caller must read as "nothing is
 /// positively ignored" rather than retry path by path.
@@ -354,11 +367,15 @@ fn check_ignore(repo_root: &Path, rel_str: &str, no_index: bool) -> Result<bool>
 /// drains stdout: git answers as it reads, so writing a list larger than the
 /// pipe buffer from the same thread that later reads the output would deadlock.
 pub fn ignored_untracked(repo_root: &Path, candidates: &[String]) -> Result<Vec<String>> {
+    let candidates: Vec<&String> = candidates
+        .iter()
+        .filter(|candidate| !candidate.is_empty() && !candidate.starts_with(':'))
+        .collect();
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
     let mut payload: Vec<u8> = Vec::new();
-    for candidate in candidates {
+    for candidate in &candidates {
         payload.extend_from_slice(candidate.as_bytes());
         payload.push(0);
     }
@@ -395,7 +412,7 @@ pub fn ignored_untracked(repo_root: &Path, candidates: &[String]) -> Result<Vec<
             bail!("`git check-ignore --stdin -z` failed: {stderr}");
         }
     }
-    let asked: std::collections::HashSet<&str> = candidates.iter().map(String::as_str).collect();
+    let asked: std::collections::HashSet<&str> = candidates.iter().map(|c| c.as_str()).collect();
     Ok(out
         .stdout
         .split(|b| *b == 0)
