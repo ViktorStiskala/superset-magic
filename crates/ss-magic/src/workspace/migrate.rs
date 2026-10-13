@@ -117,16 +117,41 @@ fn ensure_bootstrap_gitignores(repo_root: &Path) -> Result<()> {
 /// because `magic.json` is not on disk yet when the Orca output is planned.
 /// A repository with no local overlay yet contributes nothing, which is right:
 /// the one a first init bootstraps is empty.
-fn overlaid_patterns(repo_root: &Path, files: &[String]) -> Result<Vec<String>> {
+///
+/// An overlay that cannot be read or parsed (a merge conflict, a hand edit
+/// gone wrong) contributes no patterns, and the second element of the result is
+/// a warning for the caller to print. Init, edit config and migrate never
+/// parsed that file before the Orca output existed, so a broken per-machine
+/// file must not stop them now; leaving its patterns out of the list handed to
+/// Orca is always safe, because forward sync still copies those files. The
+/// function prints nothing itself so the warning text can be tested.
+fn overlaid_patterns(repo_root: &Path, files: &[String]) -> (Vec<String>, Option<String>) {
     let mut patterns = files.to_vec();
-    if let Some(local) = superset_files::load_magic_local_json(repo_root)? {
-        for pattern in local.files {
-            if !patterns.contains(&pattern) {
-                patterns.push(pattern);
+    match superset_files::load_magic_local_json(repo_root) {
+        Ok(Some(local)) => {
+            for pattern in local.files {
+                if !patterns.contains(&pattern) {
+                    patterns.push(pattern);
+                }
             }
+            (patterns, None)
+        }
+        Ok(None) => (patterns, None),
+        Err(e) => {
+            let warning = format!(
+                ".superset/magic.local.json could not be read ({e:#}); its patterns are \
+left out of the files listed for Orca until it is fixed."
+            );
+            (patterns, Some(warning))
         }
     }
-    Ok(patterns)
+}
+
+/// Prints the warning `overlaid_patterns` produced, if any, to stderr.
+fn warn_overlay(warning: Option<String>) {
+    if let Some(warning) = warning {
+        eprintln!("{}", style::warn(warning));
+    }
 }
 
 /// Path of the pre-marketplace skills-directory copy of the plugin, relative to
@@ -386,9 +411,11 @@ pub fn run_migrate(repo_root: &Path, existing: &Config) -> Result<ExitCode> {
     let migrated_files = superset_files::load_setup_config(repo_root)?
         .map(|c| c.files)
         .unwrap_or_default();
+    let (orca_patterns, overlay_warning) = overlaid_patterns(repo_root, &migrated_files);
+    warn_overlay(overlay_warning);
     let orca_plan = orca_write::plan(
         repo_root,
-        &overlaid_patterns(repo_root, &migrated_files)?,
+        &orca_patterns,
         shared.as_deref().unwrap_or_default(),
         SetupPolicy::Ensure,
     );
@@ -601,9 +628,11 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
 
     // ---- Orca output, computed before the prompt so the summary can say
     // whether orca.yaml is created, updated or cannot be edited. ----
+    let (orca_patterns, overlay_warning) = overlaid_patterns(repo_root, &files);
+    warn_overlay(overlay_warning);
     let orca_plan = orca_write::plan(
         repo_root,
-        &overlaid_patterns(repo_root, &files)?,
+        &orca_patterns,
         &shared,
         SetupPolicy::Ensure,
     );
@@ -733,9 +762,11 @@ pub fn run_init_noninteractive(repo_root: &Path, patterns: &[String]) -> Result<
         .as_ref()
         .and_then(|magic| magic.shared_directories.clone());
     let shared = shared_dirs::stored_or_detected(repo_root, stored_shared.as_deref());
+    let (orca_patterns, overlay_warning) = overlaid_patterns(repo_root, &files);
+    warn_overlay(overlay_warning);
     let orca_plan = orca_write::plan(
         repo_root,
-        &overlaid_patterns(repo_root, &files)?,
+        &orca_patterns,
         shared.as_deref().unwrap_or_default(),
         SetupPolicy::Ensure,
     );

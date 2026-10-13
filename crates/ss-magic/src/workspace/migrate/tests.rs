@@ -582,6 +582,46 @@ fn run_init_noninteractive_writes_layout_from_patterns() {
     }
 }
 
+/// A malformed per-machine overlay must not stop init: its patterns are left
+/// out of the Orca file list, the overlay itself is left byte for byte as it
+/// was, and the layout and the Orca files are still written.
+#[test]
+fn run_init_noninteractive_survives_a_malformed_magic_local_json() {
+    let repo = init_main_repo("main");
+    let root = repo.path();
+    write_file(root, ".gitignore", ".env\n");
+    write_file(root, ".env", "S=1\n");
+    write_file(root, ".superset/magic.local.json", "{not json");
+
+    run_init_noninteractive(root, &strings(&[".env"])).unwrap();
+
+    assert!(root.join(".superset/magic.json").is_file());
+    assert_eq!(
+        read_text(root, ".superset/magic.local.json"),
+        "{not json",
+        "a file init cannot read is never rewritten"
+    );
+    let include = read_text(root, worktreeinclude::FILE_NAME);
+    assert!(worktreeinclude::entries(&include).contains(&".env".to_string()));
+}
+
+/// `overlaid_patterns` for an overlay that cannot be parsed: no extra
+/// patterns, and a warning naming the file and saying what was left out.
+#[test]
+fn overlaid_patterns_drops_a_malformed_overlay_with_a_warning() {
+    let repo = fresh();
+    let root = repo.path();
+    write_file(root, ".superset/magic.local.json", "{not json");
+
+    let (patterns, warning) = overlaid_patterns(root, &strings(&[".env"]));
+
+    assert_eq!(patterns, strings(&[".env"]));
+    let warning = warning.expect("a malformed overlay must produce a warning");
+    assert!(warning.contains(".superset/magic.local.json"), "{warning}");
+    assert!(warning.contains("could not be read"), "{warning}");
+    assert!(warning.contains("left out"), "{warning}");
+}
+
 /// Non-interactive init preserves a pre-existing magic.local.json (same
 /// guard as the interactive path).
 #[test]
@@ -1241,7 +1281,8 @@ fn a_tracked_worktreeinclude_gets_its_section_but_no_ignore_rule() {
             .any(|l| l == worktreeinclude::FILE_NAME),
         "no ignore rule may be added for a tracked file"
     );
-    let patterns = overlaid_patterns(root, &strings(&[".env"])).unwrap();
+    let (patterns, warning) = overlaid_patterns(root, &strings(&[".env"]));
+    assert_eq!(warning, None);
     let notices = orca_write::plan(root, &patterns, &[], SetupPolicy::Ensure).apply(root);
     assert!(
         !read_text(root, ".gitignore")
@@ -1269,8 +1310,9 @@ fn migration_writes_the_orca_files_alongside_the_new_layout() {
     let existing = superset_files::load_config(root).unwrap().unwrap();
     let shared = shared_dirs::stored_or_detected(root, None);
     assert_eq!(shared, Some(strings(&["**/node_modules"])));
-    let patterns =
-        overlaid_patterns(root, &strings(&["**/.env", "apps/*/.dev.vars"])).unwrap();
+    let (patterns, warning) =
+        overlaid_patterns(root, &strings(&["**/.env", "apps/*/.dev.vars"]));
+    assert_eq!(warning, None);
     let plan = orca_write::plan(
         root,
         &patterns,

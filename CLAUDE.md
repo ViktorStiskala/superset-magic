@@ -514,7 +514,13 @@ The modules, by purpose:
   remembers what it read and `apply` leaves alone, with a warning, a file that
   changed on disk in the meantime. `overlaid_patterns` gives the plan the sync
   patterns as they WILL be – the `files` about to be written plus the local
-  overlay – since `magic.json` is not on disk yet at that point.
+  overlay – since `magic.json` is not on disk yet at that point. It returns
+  `(patterns, Option<warning>)` and never fails: an overlay that cannot be
+  parsed contributes no patterns and yields a warning that each call site prints
+  to stderr (`warn_overlay`) before going on, because init, edit config and
+  migrate never parsed `magic.local.json` before the Orca output existed and a
+  broken per-machine file must not stop them (leaving its patterns out of
+  Orca's list is safe – forward sync still copies them).
   `materialize_init` is the one helper behind everything `run_init` (also the
   edit-config path) and `run_init_noninteractive` do once their decisions are
   made – stage, `copy_into_repo`, bootstrap gitignores, Orca files – and
