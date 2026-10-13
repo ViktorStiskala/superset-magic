@@ -313,6 +313,51 @@ fn a_tracked_list_is_not_refreshed_and_the_sync_still_succeeds() {
     );
 }
 
+/// R26. A `.worktreeinclude` that is a symlink is never written through by the
+/// automatic refresh. Git is asked about the link's NAME, which is untracked
+/// and ignored here, while a write through the link would land on the
+/// committed file it points at and leave that file modified in the main
+/// checkout. The sync itself still succeeds.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_list_is_not_written_through_and_the_sync_still_succeeds() {
+    let (main, _holder, wt) = orca_repo(&["**/.env", ".env"]);
+    let committed = "vendor/licence.key\n";
+    write_file(main.path(), "shared.include", committed);
+    git_run(&["add", "shared.include"], main.path());
+    git_run(&["commit", "-q", "-m", "a tracked list"], main.path());
+    std::os::unix::fs::symlink(
+        "shared.include",
+        main.path().join(worktreeinclude::FILE_NAME),
+    )
+    .unwrap();
+    write_file(main.path(), ".env", "MAIN=1\n");
+    write_file(main.path(), "apps/api/.env", "API=1\n");
+
+    let (code, events) = sync(&wt, SyncOptions::default(), &setup_env(&wt));
+
+    assert_eq!(code, 0, "a refresh that cannot run never fails the sync");
+    assert_eq!(copied(&events).len(), 2);
+    assert_eq!(read(main.path(), "shared.include"), committed);
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--", "shared.include"])
+        .current_dir(main.path())
+        .output()
+        .unwrap();
+    assert!(
+        status.stdout.is_empty(),
+        "git must see no change to the tracked file behind the link: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    assert!(
+        fs::symlink_metadata(main.path().join(worktreeinclude::FILE_NAME))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is left as it was"
+    );
+}
+
 /// R26. Without the ignore rule in main nothing is written there.
 #[test]
 fn a_main_checkout_without_the_ignore_rule_is_not_refreshed() {

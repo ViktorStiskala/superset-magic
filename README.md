@@ -400,9 +400,14 @@ When Orca set the worktree up, forward sync does two more things:
   ss-magic regenerates its block of the main checkout's `.worktreeinclude`, so
   the next worktree gets newly added files from Orca directly. This step is
   best-effort: it writes only when git reports that file as both gitignored and
-  untracked, it never touches `orca.yaml`, and whatever it reports, the sync's
-  exit status stands. If the main checkout has no ignore rule for the file yet,
-  the sync says so; run `ss-magic orca` there once.
+  untracked, it never writes through a symlink, it never touches `orca.yaml`,
+  and whatever it reports, the sync's exit status stands. If the main checkout
+  has no ignore rule for the file yet, the sync says so; run `ss-magic orca`
+  there once. If `.worktreeinclude` is a symlink there – wherever it points –
+  the sync says so and leaves it alone, since the file behind the link could be
+  a tracked one. `ss-magic orca` run in that checkout is what updates it: that
+  command writes through a link that stays inside the repository, and reports
+  one that leaves it without touching the file.
 
 An Orca worktree is recognized by `ORCA_WORKTREE_PATH` (set for setup scripts)
 or the path inside `ORCA_WORKTREE_ID` (set in Orca's terminals) naming the

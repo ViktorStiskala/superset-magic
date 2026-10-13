@@ -809,7 +809,7 @@ that follows a symlink to decide existence, that is read after the refresh, that
 applies in the Sync cockpit, `reverse-sync` or `pack` (only forward sync skips),
 or a change that makes `--no-orca-skip` suppress the refresh.
 
-### The automatic refresh writes ONLY `.worktreeinclude`, and only when git says it is safe
+### The automatic refresh writes ONLY `.worktreeinclude`, never through a symlink, and only when git says it is safe
 
 After a SUCCESSFUL copy in an Orca worktree, `orca::write::refresh_snapshot`
 regenerates the managed section of main's `.worktreeinclude`. It is a background
@@ -818,16 +818,30 @@ setup script writing into the shared main checkout, so:
 - it NEVER touches `orca.yaml` (a tracked file must not show up modified in
   main) – a directory that appeared since `orca.yaml` was written is added only
   by the explicit refresh;
+- it NEVER writes through a symlink. Before git is asked and before the file is
+  read, `refresh_snapshot` inspects main's `.worktreeinclude` with
+  `fs::symlink_metadata` (which follows nothing) and skips when the entry is a
+  link – whatever it points at: a tracked file, an untracked one, a directory or
+  nothing, inside the repository or out of it. Git answers the two questions in
+  the next item about the NAME, so an untracked, ignored link to a tracked file
+  would pass both while the write landed on the tracked target. An entry that
+  cannot be inspected is a skip as well; a file that does not exist yet is not a
+  link and is created;
 - it writes only when git POSITIVELY reports the file as untracked (an empty
   `ls-files` answer for it) AND as ignored; "git could not be asked" is a no;
-- it never rewrites a file it cannot read, and never follows a symlink out of
-  the repository;
+- it never rewrites a file it cannot read;
 - it runs on neither the empty-`files` early return nor any error path;
 - every reason not to write is reported as a warning and NEVER changes the
   sync's exit status.
 
+The write still goes through the containment check described in the next
+section, as a second line of defence for a name that became a link out of the
+repository after the first check.
+
 Flag a refresh that writes `orca.yaml`, that writes on an unknown tracked or
-ignored status, that turns its own failure into a non-zero exit, or that runs
+ignored status, that writes through a symlink, that decides from where a link
+resolves instead of from the link itself, that treats a failed inspection as
+"not a link", that turns its own failure into a non-zero exit, or that runs
 before the copy.
 
 ### Init, migrate and edit config: compute before the prompt, write after the tree
@@ -856,10 +870,13 @@ Before either file is read, the write path checks containment
 (`orca::write::landing`): a target that resolves OUTSIDE the repository through
 a symlink is left untouched and reported, while an in-repo symlink is written
 through onto its target. The hazard is a repository committing `orca.yaml` as a
-link to a file the person owns elsewhere. Flag an Orca write that skips the
-containment check, that stages `.worktreeinclude`, that computes the snapshot
-before the tree materializes, or a fourth inline copy of the write sequence
-instead of `plan`/`apply`.
+link to a file the person owns elsewhere. Writing through an in-repo link is
+what THIS path does, because a person ran the command; the automatic refresh
+above writes through no symlink at all, and the two must not be made alike in
+either direction. Flag an Orca write that skips the containment check, that
+stages `.worktreeinclude`, that computes the snapshot before the tree
+materializes, or a fourth inline copy of the write sequence instead of
+`plan`/`apply`.
 
 ## The Claude Code Plugin (`crates/ss-magic-plugin/`, `plugin/`, `scripts/`)
 

@@ -967,11 +967,19 @@ The modules, by purpose:
   `OnlyWhenCreating` is the explicit refresh, which never touches the
   `scripts.setup` of an existing file. `refresh_snapshot` is the AUTOMATIC
   end-of-sync refresh: it rewrites only the managed section of main's
-  `.worktreeinclude`, only when git positively reports that file untracked AND
-  ignored, never `orca.yaml`, and every reason not to write is a `Skipped`
-  value rather than an error. Every write goes through `write_contained`, which
-  refuses a target that resolves OUTSIDE the repository through a symlink
-  (`landing`) while writing through an in-repo link.
+  `.worktreeinclude`, only when that name is NOT A SYMLINK and git positively
+  reports the file untracked AND ignored, never `orca.yaml`, and every reason
+  not to write is a `Skipped` value rather than an error. The link check
+  (`fs::symlink_metadata`, so nothing is followed) runs first, before git is
+  asked and before the file is read, and it does not look at where the link
+  leads: git answers for the link's NAME, so an untracked, ignored link to a
+  tracked file would pass both git questions while the write landed on the
+  tracked target. An entry that cannot be inspected is a skip too, and an
+  absent file is created as before. Every write goes through `write_contained`,
+  which refuses a target that resolves OUTSIDE the repository through a symlink
+  (`landing`) while writing through an in-repo link. Since the automatic refresh
+  has already turned every link away, only the `plan` / `Plan::apply` path ever
+  writes through one.
 
 ## The Claude Code plugin (`crates/ss-magic-plugin/src/`)
 
@@ -2003,11 +2011,18 @@ secret-safety rules above take here.
   A layout with no safe edit is a refusal – the file stays byte-for-byte as it
   was, the reason and the block to add by hand are printed, and everything else
   is still written. A refusal is never a failed command.
-- **The automatic refresh writes only `.worktreeinclude`, and only when git
-  says it is both untracked and ignored.** It never touches `orca.yaml`
-  (a tracked file must not show up modified in main), never rewrites a file it
-  cannot read, never follows a symlink out of the repository, and never changes
-  the sync's exit status. "Git could not be asked" is a no.
+- **The automatic refresh writes only `.worktreeinclude`, and only when that
+  name is not a symlink and git says it is both untracked and ignored.** It
+  never touches `orca.yaml` (a tracked file must not show up modified in main),
+  never rewrites a file it cannot read, never writes through a symlink –
+  whatever the link points at, inside the repository or out of it – and never
+  changes the sync's exit status. Git answers for the NAME `.worktreeinclude`,
+  so an untracked, ignored link to a tracked file passes both questions while
+  a write through it lands on the tracked target; that is why the link check
+  comes first and never asks where the link leads. "Git could not be asked" is
+  a no, and so is an entry that could not be inspected. Writing through a link
+  that stays inside the repository belongs to the explicit path alone (init,
+  migrate, edit-config, `ss-magic orca`).
 - **Neither refresh touches the `scripts.setup` of an existing `orca.yaml`.**
   A line someone removed comes back only through init, migrate or edit-config.
 - **Orca mode needs a variable that NAMES this worktree, and is never on in the

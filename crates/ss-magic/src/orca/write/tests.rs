@@ -19,6 +19,21 @@ fn include_text(root: &Path) -> String {
     fs::read_to_string(root.join(worktreeinclude::FILE_NAME)).unwrap()
 }
 
+/// Make `<root>/.worktreeinclude` a symlink to `target`, which is taken
+/// relative to `root` as a link written by hand would be.
+#[cfg(unix)]
+fn link_include_to(root: &Path, target: &str) {
+    std::os::unix::fs::symlink(target, root.join(worktreeinclude::FILE_NAME)).unwrap();
+}
+
+/// Where `<root>/.worktreeinclude` points, read WITHOUT following it. `None`
+/// when the entry is missing or is not a symlink any more – which is how a
+/// writer that replaced the link with a regular file shows up.
+#[cfg(unix)]
+fn include_link_target(root: &Path) -> Option<PathBuf> {
+    fs::read_link(root.join(worktreeinclude::FILE_NAME)).ok()
+}
+
 // --- containment ----------------------------------------------------------
 
 #[test]
@@ -152,6 +167,151 @@ fn the_refresh_is_skipped_when_the_file_is_tracked() {
     assert!(why.contains("tracked by git"), "{why}");
     assert!(!why.contains("  "), "one tidy sentence: {why:?}");
     assert_eq!(include_text(main.path()), "committed/by-hand\n");
+}
+
+/// R26. The automatic refresh must never leave a tracked file modified in the
+/// shared main checkout. Git is asked about the NAME `.worktreeinclude` only,
+/// and a name that is an untracked, ignored symlink passes both of those
+/// questions while a write through it lands on the link's target – here a
+/// committed file. So the refresh does not write through a symlink at all.
+#[cfg(unix)]
+#[test]
+fn the_refresh_never_writes_a_tracked_file_through_a_symlink() {
+    let main = main_with_rule();
+    let committed = "# shared by the team\nvendor/licence.key\n";
+    write_file(main.path(), "shared.include", committed);
+    git_run(&["add", "shared.include"], main.path());
+    git_run(&["commit", "-q", "-m", "a tracked list"], main.path());
+    link_include_to(main.path(), "shared.include");
+    // An ignored secret the patterns match, so the snapshot is not empty and
+    // the rendered file differs from what the link's target holds.
+    write_file(main.path(), ".env", "S=1\n");
+    // The two answers git gives about the name are exactly the ones that let
+    // the refresh write: the link itself is neither tracked nor unignored.
+    let name = worktreeinclude::FILE_NAME;
+    assert!(git::tracked_files(main.path(), &[name]).unwrap().is_empty());
+    assert!(git::is_ignored_str(main.path(), name).unwrap());
+
+    let outcome = refresh_snapshot(main.path(), &strings(&[".env"]));
+
+    let SnapshotRefresh::Skipped(why) = outcome else {
+        panic!("expected a skip, got {outcome:?}");
+    };
+    assert!(why.contains("is a symlink"), "{why}");
+    assert!(why.contains("ss-magic orca"), "the notice says what does update it: {why}");
+    assert!(!why.contains("  "), "one tidy sentence: {why:?}");
+    assert_eq!(
+        fs::read_to_string(main.path().join("shared.include")).unwrap(),
+        committed,
+        "the tracked file the link points at must be byte-identical"
+    );
+    assert_eq!(
+        include_link_target(main.path()),
+        Some(PathBuf::from("shared.include")),
+        "the link itself is left as it was"
+    );
+    assert_eq!(
+        git::status_porcelain(main.path(), &["."]).unwrap(),
+        Vec::new(),
+        "git must see nothing modified and nothing new in the main checkout"
+    );
+}
+
+/// The refresh does not judge where a link leads: one that points at an
+/// untracked, ignored file inside the repository is not written through
+/// either, so the person's own file behind it keeps its bytes.
+#[cfg(unix)]
+#[test]
+fn the_refresh_never_writes_an_untracked_file_through_a_symlink() {
+    let main = main_with_rule();
+    write_file(main.path(), ".gitignore", ".env\n.worktreeinclude\nlocal.include\n");
+    git_run(&["commit", "-q", "-am", "ignore the local list"], main.path());
+    let by_hand = "# mine\nsecrets/local.pem\n";
+    write_file(main.path(), "local.include", by_hand);
+    link_include_to(main.path(), "local.include");
+    write_file(main.path(), ".env", "S=1\n");
+
+    let outcome = refresh_snapshot(main.path(), &strings(&[".env"]));
+
+    assert!(
+        matches!(&outcome, SnapshotRefresh::Skipped(why) if why.contains("is a symlink")),
+        "{outcome:?}"
+    );
+    assert_eq!(fs::read_to_string(main.path().join("local.include")).unwrap(), by_hand);
+    assert_eq!(
+        include_link_target(main.path()),
+        Some(PathBuf::from("local.include"))
+    );
+}
+
+/// A link that leaves the repository is turned away by the same check, before
+/// the file behind it is even read – the containment check at the write is
+/// only the second line of defence for it.
+#[cfg(unix)]
+#[test]
+fn the_refresh_never_writes_through_a_symlink_out_of_the_repository() {
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("mine.include");
+    fs::write(&victim, "# elsewhere\n").unwrap();
+    let main = main_with_rule();
+    link_include_to(main.path(), victim.to_str().unwrap());
+    write_file(main.path(), ".env", "S=1\n");
+
+    let outcome = refresh_snapshot(main.path(), &strings(&[".env"]));
+
+    // The reason is the link check's own, not the containment check's "is a
+    // symlink to <path>, outside the repository".
+    assert!(
+        matches!(&outcome, SnapshotRefresh::Skipped(why) if why.contains("never writes through one")),
+        "{outcome:?}"
+    );
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "# elsewhere\n");
+    assert_eq!(include_link_target(main.path()), Some(victim));
+}
+
+/// A link to nothing and a link to a directory are skipped for the same
+/// reason. Neither is replaced by a regular file, and nothing is created where
+/// the dangling link points.
+#[cfg(unix)]
+#[test]
+fn the_refresh_skips_a_dangling_link_and_a_link_to_a_directory() {
+    for target in ["no-such-file", "apps"] {
+        let main = main_with_rule();
+        fs::create_dir(main.path().join("apps")).unwrap();
+        link_include_to(main.path(), target);
+        write_file(main.path(), ".env", "S=1\n");
+
+        let outcome = refresh_snapshot(main.path(), &strings(&[".env"]));
+
+        assert!(
+            matches!(&outcome, SnapshotRefresh::Skipped(why) if why.contains("is a symlink")),
+            "a link to `{target}`: {outcome:?}"
+        );
+        assert_eq!(
+            include_link_target(main.path()),
+            Some(PathBuf::from(target)),
+            "the link to `{target}` is still a link"
+        );
+        assert!(!main.path().join("no-such-file").exists());
+    }
+}
+
+/// When the entry cannot even be inspected, nobody knows whether it is a link,
+/// so the answer is the refusing one. A root that is a regular file makes the
+/// lookup fail with something other than "not found".
+#[cfg(unix)]
+#[test]
+fn the_refresh_is_skipped_when_the_entry_cannot_be_inspected() {
+    let dir = tempfile::tempdir().unwrap();
+    let not_a_directory = dir.path().join("plain-file");
+    fs::write(&not_a_directory, "x").unwrap();
+
+    let outcome = refresh_snapshot(&not_a_directory, &strings(&[".env"]));
+
+    assert!(
+        matches!(&outcome, SnapshotRefresh::Skipped(why) if why.contains("could not be inspected")),
+        "{outcome:?}"
+    );
 }
 
 /// Outside a repository git cannot vouch for anything, so nothing is written.

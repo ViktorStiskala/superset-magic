@@ -1,6 +1,7 @@
 //! Writing the Orca files into the main checkout.
 //!
-//! Two writers that share one rule about where a write may land:
+//! Two writers that share one rule about where a write may land, the automatic
+//! one being stricter still:
 //!
 //! - [`plan`] and [`Plan::apply`] are the shared Orca write path behind init,
 //!   migrate, edit-config and the explicit `ss-magic orca` refresh (KTD13). The
@@ -12,10 +13,11 @@
 //!   exactly what was planned, and gitignores `.worktreeinclude`.
 //! - [`refresh_snapshot`] is the AUTOMATIC refresh that ends a forward sync in
 //!   an Orca worktree (KTD11). It rewrites only the managed section of main's
-//!   `.worktreeinclude`, only when git positively reports that file as ignored
-//!   and untracked, and it reports rather than fails: a background setup script
-//!   must never leave the shared main checkout with a modified tracked file, and
-//!   must never turn a successful sync into a failed one.
+//!   `.worktreeinclude`, only when that name is not a symlink and git
+//!   positively reports the file as ignored and untracked, and it reports
+//!   rather than fails: a background setup script must never leave the shared
+//!   main checkout with a modified tracked file, and must never turn a
+//!   successful sync into a failed one.
 //!
 //! Neither writer ever fails the operation it belongs to. A file that cannot be
 //! edited safely is left byte-for-byte untouched and reported, and everything
@@ -26,6 +28,13 @@
 //! repository that commits `orca.yaml` or `.worktreeinclude` as a link to a file
 //! the person owns elsewhere; a command run in that checkout would otherwise
 //! follow the link and rewrite THAT file.
+//!
+//! A link that STAYS inside the repository is where the two writers part. The
+//! explicit path writes through it onto its target: a person ran that command
+//! and reads what it did. The automatic refresh writes through no symlink at
+//! all. Git can only vouch for the link's own name, and the file behind an
+//! untracked, ignored link may be a tracked one, which a background script
+//! would then leave modified in the main checkout.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -516,6 +525,16 @@ pub enum SnapshotRefresh {
 /// [`SnapshotRefresh::Skipped`], never an error, so the forward sync that calls
 /// this keeps its exit status. The write happens only when ALL of these hold:
 ///
+/// - `.worktreeinclude` is not a symlink, whatever the link points at – a
+///   tracked file, an untracked one, a directory or nothing at all. Git answers
+///   the next condition's two questions about the NAME, and a link that is
+///   itself untracked and ignored passes both while a write through it lands
+///   on its target, which can be a tracked file. So the entry is inspected
+///   without following it, before git is asked and before the file is read,
+///   and one that cannot be inspected counts as a no. A file that does not
+///   exist yet is not a link and is created as before. Writing through a link
+///   that stays inside the repository is left to the explicit path ([`plan`]
+///   and [`Plan::apply`]).
 /// - git positively reports `.worktreeinclude` as untracked (an empty
 ///   `ls-files` answer for it) AND as ignored. A tracked file would show up as
 ///   modified in the shared main checkout; an unignored one would show up as
@@ -523,7 +542,10 @@ pub enum SnapshotRefresh {
 ///   and "git could not be asked" counts as a no.
 /// - the existing file, if any, can be read as UTF-8 text. Rebuilding an
 ///   unreadable file from an empty parse would drop the person's lines.
-/// - the file does not resolve outside the repository through a symlink.
+///
+/// The write itself still goes through [`write_contained`], which refuses a
+/// target outside the repository – a second line of defence for a name that
+/// turned into such a link after the first condition was checked.
 ///
 /// The files under a directory Orca already shares are left out of the
 /// snapshot. "Already shares" is read from `orca.yaml` as it is on disk, since
@@ -531,6 +553,28 @@ pub enum SnapshotRefresh {
 /// until someone runs the explicit refresh.
 pub fn refresh_snapshot(main_root: &Path, patterns: &[String]) -> SnapshotRefresh {
     let name = worktreeinclude::FILE_NAME;
+    // `symlink_metadata` reads the entry itself and follows nothing, so a link
+    // is recognized here without its target ever being opened. Where the link
+    // leads is deliberately not asked: git can vouch for the link's name only,
+    // so no target makes a write through it safe for a background script.
+    match fs::symlink_metadata(main_root.join(name)) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return SnapshotRefresh::Skipped(format!(
+                "the main checkout's `{name}` is a symlink, and the automatic refresh never \
+                 writes through one. Run `ss-magic orca` there to update it."
+            ));
+        }
+        // Not a link, or no file yet: the conditions below decide.
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // Any other failure leaves "is it a link?" unanswered, and the unknown
+        // answer has to be the refusing one.
+        Err(err) => {
+            return SnapshotRefresh::Skipped(format!(
+                "the main checkout's `{name}` could not be inspected ({err})"
+            ));
+        }
+    }
     match git::tracked_files(main_root, &[name]) {
         Ok(tracked) if tracked.is_empty() => {}
         Ok(_) => {
@@ -586,6 +630,10 @@ pub fn refresh_snapshot(main_root: &Path, patterns: &[String]) -> SnapshotRefres
             listed: snap.entries.len(),
             warning,
         },
+        // A second line of defence. Every symlink that existed when this
+        // function started was turned away at the top, so this arm is reached
+        // only when the name became a link out of the repository while the
+        // snapshot was being computed.
         Ok(Landing::Outside(target)) => SnapshotRefresh::Skipped(format!(
             "the main checkout's `{name}` is a symlink to {}, outside the repository",
             target.display()
