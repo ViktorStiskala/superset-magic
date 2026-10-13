@@ -129,7 +129,6 @@ fn values_that_name_nothing_usable_are_not_detected() {
     let gone = dir.path().join("deleted-worktree");
     for (name, value) in [
         (WORKTREE_PATH_VAR, String::new()),
-        (WORKTREE_PATH_VAR, "worktree".to_string()),
         (WORKTREE_PATH_VAR, text(&gone)),
         // A folder workspace id has no separator at all.
         (WORKTREE_ID_VAR, "4519ac23-3e21-4b10-ae38-470f6dd00e05".to_string()),
@@ -145,6 +144,69 @@ fn values_that_name_nothing_usable_are_not_detected() {
     // A root that cannot be resolved is not an Orca worktree either.
     let env = env_of(&[(WORKTREE_PATH_VAR, text(&gone))]);
     assert!(!is_orca_worktree(&gone, &main, &env));
+}
+
+/// A relative value is never a match, even when it would resolve to this very
+/// worktree from the process's working directory.
+///
+/// The value `worktree` only means something relative to the directory that
+/// holds the worktree, so the assertion runs in a child process started there
+/// (the working directory is process-global and cannot be changed under the
+/// parallel suite). Without that, `canonicalize` fails on a name that does not
+/// exist and the case would pass even with the absolute-path guard removed.
+#[test]
+fn a_relative_value_is_not_detected_even_when_it_resolves_to_the_worktree() {
+    let (dir, _main, _worktree) = roots();
+    let out = ss_magic_core::testutil::run_ignored_test_in_child_from(
+        dir.path(),
+        &ss_magic_core::testutil::test_path_in_binary(
+            module_path!(),
+            "child_relative_value_is_not_detected",
+        ),
+        &[],
+        &[],
+    );
+    // The child returns early when it lacks the expected cwd, which would
+    // look like a pass, so it prints a marker once past that guard.
+    assert!(
+        out.contains(CHILD_RAN_MARKER),
+        "the child did not receive the scratch cwd. Child output:\n{out}"
+    );
+}
+
+/// Printed by the child once it is past its cwd guard.
+const CHILD_RAN_MARKER: &str = "child_relative_value_is_not_detected: past the cwd guard";
+
+/// The child half of
+/// `a_relative_value_is_not_detected_even_when_it_resolves_to_the_worktree`.
+/// Returns early unless the working directory holds `main` and `worktree`.
+#[test]
+#[ignore = "child half of a_relative_value_is_not_detected_even_when_it_resolves_to_the_worktree; run by the parent in a scratch cwd"]
+fn child_relative_value_is_not_detected() {
+    let (main, worktree) = (PathBuf::from("main"), PathBuf::from("worktree"));
+    if !main.is_dir() || !worktree.is_dir() {
+        return;
+    }
+    println!("{CHILD_RAN_MARKER}");
+    let here = std::env::current_dir().unwrap();
+    let (main, worktree) = (here.join("main"), here.join("worktree"));
+    // The precondition that makes the case meaningful: the relative value
+    // really does resolve to the worktree from this working directory.
+    assert_eq!(
+        Path::new("worktree").canonicalize().unwrap(),
+        worktree.canonicalize().unwrap()
+    );
+    for name in [WORKTREE_PATH_VAR, WORKTREE_ID_VAR] {
+        let value = if name == WORKTREE_ID_VAR {
+            "repo-id::worktree".to_string()
+        } else {
+            "worktree".to_string()
+        };
+        assert!(
+            !is_orca_worktree(&worktree, &main, &env_of(&[(name, value)])),
+            "a relative {name} must not be detected"
+        );
+    }
 }
 
 #[test]

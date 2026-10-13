@@ -69,6 +69,32 @@ fn a_directory_that_is_not_gitignored_is_not_shared() {
     assert_eq!(expand(root, &defaults()).dirs, strings(&["node_modules"]));
 }
 
+/// A directory that IS ignored but holds a tracked file is source to git, so it
+/// must not be shared either. The fixture proves both halves hold: git reports
+/// the directory ignored by rule and the file inside it tracked.
+#[test]
+fn an_ignored_directory_holding_a_tracked_file_is_not_shared() {
+    let main = init_main_repo("main");
+    let root = main.path();
+    write_file(root, ".gitignore", "node_modules/\n.cache/\n");
+    write_file(root, "node_modules/a/index.js", "x");
+    write_file(root, "tools/.cache/kept.txt", "x");
+    git_run(&["add", "-f", "tools/.cache/kept.txt"], root);
+    git_run(&["commit", "-q", "-m", "tracked cache"], root);
+
+    // Precondition: the rule covers the directory, and the file is tracked.
+    git_run(&["check-ignore", "-q", "--no-index", "tools/.cache/"], root);
+    let listed = std::process::Command::new("git")
+        .args(["ls-files", "tools/.cache"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let tracked = String::from_utf8_lossy(&listed.stdout);
+    assert!(tracked.contains("tools/.cache/kept.txt"), "{tracked:?}");
+
+    assert_eq!(expand(root, &defaults()).dirs, strings(&["node_modules"]));
+}
+
 #[test]
 fn only_the_stored_patterns_are_expanded() {
     let main = init_main_repo("main");

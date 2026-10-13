@@ -810,7 +810,11 @@ fn the_ladder_applies_even_when_the_values_are_already_right() {
 fn an_edit_that_would_change_another_key_through_an_alias_is_refused() {
     let current = "worktree:\n  sharedDirectories: &dirs\n    - old\nelsewhere: *dirs\n";
     let r = refusal(current, &["node_modules"], false);
-    assert!(!r.reason.is_empty());
+    assert!(
+        r.reason.contains("did not parse back to the intended values"),
+        "expected the re-parse check to refuse, got {:?}",
+        r.reason
+    );
 }
 
 #[test]
