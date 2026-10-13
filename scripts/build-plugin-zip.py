@@ -650,7 +650,7 @@ def _declared_dependency_names(text: str) -> set[str]:
 
     Line-oriented rather than a TOML parse (`tomllib` is 3.11+). Comments are
     skipped -- which matters here, because the plugin manifest's own comment names
-    all three forbidden crates in prose. Renames (`foo = { package = "bar" }`) are
+    every forbidden crate in prose. Renames (`foo = { package = "bar" }`) are
     resolved to the real crate name, since the whole point is that the crate is
     not linked in, whatever it is called locally. Hyphens are folded to
     underscores so `self-update` and `self_update` are one name.
@@ -1073,9 +1073,9 @@ def _version_repo(
     (root / "crates" / "ss-magic-plugin").mkdir(parents=True)
     (root / "crates" / "ss-magic-plugin" / "Cargo.toml").write_text(
         f'[package]\nname = "ss-magic-plugin"\nversion = "{plugin}"\n\n'
-        # Prose naming all three forbidden crates, so the guard is proved to read
+        # Prose naming every forbidden crate, so the guard is proved to read
         # dependency tables rather than to grep the file.
-        "# No self_update, no inquire, no ratatui: absent by requirement.\n"
+        "# No self_update, no inquire, no ratatui, no saphyr: absent by requirement.\n"
         '[dependencies]\nss-magic-core = { path = "../ss-magic-core" }\n'
         f"{plugin_deps}"
         + ("" if artifact_in_dist else f"\n{artifact}"),

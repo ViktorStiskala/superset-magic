@@ -155,8 +155,10 @@ pub fn parse(args: &[String]) -> Parsed {
 /// subcommand token. Position-independent because [`parse`]'s loop returns as
 /// soon as it matches a subcommand, so a whole-slice scan is the only way to
 /// also catch a trailing flag. Deliberately asymmetric with `-h`/`--help`, a
-/// terminal short-circuit recognized only BEFORE the subcommand (see USAGE): a
-/// maintainer should NOT "fix" one to match the other.
+/// terminal short-circuit recognized BEFORE the subcommand, and after it only
+/// for `orca` (which rewrites files in the shared main checkout, so asking what
+/// it does must not do it; see USAGE): a maintainer should NOT "fix" one to
+/// match the other.
 fn has_no_backup(args: &[String]) -> bool {
     args.iter().any(|a| a == "--no-backup" || a == "-n")
 }
@@ -171,8 +173,8 @@ fn has_no_orca_skip(args: &[String]) -> bool {
 
 /// True when `--version`/`-V` appears anywhere in argv.
 ///
-/// Deliberately asymmetric with `-h`/`--help`, which is only recognized before
-/// the subcommand: the scan runs PAST a subcommand token, so
+/// Deliberately asymmetric with `-h`/`--help`, which is recognized before the
+/// subcommand and, after it, only for `orca`: the scan runs PAST a subcommand token, so
 /// `ss-magic sync --version` still prints the version. Without that, an
 /// unrecognized `--version` would be skipped as an unknown flag and fall
 /// through to `Command::Bare`, which is gated for auto-update and opens the

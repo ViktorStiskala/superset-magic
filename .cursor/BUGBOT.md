@@ -243,9 +243,9 @@ structurally valid". The engine's rules:
   It must be applied in `apply::walk_source`, `apply::copy_dir_recursive(root,
   src, dst)` (and its filtered form `copy_dir_recursive_filtered`), reverse
   sync's candidate computation, `pack::append_dir_excluding_trees`, AND the
-  CLI's Orca walks – `orca::snapshot`'s directory expansion,
-  `orca::shared_dirs::walk_candidates` and `orca::worktreeinclude::copied_by_orca`
-  – every walk that re-reads the live
+  CLI's two Orca walks – `orca::snapshot`'s directory expansion and
+  `orca::shared_dirs::walk_candidates` (`orca::worktreeinclude::copied_by_orca`
+  walks nothing, it only checks that listed paths exist) – every walk that re-reads the live
   filesystem after the match set is decided. Filtering the flat match list is
   NOT sufficient: a directory match that is an ANCESTOR of an excluded tree (a
   bare `.superset` pattern, a broad `**`) re-admits the whole subtree through

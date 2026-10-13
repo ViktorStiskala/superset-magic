@@ -328,9 +328,9 @@ The modules, by purpose:
   `apply::walk_source`, `apply::copy_dir_recursive(root, src, dst)` (which takes
   the tree root precisely so it can classify each entry's rel), reverse sync's
   candidate computation, pack's `append_dir_excluding_trees`, and the CLI's
-  three Orca walks (the snapshot's directory expansion, the shared-directory
-  walk, and the skip set's expansion of a listed directory) – never only on
-  an upstream match list. Distinct from `apply::DEFAULT_EXCLUDES`, which drops a
+  two Orca walks (the snapshot's directory expansion and the shared-directory
+  walk; the skip set has no walk of its own, it only checks that each listed
+  path exists) – never only on an upstream match list. Distinct from `apply::DEFAULT_EXCLUDES`, which drops a
   match containing one of a few directory NAMES (`node_modules`, `.venv`) at ANY
   depth. (This generalizes the retired `reverse_sync::under_backups_dir`.)
 - `sync/repo_scan.rs` — `matches_for_patterns(root, &[&str])` walks the
@@ -1999,7 +1999,7 @@ the real incident this run fixed.
   `.scratchpad`, `.git`) must be applied where the file set is actually
   materialized – every directory walk (`pack`'s `append_dir_excluding_trees`,
   `apply::walk_source`, `apply::copy_dir_recursive`, reverse sync's candidate
-  computation, and the Orca snapshot / shared-directory / skip-set walks) – NOT only on the
+  computation, and the Orca snapshot / shared-directory walks) – NOT only on the
   flat match list, because a later step that re-walks the live filesystem
   (`append_dir_all`, `copy_dir_recursive`, `WalkDir`) bypasses an upstream filter.
   The trap is a directory match that is an ANCESTOR of the excluded subtree (a bare

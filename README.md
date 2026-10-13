@@ -351,12 +351,14 @@ exactly as it is, says so in a warning, and still writes everything else. Run
 the command again to update `orca.yaml`, or `ss-magic orca` to refresh
 `.worktreeinclude`.
 
-Init and migration both gitignore three things up front: the per-machine
-`magic.local.json` overlay, the tool's `.superset/backups/` tree (where a
-sync stores the bytes it overwrites, which can include recovered secrets), so
-the backup tree is protected before the first sync ever writes to it, and the
-per-machine `.worktreeinclude` snapshot (unless git tracks that file). Both flows
-preserve `config.json`'s `teardown` and `run` arrays verbatim. All
+Init, migration and edit config gitignore three things up front: the
+per-machine `magic.local.json` overlay, the tool's `.superset/backups/` tree
+(where a sync stores the bytes it overwrites, which can include recovered
+secrets), so the backup tree is protected before the first sync ever writes to
+it, and the Claude plugin's per-worktree state tree `.superset/.magic/`. A
+fourth rule, for the per-machine `.worktreeinclude` snapshot, is added
+afterwards by the Orca step of the same run, and only when git does not track
+that file. Both flows preserve `config.json`'s `teardown` and `run` arrays verbatim. All
 changes are staged into a tempdir and materialized only after the
 finishing-action prompt returns a non-cancel choice, so picking "done" or
 aborting leaves the old layout intact — never a half-migrated tree. Migration
