@@ -10,7 +10,8 @@
 //!   edits it in memory, computes the snapshot and renders `.worktreeinclude`,
 //!   so the "This will:" list can say whether `orca.yaml` is created, updated
 //!   or cannot be edited, how many files Orca will copy, and whether
-//!   `.worktreeinclude` gains an ignore rule. `apply` then writes what was
+//!   `.worktreeinclude` gains an ignore rule, is already gitignored, or is
+//!   tracked and gets none. `apply` then writes what was
 //!   planned and nothing else, and gitignores `.worktreeinclude` unless the
 //!   plan found it tracked.
 //!
@@ -209,11 +210,11 @@ enum YamlPlan {
 
 /// What will happen to `.worktreeinclude`.
 ///
-/// Both variants that keep working with the file record `tracked`: whether git
-/// tracked it when the plan was made. A rule cannot ignore a tracked file, so
-/// that one answer decides both what the "This will:" list says about the
-/// ignore rule and whether [`Plan::apply`] adds it. Asking git once, here, is
-/// what keeps the two from disagreeing.
+/// Both variants that keep working with the file record `ignore`: what git
+/// said about the file's ignore rule when the plan was made. That one answer
+/// decides both what the "This will:" list says about the rule and whether
+/// [`Plan::apply`] works on it. Asking git once, here, is what keeps the two
+/// from disagreeing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IncludePlan {
     /// Write `text`, whose managed section lists `listed` files and which was
@@ -222,12 +223,28 @@ enum IncludePlan {
         text: String,
         listed: usize,
         baseline: Baseline,
-        tracked: bool,
+        ignore: IgnoreRule,
     },
     /// The file already holds exactly this section.
-    Unchanged { listed: usize, tracked: bool },
+    Unchanged { listed: usize, ignore: IgnoreRule },
     /// Leave the file byte-for-byte untouched, for the reason given.
     Untouched(String),
+}
+
+/// The state of `.worktreeinclude`'s ignore rule as the plan found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IgnoreRule {
+    /// Git tracks the file. A rule cannot ignore a tracked file, so none is
+    /// added, and the list says so instead of promising one.
+    Tracked,
+    /// The file is untracked and a rule already ignores it, so the list says
+    /// that rather than promising a rule that would not be added. `apply`
+    /// still makes sure of it, which adds the rule only if it was removed
+    /// while the prompt was open.
+    Present,
+    /// The file is untracked and nothing ignores it yet (or git could not be
+    /// asked), so the list promises the rule and `apply` adds it.
+    Add,
 }
 
 /// The Orca output of one init / migrate / edit-config / refresh, computed
@@ -304,7 +321,8 @@ fn outside_reason(target: &Path) -> String {
 /// made it unreadable.
 ///
 /// What was read becomes the planned write's [`Baseline`], and git is asked
-/// here – once – whether it tracks the file.
+/// here – once – whether it tracks the file and, if not, whether a rule
+/// already ignores it.
 fn plan_include(
     main_root: &Path,
     patterns: &[String],
@@ -331,21 +349,38 @@ fn plan_include(
     let warning = snapshot::overflow_warning(&snap);
     let text = document.render(&snap.entries);
     let listed = snap.entries.len();
-    // Positive tracked determination: the file counts as tracked only when git
-    // lists it. "Git could not be asked" (no repository) reads as untracked,
-    // and the ignore rule is then promised and written.
-    let tracked = git::tracked_files(main_root, &[name]).is_ok_and(|list| !list.is_empty());
+    let ignore = ignore_rule(main_root, name);
     let plan = if matches!(&baseline, Baseline::Text(current) if *current == text) {
-        IncludePlan::Unchanged { listed, tracked }
+        IncludePlan::Unchanged { listed, ignore }
     } else {
         IncludePlan::Write {
             text,
             listed,
             baseline,
-            tracked,
+            ignore,
         }
     };
     (plan, warning)
+}
+
+/// What git says about the ignore rule of `name` at the root of `main_root`.
+///
+/// Tracked is asked first, by positive determination: the file counts as
+/// tracked only when git lists it. Only for an untracked file is git asked
+/// whether a rule ignores it, with the same `check-ignore` question
+/// `gitignore::ensure_path_ignored` asks before adding one, so "already
+/// gitignored" here means that step will find nothing to add. Every "git
+/// could not be asked" (no repository, a failed probe) lands on [`IgnoreRule::Add`]:
+/// the list then promises the rule and `apply` writes it, the same as before
+/// this question existed.
+fn ignore_rule(main_root: &Path, name: &str) -> IgnoreRule {
+    if git::tracked_files(main_root, &[name]).is_ok_and(|list| !list.is_empty()) {
+        IgnoreRule::Tracked
+    } else if matches!(git::is_ignored_str(main_root, name), Ok(true)) {
+        IgnoreRule::Present
+    } else {
+        IgnoreRule::Add
+    }
 }
 
 /// The `orca.yaml` half of [`plan`], plus the directory list the file on disk
@@ -528,26 +563,23 @@ impl Plan {
         let name = worktreeinclude::FILE_NAME;
         // The list is what the person confirms, so it promises the ignore rule
         // only when `apply` will add it. A rule cannot ignore a file git
-        // tracks, and for such a file the line says that in its place.
-        let ignore_step = |tracked: bool| {
-            if tracked {
-                "; it is tracked by git, so no ignore rule is added"
-            } else {
-                " + add it to .gitignore"
-            }
+        // tracks, and a rule that already ignores the file is not added again;
+        // for either, the line says which in place of the promise.
+        let ignore_step = |ignore: IgnoreRule| match ignore {
+            IgnoreRule::Tracked => "; it is tracked by git, so no ignore rule is added",
+            IgnoreRule::Present => "; it is already gitignored",
+            IgnoreRule::Add => " + add it to .gitignore",
         };
         let include = match &self.include {
-            IncludePlan::Write {
-                listed, tracked, ..
-            } => format!(
+            IncludePlan::Write { listed, ignore, .. } => format!(
                 "Write {name} ({}){}",
                 file_count(*listed),
-                ignore_step(*tracked)
+                ignore_step(*ignore)
             ),
-            IncludePlan::Unchanged { listed, tracked } => format!(
+            IncludePlan::Unchanged { listed, ignore } => format!(
                 "Keep {name} (already up to date, {}){}",
                 file_count(*listed),
-                ignore_step(*tracked)
+                ignore_step(*ignore)
             ),
             IncludePlan::Untouched(why) => format!("Leave {name} untouched ({why})"),
         };
@@ -638,7 +670,7 @@ impl Plan {
     /// file is no longer the one the plan rendered its section into.
     fn apply_include(&self, main_root: &Path, notices: &mut Vec<Notice>) {
         let name = worktreeinclude::FILE_NAME;
-        let (write, listed, tracked) = match &self.include {
+        let (write, listed, ignore) = match &self.include {
             IncludePlan::Untouched(why) => {
                 notices.push(Notice::warn(format!(
                     "{name} was left untouched because {why}."
@@ -649,17 +681,21 @@ impl Plan {
                 text,
                 listed,
                 baseline,
-                tracked,
-            } => (Some((text, baseline)), *listed, *tracked),
-            IncludePlan::Unchanged { listed, tracked } => (None, *listed, *tracked),
+                ignore,
+            } => (Some((text, baseline)), *listed, *ignore),
+            IncludePlan::Unchanged { listed, ignore } => (None, *listed, *ignore),
         };
 
-        // `tracked` is the answer git gave when the plan was made, the same
-        // one the "This will:" list was written from. Git is deliberately not
-        // asked a second time: the person confirmed a list that either
-        // promised the rule or said why there is none, and a second answer
-        // could make this step differ from the one they agreed to.
-        if tracked {
+        // `ignore` is the answer git gave when the plan was made, the same one
+        // the "This will:" list was written from. Whether the file is tracked
+        // is deliberately not asked a second time: the person confirmed a list
+        // that either promised the rule or said why there is none, and a
+        // second answer could make this step differ from the one they agreed
+        // to. An untracked file, whether the list said "already gitignored" or
+        // promised the rule, goes through `ensure_path_ignored` either way: it
+        // adds nothing when the rule is there, and puts it back if it was
+        // removed while the prompt was open.
+        if ignore == IgnoreRule::Tracked {
             notices.push(Notice::info(format!(
                 "{name} is tracked by git, so no ignore rule was added. Its contents are a \
                  per-machine snapshot; consider `git rm --cached {name}`."
