@@ -878,7 +878,8 @@ BEFORE the finishing prompt and computes the whole Orca output: the current
 `orca.yaml` is read and edited in memory, the snapshot is computed and
 `.worktreeinclude` is rendered, so the "This will:" list can say create / update
 / cannot edit, how many files Orca will copy, and whether `.worktreeinclude`
-gains an ignore rule. `patterns` are the overlaid
+gains an ignore rule, is already gitignored, or is tracked and gets none.
+`patterns` are the overlaid
 sync patterns as they WILL be after the operation, passed in because
 `magic.json` is not on disk yet. `Plan::apply(main_root)` runs AFTER
 `copy_into_repo` and the bootstrap gitignores and writes what was planned and
@@ -915,14 +916,21 @@ facts are RECORDED in the plan and carried across it:
   "unchanged", that overwrites or re-plans a changed file instead of leaving it
   alone, that moves the computation to after the prompt, or a comment or doc
   that calls the window closed.
-- **Whether git tracks `.worktreeinclude`.** `plan_include` asks once
-  (`git::tracked_files`, positive determination – "git could not be asked" reads
-  as untracked) and stores the answer in the plan. `summary_lines` ends the line
-  in `+ add it to .gitignore` for an untracked file and in `it is tracked by
-  git, so no ignore rule is added` for a tracked one, and `apply_include` acts
-  on the STORED answer. Flag a summary line that promises the rule
-  unconditionally, or an `apply` that probes git again – either lets the list
-  the person confirmed disagree with the step that runs.
+- **The state of `.worktreeinclude`'s ignore rule.** `plan_include` asks once
+  (`ignore_rule`) and stores the answer in the plan as an `IgnoreRule`:
+  `Tracked` when `git::tracked_files` lists the file (positive determination),
+  else `Present` when `git::is_ignored_str` says a rule already ignores it,
+  else `Add`; every "git could not be asked" lands on `Add`, the side that
+  promises and writes the rule. `summary_lines` ends the line in `it is tracked
+  by git, so no ignore rule is added`, `it is already gitignored` or `+ add it
+  to .gitignore`, and `apply_include` acts on the STORED answer: no rule for
+  `Tracked`, and `gitignore::ensure_path_ignored` for both other values, so a
+  rule removed while the prompt was open is put back. Flag a summary line that
+  promises the rule unconditionally or for a file already ignored, a tracked
+  file reported as "already gitignored", an "already gitignored" answer that
+  skips `ensure_path_ignored`, or an `apply` that asks whether the file is
+  tracked again – each lets the list the person confirmed disagree with the
+  step that runs.
 
 Before either file is read, the write path checks containment
 (`orca::write::landing`): a target that resolves OUTSIDE the repository through
@@ -1609,6 +1617,18 @@ documentation or a status report that claims `file-changed` is active
   `merge_setup_into_config` builds a new `Config` from a new `setup` array
   while **preserving `teardown` and `run` from disk**. Flag a merge that drops
   or reorders `teardown`/`run`.
+- The new `setup` array keeps the person's own commands too. Migration
+  (`migrated_setup`) replaces the `setup.sh` entry in place, or drops it when
+  another entry already runs the sync in any marker spelling (the wrapper, a
+  direct `ss-magic sync`, anything containing `magic.sh`); init and edit
+  config (`migrate::init_setup`) start from the existing array, replace a
+  `setup.sh` reference the same way, and put the wrapper
+  (`./.superset/magic.sh sync`) FIRST only when no entry is a wrapper or sync
+  marker yet. Both init paths once wrote `[wrapper]` alone, and an edit-config
+  run deleted `pnpm install --frozen-lockfile` from a real repository's
+  workspace setup. Flag any init, edit-config or migration path that builds
+  `setup` from scratch, drops or reorders an entry that is not a `setup.sh`
+  reference, or adds a second wrapper beside an existing marker.
 - `magic.json` (committed) is overlaid with `magic.local.json` (gitignored,
   per-machine) via `load_overlaid`: `files` are UNION + DEDUPE with
   `magic.json` order first. Flag overlay changes that reorder base entries or

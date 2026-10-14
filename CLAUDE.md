@@ -25,7 +25,7 @@ tune it per crate) and `[profile.dist]` inheriting it. Members live under
 - `crates/ss-magic-core` – the shared library. `publish = false` plus
   `[package.metadata.dist] dist = false`, version `0.1.0`, never a release
   surface and never tagged.
-- `crates/ss-magic` – binary `ss-magic`, the sync CLI. Currently `0.12.0`.
+- `crates/ss-magic` – binary `ss-magic`, the sync CLI. Currently `0.12.1`.
 - `crates/ss-magic-plugin` – binary `ss-magic-plugin`, the plugin's hook runtime
   and verb tree. Currently `1.0.1`.
 
@@ -518,7 +518,8 @@ The modules, by purpose:
   Orca output is COMPUTED before the finishing prompt (`orca::write::plan`, so
   the "This will:" list says whether `orca.yaml` is created, updated or cannot
   be edited, how many files Orca will copy, and whether `.worktreeinclude`
-  gains an ignore rule or is tracked and gets none) and WRITTEN after the tree
+  gains an ignore rule, is already gitignored, or is tracked and gets none)
+  and WRITTEN after the tree
   materializes (`Plan::apply`). The prompt sits between the two, so the plan
   remembers what it read and `apply` leaves alone, with a warning, a file that
   changed on disk in the meantime. `overlaid_patterns` gives the plan the sync
@@ -534,7 +535,19 @@ The modules, by purpose:
   edit-config path) and `run_init_noninteractive` do once their decisions are
   made – stage, `copy_into_repo`, bootstrap gitignores, Orca files – and
   `materialize_migration` is its migrate counterpart, split from `run_migrate`
-  so the whole write is testable without a prompt. Interactive init runs a
+  so the whole write is testable without a prompt. The `setup` array both init
+  paths write is `init_setup(existing)`: the existing array with any `setup.sh`
+  reference replaced in place (`migrated_setup`, which only the scripted init
+  can meet, and which DROPS the reference instead when another entry already
+  runs the sync in any spelling `entry_is_magic_marker` accepts, so the sync
+  never runs twice) and the wrapper put FIRST only when no entry is a wrapper or sync
+  marker yet – every other command stays where it was. Both paths used to
+  write `[wrapper]` alone, so an edit-config run silently deleted commands
+  such as `pnpm install` from every Superset workspace created afterwards.
+  The summary's overlay line comes from `local_overlay_line(exists, ignored)`:
+  "Bootstrap" or "Keep" `magic.local.json`, then "+ add it to .gitignore" or
+  "(already gitignored)", since a second run creates no file and adds no rule.
+  Interactive init runs a
   second picker (`ui::pick_shared_directories`) for `magic.json`'s
   `sharedDirectories`: what starts checked is the stored list when the key
   exists (a stored "none" included) and otherwise every kind that matches
@@ -996,12 +1009,17 @@ The modules, by purpose:
   `.worktreeinclude`, whose ignore rule is still added). Nothing is recomputed
   at apply time – the plan is what the person confirmed – and the window is
   NARROWED to the instant between that re-read and the rename, not closed.
-  Second, `plan_include` asks git ONCE whether `.worktreeinclude` is tracked
-  (positive determination; "could not be asked" reads as untracked) and records
-  the answer: `summary_lines` ends the line in "+ add it to .gitignore" or in
-  "it is tracked by git, so no ignore rule is added", and `apply_include` acts
-  on the recorded value instead of probing again, so the list the person
-  confirmed and the step that runs cannot disagree. `apply` returns `Notice`s
+  Second, `plan_include` asks git ONCE about the ignore rule (`ignore_rule`)
+  and records the answer as an `IgnoreRule`: `Tracked` (positive
+  determination), else `Present` when `git check-ignore` – the same question
+  `gitignore::ensure_path_ignored` asks – already ignores the file, else `Add`;
+  every "could not be asked" lands on `Add`. `summary_lines` ends the line in
+  "it is tracked by git, so no ignore rule is added", "it is already
+  gitignored" or "+ add it to .gitignore", and `apply_include` acts on the
+  recorded value instead of probing again, so the list the person confirmed
+  and the step that runs cannot disagree. For `Present` it still calls
+  `ensure_path_ignored`, which adds nothing when the rule is there and puts it
+  back if it was removed while the prompt was open. `apply` returns `Notice`s
   and never fails the operation. `SetupPolicy::Ensure` is init/migrate/edit-config;
   `OnlyWhenCreating` is the explicit refresh, which never touches the
   `scripts.setup` of an existing file. `refresh_snapshot` is the AUTOMATIC

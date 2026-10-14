@@ -202,6 +202,101 @@ fn migrated_setup_two_raw_setup_sh_keeps_wrapper_once() {
     assert_eq!(new.iter().filter(|e| *e == MAGIC_WRAPPER_ENTRY).count(), 1);
 }
 
+// ── init_setup: the setup array init and edit config write ───────────────
+
+/// Edit config on a repository whose `setup` runs the wrapper and then the
+/// person's own install command. Both are kept, in order – edit config used to
+/// write the wrapper alone and drop `pnpm install` from every new workspace.
+#[test]
+fn init_setup_keeps_every_command_beside_the_wrapper() {
+    let existing = cfg(
+        vec![MAGIC_WRAPPER_ENTRY, "pnpm install --frozen-lockfile"],
+        vec![],
+        vec![],
+    );
+    assert_eq!(
+        init_setup(Some(&existing)),
+        strings(&[MAGIC_WRAPPER_ENTRY, "pnpm install --frozen-lockfile"])
+    );
+}
+
+/// A marker the person placed later in the array, or spelled as a direct
+/// `ss-magic sync`, is respected where it is: no second wrapper is added.
+#[test]
+fn init_setup_leaves_an_array_with_a_marker_as_it_is() {
+    let later = cfg(vec!["uv sync", MAGIC_WRAPPER_ENTRY], vec![], vec![]);
+    assert_eq!(
+        init_setup(Some(&later)),
+        strings(&["uv sync", MAGIC_WRAPPER_ENTRY])
+    );
+    let direct = cfg(vec!["ss-magic sync", "uv sync"], vec![], vec![]);
+    assert_eq!(
+        init_setup(Some(&direct)),
+        strings(&["ss-magic sync", "uv sync"])
+    );
+}
+
+/// Init on a `config.json` with commands but no wrapper puts the wrapper first,
+/// so the configured files are in place before those commands run.
+#[test]
+fn init_setup_puts_the_wrapper_first_when_there_is_none() {
+    let existing = cfg(vec!["pnpm install", "make dev-env"], vec![], vec![]);
+    assert_eq!(
+        init_setup(Some(&existing)),
+        strings(&[MAGIC_WRAPPER_ENTRY, "pnpm install", "make dev-env"])
+    );
+    assert_eq!(
+        init_setup(Some(&cfg(vec![], vec![], vec![]))),
+        strings(&[MAGIC_WRAPPER_ENTRY])
+    );
+    assert_eq!(init_setup(None), strings(&[MAGIC_WRAPPER_ENTRY]));
+}
+
+/// The scripted `ss-magic init` is not routed by branch, so it can meet the
+/// old `setup.sh` reference. It is replaced in place, as migration does it.
+#[test]
+fn init_setup_replaces_a_setup_sh_reference_in_place() {
+    let existing = cfg(vec!["uv sync", "./.superset/setup.sh"], vec![], vec![]);
+    assert_eq!(
+        init_setup(Some(&existing)),
+        strings(&["uv sync", MAGIC_WRAPPER_ENTRY])
+    );
+}
+
+/// A `setup.sh` reference beside a sync marker spelled other than the wrapper
+/// is dropped rather than replaced: replacing it would leave two entries that
+/// each run the whole sync. Migration and init share this through
+/// `migrated_setup`.
+#[test]
+fn a_setup_sh_reference_beside_another_sync_marker_is_dropped() {
+    let direct = strings(&["./.superset/setup.sh", "ss-magic sync"]);
+    assert_eq!(migrated_setup(&direct), strings(&["ss-magic sync"]));
+    let short = cfg(vec!["magic.sh sync", "./.superset/setup.sh"], vec![], vec![]);
+    assert_eq!(init_setup(Some(&short)), strings(&["magic.sh sync"]));
+}
+
+/// The overlay line says what init and edit config will actually do with
+/// `magic.local.json`: keep an existing one, and add no rule that is there.
+#[test]
+fn local_overlay_line_describes_the_file_and_its_rule() {
+    assert_eq!(
+        local_overlay_line(false, false),
+        "Bootstrap .superset/magic.local.json + add it to .gitignore"
+    );
+    assert_eq!(
+        local_overlay_line(true, true),
+        "Keep .superset/magic.local.json (already gitignored)"
+    );
+    assert_eq!(
+        local_overlay_line(true, false),
+        "Keep .superset/magic.local.json + add it to .gitignore"
+    );
+    assert_eq!(
+        local_overlay_line(false, true),
+        "Bootstrap .superset/magic.local.json (already gitignored)"
+    );
+}
+
 // ── stage_migration: file transforms (no UI) ────────────────────────────
 
 /// Seed the repo with the OLD layout: setup.sh + setup_config.json +
@@ -580,6 +675,51 @@ fn run_init_noninteractive_writes_layout_from_patterns() {
             .mode();
         assert_eq!(mode & 0o777, 0o755, "magic.sh must be 0755");
     }
+}
+
+/// Init over an existing `config.json` keeps the person's own `setup`
+/// commands, and their `teardown` and `run`, while rewriting the rest of the
+/// layout. The menu's edit config writes through the same `materialize_init`.
+#[test]
+fn run_init_noninteractive_keeps_existing_setup_commands() {
+    let repo = fresh();
+    let root = repo.path();
+    let existing = cfg(
+        vec![MAGIC_WRAPPER_ENTRY, "pnpm install --frozen-lockfile"],
+        vec!["./drop.sh"],
+        vec!["pnpm dev"],
+    );
+    fs::create_dir_all(root.join(".superset")).unwrap();
+    superset_files::write_config_json(root, &existing).unwrap();
+
+    run_init_noninteractive(root, &strings(&[".env"])).unwrap();
+
+    let written = superset_files::load_config(root).unwrap().unwrap();
+    assert_eq!(written.setup, existing.setup, "the install command survives");
+    assert_eq!(written.teardown, existing.teardown);
+    assert_eq!(written.run, existing.run);
+}
+
+/// Init over a `config.json` whose `setup` has commands but nothing that runs
+/// the sync: the wrapper is written FIRST and the commands follow unchanged. A
+/// write that kept the array as it was would pass the test above and leave
+/// every new workspace without its configured files.
+#[test]
+fn run_init_noninteractive_puts_the_wrapper_before_existing_commands() {
+    let repo = fresh();
+    let root = repo.path();
+    let existing = cfg(vec!["pnpm install", "make dev-env"], vec!["./drop.sh"], vec![]);
+    fs::create_dir_all(root.join(".superset")).unwrap();
+    superset_files::write_config_json(root, &existing).unwrap();
+
+    run_init_noninteractive(root, &strings(&[".env"])).unwrap();
+
+    let written = superset_files::load_config(root).unwrap().unwrap();
+    assert_eq!(
+        written.setup,
+        strings(&[MAGIC_WRAPPER_ENTRY, "pnpm install", "make dev-env"])
+    );
+    assert_eq!(written.teardown, existing.teardown);
 }
 
 /// A malformed per-machine overlay must not stop init: its patterns are left

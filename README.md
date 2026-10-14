@@ -327,10 +327,17 @@ From the main-checkout menu, ss-magic branches on `config.json`'s `setup`:
 - An entry referencing the old `./.superset/setup.sh` → **migrate**: rename
   `setup_config.json` → `magic.json` (carrying its patterns along), write
   `magic.sh`, replace the `setup.sh` entry in place with
-  `./.superset/magic.sh sync`, delete `setup.sh`, bootstrap
+  `./.superset/magic.sh sync` (or drop it when another entry already runs the
+  sync, so it never runs twice), delete `setup.sh`, bootstrap
   `magic.local.json` + its `.gitignore` entry.
 - A `magic.sh` / `ss-magic` marker only → **edit config**.
 - Neither marker (or absent `config.json`) → **init** the contract.
+
+Init and edit config keep your own `setup` commands, such as
+`pnpm install --frozen-lockfile`, in the order you wrote them. When no entry
+runs the wrapper yet, `./.superset/magic.sh sync` is added FIRST, so the
+configured files are copied before your commands run; an array that already
+runs it is left as it is.
 
 Init, migration and edit config also write the
 [Orca files](#how-it-works-with-orca): `orca.yaml` and `.worktreeinclude` at
@@ -340,8 +347,10 @@ to it; migration and the scripted init keep a stored choice and otherwise take
 every kind they detect. The summary shown before the finishing action says
 whether `orca.yaml` will be created, updated, or cannot be edited, how many
 files `.worktreeinclude` will list, and whether that file is added to
-`.gitignore` – a file git already tracks gets no rule, and the summary says so
-instead of promising one.
+`.gitignore` – a file git already tracks gets no rule, and a file an earlier
+run already gitignored gets no second one, and the summary says which instead
+of promising one. The `magic.local.json` line likewise says whether that file
+is bootstrapped or kept and whether it is already gitignored.
 
 The Orca files are worked out before that prompt and written after it. If
 `orca.yaml` or `.worktreeinclude` changes on disk while the prompt is open –
@@ -358,7 +367,8 @@ secrets), so the backup tree is protected before the first sync ever writes to
 it, and the Claude plugin's per-worktree state tree `.superset/.magic/`. A
 fourth rule, for the per-machine `.worktreeinclude` snapshot, is added
 afterwards by the Orca step of the same run, and only when git does not track
-that file. Both flows preserve `config.json`'s `teardown` and `run` arrays verbatim. All
+that file. Every flow preserves `config.json`'s `teardown` and `run` arrays
+verbatim, and the other commands in its `setup` array as described above. All
 changes are staged into a tempdir and materialized only after the
 finishing-action prompt returns a non-cancel choice, so picking "done" or
 aborting leaves the old layout intact — never a half-migrated tree. Migration
@@ -958,7 +968,8 @@ repository's GitHub releases.
 A repo using ss-magic carries:
 
 - `.superset/config.json` — Superset-owned `{ setup, teardown, run }`. Its
-  `setup` array runs `./.superset/magic.sh sync` during workspace creation.
+  `setup` array runs `./.superset/magic.sh sync` during workspace creation,
+  beside any commands of your own, which ss-magic keeps in place.
   `teardown` and `run` are preserved verbatim by ss-magic.
 - `.superset/magic.sh` — the committed wrapper Superset invokes. It runs
   `command -v ss-magic` then `exec ss-magic "$@"` (propagating the binary's

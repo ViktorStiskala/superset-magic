@@ -547,13 +547,14 @@ fn apply_writes_both_files_when_nothing_changed_since_the_plan() {
         worktreeinclude::entries(&include),
         strings(&["secrets/local.pem", ".env"])
     );
-    // A second plan finds both files in step with the checkout.
+    // A second plan finds both files in step with the checkout, and the rule
+    // the first apply added already in place.
     assert_eq!(
         plan(main.path(), &patterns, &[], SetupPolicy::Ensure).summary_lines(),
         vec![
             "Keep orca.yaml (already up to date)".to_string(),
-            "Keep .worktreeinclude (already up to date, 1 file for Orca to copy) + add it to \
-             .gitignore"
+            "Keep .worktreeinclude (already up to date, 1 file for Orca to copy); it is already \
+             gitignored"
                 .to_string(),
         ]
     );
@@ -789,6 +790,85 @@ fn the_summary_promises_an_ignore_rule_only_for_an_untracked_worktreeinclude() {
         include_line(root),
         "Keep .worktreeinclude (already up to date, 1 file for Orca to copy); it is tracked by \
          git, so no ignore rule is added"
+    );
+}
+
+/// A `.worktreeinclude` an earlier run already gitignored gets no new rule, so
+/// the list says it is already gitignored instead of promising one – the line
+/// a second edit-config or `ss-magic orca` run used to print as "+ add it to
+/// .gitignore" although nothing would be added. A rule that also matches a
+/// tracked file does not make that file "already gitignored": tracked wins.
+#[test]
+fn the_summary_says_when_the_worktreeinclude_is_already_gitignored() {
+    let main = main_with_rule();
+    let root = main.path();
+    let name = worktreeinclude::FILE_NAME;
+    write_file(root, ".env", "S=1\n");
+    let patterns = strings(&[".env"]);
+    let include_line =
+        |root: &Path| plan(root, &patterns, &[], SetupPolicy::Ensure).summary_lines()[1].clone();
+
+    // A first write, with the rule already in place.
+    let planned = plan(root, &patterns, &[], SetupPolicy::Ensure);
+    assert_eq!(
+        planned.summary_lines()[1],
+        "Write .worktreeinclude (1 file for Orca to copy); it is already gitignored"
+    );
+    let gitignore_before = fs::read_to_string(root.join(".gitignore")).unwrap();
+    let notices = planned.apply(root);
+    assert_eq!(
+        fs::read_to_string(root.join(".gitignore")).unwrap(),
+        gitignore_before,
+        "nothing is added to .gitignore"
+    );
+    assert!(
+        !notices.iter().any(|notice| notice.text.contains("Gitignored")),
+        "{notices:?}"
+    );
+    assert_tidy(&notices);
+
+    // The run after it, where nothing changes.
+    assert_eq!(
+        include_line(root),
+        "Keep .worktreeinclude (already up to date, 1 file for Orca to copy); it is already \
+         gitignored"
+    );
+
+    // Tracked under the same rule: tracked wins.
+    git_run(&["add", "-f", name], root);
+    git_run(&["commit", "-q", "-m", "track the list"], root);
+    assert_eq!(
+        include_line(root),
+        "Keep .worktreeinclude (already up to date, 1 file for Orca to copy); it is tracked by \
+         git, so no ignore rule is added"
+    );
+}
+
+/// The list said "already gitignored", and the rule was removed while the
+/// prompt was open. `apply` still makes sure of the rule for an untracked
+/// file, so it is put back rather than left missing.
+#[test]
+fn apply_restores_a_rule_removed_after_the_plan_said_it_was_there() {
+    let main = main_with_rule();
+    let root = main.path();
+    write_file(root, ".env", "S=1\n");
+    let planned = plan(root, &strings(&[".env"]), &[], SetupPolicy::Ensure);
+    assert!(
+        planned.summary_lines()[1].ends_with("it is already gitignored"),
+        "{:?}",
+        planned.summary_lines()
+    );
+
+    write_file(root, ".gitignore", ".env\n");
+
+    let notices = planned.apply(root);
+
+    assert!(include_is_gitignored(root), "the rule is put back");
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.text == "Gitignored .worktreeinclude"),
+        "{notices:?}"
     );
 }
 
