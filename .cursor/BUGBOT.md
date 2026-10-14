@@ -1618,7 +1618,9 @@ documentation or a status report that claims `file-changed` is active
   while **preserving `teardown` and `run` from disk**. Flag a merge that drops
   or reorders `teardown`/`run`.
 - The new `setup` array keeps the person's own commands too. Migration
-  (`migrated_setup`) replaces the `setup.sh` entry in place; init and edit
+  (`migrated_setup`) replaces the `setup.sh` entry in place, or drops it when
+  another entry already runs the sync in any marker spelling (the wrapper, a
+  direct `ss-magic sync`, anything containing `magic.sh`); init and edit
   config (`migrate::init_setup`) start from the existing array, replace a
   `setup.sh` reference the same way, and put the wrapper
   (`./.superset/magic.sh sync`) FIRST only when no entry is a wrapper or sync

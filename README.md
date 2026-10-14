@@ -327,7 +327,8 @@ From the main-checkout menu, ss-magic branches on `config.json`'s `setup`:
 - An entry referencing the old `./.superset/setup.sh` → **migrate**: rename
   `setup_config.json` → `magic.json` (carrying its patterns along), write
   `magic.sh`, replace the `setup.sh` entry in place with
-  `./.superset/magic.sh sync`, delete `setup.sh`, bootstrap
+  `./.superset/magic.sh sync` (or drop it when another entry already runs the
+  sync, so it never runs twice), delete `setup.sh`, bootstrap
   `magic.local.json` + its `.gitignore` entry.
 - A `magic.sh` / `ss-magic` marker only → **edit config**.
 - Neither marker (or absent `config.json`) → **init** the contract.

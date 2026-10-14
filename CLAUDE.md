@@ -538,7 +538,9 @@ The modules, by purpose:
   so the whole write is testable without a prompt. The `setup` array both init
   paths write is `init_setup(existing)`: the existing array with any `setup.sh`
   reference replaced in place (`migrated_setup`, which only the scripted init
-  can meet) and the wrapper put FIRST only when no entry is a wrapper or sync
+  can meet, and which DROPS the reference instead when another entry already
+  runs the sync in any spelling `entry_is_magic_marker` accepts, so the sync
+  never runs twice) and the wrapper put FIRST only when no entry is a wrapper or sync
   marker yet – every other command stays where it was. Both paths used to
   write `[wrapper]` alone, so an edit-config run silently deleted commands
   such as `pnpm install` from every Superset workspace created afterwards.

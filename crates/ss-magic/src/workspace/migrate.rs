@@ -276,10 +276,15 @@ pub fn detect_branch(config: Option<&Config>) -> Branch {
 ///
 /// Mirrors `merge_setup_into_config`'s preservation discipline: only the
 /// `setup.sh` reference is touched; all other commands keep their position.
-/// If the wrapper entry is already present elsewhere, the replaced slot is
-/// dropped (it would otherwise duplicate the wrapper).
+/// If another entry already runs the sync – the wrapper, or any other spelling
+/// [`entry_is_magic_marker`] accepts, such as a direct `ss-magic sync` – the
+/// `setup.sh` slot is dropped instead of replaced, since a second sync entry
+/// would run the whole copy (and its backup pass) twice in every new
+/// workspace.
 fn migrated_setup(old_setup: &[String]) -> Vec<String> {
-    let already_has_wrapper = old_setup.iter().any(|e| e == MAGIC_WRAPPER_ENTRY);
+    let already_has_wrapper = old_setup
+        .iter()
+        .any(|e| !entry_is_setup_sh(e) && entry_is_magic_marker(e));
     let mut out: Vec<String> = Vec::with_capacity(old_setup.len());
     let mut replaced = false;
     for entry in old_setup {

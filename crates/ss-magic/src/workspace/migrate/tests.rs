@@ -263,6 +263,18 @@ fn init_setup_replaces_a_setup_sh_reference_in_place() {
     );
 }
 
+/// A `setup.sh` reference beside a sync marker spelled other than the wrapper
+/// is dropped rather than replaced: replacing it would leave two entries that
+/// each run the whole sync. Migration and init share this through
+/// `migrated_setup`.
+#[test]
+fn a_setup_sh_reference_beside_another_sync_marker_is_dropped() {
+    let direct = strings(&["./.superset/setup.sh", "ss-magic sync"]);
+    assert_eq!(migrated_setup(&direct), strings(&["ss-magic sync"]));
+    let short = cfg(vec!["magic.sh sync", "./.superset/setup.sh"], vec![], vec![]);
+    assert_eq!(init_setup(Some(&short)), strings(&["magic.sh sync"]));
+}
+
 /// The overlay line says what init and edit config will actually do with
 /// `magic.local.json`: keep an existing one, and add no rule that is there.
 #[test]
@@ -686,6 +698,28 @@ fn run_init_noninteractive_keeps_existing_setup_commands() {
     assert_eq!(written.setup, existing.setup, "the install command survives");
     assert_eq!(written.teardown, existing.teardown);
     assert_eq!(written.run, existing.run);
+}
+
+/// Init over a `config.json` whose `setup` has commands but nothing that runs
+/// the sync: the wrapper is written FIRST and the commands follow unchanged. A
+/// write that kept the array as it was would pass the test above and leave
+/// every new workspace without its configured files.
+#[test]
+fn run_init_noninteractive_puts_the_wrapper_before_existing_commands() {
+    let repo = fresh();
+    let root = repo.path();
+    let existing = cfg(vec!["pnpm install", "make dev-env"], vec!["./drop.sh"], vec![]);
+    fs::create_dir_all(root.join(".superset")).unwrap();
+    superset_files::write_config_json(root, &existing).unwrap();
+
+    run_init_noninteractive(root, &strings(&[".env"])).unwrap();
+
+    let written = superset_files::load_config(root).unwrap().unwrap();
+    assert_eq!(
+        written.setup,
+        strings(&[MAGIC_WRAPPER_ENTRY, "pnpm install", "make dev-env"])
+    );
+    assert_eq!(written.teardown, existing.teardown);
 }
 
 /// A malformed per-machine overlay must not stop init: its patterns are left
