@@ -297,6 +297,47 @@ fn migrated_setup(old_setup: &[String]) -> Vec<String> {
     out
 }
 
+/// Build the `setup` array init and edit config write: the existing one, with
+/// the wrapper ensured and every other command kept in its place.
+///
+/// Edit config runs on a repository whose `setup` already holds the wrapper,
+/// often beside commands of the person's own (`pnpm install`, `uv sync`), and
+/// init may meet a `config.json` with commands but no wrapper. Both used to
+/// write `[wrapper]` alone, which silently deleted those commands from every
+/// Superset workspace created afterwards. Now a `setup.sh` reference is
+/// replaced in place exactly as migration does it ([`migrated_setup`] – only
+/// the scripted `ss-magic init` can meet one, the menu routes such a
+/// repository to migrate); then, when no entry is a wrapper or sync marker
+/// yet, the wrapper is put FIRST, so the configured files are in place before
+/// the person's own commands run. An array that already carries a marker is
+/// returned as it is. `None` (no `config.json`) is the wrapper alone.
+fn init_setup(existing: Option<&Config>) -> Vec<String> {
+    let mut setup = existing.map_or_else(Vec::new, |cfg| migrated_setup(&cfg.setup));
+    if !setup.iter().any(|entry| entry_is_magic_marker(entry)) {
+        setup.insert(0, MAGIC_WRAPPER_ENTRY.to_string());
+    }
+    setup
+}
+
+/// The "This will:" line for the local overlay. Init and edit config only
+/// create `magic.local.json` when it is absent (the file is gitignored, so an
+/// existing one is unrecoverable and is kept), and `ensure_bootstrap_gitignores`
+/// adds its ignore rule only when git does not already apply one. Saying
+/// "Bootstrap … + add it to .gitignore" unconditionally described neither on a
+/// second run. `ignored` is git's answer, with "could not be asked" passed as
+/// `false` – the rule is then promised, and the bootstrap writes it.
+fn local_overlay_line(exists: bool, ignored: bool) -> String {
+    format!(
+        "{} {MAGIC_LOCAL_REL}{}",
+        if exists { "Keep" } else { "Bootstrap" },
+        if ignored {
+            " (already gitignored)"
+        } else {
+            " + add it to .gitignore"
+        }
+    )
+}
+
 /// Lines describing the migration, shared by the on-screen summary and tests.
 /// Pure: computes the after-`setup` array but writes nothing.
 fn migration_summary(existing: &Config) -> Vec<String> {
@@ -568,7 +609,8 @@ pub fn build_pattern_options(
 ///
 /// Reuses the patterns picker (`ui::pick_patterns`), seeds `magic.json`'s
 /// `files` with `default_magic_files()` + the chosen patterns, writes
-/// `magic.sh`, sets `config.json` `setup` to the wrapper entry, and bootstraps
+/// `magic.sh`, ensures the wrapper entry in `config.json`'s `setup` while
+/// keeping every other command there ([`init_setup`]), and bootstraps
 /// `magic.local.json` + gitignore. Stage → prompt → materialize, same as
 /// migration.
 ///
@@ -642,8 +684,14 @@ pub fn run_init(repo_root: &Path, existing: Option<&Config>) -> Result<ExitCode>
     let mut summary = vec![
         "Write .superset/magic.json (synced patterns)".to_string(),
         "Write .superset/magic.sh (executable wrapper)".to_string(),
-        format!("Write .superset/config.json setup → [{MAGIC_WRAPPER_ENTRY}]"),
-        "Bootstrap .superset/magic.local.json + add it to .gitignore".to_string(),
+        format!(
+            "Write .superset/config.json setup → [{}]",
+            init_setup(existing).join(", ")
+        ),
+        local_overlay_line(
+            repo_root.join(MAGIC_LOCAL_REL).exists(),
+            matches!(git::is_ignored_str(repo_root, MAGIC_LOCAL_REL), Ok(true)),
+        ),
     ];
     summary.extend(orca_plan.summary_lines());
     ui::print_pattern_list(&summary);
@@ -693,8 +741,9 @@ struct InitWritten {
 /// Stages `magic.json` (with `files` and `shared` as its two lists – `shared`
 /// being `None` leaves `sharedDirectories` out of the file – and every unknown
 /// key of `existing_magic` carried over), `magic.sh`, `config.json`
-/// (the wrapper entry as `setup`, `teardown`/`run` of `existing_config`
-/// preserved) and, when the repository has none, a fresh `magic.local.json`;
+/// (`existing_config`'s `setup` with the wrapper ensured, see [`init_setup`],
+/// and its `teardown`/`run` preserved) and, when the repository has none, a
+/// fresh `magic.local.json`;
 /// copies the stage in; adds the bootstrap gitignore rules; then writes the
 /// Orca files per `orca_plan`. Nothing in the repository is touched before the
 /// stage is complete.
@@ -714,10 +763,8 @@ fn materialize_init(
     let magic_cfg = superset_files::merge_files_into_magic_config(existing_magic, files, shared);
     superset_files::write_magic_json(stage_root, &magic_cfg)?;
     superset_files::write_magic_sh(stage_root)?;
-    let merged = superset_files::merge_setup_into_config(
-        existing_config,
-        vec![MAGIC_WRAPPER_ENTRY.to_string()],
-    );
+    let merged =
+        superset_files::merge_setup_into_config(existing_config, init_setup(existing_config));
     superset_files::write_config_json(stage_root, &merged)?;
     // Only seed magic.local.json when the repo doesn't already have one — it's
     // gitignored (unrecoverable), so staging the empty template would clobber a
