@@ -249,6 +249,7 @@ jobs:
       - name: No document spells the old `ss-magic plugin` subcommand
         run: |
           set -euo pipefail
+          # docs/explainers/ (the user docs the README links to) and
           # docs/solutions/, every CLAUDE.md (the root one and the per-crate /
           # per-subtree ones), every CODING_STANDARDS.md and REVIEW.md are in
           # scope too: all are read by agents working in this repo, so a retired
@@ -262,7 +263,7 @@ jobs:
             git ls-files -- 'CLAUDE.md' '**/CLAUDE.md' \
               'CODING_STANDARDS.md' '**/CODING_STANDARDS.md' 'REVIEW.md')
           if grep -rn 'ss-magic plugin ' \
-              plugin/skills/ docs/solutions/ \
+              plugin/skills/ docs/explainers/ docs/solutions/ \
               README.md CONTRIBUTING.md CONCEPTS.md .cursor/BUGBOT.md \
               "${agent_docs[@]}"; then
             echo "the plugin is its own binary now; spell it 'ss-magic-plugin <verb>'." >&2

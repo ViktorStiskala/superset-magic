@@ -3,7 +3,8 @@
 Two Rust binaries for the Superset workspace contract, sharing one library crate
 (standalone repo: `ViktorStiskala/superset-magic`): `ss-magic`, the interactive
 sync CLI, and `ss-magic-plugin`, the Claude Code plugin. See
-[README.md](./README.md) for user-facing docs.
+[README.md](./README.md) for the user-facing overview and
+[docs/explainers/](./docs/explainers/) for the detailed user docs it links to.
 
 ## Where things are documented
 
@@ -83,8 +84,10 @@ into `${CLAUDE_PLUGIN_DATA}/bin/ss-magic-plugin` and nothing looks for it on
   so the zip rides the plugin's tag only. Verify a change there with
   `dist build --artifacts=global`, never `dist plan` – detail in
   [.github/CLAUDE.md](./.github/CLAUDE.md).
-- The per-target archives are attested, but self-update trusts TLS + cargo-dist
-  checksums, not attestations. Changing the attestation phase is a security
+- The per-target archives are attested, but self-update trusts the
+  TLS-authenticated download alone: `self_update` is built without its
+  `signatures` feature and reads neither the published `.sha256` files nor the
+  attestations. Changing the attestation phase is a security
   decision.
 
 The per-line release procedure and other contributor docs live in
@@ -182,8 +185,9 @@ flowchart TB
   absent);\
   `/bin/bash scripts/test-bootstrap.sh` and `/bin/bash scripts/test-mark-latest.sh`
   (bash 3.2);\
-  the doc greps (no skill body names `CLAUDE_PLUGIN_DATA`, no document spells
-  the retired `ss-magic` + `plugin` subcommand form, the README installer pinned
+  the doc greps (no skill body names `CLAUDE_PLUGIN_DATA`, no document –
+  `docs/explainers/` included – spells the retired `ss-magic` + `plugin`
+  subcommand form, the README installer pinned
   to a release, never `latest`);\
   the release-tag-shape gate (a tag must match `^v[0-9]+\.[0-9]+\.[0-9]+$` or
   `^ss-magic-plugin-v[0-9]+\.[0-9]+\.[0-9]+$`).\
@@ -220,7 +224,10 @@ flowchart TB
   that exact commit – a red release still burns its version. See
   [docs/solutions/logic-errors/cargo-dist-plan-job-failure-publishes-empty-release.md](./docs/solutions/logic-errors/cargo-dist-plan-job-failure-publishes-empty-release.md).
 - **Docs sync.** A change is done only when the docs describe the code as it is
-  now: update [README.md](./README.md) (command list, prose) and the
+  now: update [README.md](./README.md) (overview, the CLI and plugin command
+  inventories, the explainer index), the explainer under
+  [docs/explainers/](./docs/explainers/) that owns the behavior (each README
+  section links to its owner; detail lives there, not in the README), and the
   `CLAUDE.md` that owns the area (this file or a subdirectory one);\
   update the owning `CODING_STANDARDS.md` when a code rule is established or
   retired;\

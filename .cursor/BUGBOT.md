@@ -1889,8 +1889,8 @@ out of step or a stale digest, or a bump applied to the wrong group's surfaces.
   a content change under `plugin/` came with a version bump (its baseline
   considers BOTH tag shapes), the bootstrap failure-path suite, a build of the
   exact asset cargo-dist will publish, and three document greps: no skill body
-  names `CLAUDE_PLUGIN_DATA`; no document (`plugin/skills/`, `docs/solutions/`,
-  `README.md`, `CONTRIBUTING.md`, `CONCEPTS.md`, every tracked `CLAUDE.md`,
+  names `CLAUDE_PLUGIN_DATA`; no document (`plugin/skills/`, `docs/explainers/`,
+  `docs/solutions/`, `README.md`, `CONTRIBUTING.md`, `CONCEPTS.md`, every tracked `CLAUDE.md`,
   `CODING_STANDARDS.md` and `REVIEW.md` found by `git ls-files`, this file) spells
   the retired `ss-magic` + `plugin` subcommand form – `docs/plans/` is
   deliberately out of scope, a plan being a historical record; and `README.md`
@@ -1929,7 +1929,13 @@ out of step or a stale digest, or a bump applied to the wrong group's surfaces.
 
 ## Documentation Sync (REQUIRED)
 
-`README.md` (user-facing), `CONTRIBUTING.md` (contributor-facing: from-source
+`README.md` (the user-facing overview: what the tool does, the installer
+one-liner, the CLI and plugin command inventories, and an index of explainers),
+the user-facing explainers under `docs/explainers/` (one per area – install and
+self-update, the `.superset/` contract, sync patterns, forward and reverse sync,
+the interactive Sync cockpit, pack, Orca, and the plugin's install/config,
+hooks, and session state – holding the detail the README only summarizes and
+links to), `CONTRIBUTING.md` (contributor-facing: from-source
 builds, tests, PR expectations, release/versioning), `CONCEPTS.md` (domain
 vocabulary), and the repo's contributor-instructions files – the one at the
 repo root (cross-cutting conventions) plus one per crate or subtree
@@ -1939,7 +1945,9 @@ repo root (cross-cutting conventions) plus one per crate or subtree
 reflect the current state after every implementation change – a new command,
 flag, module, or changed behavior. Flag a behavior- or architecture-changing PR
 that leaves any of them describing the old state (e.g. a new subcommand or
-plugin verb not listed in the README command inventory or the
+plugin verb not listed in the README command inventory, a changed behavior
+whose owning explainer under `docs/explainers/` still describes the old one, a
+README section that re-grows detail its explainer already owns, or the
 `main.rs`/`cli.rs` descriptions, a changed build/test/release workflow not
 reflected in `CONTRIBUTING.md`, or a new module absent from the
 contributor-instructions file that owns its directory). The code rules live in
