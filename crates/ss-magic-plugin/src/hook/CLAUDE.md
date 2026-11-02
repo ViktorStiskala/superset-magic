@@ -4,6 +4,8 @@ Scope: the `ss-magic-plugin hook <event>` runtime – the one pipeline plus one 
 
 Code rules for this subtree: [CODING_STANDARDS.md](../../CODING_STANDARDS.md) – read it before writing or reviewing code here, and update it when a change establishes or retires a rule. The root [CODING_STANDARDS.md](../../../../CODING_STANDARDS.md) applies too.
 
+**This file is scanned by the hook tests.** The source-scan tests in `tests.rs` read EVERY file under `src/hook/` except `mod.rs`, `event.rs` and `tests.rs` – this `CLAUDE.md` included – and fail on a forbidden token anywhere in it. Never spell, even in prose, the names those scans forbid: the standard-stream print macros and stream handles, the gitignore-writer functions, the HTTP client type or crate, and the release-fetch functions. Describe them in words and point at the test.
+
 The shipped `plugin/hooks/hooks.json` declares exactly five events: `SessionStart`, `PreToolUse`, `PreCompact`, `SubagentStop`, `SessionEnd`. There is no `FileChanged` entry (see `file_changed.rs` below).
 
 ```mermaid
@@ -64,7 +66,7 @@ flowchart LR
    - On `startup` only, it reads the plugin line's release cache (`release_check::cache_file`) and decides through the pure `release_check::suggestion(pinned, cache, source, quiet)`. Skip reasons, in order: not startup, no pin, no cache, no plugin tag, not newer, already suggested, then quiet mode LAST – so a headless session with something to say records `release suggestion suppressed (quiet mode: …)` while one with nothing to say records "not newer".
    - When a newer release is due it RECORDS it before announcing: `release_check::record_suggested` takes the shared non-blocking `release-check.lock` under the temp root, re-reads the cache and writes `suggested = tag`. Contention (`Busy`), a tag the cache no longer names (`Superseded`), no lock root or a write failure all WITHHOLD the notice for this session, because the record is what makes it once-per-tag. Quiet mode is decided before the write, so a headless session never spends the budget.
    - Then (R30), still only on `startup`, only when someone is watching and a pin exists: if the cache is missing or older than 24 h it spawns `current_exe() release-check --refresh --quiet` detached (`release_check::spawn_detached`) and returns without waiting. The spawn happens AFTER the lock is released, so the refresh never contends with this invocation's own marker write.
-   - A source-scan test in `hook/tests.rs` asserts no `hook/` module names `UreqReleaseClient`, `ureq`, `fetch_releases`, `refresh_cache`, `refresh_with`, `for_product` or `resolve_newest_uncached`: no hook constructs an HTTP client.
+   - A source-scan test in `hook/tests.rs` (`no_hook_module_constructs_an_http_client`) asserts that no file under `hook/` names the HTTP client or any of core's release-fetch functions – the forbidden list is in the test itself: no hook constructs an HTTP client.
 - Full detail of `record_suggested`, `spawn_detached` and the cache lives with `release_check.rs` in [crates/ss-magic-plugin/CLAUDE.md](../../CLAUDE.md).
 - Test isolation: everything the handler reads from outside the envelope (plugin root, override, entrypoint, cache dir for both the compaction marker and release cache, lock root, spawner) arrives in one `Surroundings` value (`handle` = `handle_with(ctx, &Surroundings::from_process())`). No test can write a once-per-machine marker into the developer's own cache dir, and no test spawns a real refresh.
 
