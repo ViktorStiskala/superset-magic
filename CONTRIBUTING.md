@@ -391,9 +391,16 @@ shape matters.
 - **A change under `plugin/` also re-pins the digest.** Run `python3
   scripts/build-plugin-zip.py --update-manifest`, then `--check`.
 - Update the docs in the same PR: `README.md` must describe the tool as it is
-  after your change, and `CLAUDE.md` / `.cursor/BUGBOT.md` must reflect any
-  architecture or convention change. `.cursor/BUGBOT.md` has to stay
-  self-contained – restate a convention inline there rather than linking to it.
+  after your change; the `CLAUDE.md` that owns the area (the root one for
+  cross-cutting conventions, or the one in the crate or subdirectory you
+  touched) must reflect any architecture or convention change; the owning
+  `CODING_STANDARDS.md` (root, `crates/ss-magic-plugin/`, or
+  `crates/ss-magic/src/orca/`) must gain or lose a rule when your change
+  establishes or retires one; and `.cursor/BUGBOT.md` must mirror all of it.
+  `.cursor/BUGBOT.md` has to stay self-contained – restate a convention inline
+  there rather than linking to it. Never add a `CLAUDE.md` or
+  `CODING_STANDARDS.md` under `plugin/`: every file there ships in the
+  marketplace zip.
 - Keep the secret-safety invariants intact unless the change is explicitly
   about them: absolute / `..` patterns rejected, reverse-synced paths always
   gitignored in main, no overwrite of an existing main-checkout file without a
