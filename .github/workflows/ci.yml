@@ -249,14 +249,23 @@ jobs:
       - name: No document spells the old `ss-magic plugin` subcommand
         run: |
           set -euo pipefail
-          # docs/solutions/ and CLAUDE.md are in scope too: both are read by
-          # agents working in this repo, so a retired command there is acted on,
-          # not merely misread. docs/plans/ is deliberately NOT in scope - a plan
+          # docs/explainers/ (the user docs the README links to) and
+          # docs/solutions/, every CLAUDE.md (the root one and the per-crate /
+          # per-subtree ones), every CODING_STANDARDS.md and REVIEW.md are in
+          # scope too: all are read by agents working in this repo, so a retired
+          # command there is acted on, not merely misread. git ls-files finds
+          # the nested instruction files, so a new one is covered without
+          # editing this list. docs/plans/ is deliberately NOT in scope - a plan
           # is a historical record and quotes the spelling that was current when
           # it was written.
+          agent_docs=()
+          while IFS= read -r f; do agent_docs+=("$f"); done < <(
+            git ls-files -- 'CLAUDE.md' '**/CLAUDE.md' \
+              'CODING_STANDARDS.md' '**/CODING_STANDARDS.md' 'REVIEW.md')
           if grep -rn 'ss-magic plugin ' \
-              plugin/skills/ docs/solutions/ \
-              README.md CONTRIBUTING.md CONCEPTS.md CLAUDE.md .cursor/BUGBOT.md; then
+              plugin/skills/ docs/explainers/ docs/solutions/ \
+              README.md CONTRIBUTING.md CONCEPTS.md .cursor/BUGBOT.md \
+              "${agent_docs[@]}"; then
             echo "the plugin is its own binary now; spell it 'ss-magic-plugin <verb>'." >&2
             exit 1
           fi

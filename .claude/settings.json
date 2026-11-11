@@ -1,6 +1,7 @@
 {
   "enabledPlugins": {
-    "compound-engineering@compound-engineering-plugin": true
+    "compound-engineering@compound-engineering-plugin": true,
+    "claude-md-management@claude-plugins-official": true
   },
   "extraKnownMarketplaces": {
     "compound-engineering-plugin": {
